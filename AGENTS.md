@@ -21,7 +21,19 @@
 
 ## 3. 核心模块防回归清单
 修改 `data/.config.yaml`、`docker-compose.yml` 或 `data/start_with_env.py` 时，必须完整保留以下已调优能力：
-- **长期记忆共存**：保留 `Memory: AnimaBrain`（`http://anima-brain:18787`）与 `start_with_env.py` 中的异步记忆同步钩子；
+- **长期记忆共存与双端人设同步**：
+  - 保留 `Memory: AnimaBrain`（`http://anima-brain:18787`）、`start_with_env.py` 记忆钩子以及 `docker-compose.yml` 中 `./anima-brain/xiaozhi_anima_service.py:/app/xiaozhi_anima_service.py:ro` 挂载（确保从 `turn_appraisals` 表读取真实历史情绪而非恒定 `calm`）；
+  - `data/anima_memory_provider.py` 召回时必须剥离重复的 `【角色身份设定】` 段落（以 `18080` 主 `prompt` 为唯一人设权威），且 `data/console_server.py` 保存配置时必须自动调用 `/api/update_character` 双端同步角色 `name` 与 `persona`；
 - **防抢话 VAD 阈值**：保留 `VAD.SileroVAD` 的 `min_silence_duration_ms: 1100` 与 `threshold_low: 0.2`（严禁回退至上游默认的 `200ms` 导致用户句中换气被截断）；
 - **免 Key 天气补丁**：保留 `data/nmc_weather_patch.py`（中央气象台 `nmc.cn` 实时与 7 天预报，默认城市 `长沙`，过滤 `9999` 缺测哨兵值），不回退上游已 `401` 失效的和风测试 Key；
 - **冷内存自动裁剪**：保留 `data/start_all.ps1` 启动末尾对 `19880` 进程的 `EmptyWorkingSet` 冷页回收与 WSL2 `drop_caches`。
+
+## 4. 雷电芽衣 7 情绪动态语音与流式切句规范
+- **防流式吞括号念标签**：保留 `data/mei_emotion_router.py` 对 `ConnectionHandler._clean_response_garbage`、`PromptManager.build_enhanced_prompt` 及 `_inject_tool_call_fewshot` 的补丁，严防 `direct_answer` 分块边界误删 `[gentle]` 右括号 `]` 导致 TTS 朗读英文标签，同时保留 `[安全挡]` 等正常正文方括号。
+- **整句连贯合成**：保持 `TTS.GPT_SOVITS_V2.text_split_method: cut0` 与外层防首句 2～3 字短逗号强切逻辑；普通句尾 `～` 不得覆盖本轮显式情绪标签。
+- **播放级表情同步与试听保护**：ESP32 屏幕表情必须经 `_segment_emotion_queue` 在 `send_tts_message("sentence_start")` 阶段按 `AudioRateController` 真实播放进度发送（严禁在合成线程提前推送）；`18080` 控制台 `/api/tts-preview` 试听非当前 `GPT-SoVITS` 音色后，必须在 `finally` 块自动还原已保存的线上音色权重。
+- **必跑 17 项自检套件**：修改 TTS、情绪路由、提示词或记忆代码后，必须运行 `docker exec xiaozhi-esp32-server python3 /opt/xiaozhi-esp32-server/data/test_mei_emotion_and_prosody.py` 确认 17 项测试全通过。
+
+## 5. GitHub 公开仓库同步与隐私红线
+- **远端公开仓库**：`https://github.com/zou172866/xiaozhi-windows-pc-mcp`（推送更新时保持 `.gitattributes` 锁定 `*.bat` / `*.ps1` 为 `eol=crlf`；引入第三方目录前先检查是否存在嵌套 `.git` 防止产生 `160000` 空目录）。
+- **公网脱敏硬拦截**：提交前必跑 `git add -n .` 核验，严禁将 `*.bin`（含家庭 Wi-Fi 凭证的 ESP32 NVS 备份）、`data/anima/`（`brain.sqlite3` 隐私记忆库与访问令牌）、`data/chat_history.json`、`data/agy_tasks/`、屏幕截图、运行日志、`.venv` 或百兆模型音频文件推入版本库。
