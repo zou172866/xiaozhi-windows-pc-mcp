@@ -113,8 +113,8 @@ Strict rules:
 1. Every `source_quote` MUST be an EXACT character-for-character substring of `user_message`. Never paraphrase quotes!
 2. Only extract durable, meaningful user facts/preferences/plans/open-loops. For casual greetings or filler chat with no new durable fact, set `"memories": []` and `"corrections": []`.
 3. If the user updates or contradicts an item in `existing_facts`, put it in `corrections` using that item's `id`, `revision`, and exact `key` (`"superseded"` if state changed over time, `"corrected"` if old fact was wrong).
-4. If the user mentions an upcoming unresolved personal event (e.g. exam, trip, interview, task tomorrow), set `details.loop_status = "open"` and `details.followup = "ask"`.
-5. `trust`, `warmth`, `tension` deltas are integers in -3..3 (0 or 1 for normal friendly chat); `romance` must be 0 unless romance is enabled.
+4. If the user mentions an upcoming unresolved personal event (e.g. exam, trip, interview, task tomorrow), set `details.loop_status = "open"` and `details.followup = "ask"`. If the user later says an `open` event is finished/past or no longer bothering them, update it via `corrections` with `details.loop_status = "resolved"` and `details.followup = "background_only"`.
+5. `trust`, `warmth`, `tension`, `disclosure` deltas are integers in -3..3 (`trust`/`warmth`: 0 or 1 for friendly chat; `disclosure`: 1 whenever the user shares personal feelings, daily life, stories, or fondness); `romance` must be 0 unless romance is enabled.
 """
 
 
@@ -127,6 +127,45 @@ def load_or_create_token() -> str:
     token = secrets.token_urlsafe(32)
     TOKEN_PATH.write_text(token, encoding="utf-8")
     return token
+
+
+def install_gemini_embedding_compat_patch() -> None:
+    """Gemini's OpenAI-compatible /embeddings omits per-item `index` keys while preserving input order.
+    Patch companion_engine.media.Embeddings.encode so indexing, semantic recall, and reconciliation work cleanly."""
+    from companion_engine import media as _media_mod
+    from companion_engine.providers import ProviderError
+
+    if getattr(_media_mod.Embeddings, "_gemini_index_patched", False):
+        return
+
+    def _compat_encode(self, texts):
+        response = _media_mod.post(
+            self.base + "/embeddings",
+            key=self.key,
+            transport=self.transport,
+            json={"model": self.model, "input": texts, "encoding_format": "float"},
+        )
+        try:
+            data = response.json()
+            raw_rows = data["data"]
+            if not isinstance(raw_rows, list) or len(raw_rows) != len(texts):
+                raise ValueError("Invalid embedding count")
+            if all(isinstance(r, dict) and "index" in r for r in raw_rows):
+                rows = sorted(raw_rows, key=lambda r: r["index"])
+                if [r["index"] for r in rows] != list(range(len(texts))):
+                    raise ValueError("Invalid embedding indices")
+            else:
+                rows = raw_rows
+            return {
+                "vectors": [_media_mod.checked_vector(r["embedding"]) for r in rows],
+                "usage": data.get("usage") or {"billing": "unknown"},
+            }
+        except (ValueError, KeyError, TypeError):
+            raise ProviderError("Invalid embedding envelope; billing may have occurred") from None
+
+    _media_mod.Embeddings.encode = _compat_encode
+    _media_mod.Embeddings._gemini_index_patched = True
+    log.info("Applied Gemini OpenAI-compatible /embeddings index compatibility patch")
 
 
 def ensure_default_character(brain: CompanionBrain) -> None:
@@ -142,6 +181,38 @@ def ensure_default_character(brain: CompanionBrain) -> None:
             timezone="Asia/Shanghai",
         )
         log.info("Created default Anima Brain character: %s (小智)", DEFAULT_CHARACTER_ID)
+
+
+def clear_stale_review_jobs(brain: CompanionBrain, max_age_seconds: int = 600) -> int:
+    """Auto-clear transient failed automation jobs stuck in 'review' so summaries/indexing never stall forever."""
+    engine = brain.engine
+    cutoff = time.time() - max_age_seconds
+    cleared = 0
+    try:
+        with engine._lock:
+            rows = engine.db.execute(
+                "SELECT id, character_id, kind, error, created FROM memory_jobs "
+                "WHERE owner=? AND state='review' AND (created IS NULL OR created < ?)",
+                (engine.owner, cutoff),
+            ).fetchall()
+            if rows:
+                with engine._transaction():
+                    for r in rows:
+                        engine.db.execute("DELETE FROM memory_jobs WHERE id=?", (r["id"],))
+                        cleared += 1
+                log.info("Auto-cleared %d stale review memory_job(s) so background indexing/summaries can resume", cleared)
+    except Exception as exc:
+        log.warning("clear_stale_review_jobs skipped: %s", exc)
+    return cleared
+
+
+def _fmt_mem_date(ts: float | None) -> str:
+    if not ts:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+    except Exception:
+        return ""
 
 
 def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: str) -> dict[str, Any]:
@@ -278,12 +349,24 @@ def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: s
             sections.append(f"【长期核心人物笔记】\n{core_texts}")
 
     if active_facts:
-        fact_lines = [f"- [{m.category}] {m.text}" for m in active_facts]
-        sections.append("【已确认的关于对方的长期记忆】\n" + "\n".join(fact_lines))
+        fact_lines = [
+            f"- [{_fmt_mem_date(getattr(m, 'updated_at', None)) or '历史'} | {m.category}] {m.text}"
+            for m in active_facts
+        ]
+        sections.append(
+            "【已确认的关于对方的长期记忆（带记录日期，切勿把往日事项误说成今天）】\n"
+            + "\n".join(fact_lines)
+        )
 
     if open_loops:
-        loop_lines = [f"- {m.text}" for m in open_loops]
-        sections.append("【未完待续/可自然关心跟进的事项】\n" + "\n".join(loop_lines))
+        loop_lines = [
+            f"- [{_fmt_mem_date(getattr(m, 'updated_at', None)) or '近期'}] {m.text}"
+            for m in open_loops
+        ]
+        sections.append(
+            "【未完待续事项（仅作背景知情，切勿每次打招呼都机械重复追问同一件旧事，除非对方主动聊起）】\n"
+            + "\n".join(loop_lines)
+        )
 
     if episode_docs:
         ep_lines = [d["text"].strip()[:500] for d in episode_docs if d.get("text")]
@@ -291,17 +374,21 @@ def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: s
             sections.append("【过往互动片段摘要】\n" + "\n".join(ep_lines))
 
     if evidence_sources:
-        ev_lines = [
-            f"- ({'用户原话' if s.get('speaker') == 'user' else '你曾回复'}) {s.get('text', '')[:160]}"
-            for s in evidence_sources[:4]
-        ]
-        sections.append("【相关历史原话溯源】\n" + "\n".join(ev_lines))
+        ev_lines = []
+        prefers_gege = "哥哥" in (spec.persona or "")
+        for s in evidence_sources[:4]:
+            txt = (s.get("text") or "")[:180]
+            if prefers_gege and s.get("speaker") != "user" and "舰长" in txt:
+                continue
+            ev_lines.append(f"- ({'用户原话' if s.get('speaker') == 'user' else '你曾回复'}) {txt}")
+        if ev_lines:
+            sections.append("【相关历史原话溯源】\n" + "\n".join(ev_lines))
 
     if recent_turns:
         rt_lines = []
         for t in recent_turns:
-            u = (t.get("user_message") or "").strip()[:120]
-            a = (t.get("assistant_reply") or "").strip()[:120]
+            u = (t.get("user_message") or "").strip()[:180]
+            a = (t.get("assistant_reply") or "").strip()[:320]
             rt_lines.append(f"用户：{u}\n{spec.name}：{a}")
         sections.append("【最近跨端对话衔接（若当前在同一轮已包含则勿重复）】\n" + "\n---\n".join(rt_lines))
 
@@ -610,17 +697,30 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
                 ingest_queue.task_done()
 
     worker_task: asyncio.Task | None = None
+    heal_task: asyncio.Task | None = None
+
+    async def review_healer():
+        while True:
+            await asyncio.sleep(180)
+            try:
+                await asyncio.to_thread(clear_stale_review_jobs, brain, 180)
+            except Exception:
+                pass
 
     async def combined_app(scope, receive, send):
-        nonlocal worker_task
+        nonlocal worker_task, heal_task
         if scope["type"] == "lifespan":
             async def wrapped_receive():
                 msg = await receive()
-                nonlocal worker_task
+                nonlocal worker_task, heal_task
                 if msg["type"] == "lifespan.startup":
                     worker_task = asyncio.create_task(ingest_worker())
-                elif msg["type"] == "lifespan.shutdown" and worker_task:
-                    worker_task.cancel()
+                    heal_task = asyncio.create_task(review_healer())
+                elif msg["type"] == "lifespan.shutdown":
+                    if worker_task:
+                        worker_task.cancel()
+                    if heal_task:
+                        heal_task.cancel()
                 return msg
 
             await studio_app(scope, wrapped_receive, send)
@@ -704,6 +804,7 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
 
 
 def main():
+    install_gemini_embedding_compat_patch()
     token = load_or_create_token()
     studio_url = f"http://localhost:{PORT}/#token={token}"
     URL_PATH.write_text(studio_url + "\n", encoding="utf-8")
@@ -734,12 +835,13 @@ def main():
             allow_chat_images=True,
             automation=automation,
             reply_instructions=(
-                "默认使用自然、真诚、简短的中文口语交流（除非对方用其他语言提问）。"
-                "日常闲聊尽量控制在 1～3 句话，像熟悉的朋友，不说生硬客服套话。"
+                "默认使用自然、真诚、温暖的中文口语交流（除非对方用其他语言提问）。"
+                "根据话题自然舒展地陪伴聊天或讲故事，不说生硬客服套话。"
             ),
         ),
     ) as brain:
         ensure_default_character(brain)
+        clear_stale_review_jobs(brain)
         app = create_combined_asgi_app(brain, token)
         log.info("==========================================================")
         log.info("Anima Brain + Companion Studio is READY on port %d", PORT)

@@ -15,6 +15,7 @@ import yaml
 
 import mei_emotion_router
 import pc_audio_router
+import reply_length_router
 
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
 DATA_DIR = os.path.join(ROOT_DIR, "data")
@@ -492,6 +493,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 logs = list(_raw_logs)[-100:]
 
             audio_cfg = pc_audio_router.read_audio_output_config()
+            reply_len_cfg = reply_length_router.read_reply_length_config()
 
             self._send_json(
                 {
@@ -511,6 +513,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "audio_output": audio_cfg["target"],
                         "pc_audio_volume": audio_cfg["volume"],
                         "pc_audio_online": pc_audio_router.is_pc_audio_bridge_online(),
+                        "reply_length": reply_len_cfg,
                         "agy_bridge_online": _check_agy_bridge_online(),
                         "mei_emotions": [
                             {"id": k, "label": v.get("label_zh", k)}
@@ -561,6 +564,19 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "pc_audio_online": pc_audio_router.is_pc_audio_bridge_online(force=True),
                     }
                 )
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/reply-length":
+            try:
+                body = self._read_body_json()
+                saved = reply_length_router.write_reply_length_config(
+                    chat_chars=body.get("chat_chars", None),
+                    story_chars=body.get("story_chars", None),
+                    preset=body.get("preset", None),
+                )
+                self._send_json({"ok": True, "reply_length": saved})
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return

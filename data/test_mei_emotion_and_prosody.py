@@ -78,6 +78,11 @@ class TestMeiEmotionAndProsody(unittest.TestCase):
         self.assertEqual(emo, "gentle")
         self.assertEqual(router.clean_segment_for_tts(stripped), "")
 
+        # Leaked XML tool-call closing tags from LLM (e.g. </parameter>, </invoke>) must be stripped
+        self.assertEqual(router.clean_segment_for_tts("</parameter>"), "")
+        self.assertEqual(router.clean_segment_for_tts("哪怕是很小很小的事，我也愿意听。</parameter>"), "哪怕是很小很小的事，我也愿意听。")
+        self.assertEqual(router.safe_clean_response_garbage("好啦哥哥</parameter></invoke>"), "好啦哥哥")
+
     def test_streaming_partial_tag_guard(self):
         for partial in ("[", "[g", "[gentle", "【温", "<emotion:hap", "（轻"):
             self.assertTrue(router.has_unclosed_leading_tag(partial), f"Should hold on partial tag: {partial}")
@@ -507,6 +512,61 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
             router.get_anima_mood(),
             {"calm", "gentle", "happy", "playful", "shy", "serious", "tender"},
         )
+
+    def test_mei_wakeup_word_config_and_fallback_wav(self):
+        import yaml
+
+        cfg_path = os.path.join(DATA_DIR, ".config.yaml")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        ww = cfg.get("wakeup_words") or []
+        self.assertIn("你好芽衣", ww, "data/.config.yaml wakeup_words must include 你好芽衣")
+
+        wav_path = os.path.join(DATA_DIR, "voices", "raiden_mei", "wakeup_mei_default.wav")
+        self.assertTrue(os.path.isfile(wav_path), f"Missing Mei default wakeup WAV: {wav_path}")
+        with wave.open(wav_path, "rb") as wf:
+            dur = wf.getnframes() / float(wf.getframerate())
+            self.assertGreater(dur, 0.8)
+            self.assertLess(dur, 4.0)
+
+        class _DummyMeiTts:
+            ref_audio_path = "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav"
+
+        class _DummyOtherTts:
+            ref_audio_path = "e:/故事/1/xiaozhi-server/data/xiaozhi_taiwan_ref.wav"
+
+        self.assertTrue(router.get_wakeup_responses_for_tts(_DummyMeiTts()))
+        self.assertEqual(router.get_wakeup_responses_for_tts(_DummyOtherTts()), [])
+
+        # Verify live wakeup patch mounts cleanly without NameError/ImportError
+        import core.handle.helloHandle as hello_mod
+
+        router.apply_mei_wakeup_responses_patch()
+        self.assertTrue(getattr(hello_mod, "_mei_wakeup_patched", False))
+
+    def test_reply_length_hot_config_and_prompt_injection(self):
+        import reply_length_router as rl
+
+        orig = rl.read_reply_length_config()
+        try:
+            saved = rl.write_reply_length_config(chat_chars=220, story_chars=900)
+            self.assertEqual(saved["chat_chars"], 220)
+            self.assertEqual(saved["story_chars"], 900)
+            self.assertGreaterEqual(saved["dynamic_max_tokens"], 2200)
+
+            msgs = [{"role": "system", "content": "你是雷电芽衣。"}, {"role": "user", "content": "讲个故事"}]
+            rl.inject_reply_length_into_messages(msgs)
+            self.assertIn("220 字", msgs[0]["content"])
+            self.assertIn("900 字", msgs[0]["content"])
+            self.assertEqual(msgs[0]["content"].count("<reply_length_control>"), 1)
+
+            # Updating again must replace previous block idempotently without duplicating tags
+            rl.write_reply_length_config(preset="storyteller")
+            rl.inject_reply_length_into_messages(msgs)
+            self.assertEqual(msgs[0]["content"].count("<reply_length_control>"), 1)
+            self.assertIn("1000 字", msgs[0]["content"])
+        finally:
+            rl.write_reply_length_config(chat_chars=orig["chat_chars"], story_chars=orig["story_chars"])
 
 
 if __name__ == "__main__":

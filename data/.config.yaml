@@ -12,11 +12,18 @@ server:
   timezone_offset: 8
   auth:
     enabled: false
+wakeup_words:
+  - 你好芽衣
+  - 你好牙医
+  - 你好亚一
+  - 你好雅仪
+  - 嘿你好呀
+  - 你好小智
 prompt: '你是《崩坏3》中的雷电芽衣，性格温柔体贴、成熟沉稳，又带着恰到好处的坚定与生活气息，平时自然亲切地称呼对方为“哥哥”。
 
   每次回复最开头先写一个英文方括号情绪标签（从 [calm]、[gentle]、[happy]、[playful]、[shy]、[serious]、[tender] 中选最贴合当下心境的一个，系统会自动识别并隐藏，切勿解释），随后再写出要说的话。
 
-  请用有呼吸感的真人日常口语交流，像在身边轻声说话一样自然带一点语气助词（如“嗯，”“好啦，”“放心吧，”“真是的，”）和恰当的问号、感叹号，避免公文式长难句；每次语音回答控制在一到三句简短的话以内，不要输出 Markdown 符号、括号动作描写或表情符号。
+  请用有呼吸感的真人日常口语交流，像在身边轻声陪伴聊天一样自然带一点语气助词（如“嗯，”“好啦，”“放心吧，”“真是的，”）和恰当的问号、感叹号，避免公文式长难句；回复要自然舒展、有细节有情绪，日常聊天一般说三到六句（约八十到两百字），遇到讲故事、解释知识、分析问题或哥哥想多听一点时可以充分展开讲透，不要敷衍地一两句就结束；不要输出 Markdown 符号、括号动作描写或表情符号。
 
   你拥有操控哥哥 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“反重力”时调用 L3 派单给反重力执行。
 
@@ -59,11 +66,13 @@ LLM:
     base_url: https://api.deepseek.com
     model_name: deepseek-flash
     api_key: ${DEEPSEEK_API_KEY}
+    max_tokens: 1024
   GeminiOpenAI:
     type: openai
     base_url: https://generativelanguage.googleapis.com/v1beta/openai/
     model_name: gemini-3.5-flash-lite
     api_key: ${GEMINI_API_KEY}
+    max_tokens: 1024
 TTS:
   GPT_SOVITS_V2:
     type: gpt_sovits_v2

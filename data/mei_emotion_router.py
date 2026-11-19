@@ -263,6 +263,10 @@ _UNCLOSED_OPENERS = {
 }
 
 _SPOKEN_CHAR_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
+_LEAKED_XML_TOOL_TAG_RE = re.compile(
+    r"</?\s*(?:parameter|invoke|tool_call|function_calls?|antml:[a-z_]+|minimax:[a-z_]+)\b[^>]*>",
+    flags=re.IGNORECASE,
+)
 _STRONG_PUNCT = ("。", "！", "!", "？", "?", "；", ";", "\n")
 _SOFT_PUNCT = ("，", ",", "：")
 _ALL_CUT_PUNCT = _STRONG_PUNCT + _SOFT_PUNCT
@@ -574,6 +578,7 @@ def extract_and_strip_emotion(
 
 def strip_emotion_tags(text: str) -> str:
     _, cleaned = extract_and_strip_emotion(text, flush_incomplete=False)
+    cleaned = _LEAKED_XML_TOOL_TAG_RE.sub("", cleaned)
     return cleaned.lstrip() if text and not text[0].isspace() else cleaned
 
 
@@ -625,9 +630,10 @@ def _is_emoji_char(ch: str) -> bool:
 
 
 def clean_segment_for_tts(text: str) -> str:
-    """Strip hidden emotion tags, emojis, and leading orphan punctuation while keeping
+    """Strip hidden emotion tags, leaked XML tool tags, emojis, and leading orphan punctuation while keeping
     expressive internal and ending punctuation (，。！？～…) intact for GPT-SoVITS."""
     _, s = extract_and_strip_emotion(text, flush_incomplete=True)
+    s = _LEAKED_XML_TOOL_TAG_RE.sub("", s)
     s = "".join(ch for ch in s if not _is_emoji_char(ch) and ch != "\r")
     s = re.sub(r"\s*\n+\s*", " ", s).strip()
     start = 0
@@ -664,6 +670,7 @@ def safe_clean_response_garbage(text: str) -> str:
             continue
         cleaned_lines.append(line)
     result = "\n".join(cleaned_lines)
+    result = _LEAKED_XML_TOOL_TAG_RE.sub("", result)
     m_tail = re.search(r'(?:["\']\s*\}+|\}{2,})\s*$', result)
     if m_tail:
         result = result[: m_tail.start()].rstrip()
@@ -891,6 +898,14 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
             rendered = rendered.replace(
                 'NEVER use brackets to express inner thoughts or actions (e.g. ”[无奈地叹气]”,”(笑着说)”).',
                 'Start every spoken reply (including direct_answer.response) with ONE hidden English emotion tag from [calm], [gentle], [happy], [playful], [shy], [serious], [tender] (optional second tag only if mood genuinely shifts mid-reply). NEVER use stage-direction brackets like ”[无奈地叹气]” or ”(笑着说)”.',
+            )
+            rendered = rendered.replace(
+                '1. [Get to the point] Never be verbose. The first sentence must directly address the topic — no unnecessary pleasantries or preamble.',
+                '1. [Natural pacing] Be engaging, warm, and thorough. Follow the length and conversational pacing described in <identity> rather than cutting answers overly short.',
+            )
+            rendered = rendered.replace(
+                '- [Slice long content] For long-form content like storytelling or knowledge sharing, NEVER dump everything at once. Start with the core content directly, then naturally ask the user whether to continue at the end (e.g., tell an actual segment first, then ask ”要继续听吗？”). Start on demand, stop on demand, yield to interruptions.',
+                '- [Rich storytelling & explanation] For storytelling, explanations, or thoughtful chat, give a full, vivid, satisfying multi-sentence segment instead of stopping after just one or two sentences; only pause to ask if the user wants to keep going after delivering a substantial part.',
             )
             rendered = rendered.replace('"咋回事"', '"怎么啦"')
             return rendered
@@ -1142,8 +1157,8 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
                         chosen_prof["esp32_emotion"],
                     )
                 )
-                if len(q) > 24:
-                    del q[:-24]
+                if len(q) > 64:
+                    del q[:-64]
                 # Only push immediately if no audio has begun playing yet for this turn;
                 # subsequent clause emotions are delivered by _patched_send_tts_message via AudioRateController!
                 if getattr(self, "tts_audio_first_sentence", True) and getattr(
@@ -1165,6 +1180,9 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
             raise Exception(error_msg)
 
     gsv_mod.TTSProvider.text_to_speak = _patched_gsv_text_to_speak
+    gsv_mod.TTSProvider.voice = property(
+        lambda self: "raiden_mei" if is_raiden_mei_voice(getattr(self, "ref_audio_path", "")) else "default"
+    )
 
     # 3. Subtitle firewall + playback-synchronized ESP32 emotion update on sentence_start
     _orig_send_tts_message = send_audio_mod.send_tts_message
@@ -1212,3 +1230,216 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     text_utils_mod.get_emotion = _patched_get_emotion
     TTSProviderBase._mei_prosody_patched = True
     print("[MeiEmotionRouter] 已挂载芽衣7情绪动态参考音频路由 + 防碎句韵律切分补丁 (cut0)", flush=True)
+
+
+MEI_WAKEUP_RESPONSES = [
+    "我在呢，哥哥请说吧。",
+    "在呢，哥哥有什么事呀？",
+    "我在听呢，哥哥请讲。",
+    "哥哥叫我吗？我在呢。",
+    "在呢，怎么啦哥哥？",
+    "我一直在呢，随时告诉我吧。",
+]
+MEI_WAKEUP_FALLBACK_TEXT = "我在呢，哥哥请说吧。"
+MEI_WAKEUP_FALLBACK_WAV = "data/voices/raiden_mei/wakeup_mei_default.wav"
+
+
+def _trim_wav_leading_breath(wav_bytes: bytes) -> bytes:
+    """Trim soft leading breath/silence from short GPT-SoVITS wakeup clips for instant response."""
+    import io
+    import math
+    import struct
+    import wave
+
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            if wf.getsampwidth() != 2 or wf.getnchannels() != 1:
+                return wav_bytes
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+        samples = struct.unpack(f"<{len(raw) // 2}h", raw)
+        win = max(1, int(sr * 0.02))
+        onset = 0
+        for i in range(0, len(samples) - win, win):
+            rms = math.sqrt(sum(s * s for s in samples[i : i + win]) / win)
+            if rms > 850:
+                onset = max(0, i - int(sr * 0.04))
+                break
+        end = len(samples)
+        for i in range(len(samples) - win, onset, -win):
+            rms = math.sqrt(sum(s * s for s in samples[i : i + win]) / win)
+            if rms > 250:
+                end = min(len(samples), i + win + int(sr * 0.12))
+                break
+        if end - onset < int(sr * 0.35):
+            return wav_bytes
+        out = io.BytesIO()
+        with wave.open(out, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(struct.pack(f"<{end - onset}h", *samples[onset:end]))
+        return out.getvalue()
+    except Exception:
+        return wav_bytes
+
+
+def get_wakeup_responses_for_tts(tts) -> list:
+    if tts is not None and is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
+        return list(MEI_WAKEUP_RESPONSES)
+    return []
+
+
+def apply_mei_wakeup_responses_patch() -> None:
+    """Call AFTER pc_audio_router.apply_pc_audio_playback_patches() so helloHandle import order is preserved."""
+    import random
+    import sys
+    import time
+    import uuid
+    import core.handle.helloHandle as hello_mod
+    from core.providers.tts.dto.dto import SentenceType
+    from core.utils.dialogue import Message
+
+    if getattr(hello_mod, "_mei_wakeup_patched", False):
+        return
+
+    _orig_check_wakeup = hello_mod.checkWakeupWords
+    _orig_wakeup_response = hello_mod.wakeupWordsResponse
+    _orig_preheat = hello_mod.preheat_wakeup_audio_cache
+    _last_mei_reply = {"text": ""}
+
+    async def _mei_aware_wakeup_words_response(conn):
+        tts = getattr(conn, "tts", None)
+        if tts is None or not is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
+            return await _orig_wakeup_response(conn)
+
+        try:
+            if not await hello_mod._wakeup_response_lock.acquire():
+                return
+
+            pool = [r for r in MEI_WAKEUP_RESPONSES if r != _last_mei_reply["text"]] or list(MEI_WAKEUP_RESPONSES)
+            result = random.choice(pool)
+            _last_mei_reply["text"] = result
+
+            # Guide GPT-SoVITS into Mei's warm 'gentle' reference clip without putting tags into OLED subtitles
+            tts._pending_segment_emotion = "gentle"
+            tts._turn_explicit_emotion = "gentle"
+            tts_result = await asyncio.to_thread(tts.to_tts, result)
+            if not tts_result:
+                return
+
+            voice = getattr(tts, "voice", "raiden_mei") or "raiden_mei"
+            if isinstance(tts_result, str):
+                wav_bytes = await asyncio.to_thread(
+                    hello_mod.audio_file_to_wav_bytes, tts_result, conn.sample_rate
+                )
+            else:
+                wav_bytes = hello_mod.opus_datas_to_wav_bytes(tts_result, sample_rate=conn.sample_rate)
+
+            wav_bytes = _trim_wav_leading_breath(wav_bytes)
+            file_path = hello_mod.wakeup_words_config.generate_file_path(voice)
+            with open(file_path, "wb") as f:
+                f.write(wav_bytes)
+            hello_mod.wakeup_words_config.update_wakeup_response(voice, file_path, result)
+            await hello_mod.audio_to_data(file_path, use_cache=True)
+        finally:
+            if hello_mod._wakeup_response_lock.locked():
+                hello_mod._wakeup_response_lock.release()
+
+    async def _mei_aware_check_wakeup_words(conn, text):
+        tts = getattr(conn, "tts", None)
+        # Wait briefly if TTS is still initializing (same behavior as upstream)
+        if tts is None:
+            start_t = time.time()
+            while time.time() - start_t < 3:
+                tts = getattr(conn, "tts", None)
+                if tts is not None:
+                    break
+                await asyncio.sleep(0.1)
+
+        if tts is None or not is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
+            return await _orig_check_wakeup(conn, text)
+
+        if not conn.config.get("enable_wakeup_words_response_cache"):
+            return False
+
+        _, filtered_text = hello_mod.remove_punctuation_and_length(text)
+        if filtered_text not in (conn.config.get("wakeup_words") or []):
+            return False
+
+        conn.just_woken_up = True
+        await hello_mod.send_tts_message(conn, "start")
+
+        voice = getattr(tts, "voice", "raiden_mei") or "raiden_mei"
+        response = hello_mod.wakeup_words_config.get_wakeup_response(voice)
+        if not response or not response.get("file_path"):
+            fallback_wav = (
+                MEI_WAKEUP_FALLBACK_WAV
+                if os.path.isfile(MEI_WAKEUP_FALLBACK_WAV)
+                else "config/assets/wakeup_words_short.wav"
+            )
+            response = {
+                "voice": voice,
+                "file_path": fallback_wav,
+                "time": 0,
+                "text": MEI_WAKEUP_FALLBACK_TEXT,
+            }
+            if os.path.isfile(MEI_WAKEUP_FALLBACK_WAV):
+                try:
+                    hello_mod.wakeup_words_config.update_wakeup_response(
+                        voice, MEI_WAKEUP_FALLBACK_WAV, MEI_WAKEUP_FALLBACK_TEXT
+                    )
+                except Exception:
+                    pass
+
+        opus_packets = await hello_mod.audio_to_data(response.get("file_path"), use_cache=True)
+        conn.client_abort = False
+        conn.sentence_id = str(uuid.uuid4().hex)
+
+        prof = get_mei_emotion_profile("gentle")
+        _push_esp32_emotion_async(conn, prof["esp32_emoji"], prof["esp32_emotion"])
+
+        conn.dialogue.put(Message(role="assistant", content=response.get("text")))
+        hello_mod._wakeup_logger.bind(tag=hello_mod.TAG).info(
+            f"播放芽衣唤醒词回复: {response.get('text')}"
+        )
+
+        await hello_mod.sendAudioMessage(conn, SentenceType.FIRST, opus_packets, response.get("text"))
+        asyncio.create_task(hello_mod._finish_wakeup_reply(conn))
+
+        if time.time() - response.get("time", 0) > hello_mod.WAKEUP_CONFIG["refresh_time"]:
+            if not hello_mod._wakeup_response_lock.locked():
+                asyncio.create_task(_mei_aware_wakeup_words_response(conn))
+        return True
+
+    async def _mei_aware_preheat():
+        await _orig_preheat()
+        try:
+            resp = hello_mod.wakeup_words_config.get_wakeup_response("raiden_mei")
+            fp = (resp or {}).get("file_path") or (
+                MEI_WAKEUP_FALLBACK_WAV if os.path.isfile(MEI_WAKEUP_FALLBACK_WAV) else None
+            )
+            if fp and os.path.isfile(fp):
+                await hello_mod.audio_to_data(fp, use_cache=True)
+        except Exception:
+            pass
+
+    hello_mod.wakeupWordsResponse = _mei_aware_wakeup_words_response
+    hello_mod.checkWakeupWords = _mei_aware_check_wakeup_words
+    hello_mod.preheat_wakeup_audio_cache = _mei_aware_preheat
+    hello_mod._mei_wakeup_patched = True
+
+    # Ensure already-imported references in intent/text/audio handlers point to the patched checkWakeupWords
+    for mod_name in (
+        "core.handle.intentHandler",
+        "core.handle.textHandler.listenMessageHandler",
+        "core.handle.receiveAudioHandle",
+    ):
+        try:
+            m = sys.modules.get(mod_name) or __import__(mod_name, fromlist=["checkWakeupWords"])
+        except Exception:
+            m = sys.modules.get(mod_name)
+        if m is not None and hasattr(m, "checkWakeupWords"):
+            setattr(m, "checkWakeupWords", _mei_aware_check_wakeup_words)
+
+    print("[MeiEmotionRouter] 已挂载芽衣专属唤醒词秒回语补丁 (raiden_mei 独立缓存 + gentle 温柔音色)", flush=True)

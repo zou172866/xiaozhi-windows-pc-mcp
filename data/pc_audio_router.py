@@ -268,8 +268,8 @@ def apply_pc_audio_to_tts_patch() -> None:
         cur_sid = getattr(self, "current_sentence_id", None) or getattr(conn, "sentence_id", None)
         _ensure_conn_pc_state(conn)
         conn._pc_audio_clip_queue.append((cur_sid, original_text, wav_bytes, dur_ms, cfg["volume"]))
-        if len(conn._pc_audio_clip_queue) > 24:
-            del conn._pc_audio_clip_queue[:-24]
+        if len(conn._pc_audio_clip_queue) > 64:
+            del conn._pc_audio_clip_queue[:-64]
 
         # Push FIRST (triggers sentence_start -> plays WAV on PC + syncs ESP32 OLED subtitle/emotion)
         self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, cur_sid))
@@ -332,7 +332,7 @@ def apply_pc_audio_playback_patches() -> None:
                 if not getattr(conn, "client_abort", False) and getattr(conn, "sentence_id", None) == cur_sid:
                     async with conn._pc_audio_send_lock:
                         pass
-                    await _wait_pc_audio_done(timeout=10.0)
+                    await _wait_pc_audio_done(timeout=25.0)
                 conn._pc_audio_active_sid = None
 
         return await _orig_send_tts_message(conn, state, text)

@@ -101,6 +101,12 @@ def _patched_get_llm_dialogue_with_memory(
     if memory_str and msgs and msgs[0].get("role") == "system":
         if memory_str not in msgs[0].get("content", ""):
             msgs[0]["content"] += f"\n\n<memory>\n{memory_str}\n</memory>"
+    try:
+        import reply_length_router
+
+        reply_length_router.inject_reply_length_into_messages(msgs)
+    except Exception:
+        pass
     return msgs
 
 
@@ -132,6 +138,18 @@ try:
     pc_audio_router.apply_pc_audio_playback_patches()
 except Exception as _pa2_exc:
     print(f"[PCAudioRouter] 播放同步层加载异常: {_pa2_exc}", flush=True)
+
+try:
+    import mei_emotion_router
+    mei_emotion_router.apply_mei_wakeup_responses_patch()
+except Exception as _mw_exc:
+    print(f"[MeiEmotionRouter] 芽衣唤醒回复补丁加载异常: {_mw_exc}", flush=True)
+
+try:
+    import reply_length_router
+    reply_length_router.apply_reply_length_llm_patch()
+except Exception as _rl_exc:
+    print(f"[ReplyLengthRouter] 回复字数热调补丁加载异常: {_rl_exc}", flush=True)
 
 
 # 6. Memory optimization for Sherpa-ONNX local ASR + periodic glibc heap trim

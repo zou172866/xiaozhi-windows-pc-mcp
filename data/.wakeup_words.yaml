@@ -1,10 +1,5 @@
-c21f969b5f03d33d43e04f8f136e7682:
-  file_path: config/assets/wakeup_words/c21f969b5f03d33d43e04f8f136e7682.wav
-  text: 我认真听着呢，请讲。
-  time: 1795084577.348417
-  voice: default
-ed76d459636c2481aec828516c1b4f54:
-  file_path: config/assets/wakeup_words/ed76d459636c2481aec828516c1b4f54.wav
-  text: 我认真听着呢，请讲。
-  time: 1794981781.1963096
-  voice: zh-CN-XiaoxiaoNeural
+cf07c9793894845cbdf7390f6ee0fb47:
+  file_path: config/assets/wakeup_words/cf07c9793894845cbdf7390f6ee0fb47.wav
+  text: 我一直在呢，随时告诉我吧。
+  time: 1795093259.2870734
+  voice: raiden_mei

@@ -487,6 +487,38 @@
       </div>
     </div>
 
+    <!-- Section 1c: Reply & Storytelling Length Control (Instant Hot-Update, No Restart Required) -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">回复字数与讲故事篇幅（拖动即刻生效，免重启）</h2>
+      </div>
+      <p class="section-desc">分别微调平时闲聊和讲故事/深度讲解的篇幅；拖动滑块或点选预设后，下一句话立刻生效并自动放宽生成上限。</p>
+
+      <div class="preset-bar" id="replyLenPresetBar" style="margin-bottom:10px;">
+        <button type="button" class="preset-pill" data-len-preset="concise">简短利落（60 / 200 字）</button>
+        <button type="button" class="preset-pill active" data-len-preset="balanced">舒展日常（150 / 450 字 · 推荐）</button>
+        <button type="button" class="preset-pill" data-len-preset="chatty">话痨详聊（260 / 750 字）</button>
+        <button type="button" class="preset-pill" data-len-preset="storyteller">长篇故事（200 / 1000 字）</button>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:0;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">日常聊天目标字数</span>
+        <input type="range" id="chatCharsRange" min="40" max="600" step="10" value="150" aria-label="日常聊天目标字数">
+        <strong id="chatCharsVal" class="num" style="font-size:12.5px;min-width:118px;text-align:right;">150 字（约 33 秒）</strong>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:8px;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">讲故事 / 详述字数</span>
+        <input type="range" id="storyCharsRange" min="150" max="1500" step="50" value="450" aria-label="讲故事与详述目标字数">
+        <strong id="storyCharsVal" class="num" style="font-size:12.5px;min-width:118px;text-align:right;">450 字（约 1分40秒）</strong>
+      </div>
+
+      <div class="field-foot">
+        <span>当前动态生成上限：<strong id="replyMaxTokText" class="num">1246 tokens</strong></span>
+        <span>下一句话即刻生效，无需重启或重连 ESP32</span>
+      </div>
+    </div>
+
     <!-- Section 2: LLM Provider Switch (DeepSeek <-> Gemini) -->
     <div class="config-section">
       <h2 class="section-title" style="margin-bottom:6px;">对话与调度大模型 API（DeepSeek / Gemini 双模切换）</h2>
@@ -657,6 +689,12 @@
     pcAudioVolVal: document.getElementById("pcAudioVolVal"),
     pcAudioTestBtn: document.getElementById("pcAudioTestBtn"),
     pcAudioStatusText: document.getElementById("pcAudioStatusText"),
+    replyLenPresetBar: document.getElementById("replyLenPresetBar"),
+    chatCharsRange: document.getElementById("chatCharsRange"),
+    chatCharsVal: document.getElementById("chatCharsVal"),
+    storyCharsRange: document.getElementById("storyCharsRange"),
+    storyCharsVal: document.getElementById("storyCharsVal"),
+    replyMaxTokText: document.getElementById("replyMaxTokText"),
     providerSelect: document.getElementById("providerSelect"),
     modelSelect: document.getElementById("modelSelect"),
     modelCustomInput: document.getElementById("modelCustomInput"),
@@ -802,6 +840,86 @@
       }
     });
   }
+
+  let replyLenDragging = false;
+  function formatCharsWithDuration(chars) {
+    const n = Number(chars) || 0;
+    const sec = Math.max(5, Math.round(n / 4.5));
+    if (sec < 60) return `${n} 字（约 ${sec} 秒）`;
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${n} 字（约 ${m}分${s < 10 ? "0" : ""}${s}秒）`;
+  }
+
+  function renderReplyLengthUI(rl) {
+    if (!rl || !els.chatCharsRange || !els.storyCharsRange) return;
+    const chatN = Number(rl.chat_chars) || 150;
+    const storyN = Number(rl.story_chars) || 450;
+    els.chatCharsRange.value = String(chatN);
+    els.storyCharsRange.value = String(storyN);
+    els.chatCharsVal.textContent = formatCharsWithDuration(chatN);
+    els.storyCharsVal.textContent = formatCharsWithDuration(storyN);
+    if (els.replyMaxTokText && rl.dynamic_max_tokens) {
+      els.replyMaxTokText.textContent = `${rl.dynamic_max_tokens} tokens`;
+    }
+    if (els.replyLenPresetBar) {
+      const p = rl.preset || "custom";
+      els.replyLenPresetBar.querySelectorAll(".preset-pill").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.lenPreset === p);
+      });
+    }
+  }
+
+  async function saveReplyLength(payload, toastLabel) {
+    try {
+      const resp = await fetch("/api/reply-length", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const res = await resp.json();
+      if (res.ok && res.reply_length) {
+        renderReplyLengthUI(res.reply_length);
+        showBanner(
+          "info",
+          toastLabel || `回复篇幅已即时生效：日常约 ${res.reply_length.chat_chars} 字 · 故事约 ${res.reply_length.story_chars} 字`
+        );
+        setTimeout(hideBanner, 2600);
+      }
+    } catch (_) {
+      showBanner("err", "保存回复字数设置失败，请检查本地服务连接。");
+    }
+  }
+
+  if (els.replyLenPresetBar) {
+    els.replyLenPresetBar.addEventListener("click", (e) => {
+      const btn = e.target.closest(".preset-pill");
+      if (!btn) return;
+      const preset = btn.dataset.lenPreset;
+      if (preset) saveReplyLength({ preset });
+    });
+  }
+
+  [
+    [els.chatCharsRange, els.chatCharsVal],
+    [els.storyCharsRange, els.storyCharsVal]
+  ].forEach(([rangeEl, valEl]) => {
+    if (!rangeEl || !valEl) return;
+    rangeEl.addEventListener("input", () => {
+      replyLenDragging = true;
+      valEl.textContent = formatCharsWithDuration(rangeEl.value);
+      if (els.replyLenPresetBar) {
+        els.replyLenPresetBar.querySelectorAll(".preset-pill").forEach(b => b.classList.remove("active"));
+      }
+    });
+    rangeEl.addEventListener("change", async () => {
+      replyLenDragging = false;
+      await saveReplyLength({
+        chat_chars: Number(els.chatCharsRange.value),
+        story_chars: Number(els.storyCharsRange.value)
+      });
+    });
+  });
 
   function populateModelOptions(provider, selectedModel) {
     const list = PROVIDER_MODELS[provider] || PROVIDER_MODELS.DeepSeekLLM;
@@ -1123,6 +1241,9 @@
           ? "已在线（48kHz WinMM 直通就绪）"
           : "离线（请运行 启动或重启服务.bat 拉起 18900）";
         els.pcAudioStatusText.style.color = cfg.pc_audio_online ? "var(--accent)" : "var(--danger)";
+      }
+      if (!replyLenDragging && cfg.reply_length) {
+        renderReplyLengthUI(cfg.reply_length);
       }
 
       els.dsKeyBadge.textContent = cfg.deepseek_key_ok ? "已就绪" : "未设置";
