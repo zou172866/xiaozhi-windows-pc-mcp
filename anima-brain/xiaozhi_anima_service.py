@@ -206,6 +206,252 @@ def clear_stale_review_jobs(brain: CompanionBrain, max_age_seconds: int = 600) -
     return cleared
 
 
+RELATIONSHIP_PRESETS: dict[str, dict[str, Any]] = {
+    "restrained": {
+        "label": "克制助手",
+        "relationship_enabled": True,
+        "romance_enabled": False,
+        "axes": {
+            "familiarity": 0.30,
+            "warmth": 0.35,
+            "trust": 0.40,
+            "romance": 0.00,
+            "tension": 0.00,
+        },
+    },
+    "confidant": {
+        "label": "温柔知己",
+        "relationship_enabled": True,
+        "romance_enabled": True,
+        "axes": {
+            "familiarity": 0.62,
+            "warmth": 0.68,
+            "trust": 0.66,
+            "romance": 0.25,
+            "tension": 0.00,
+        },
+    },
+    "intimate": {
+        "label": "亲密依恋",
+        "relationship_enabled": True,
+        "romance_enabled": True,
+        "axes": {
+            "familiarity": 0.88,
+            "warmth": 0.90,
+            "trust": 0.88,
+            "romance": 0.85,
+            "tension": 0.00,
+        },
+    },
+}
+
+_STAGE_LABELS = ("stranger", "acquaintance", "familiar", "close")
+_STAGE_LABELS_ZH = ("初识陌生", "礼貌熟识", "温柔知己", "亲密依恋")
+
+
+def _clamp_axis(val: Any, default: float) -> float:
+    try:
+        f = float(val)
+    except Exception:
+        return default
+    if f > 1.0:
+        f = f / 100.0
+    return round(max(0.0, min(1.0, f)), 4)
+
+
+def _infer_relationship_preset(
+    axes: dict[str, float], romance_enabled: bool, relationship_enabled: bool
+) -> str:
+    if not relationship_enabled:
+        return "off"
+    for key, p in RELATIONSHIP_PRESETS.items():
+        if bool(romance_enabled) != bool(p["romance_enabled"]):
+            continue
+        p_axes = p["axes"]
+        if all(
+            abs(float(axes.get(ax, 0.0)) - float(p_axes[ax])) <= 0.035
+            for ax in ("familiarity", "warmth", "trust", "romance")
+        ):
+            return key
+    return "custom"
+
+
+def _compute_chinese_intimacy_guidance(
+    spec: CharacterSpec, axes: dict[str, Any], bands: dict[str, Any]
+) -> str:
+    if not spec.relationship_enabled:
+        return ""
+    fam = float(axes.get("familiarity", 0.0))
+    warm = float(axes.get("warmth", 0.0))
+    trust = float(axes.get("trust", 0.0))
+    rom = float(axes.get("romance", 0.0))
+    rom_on = bool(spec.romance_enabled)
+    pct_str = (
+        f"熟悉度 {round(fam * 100)}% / 温暖度 {round(warm * 100)}% / "
+        f"信任度 {round(trust * 100)}% / 浪漫 {'开启 ' + str(round(rom * 100)) + '%' if rom_on else '关闭'}"
+    )
+    avg_core = (fam + warm + trust) / 3.0
+    if not rom_on and avg_core <= 0.45:
+        return (
+            f"中文互动尺度参考（{pct_str}）：当前处于克制得体的助手与熟人阶段，"
+            "说话温和礼貌、干脆周到，保持清晰分寸，不要过度撒娇、粘人或使用恋爱暧昧措辞。"
+        )
+    if rom_on and (rom >= 0.60 or (avg_core >= 0.78 and rom >= 0.45)):
+        return (
+            f"中文互动尺度参考（{pct_str}）：当前处于深度亲密依恋阶段，彼此默契极深，"
+            "可以更自然大方地流露温柔偏爱、轻声哄慰、细心牵挂与偶尔害羞撒娇的亲昵口吻"
+            "（贴合心境时多自然使用 [tender]、[shy]、[playful]、[gentle]），同时保持优雅真实、不油腻不刻意。"
+        )
+    if not rom_on and avg_core >= 0.75:
+        return (
+            f"中文互动尺度参考（{pct_str}）：当前处于高度信赖的挚友/家人阶段，"
+            "交流可以很放松、默契、深情关照或轻快打趣，但保持纯粹深厚的情谊，不往恋爱暧昧方向引导。"
+        )
+    if rom_on and rom > 0.15:
+        return (
+            f"中文互动尺度参考（{pct_str}）：当前处于温柔熟悉的知己阶段，"
+            "口吻自然亲切、细心体贴、带有一点柔和心动与专属关怀；对方主动亲近或撒娇时可温柔接住，不必拘谨也不过度抢跑。"
+        )
+    return (
+        f"中文互动尺度参考（{pct_str}）：当前处于温和相熟的日常陪伴阶段，"
+        "保持自然真诚的关心与轻松聊天气氛，不生硬也不越界。"
+    )
+
+
+def _format_relationship_snapshot(
+    character_id: str, spec: CharacterSpec, state: dict[str, Any], now: float, owner: str = "local"
+) -> dict[str, Any]:
+    decayed_state = emotion.decayed(state, now, f"{owner}:{character_id}")
+    axes_raw = decayed_state.get("axes") or {}
+    axes = {
+        k: round(float(axes_raw.get(k, 0.0)), 4)
+        for k in ("familiarity", "warmth", "trust", "romance", "tension")
+    }
+    bands_raw = decayed_state.get("bands") or {}
+    bands = {
+        k: max(0, min(3, int(bands_raw.get(k, 0))))
+        for k in ("familiarity", "warmth", "trust", "romance", "tension")
+    }
+    fam_band = bands["familiarity"]
+    stage_label = _STAGE_LABELS[fam_band]
+    stage_zh = _STAGE_LABELS_ZH[fam_band]
+    if spec.romance_enabled and axes["romance"] >= 0.60 and fam_band >= 2:
+        stage_zh = "亲密依恋"
+    elif not spec.romance_enabled and fam_band >= 3:
+        stage_zh = "挚友信赖"
+
+    note_txt = (
+        emotion.note(decayed_state, now, romance_enabled=spec.romance_enabled)
+        if spec.relationship_enabled
+        else ""
+    )
+    guidance_zh = _compute_chinese_intimacy_guidance(spec, axes, bands)
+    return {
+        "character_id": character_id,
+        "character_name": spec.name,
+        "relationship_enabled": bool(spec.relationship_enabled),
+        "romance_enabled": bool(spec.romance_enabled),
+        "preset": _infer_relationship_preset(axes, spec.romance_enabled, spec.relationship_enabled),
+        "stage": stage_label,
+        "stage_label_zh": stage_zh,
+        "axes": axes,
+        "bands": bands,
+        "note": note_txt,
+        "guidance_zh": guidance_zh,
+    }
+
+
+def get_relationship_snapshot(brain: CompanionBrain, character_id: str) -> dict[str, Any]:
+    engine = brain.engine
+    now = time.time()
+    with engine._lock:
+        try:
+            row = engine._character(character_id)
+        except Exception:
+            ensure_default_character(brain)
+            character_id = DEFAULT_CHARACTER_ID
+            row = engine._character(character_id)
+        spec = CharacterSpec.model_validate_json(row["spec"])
+        state = json.loads(row["state"])
+        owner = engine.owner
+    return _format_relationship_snapshot(character_id, spec, state, now, owner=owner)
+
+
+def update_relationship_settings(
+    brain: CompanionBrain, character_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Hot-update relationship flags and axes directly in SQLite (effective on the very next turn)."""
+    engine = brain.engine
+    now = time.time()
+    payload = payload or {}
+
+    with engine._lock:
+        try:
+            row = engine._character(character_id)
+        except Exception:
+            ensure_default_character(brain)
+            character_id = DEFAULT_CHARACTER_ID
+            row = engine._character(character_id)
+
+        spec = CharacterSpec.model_validate_json(row["spec"])
+        state = emotion.decayed(json.loads(row["state"]), now, f"{engine.owner}:{character_id}")
+        axes = dict(state.get("axes") or {})
+        for ax in ("familiarity", "warmth", "trust", "romance", "tension"):
+            axes.setdefault(ax, 0.0)
+
+        spec_dict = spec.model_dump()
+        preset_key = str(payload.get("preset") or "").strip().lower()
+        if preset_key in RELATIONSHIP_PRESETS:
+            p = RELATIONSHIP_PRESETS[preset_key]
+            spec_dict["relationship_enabled"] = bool(p["relationship_enabled"])
+            spec_dict["romance_enabled"] = bool(p["romance_enabled"])
+            for ax, val in p["axes"].items():
+                axes[ax] = float(val)
+
+        if "relationship_enabled" in payload and payload["relationship_enabled"] is not None:
+            spec_dict["relationship_enabled"] = bool(payload["relationship_enabled"])
+        if "romance_enabled" in payload and payload["romance_enabled"] is not None:
+            spec_dict["romance_enabled"] = bool(payload["romance_enabled"])
+
+        raw_axes = payload.get("axes") if isinstance(payload.get("axes"), dict) else {}
+        for ax in ("familiarity", "warmth", "trust", "romance", "tension"):
+            if ax in payload and payload[ax] is not None:
+                axes[ax] = _clamp_axis(payload[ax], axes[ax])
+            elif ax in raw_axes and raw_axes[ax] is not None:
+                axes[ax] = _clamp_axis(raw_axes[ax], axes[ax])
+
+        state["axes"] = axes
+        state["at"] = now
+        state["interaction_at"] = now
+        # Clear previous hysteresis bands so user's explicit slider/preset choice snaps immediately
+        state["bands"] = {}
+        state["bands"] = emotion._bands(state)
+
+        new_spec = CharacterSpec.model_validate(spec_dict)
+        with engine._transaction():
+            engine.db.execute(
+                "UPDATE characters SET spec=?, state=? WHERE owner=? AND id=?",
+                (
+                    new_spec.model_dump_json(),
+                    json.dumps(state, ensure_ascii=False),
+                    engine.owner,
+                    character_id,
+                ),
+            )
+        owner = engine.owner
+
+    snap = _format_relationship_snapshot(character_id, new_spec, state, now, owner=owner)
+    log.info(
+        "Hot-updated relationship for %s: preset=%s, stage=%s, romance=%s, axes=%s",
+        character_id,
+        snap["preset"],
+        snap["stage"],
+        snap["romance_enabled"],
+        snap["axes"],
+    )
+    return snap
+
+
 def _fmt_mem_date(ts: float | None) -> str:
     if not ts:
         return ""
@@ -234,12 +480,16 @@ def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: s
 
         # 1. Decayed emotional & relationship state (read-only preview)
         rel_note = None
+        rel_guidance_zh = ""
         mood_summary = None
         if spec.relationship_enabled:
             state = emotion.decayed(
                 json.loads(row["state"]), now, f"{engine.owner}:{character_id}"
             )
             rel_note = emotion.note(state, now, romance_enabled=spec.romance_enabled)
+            rel_guidance_zh = _compute_chinese_intimacy_guidance(
+                spec, state.get("axes") or {}, state.get("bands") or {}
+            )
             fam_band = max(0, min(3, int((state.get("bands") or {}).get("familiarity", 0))))
             stage_label = ("stranger", "acquaintance", "familiar", "close")[fam_band]
             mood_label = state.get("last_emotion") or ""
@@ -341,7 +591,8 @@ def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: s
         sections.append(f"【角色深层内核】\n{spec.core_persona.strip()}")
 
     if rel_note:
-        sections.append(f"【当前情绪与关系连续性状态】\n{rel_note}")
+        rel_block = rel_note if not rel_guidance_zh else f"{rel_note}\n{rel_guidance_zh}"
+        sections.append(f"【当前情绪与关系连续性状态】\n{rel_block}")
 
     if core_docs:
         core_texts = "\n".join(d["text"].strip()[:1200] for d in core_docs if d.get("text"))
@@ -750,7 +1001,23 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
                 except Exception:
                     body = {}
 
-                char_id = str(body.get("character_id") or DEFAULT_CHARACTER_ID).strip()
+                char_id = str(
+                    body.get("character_id")
+                    or req.query_params.get("character_id")
+                    or DEFAULT_CHARACTER_ID
+                ).strip()
+
+                if path == "/xiaozhi/relationship":
+                    if req.method == "GET":
+                        data = await asyncio.to_thread(get_relationship_snapshot, brain, char_id)
+                        resp = JSONResponse(data)
+                        await resp(scope, receive, send)
+                        return
+                    if req.method == "POST":
+                        data = await asyncio.to_thread(update_relationship_settings, brain, char_id, body)
+                        resp = JSONResponse(data)
+                        await resp(scope, receive, send)
+                        return
 
                 if path == "/xiaozhi/recall" and req.method == "POST":
                     query = str(body.get("query") or "")

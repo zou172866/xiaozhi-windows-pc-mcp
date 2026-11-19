@@ -544,6 +544,60 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
         router.apply_mei_wakeup_responses_patch()
         self.assertTrue(getattr(hello_mod, "_mei_wakeup_patched", False))
 
+    def test_interrupt_word_config_and_silent_listen_handler(self):
+        import asyncio
+        import yaml
+        from unittest.mock import AsyncMock, patch
+        import core.handle.textHandler.listenMessageHandler as listen_mod
+        import core.handle.helloHandle as hello_mod
+
+        cfg_path = os.path.join(DATA_DIR, ".config.yaml")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        iw = cfg.get("interrupt_words") or []
+        self.assertIn("听我说", iw, "data/.config.yaml interrupt_words must include 听我说")
+
+        router.apply_mei_wakeup_responses_patch()
+        self.assertTrue(getattr(listen_mod.ListenTextMessageHandler, "_interrupt_word_patched", False))
+
+        class _DummyLog:
+            def bind(self, **kw):
+                return self
+
+            def info(self, *a, **k):
+                pass
+
+            def debug(self, *a, **k):
+                pass
+
+        class _DummyConn:
+            config = {"interrupt_words": ["听我说"], "wakeup_words": ["你好芽衣"], "enable_greeting": True}
+            client_have_voice = True
+            client_is_speaking = False
+            just_woken_up = True
+            last_activity_time = 0
+            logger = _DummyLog()
+
+            def reset_audio_states(self):
+                pass
+
+        async def _run():
+            conn = _DummyConn()
+            handler = listen_mod.ListenTextMessageHandler()
+            with (
+                patch.object(listen_mod, "send_stt_message", new=AsyncMock()) as m_stt,
+                patch.object(hello_mod, "send_tts_message", new=AsyncMock()) as m_tts,
+                patch.object(listen_mod, "startToChat", new=AsyncMock()) as m_chat,
+            ):
+                await handler.handle(conn, {"type": "listen", "state": "detect", "text": "听我说"})
+                m_stt.assert_awaited_once_with(conn, "听我说")
+                m_tts.assert_awaited_once_with(conn, "stop", None)
+                m_chat.assert_not_awaited()
+                self.assertFalse(conn.just_woken_up)
+                self.assertFalse(conn.client_is_speaking)
+
+        asyncio.run(_run())
+
     def test_reply_length_hot_config_and_prompt_injection(self):
         import reply_length_router as rl
 
@@ -567,6 +621,99 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
             self.assertIn("1000 字", msgs[0]["content"])
         finally:
             rl.write_reply_length_config(chat_chars=orig["chat_chars"], story_chars=orig["story_chars"])
+
+    def test_live_relationship_hot_control_roundtrip(self):
+        import httpx
+        import anima_memory_provider
+
+        token = anima_memory_provider._read_token()
+        self.assertTrue(token, "Expected studio_token.txt to be readable")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        with httpx.Client(timeout=4.0, trust_env=False) as client:
+            r0 = client.get(
+                "http://anima-brain:18787/xiaozhi/relationship",
+                params={"character_id": "xiaozhi"},
+                headers=headers,
+            )
+            self.assertEqual(r0.status_code, 200)
+            orig = r0.json()
+            orig_axes = orig["axes"]
+
+            try:
+                # 1. Switch to restrained preset via 18080 console API
+                r1 = client.post(
+                    "http://127.0.0.1:18080/api/relationship",
+                    json={"preset": "restrained"},
+                )
+                self.assertEqual(r1.status_code, 200)
+                j1 = r1.json()
+                self.assertTrue(j1.get("ok"))
+                rel1 = j1["relationship"]
+                self.assertEqual(rel1["preset"], "restrained")
+                self.assertFalse(rel1["romance_enabled"])
+                self.assertAlmostEqual(rel1["axes"]["familiarity"], 0.30, places=2)
+
+                rec1 = client.post(
+                    "http://anima-brain:18787/xiaozhi/recall",
+                    headers=headers,
+                    json={"character_id": "xiaozhi", "query": "你好"},
+                ).json()
+                self.assertIn("克制得体", rec1.get("context_text", ""))
+
+                # 2. Switch to intimate preset via 18080 console API -> immediate Lv.3 close
+                r2 = client.post(
+                    "http://127.0.0.1:18080/api/relationship",
+                    json={"preset": "intimate"},
+                )
+                self.assertEqual(r2.status_code, 200)
+                rel2 = r2.json()["relationship"]
+                self.assertEqual(rel2["preset"], "intimate")
+                self.assertTrue(rel2["romance_enabled"])
+                self.assertEqual(rel2["stage"], "close")
+                self.assertEqual(rel2["bands"]["familiarity"], 3)
+                self.assertAlmostEqual(rel2["axes"]["romance"], 0.85, places=2)
+
+                rec2 = client.post(
+                    "http://anima-brain:18787/xiaozhi/recall",
+                    headers=headers,
+                    json={"character_id": "xiaozhi", "query": "晚安"},
+                ).json()
+                self.assertIn("深度亲密依恋", rec2.get("context_text", ""))
+                self.assertIn("stage=close", rec2.get("mood", ""))
+
+                # 3. Custom slider right above 0.75 must snap immediately to Lv.3 without hysteresis lag
+                r3 = client.post(
+                    "http://127.0.0.1:18080/api/relationship",
+                    json={
+                        "romance_enabled": False,
+                        "familiarity": 0.76,
+                        "warmth": 0.76,
+                        "trust": 0.76,
+                        "romance": 0.40,
+                    },
+                )
+                self.assertEqual(r3.status_code, 200)
+                rel3 = r3.json()["relationship"]
+                self.assertEqual(rel3["preset"], "custom")
+                self.assertFalse(rel3["romance_enabled"])
+                self.assertEqual(rel3["bands"]["familiarity"], 3)
+                self.assertAlmostEqual(rel3["axes"]["romance"], 0.40, places=2)
+            finally:
+                client.post(
+                    "http://anima-brain:18787/xiaozhi/relationship",
+                    headers=headers,
+                    json={
+                        "character_id": "xiaozhi",
+                        "relationship_enabled": orig["relationship_enabled"],
+                        "romance_enabled": orig["romance_enabled"],
+                        "familiarity": orig_axes["familiarity"],
+                        "warmth": orig_axes["warmth"],
+                        "trust": orig_axes["trust"],
+                        "romance": orig_axes["romance"],
+                        "tension": orig_axes.get("tension", 0.0),
+                    },
+                )
 
 
 if __name__ == "__main__":

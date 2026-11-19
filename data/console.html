@@ -215,6 +215,62 @@
     accent-color: var(--accent);
     cursor: pointer;
   }
+  .audio-vol-bar.is-disabled { opacity: 0.56; }
+  .audio-vol-bar.is-disabled input[type="range"] { cursor: not-allowed; }
+  .switch-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 9px 12px;
+    margin-bottom: 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+  }
+  .switch-row-label strong { display: block; font-size: 13px; color: var(--ink); font-weight: 600; }
+  .switch-row-label span { display: block; font-size: 12px; color: var(--ink-secondary); margin-top: 1px; }
+  .toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 40px;
+    height: 22px;
+    flex: none;
+    cursor: pointer;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: var(--border-strong);
+    border-radius: 99px;
+    transition: background-color 0.16s ease;
+  }
+  .toggle-slider::before {
+    content: "";
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    left: 3px;
+    top: 3px;
+    border-radius: 50%;
+    background: #FFFFFF;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.16);
+    transition: transform 0.16s ease;
+  }
+  .toggle-switch input:checked + .toggle-slider { background: var(--accent); }
+  .toggle-switch input:checked + .toggle-slider::before { transform: translateX(18px); }
+  .toggle-switch input:focus-visible + .toggle-slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .rel-stage-badge {
+    font-size: 12px;
+    font-weight: 550;
+    padding: 2px 9px;
+    border-radius: 99px;
+    border: 1px solid var(--accent-border);
+    background: var(--accent-tint);
+    color: var(--accent);
+    white-space: nowrap;
+  }
   @media (max-width: 680px) { .mode-grid, .mode-grid-2 { grid-template-columns: 1fr; } }
 
   .mode-btn {
@@ -519,6 +575,61 @@
       </div>
     </div>
 
+    <!-- Section 1d: Relationship & Intimacy Hot-Control (Instant Hot-Update, No Restart Required) -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">亲密度与关系热度（拖动即刻生效，免重启）</h2>
+        <span id="relStageBadge" class="rel-stage-badge num">检测中…</span>
+      </div>
+      <p class="section-desc">实时调节 Anima Brain 中雷电芽衣对你的熟悉、温暖、信任与浪漫尺度；点选预设、开关浪漫模式或拖动滑块后，下一句话立刻按新关系注入。</p>
+
+      <div class="preset-bar" id="relPresetBar" style="margin-bottom:10px;">
+        <button type="button" class="preset-pill" data-rel-preset="restrained">克制助手（礼貌分寸 · 无浪漫）</button>
+        <button type="button" class="preset-pill" data-rel-preset="confidant">温柔知己（熟识贴心 · 轻浪漫）</button>
+        <button type="button" class="preset-pill" data-rel-preset="intimate">亲密依恋（深度默契 · 偏爱哄慰）</button>
+      </div>
+
+      <div class="switch-row">
+        <div class="switch-row-label">
+          <strong>允许浪漫亲昵互动（Romance 开关）</strong>
+          <span id="relRomanceHint">开启后允许顺应你的亲昵与撒娇表达，并激活下方浪漫值刻度</span>
+        </div>
+        <label class="toggle-switch" aria-label="允许浪漫亲昵互动开关">
+          <input type="checkbox" id="relRomanceToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:0;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">熟悉度（Familiarity）</span>
+        <input type="range" id="relFamRange" min="0" max="100" step="1" value="62" aria-label="熟悉度">
+        <strong id="relFamVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">62% · Lv.2</strong>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:8px;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">温暖度（Warmth）</span>
+        <input type="range" id="relWarmRange" min="0" max="100" step="1" value="66" aria-label="温暖度">
+        <strong id="relWarmVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">66% · Lv.2</strong>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:8px;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">信任度（Trust）</span>
+        <input type="range" id="relTrustRange" min="0" max="100" step="1" value="62" aria-label="信任度">
+        <strong id="relTrustVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">62% · Lv.2</strong>
+      </div>
+
+      <div class="audio-vol-bar" id="relRomRow" style="margin-top:8px;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">浪漫值（Romance）</span>
+        <input type="range" id="relRomRange" min="0" max="100" step="1" value="20" aria-label="浪漫值">
+        <strong id="relRomVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">20% · 已解锁</strong>
+      </div>
+
+      <div class="field-foot">
+        <span>Anima Brain 同步状态（18787）：<strong id="relStatusText">检测中…</strong></span>
+        <span>下一句话即刻生效，无需重启或重连 ESP32</span>
+      </div>
+    </div>
+
     <!-- Section 2: LLM Provider Switch (DeepSeek <-> Gemini) -->
     <div class="config-section">
       <h2 class="section-title" style="margin-bottom:6px;">对话与调度大模型 API（DeepSeek / Gemini 双模切换）</h2>
@@ -695,6 +806,20 @@
     storyCharsRange: document.getElementById("storyCharsRange"),
     storyCharsVal: document.getElementById("storyCharsVal"),
     replyMaxTokText: document.getElementById("replyMaxTokText"),
+    relStageBadge: document.getElementById("relStageBadge"),
+    relPresetBar: document.getElementById("relPresetBar"),
+    relRomanceToggle: document.getElementById("relRomanceToggle"),
+    relRomanceHint: document.getElementById("relRomanceHint"),
+    relFamRange: document.getElementById("relFamRange"),
+    relFamVal: document.getElementById("relFamVal"),
+    relWarmRange: document.getElementById("relWarmRange"),
+    relWarmVal: document.getElementById("relWarmVal"),
+    relTrustRange: document.getElementById("relTrustRange"),
+    relTrustVal: document.getElementById("relTrustVal"),
+    relRomRow: document.getElementById("relRomRow"),
+    relRomRange: document.getElementById("relRomRange"),
+    relRomVal: document.getElementById("relRomVal"),
+    relStatusText: document.getElementById("relStatusText"),
     providerSelect: document.getElementById("providerSelect"),
     modelSelect: document.getElementById("modelSelect"),
     modelCustomInput: document.getElementById("modelCustomInput"),
@@ -917,6 +1042,174 @@
       await saveReplyLength({
         chat_chars: Number(els.chatCharsRange.value),
         story_chars: Number(els.storyCharsRange.value)
+      });
+    });
+  });
+
+  let relDragging = false;
+  let relSaving = false;
+  const REL_PRESET_NAMES = {
+    restrained: "克制助手",
+    confidant: "温柔知己",
+    intimate: "亲密依恋",
+  };
+
+  function axisBandFromPct(pct) {
+    const v = Number(pct) / 100;
+    if (v >= 0.75) return 3;
+    if (v >= 0.50) return 2;
+    if (v >= 0.25) return 1;
+    return 0;
+  }
+
+  function formatCoreAxisVal(pct) {
+    const p = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
+    return `${p}% · Lv.${axisBandFromPct(p)}`;
+  }
+
+  function formatRomanceAxisVal(pct, romanceOn) {
+    const p = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
+    if (!romanceOn) return `${p}% · 已关闭`;
+    if (p >= 60) return `${p}% · 浓烈依恋`;
+    if (p > 15) return `${p}% · 已解锁`;
+    return `${p}% · 轻浅`;
+  }
+
+  function syncRomanceRowState(romanceOn, romPct) {
+    if (els.relRomRow) els.relRomRow.classList.toggle("is-disabled", !romanceOn);
+    if (els.relRomRange) els.relRomRange.disabled = !romanceOn;
+    if (els.relRomVal) els.relRomVal.textContent = formatRomanceAxisVal(romPct, romanceOn);
+    if (els.relRomanceHint) {
+      els.relRomanceHint.textContent = romanceOn
+        ? "已开启：允许顺应你的亲昵与撒娇表达，下方浪漫值实时生效"
+        : "已关闭：保持纯粹挚友/助手分寸，不往恋爱暧昧方向发展";
+    }
+  }
+
+  function renderRelationshipUI(rel) {
+    if (!rel || !els.relFamRange) return;
+    const axes = rel.axes || {};
+    const famPct = Math.round((Number(axes.familiarity) || 0) * 100);
+    const warmPct = Math.round((Number(axes.warmth) || 0) * 100);
+    const trustPct = Math.round((Number(axes.trust) || 0) * 100);
+    const romPct = Math.round((Number(axes.romance) || 0) * 100);
+    const romOn = Boolean(rel.romance_enabled);
+
+    els.relFamRange.value = String(famPct);
+    els.relWarmRange.value = String(warmPct);
+    els.relTrustRange.value = String(trustPct);
+    els.relRomRange.value = String(romPct);
+
+    els.relFamVal.textContent = formatCoreAxisVal(famPct);
+    els.relWarmVal.textContent = formatCoreAxisVal(warmPct);
+    els.relTrustVal.textContent = formatCoreAxisVal(trustPct);
+    if (els.relRomanceToggle) els.relRomanceToggle.checked = romOn;
+    syncRomanceRowState(romOn, romPct);
+
+    if (els.relPresetBar) {
+      const p = rel.preset || "custom";
+      els.relPresetBar.querySelectorAll(".preset-pill").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.relPreset === p);
+      });
+    }
+    if (els.relStageBadge) {
+      const famBand = (rel.bands && typeof rel.bands.familiarity === "number")
+        ? rel.bands.familiarity
+        : axisBandFromPct(famPct);
+      els.relStageBadge.textContent = rel.online
+        ? `${rel.stage_label_zh || "已同步"} · Lv.${famBand}`
+        : "Anima Brain 离线";
+    }
+    if (els.relStatusText) {
+      if (rel.online) {
+        els.relStatusText.textContent = `已实时同步（${rel.stage_label_zh || rel.stage} · ${romOn ? "浪漫开启" : "浪漫关闭"}）`;
+        els.relStatusText.style.color = "var(--accent)";
+      } else {
+        els.relStatusText.textContent = "离线（请检查 18787 Anima Brain 容器）";
+        els.relStatusText.style.color = "var(--danger)";
+      }
+    }
+  }
+
+  async function saveRelationship(payload, toastLabel) {
+    relSaving = true;
+    try {
+      const resp = await fetch("/api/relationship", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const res = await resp.json();
+      if (!res.ok || !res.relationship) {
+        throw new Error(res.error || "写入失败");
+      }
+      renderRelationshipUI(res.relationship);
+      const ax = res.relationship.axes || {};
+      const romTxt = res.relationship.romance_enabled ? `浪漫 ${Math.round((ax.romance || 0) * 100)}%` : "浪漫关闭";
+      showBanner(
+        "info",
+        toastLabel || `亲密度已即时生效（${res.relationship.stage_label_zh}）：熟悉 ${Math.round((ax.familiarity || 0) * 100)}% · 温暖 ${Math.round((ax.warmth || 0) * 100)}% · 信任 ${Math.round((ax.trust || 0) * 100)}% · ${romTxt}`
+      );
+      setTimeout(hideBanner, 2800);
+    } catch (err) {
+      showBanner("err", `调节亲密度失败：${err.message}`);
+    } finally {
+      relSaving = false;
+    }
+  }
+
+  if (els.relPresetBar) {
+    els.relPresetBar.addEventListener("click", (e) => {
+      const btn = e.target.closest(".preset-pill");
+      if (!btn) return;
+      const preset = btn.dataset.relPreset;
+      if (!preset) return;
+      saveRelationship(
+        { preset },
+        `已即时切换亲密度预设【${REL_PRESET_NAMES[preset] || preset}】，下一句话立即生效`
+      );
+    });
+  }
+
+  if (els.relRomanceToggle) {
+    els.relRomanceToggle.addEventListener("change", () => {
+      const on = Boolean(els.relRomanceToggle.checked);
+      syncRomanceRowState(on, els.relRomRange ? els.relRomRange.value : 0);
+      if (els.relPresetBar) {
+        els.relPresetBar.querySelectorAll(".preset-pill").forEach(b => b.classList.remove("active"));
+      }
+      saveRelationship(
+        { romance_enabled: on },
+        on ? "已开启浪漫亲昵互动模式，下一句话立即生效" : "已关闭浪漫亲昵互动模式（保持纯挚友/助手分寸）"
+      );
+    });
+  }
+
+  [
+    [els.relFamRange, els.relFamVal, false],
+    [els.relWarmRange, els.relWarmVal, false],
+    [els.relTrustRange, els.relTrustVal, false],
+    [els.relRomRange, els.relRomVal, true]
+  ].forEach(([rangeEl, valEl, isRomance]) => {
+    if (!rangeEl || !valEl) return;
+    rangeEl.addEventListener("input", () => {
+      relDragging = true;
+      valEl.textContent = isRomance
+        ? formatRomanceAxisVal(rangeEl.value, Boolean(els.relRomanceToggle && els.relRomanceToggle.checked))
+        : formatCoreAxisVal(rangeEl.value);
+      if (els.relPresetBar) {
+        els.relPresetBar.querySelectorAll(".preset-pill").forEach(b => b.classList.remove("active"));
+      }
+    });
+    rangeEl.addEventListener("change", async () => {
+      relDragging = false;
+      await saveRelationship({
+        relationship_enabled: true,
+        romance_enabled: Boolean(els.relRomanceToggle && els.relRomanceToggle.checked),
+        familiarity: Number(els.relFamRange.value) / 100,
+        warmth: Number(els.relWarmRange.value) / 100,
+        trust: Number(els.relTrustRange.value) / 100,
+        romance: Number(els.relRomRange.value) / 100
       });
     });
   });
@@ -1244,6 +1537,9 @@
       }
       if (!replyLenDragging && cfg.reply_length) {
         renderReplyLengthUI(cfg.reply_length);
+      }
+      if (!relDragging && !relSaving && cfg.relationship) {
+        renderRelationshipUI(cfg.relationship);
       }
 
       els.dsKeyBadge.textContent = cfg.deepseek_key_ok ? "已就绪" : "未设置";

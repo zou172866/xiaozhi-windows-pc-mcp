@@ -1442,4 +1442,50 @@ def apply_mei_wakeup_responses_patch() -> None:
         if m is not None and hasattr(m, "checkWakeupWords"):
             setattr(m, "checkWakeupWords", _mei_aware_check_wakeup_words)
 
-    print("[MeiEmotionRouter] 已挂载芽衣专属唤醒词秒回语补丁 (raiden_mei 独立缓存 + gentle 温柔音色)", flush=True)
+    # Patch ListenTextMessageHandler so offline interrupt words (e.g. "听我说") switch straight to
+    # listening with ZERO greeting TTS and ZERO 2s just_woken_up VAD suppression (even from IDLE).
+    try:
+        import core.handle.textHandler.listenMessageHandler as listen_mod
+        import core.handle.abortHandle as abort_mod
+
+        cls = getattr(listen_mod, "ListenTextMessageHandler", None)
+        if cls is not None and not getattr(cls, "_interrupt_word_patched", False):
+            _orig_listen_handle = cls.handle
+
+            async def _interrupt_aware_listen_handle(self, conn, msg_json):
+                if isinstance(msg_json, dict) and msg_json.get("state") == "detect" and "text" in msg_json:
+                    original_text = str(msg_json.get("text") or "")
+                    _, filtered_text = listen_mod.remove_punctuation_and_length(original_text)
+                    cfg_words = (getattr(conn, "config", None) or {}).get("interrupt_words")
+                    if not isinstance(cfg_words, (list, tuple, set)):
+                        cfg_words = ("听我说",)
+                    norm_words = {
+                        listen_mod.remove_punctuation_and_length(str(w))[1]
+                        for w in cfg_words
+                        if str(w).strip()
+                    }
+                    if filtered_text and filtered_text in norm_words:
+                        conn.client_have_voice = False
+                        conn.reset_audio_states()
+                        conn.last_activity_time = time.time() * 1000
+                        conn.just_woken_up = False
+                        if getattr(conn, "client_is_speaking", False):
+                            try:
+                                await abort_mod.handleAbortMessage(conn)
+                            except Exception:
+                                pass
+                        await listen_mod.send_stt_message(conn, original_text)
+                        await hello_mod.send_tts_message(conn, "stop", None)
+                        conn.client_is_speaking = False
+                        conn.logger.bind(tag=listen_mod.TAG).info(
+                            f"收到打断词「{original_text}」，已静音并直接进入聆听模式"
+                        )
+                        return
+                return await _orig_listen_handle(self, conn, msg_json)
+
+            cls.handle = _interrupt_aware_listen_handle
+            cls._interrupt_word_patched = True
+    except Exception as exc:
+        print(f"[MeiEmotionRouter] 挂载打断词直通聆听补丁跳过: {exc}", flush=True)
+
+    print("[MeiEmotionRouter] 已挂载芽衣专属唤醒词秒回语 + 打断词直通聆听补丁 (raiden_mei 独立缓存 + gentle 温柔音色)", flush=True)

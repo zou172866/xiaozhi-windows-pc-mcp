@@ -319,6 +319,116 @@ def _read_raw_yaml() -> dict:
 
 ANIMA_HOST = "http://anima-brain:18787"
 ANIMA_TOKEN_PATH = os.path.join(DATA_DIR, "anima", "studio_token.txt")
+_anima_rel_lock = threading.Lock()
+_anima_rel_cache: dict | None = None
+_anima_rel_ts = 0.0
+_ANIMA_REL_TTL = 3.0
+
+
+def _read_anima_token() -> str:
+    if not os.path.isfile(ANIMA_TOKEN_PATH):
+        return ""
+    try:
+        with open(ANIMA_TOKEN_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _get_anima_character_id(cfg: dict | None = None) -> str:
+    try:
+        c = cfg if cfg is not None else _read_raw_yaml()
+        cid = str(((c.get("Memory") or {}).get("AnimaBrain") or {}).get("character_id") or "").strip()
+        if cid:
+            return cid
+    except Exception:
+        pass
+    return "xiaozhi"
+
+
+def _default_offline_relationship(char_id: str = "xiaozhi") -> dict:
+    return {
+        "online": False,
+        "character_id": char_id,
+        "character_name": "雷电芽衣",
+        "relationship_enabled": True,
+        "romance_enabled": True,
+        "preset": "custom",
+        "stage": "familiar",
+        "stage_label_zh": "等待连接",
+        "axes": {
+            "familiarity": 0.62,
+            "warmth": 0.66,
+            "trust": 0.62,
+            "romance": 0.20,
+            "tension": 0.0,
+        },
+        "bands": {"familiarity": 2, "warmth": 2, "trust": 2, "romance": 0, "tension": 0},
+        "guidance_zh": "",
+    }
+
+
+def _fetch_anima_relationship(force: bool = False, cfg: dict | None = None) -> dict:
+    global _anima_rel_cache, _anima_rel_ts
+    now = time.monotonic()
+    with _anima_rel_lock:
+        if not force and _anima_rel_cache is not None and (now - _anima_rel_ts) < _ANIMA_REL_TTL:
+            return dict(_anima_rel_cache)
+
+    char_id = _get_anima_character_id(cfg)
+    token = _read_anima_token()
+    if not token:
+        return _default_offline_relationship(char_id)
+    try:
+        with httpx.Client(timeout=1.8, trust_env=False) as client:
+            resp = client.get(
+                f"{ANIMA_HOST}/xiaozhi/relationship",
+                params={"character_id": char_id},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                data["online"] = True
+                with _anima_rel_lock:
+                    _anima_rel_cache = dict(data)
+                    _anima_rel_ts = time.monotonic()
+                return data
+    except Exception:
+        pass
+    with _anima_rel_lock:
+        if _anima_rel_cache is not None:
+            stale = dict(_anima_rel_cache)
+            stale["online"] = False
+            _anima_rel_ts = time.monotonic()
+            return stale
+    return _default_offline_relationship(char_id)
+
+
+def _update_anima_relationship(payload: dict) -> tuple[bool, dict | str]:
+    global _anima_rel_cache, _anima_rel_ts
+    char_id = _get_anima_character_id()
+    token = _read_anima_token()
+    if not token:
+        return False, "未找到 Anima Brain 访问令牌 (studio_token.txt)"
+    req_body = dict(payload or {})
+    req_body.setdefault("character_id", char_id)
+    try:
+        with httpx.Client(timeout=4.0, trust_env=False) as client:
+            resp = client.post(
+                f"{ANIMA_HOST}/xiaozhi/relationship",
+                headers={"Authorization": f"Bearer {token}"},
+                json=req_body,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                data["online"] = True
+                with _anima_rel_lock:
+                    _anima_rel_cache = dict(data)
+                    _anima_rel_ts = time.monotonic()
+                return True, data
+            return False, f"Anima Brain 返回 HTTP {resp.status_code}: {resp.text[:160]}"
+    except Exception as exc:
+        return False, f"无法连接 Anima Brain (18787): {exc}"
 
 
 def _infer_character_name(prompt: str) -> str:
@@ -494,6 +604,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
             audio_cfg = pc_audio_router.read_audio_output_config()
             reply_len_cfg = reply_length_router.read_reply_length_config()
+            rel_cfg = _fetch_anima_relationship(force=False, cfg=cfg)
 
             self._send_json(
                 {
@@ -514,6 +625,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "pc_audio_volume": audio_cfg["volume"],
                         "pc_audio_online": pc_audio_router.is_pc_audio_bridge_online(),
                         "reply_length": reply_len_cfg,
+                        "relationship": rel_cfg,
                         "agy_bridge_online": _check_agy_bridge_online(),
                         "mei_emotions": [
                             {"id": k, "label": v.get("label_zh", k)}
@@ -525,6 +637,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     "logs": logs,
                 }
             )
+            return
+
+        if parsed.path == "/api/relationship":
+            rel_cfg = _fetch_anima_relationship(force=True)
+            self._send_json({"ok": bool(rel_cfg.get("online")), "relationship": rel_cfg})
             return
 
         self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
@@ -577,6 +694,18 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     preset=body.get("preset", None),
                 )
                 self._send_json({"ok": True, "reply_length": saved})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/relationship":
+            try:
+                body = self._read_body_json()
+                ok, result = _update_anima_relationship(body)
+                if ok:
+                    self._send_json({"ok": True, "relationship": result})
+                else:
+                    self._send_json({"ok": False, "error": str(result)}, HTTPStatus.BAD_GATEWAY)
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
