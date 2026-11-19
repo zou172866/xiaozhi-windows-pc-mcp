@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "windows_pc_control": {
+      "url": "http://host.docker.internal:18900/mcp",
+      "transport": "streamable-http",
+      "timeout": 25
+    }
+  }
+}

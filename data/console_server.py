@@ -1,0 +1,525 @@
+import asyncio
+import json
+import os
+import re
+import threading
+import time
+from collections import deque
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+import edge_tts
+import httpx
+import yaml
+
+ROOT_DIR = "/opt/xiaozhi-esp32-server"
+DATA_DIR = os.path.join(ROOT_DIR, "data")
+CONFIG_PATH = os.path.join(DATA_DIR, ".config.yaml")
+HTML_PATH = os.path.join(DATA_DIR, "console.html")
+HISTORY_PATH = os.path.join(DATA_DIR, "chat_history.json")
+MODE_PATH = os.path.join(DATA_DIR, "pc_control_mode.json")
+AGY_HB_PATH = os.path.join(DATA_DIR, "agy_tasks", "worker_heartbeat.json")
+LOG_PATH = os.path.join(ROOT_DIR, "tmp", "server.log")
+
+CONSOLE_PORT = int(os.environ.get("CONSOLE_PORT", "18080"))
+GSV_Host = "http://host.docker.internal:19880"
+GSV_INFER_YAML = os.path.join(DATA_DIR, "tts_infer_xiaozhi.yaml")
+
+GSV_PROFILES = {
+    "__gsv_raiden_mei__": {
+        "version": "v4",
+        "gpt_weights": "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/v4/芽衣/芽衣-e10.ckpt",
+        "sovits_weights": "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/v4/芽衣/芽衣_e10_s430_l32.pth",
+        "block": {
+            "type": "gpt_sovits_v2",
+            "url": f"{GSV_Host}/tts",
+            "output_dir": "tmp/",
+            "text_lang": "zh",
+            "ref_audio_path": "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav",
+            "aux_ref_audio_paths": [],
+            "prompt_text": "今夜月色很美，呵...适合与朋友小聚一番。",
+            "prompt_lang": "zh",
+            "top_k": 12,
+            "top_p": 1,
+            "temperature": 1,
+            "text_split_method": "cut5",
+            "batch_size": 1,
+            "batch_threshold": 0.75,
+            "split_bucket": True,
+            "return_fragment": False,
+            "speed_factor": 1.0,
+            "streaming_mode": False,
+            "seed": -1,
+            "parallel_infer": True,
+            "repetition_penalty": 1.35,
+        },
+    },
+    "__gsv_xiaozhi_tw__": {
+        "version": "v2ProPlus",
+        "gpt_weights": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+        "sovits_weights": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
+        "block": {
+            "type": "gpt_sovits_v2",
+            "url": f"{GSV_Host}/tts",
+            "output_dir": "tmp/",
+            "text_lang": "zh",
+            "ref_audio_path": "e:/故事/1/xiaozhi-server/data/xiaozhi_taiwan_ref.wav",
+            "aux_ref_audio_paths": ["e:/故事/1/xiaozhi-server/data/xiaozhi_taiwan_aux.wav"],
+            "prompt_text": "哈啰啊，我是小智啦，声音好听的台湾女孩一枚，超开心认识你耶，最近在忙啥？",
+            "prompt_lang": "zh",
+            "top_k": 12,
+            "top_p": 1,
+            "temperature": 1,
+            "text_split_method": "cut5",
+            "batch_size": 1,
+            "batch_threshold": 0.75,
+            "split_bucket": True,
+            "return_fragment": False,
+            "speed_factor": 1.04,
+            "streaming_mode": False,
+            "seed": -1,
+            "parallel_infer": True,
+            "repetition_penalty": 1.35,
+        },
+    },
+}
+_active_gsv_loaded = None
+
+
+def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
+    global _active_gsv_loaded
+    prof = GSV_PROFILES.get(voice_id)
+    if not prof:
+        return
+    if _active_gsv_loaded != voice_id:
+        httpx.get(f"{GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=25.0)
+        httpx.get(f"{GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=30.0)
+        _active_gsv_loaded = voice_id
+    if persist_boot_yaml:
+        boot_cfg = {
+            "custom": {
+                "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
+                "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
+                "device": "cuda",
+                "is_half": True,
+                "t2s_weights_path": prof["gpt_weights"],
+                "version": prof["version"],
+                "vits_weights_path": prof["sovits_weights"],
+            }
+        }
+        with open(GSV_INFER_YAML, "w", encoding="utf-8") as f:
+            yaml.safe_dump(boot_cfg, f, allow_unicode=True, sort_keys=False)
+
+
+_state_lock = threading.Lock()
+_chat_messages = []
+_raw_logs = deque(maxlen=150)
+_device_info = {
+    "device_id": "cc:68:c7:a8:19:dc",
+    "last_seen": "",
+    "activity": "idle",
+    "server_ready": False,
+}
+_current_ai_turn_open = False
+_log_offset = 0
+
+
+def _load_history():
+    global _chat_messages
+    if os.path.exists(HISTORY_PATH):
+        try:
+            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                items = json.load(f)
+                if isinstance(items, list):
+                    _chat_messages = items[-100:]
+        except Exception:
+            _chat_messages = []
+
+
+def _save_history():
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(_chat_messages[-100:], f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _read_pc_mode() -> str:
+    try:
+        if os.path.exists(MODE_PATH):
+            with open(MODE_PATH, "r", encoding="utf-8") as f:
+                m = json.load(f).get("mode", "safe")
+                if m in ("off", "safe", "full"):
+                    return m
+    except Exception:
+        pass
+    return "safe"
+
+
+def _write_pc_mode(mode: str):
+    os.makedirs(os.path.dirname(MODE_PATH), exist_ok=True)
+    with open(MODE_PATH, "w", encoding="utf-8") as f:
+        json.dump({"mode": mode}, f, ensure_ascii=False, indent=2)
+
+
+def _check_agy_bridge_online() -> bool:
+    try:
+        if os.path.exists(AGY_HB_PATH):
+            with open(AGY_HB_PATH, "r", encoding="utf-8") as f:
+                hb = json.load(f)
+            return (time.time() - float(hb.get("ts", 0))) < 15.0
+    except Exception:
+        pass
+    return False
+
+
+_RE_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+_RE_OTA_DEV = re.compile(r"OTA请求设备ID:\s*([0-9a-fA-F:]+)")
+_RE_LISTEN_START = re.compile(r'收到listen消息：.*"state"\s*:\s*"start"')
+_RE_USER_MSG = re.compile(r"大模型收到用户消息:\s*(.+)$")
+_RE_AI_SENTENCE = re.compile(r"发送音频消息:\s*SentenceType\.(\w+),\s*(.+)$")
+
+
+def _join_cn_clauses(prev: str, nxt: str) -> str:
+    if not prev:
+        return nxt
+    if prev[-1] in "，。！？；：,.!?;:~～…":
+        return prev + nxt
+    return prev + "，" + nxt
+
+
+def _process_log_line(line: str):
+    global _current_ai_turn_open
+    s = line.strip()
+    if not s:
+        return
+
+    with _state_lock:
+        _raw_logs.append(s)
+
+        m_time = _RE_TIME.match(s)
+        ts_short = m_time.group(1)[11:19] if m_time else time.strftime("%H:%M:%S")
+
+        if "ASR模块初始化完成" in s or "Websocket地址是" in s:
+            _device_info["server_ready"] = True
+
+        m_dev = _RE_OTA_DEV.search(s)
+        if m_dev:
+            _device_info["device_id"] = m_dev.group(1)
+            _device_info["last_seen"] = ts_short
+
+        if _RE_LISTEN_START.search(s):
+            _device_info["activity"] = "listening"
+            _device_info["last_seen"] = ts_short
+            _current_ai_turn_open = False
+            return
+
+        m_user = _RE_USER_MSG.search(s)
+        if m_user:
+            text = m_user.group(1).strip()
+            _device_info["activity"] = "speaking"
+            _device_info["last_seen"] = ts_short
+            _current_ai_turn_open = False
+            _chat_messages.append({"role": "user", "text": text, "time": ts_short})
+            _save_history()
+            return
+
+        m_ai = _RE_AI_SENTENCE.search(s)
+        if m_ai:
+            stype, content = m_ai.group(1), m_ai.group(2).strip()
+            _device_info["last_seen"] = ts_short
+            if stype == "LAST" or content == "None":
+                _current_ai_turn_open = False
+                _device_info["activity"] = "idle"
+                _save_history()
+            else:
+                _device_info["activity"] = "speaking"
+                if _current_ai_turn_open and _chat_messages and _chat_messages[-1]["role"] == "assistant":
+                    _chat_messages[-1]["text"] = _join_cn_clauses(_chat_messages[-1]["text"], content)
+                else:
+                    _chat_messages.append({"role": "assistant", "text": content, "time": ts_short})
+                    _current_ai_turn_open = True
+            return
+
+
+def _log_watcher_loop():
+    global _log_offset
+    _load_history()
+    last_inode = None
+    while True:
+        try:
+            if os.path.exists(LOG_PATH):
+                st = os.stat(LOG_PATH)
+                if last_inode != st.st_ino or st.st_size < _log_offset:
+                    _log_offset = 0
+                    last_inode = st.st_ino
+                if st.st_size > _log_offset:
+                    with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(_log_offset)
+                        chunk = f.read()
+                        _log_offset = f.tell()
+                    for ln in chunk.splitlines():
+                        _process_log_line(ln)
+        except Exception:
+            pass
+        time.sleep(0.4)
+
+
+def _read_raw_yaml() -> dict:
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _write_updated_yaml(prompt: str, llm_provider: str, model_name: str, voice: str):
+    cfg = _read_raw_yaml()
+    cfg["prompt"] = prompt.strip() + "\n"
+
+    selected = cfg.setdefault("selected_module", {})
+    llm_section = cfg.setdefault("LLM", {})
+
+    # Ensure both DeepSeekLLM and GeminiOpenAI blocks always remain intact
+    ds_cfg = llm_section.setdefault("DeepSeekLLM", {})
+    ds_cfg["type"] = "openai"
+    ds_cfg["base_url"] = "https://api.deepseek.com"
+    ds_cfg.setdefault("model_name", "deepseek-flash")
+    ds_cfg["api_key"] = "${DEEPSEEK_API_KEY}"
+
+    gem_cfg = llm_section.setdefault("GeminiOpenAI", {})
+    gem_cfg["type"] = "openai"
+    gem_cfg["base_url"] = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    gem_cfg.setdefault("model_name", "gemini-3.5-flash-lite")
+    gem_cfg["api_key"] = "${GEMINI_API_KEY}"
+
+    if llm_provider == "GeminiOpenAI":
+        selected["LLM"] = "GeminiOpenAI"
+        gem_cfg["model_name"] = model_name.strip() or "gemini-3.5-flash-lite"
+    else:
+        selected["LLM"] = "DeepSeekLLM"
+        ds_cfg["model_name"] = model_name.strip() or "deepseek-flash"
+
+    tts_section = cfg.setdefault("TTS", {})
+    v_id = voice.strip()
+    if v_id in GSV_PROFILES:
+        _ensure_gsv_weights(v_id, persist_boot_yaml=True)
+        selected["TTS"] = "GPT_SOVITS_V2"
+        tts_section["GPT_SOVITS_V2"] = dict(GSV_PROFILES[v_id]["block"])
+    else:
+        selected["TTS"] = "EdgeTTS"
+        tts_cfg = tts_section.setdefault("EdgeTTS", {})
+        tts_cfg.setdefault("type", "edge")
+        tts_cfg["voice"] = v_id
+        tts_cfg.setdefault("output_dir", "tmp/")
+
+    header = (
+        "# =====================================================================\n"
+        "# 小智 ESP32 本地服务端精简配置（由本地 Web 控制台管理）\n"
+        "# 自动读取 DEEPSEEK_API_KEY 与 GEMINI_API_KEY 环境变量，不落盘明文密钥\n"
+        "# =====================================================================\n\n"
+    )
+    body = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        f.write(header + body)
+
+
+async def _synthesize_mp3(text: str, voice: str) -> bytes:
+    comm = edge_tts.Communicate(text=text, voice=voice)
+    chunks = bytearray()
+    async for item in comm.stream():
+        if item.get("type") == "audio":
+            chunks.extend(item["data"])
+    return bytes(chunks)
+
+
+class ConsoleHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def _send_json(self, payload: dict, status=HTTPStatus.OK):
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _read_body_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
+            if not os.path.exists(HTML_PATH):
+                self._send_json({"error": "console.html not found"}, HTTPStatus.NOT_FOUND)
+                return
+            with open(HTML_PATH, "rb") as f:
+                html_bytes = f.read()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(html_bytes)))
+            self.end_headers()
+            self.wfile.write(html_bytes)
+            return
+
+        if parsed.path == "/api/state":
+            cfg = _read_raw_yaml()
+            selected = cfg.get("selected_module", {})
+            llm_key = selected.get("LLM", "DeepSeekLLM")
+            tts_key = selected.get("TTS", "GPT_SOVITS_V2")
+            llm_cfg = cfg.get("LLM", {}).get(llm_key, {})
+            tts_cfg = cfg.get("TTS", {}).get(tts_key, {})
+            srv_cfg = cfg.get("server", {})
+            ws_url = srv_cfg.get("websocket", "ws://192.168.31.200:18000/xiaozhi/v1/")
+            ota_url = ws_url.replace("ws://", "http://").replace(":18000/xiaozhi/v1/", ":18003/xiaozhi/ota/")
+
+            ds_env = os.environ.get("DEEPSEEK_API_KEY", "")
+            gem_env = os.environ.get("GEMINI_API_KEY", "")
+            ds_ok = bool(ds_env and len(ds_env) > 10 and "请在这里" not in ds_env)
+            gem_ok = bool(gem_env and len(gem_env) > 10 and "请在这里" not in gem_env)
+
+            if tts_key == "GPT_SOVITS_V2":
+                ref_p = str(tts_cfg.get("ref_audio_path", ""))
+                active_voice = "__gsv_raiden_mei__" if "raiden_mei" in ref_p else "__gsv_xiaozhi_tw__"
+            else:
+                active_voice = tts_cfg.get("voice", "zh-CN-XiaoxiaoNeural")
+
+            with _state_lock:
+                dev = dict(_device_info)
+                msgs = list(_chat_messages[-60:])
+                logs = list(_raw_logs)[-100:]
+
+            self._send_json(
+                {
+                    "config": {
+                        "prompt": (cfg.get("prompt") or "").strip(),
+                        "llm_provider": llm_key,
+                        "model_name": llm_cfg.get(
+                            "model_name",
+                            "deepseek-flash" if llm_key == "DeepSeekLLM" else "gemini-3.5-flash-lite",
+                        ),
+                        "voice": active_voice,
+                        "websocket": ws_url,
+                        "ota_url": ota_url,
+                        "deepseek_key_ok": ds_ok,
+                        "gemini_key_ok": gem_ok,
+                        "pc_mode": _read_pc_mode(),
+                        "agy_bridge_online": _check_agy_bridge_online(),
+                    },
+                    "device": dev,
+                    "messages": msgs,
+                    "logs": logs,
+                }
+            )
+            return
+
+        self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/api/pc-mode":
+            try:
+                body = self._read_body_json()
+                mode = str(body.get("mode") or "safe").strip()
+                if mode not in ("off", "safe", "full"):
+                    self._send_json({"ok": False, "error": "无效的权限挡位"}, HTTPStatus.BAD_REQUEST)
+                    return
+                _write_pc_mode(mode)
+                self._send_json({"ok": True, "mode": mode})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/config":
+            try:
+                body = self._read_body_json()
+                prompt = str(body.get("prompt") or "").strip()
+                llm_provider = str(body.get("llm_provider") or "DeepSeekLLM").strip()
+                model_name = str(body.get("model_name") or "").strip()
+                voice = str(body.get("voice") or "__gsv_raiden_mei__").strip()
+                restart_now = bool(body.get("restart", True))
+
+                if not prompt:
+                    self._send_json({"ok": False, "error": "角色提示词不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                _write_updated_yaml(
+                    prompt=prompt,
+                    llm_provider=llm_provider,
+                    model_name=model_name,
+                    voice=voice,
+                )
+                self._send_json({"ok": True, "restarting": restart_now})
+
+                if restart_now:
+                    def _delayed_restart():
+                        time.sleep(0.5)
+                        os._exit(0)
+
+                    threading.Thread(target=_delayed_restart, daemon=True).start()
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/clear-history":
+            with _state_lock:
+                _chat_messages.clear()
+                _save_history()
+            self._send_json({"ok": True})
+            return
+
+        if parsed.path == "/api/tts-preview":
+            try:
+                body = self._read_body_json()
+                voice = str(body.get("voice") or "__gsv_raiden_mei__").strip()
+                text = str(body.get("text") or "舰长，欢迎回来，今天的工作辛苦了，稍微休息一下吧。").strip()
+                if voice in GSV_PROFILES:
+                    _ensure_gsv_weights(voice, persist_boot_yaml=False)
+                    req_payload = dict(GSV_PROFILES[voice]["block"])
+                    req_payload["text"] = text[:120]
+                    for drop_k in ("type", "url", "output_dir"):
+                        req_payload.pop(drop_k, None)
+                    r = httpx.post(f"{GSV_Host}/tts", json=req_payload, timeout=25.0)
+                    if r.status_code != 200:
+                        raise RuntimeError(f"本地 GPT-SoVITS 未就绪或返回异常 ({r.status_code})")
+                    wav_bytes = r.content
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "audio/wav")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(wav_bytes)))
+                    self.end_headers()
+                    self.wfile.write(wav_bytes)
+                else:
+                    mp3_bytes = asyncio.run(_synthesize_mp3(text=text[:120], voice=voice))
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "audio/mpeg")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(mp3_bytes)))
+                    self.end_headers()
+                    self.wfile.write(mp3_bytes)
+            except Exception as e:
+                self._send_json({"ok": False, "error": f"音色试听合成失败: {e}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+
+
+def start_console_background():
+    watcher = threading.Thread(target=_log_watcher_loop, name="console-log-watcher", daemon=True)
+    watcher.start()
+
+    def _serve():
+        httpd = ThreadingHTTPServer(("0.0.0.0", CONSOLE_PORT), ConsoleHandler)
+        print(f"[WebConsole] 本地可视化控制台已启动: http://localhost:{CONSOLE_PORT}", flush=True)
+        httpd.serve_forever()
+
+    srv_thread = threading.Thread(target=_serve, name="console-http-server", daemon=True)
+    srv_thread.start()

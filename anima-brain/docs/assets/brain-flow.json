@@ -1,0 +1,863 @@
+{
+  "version": 3,
+  "width": 1200,
+  "height": 650,
+  "views": [
+    {
+      "id": "overview",
+      "label": "The whole brain",
+      "eyebrow": "01 / A TURN THROUGH THE SYSTEM",
+      "description": "Different memories. One continuous conversation.",
+      "nodes": [
+        {
+          "id": "input",
+          "x": 30,
+          "y": 76,
+          "w": 180,
+          "h": 98,
+          "title": "A new message",
+          "subtitle": "Text · voice · image",
+          "tag": "INPUT",
+          "tone": "neutral"
+        },
+        {
+          "id": "recall",
+          "x": 270,
+          "y": 76,
+          "w": 180,
+          "h": 98,
+          "title": "Build the context",
+          "subtitle": "Sources + facts + state",
+          "tag": "READ",
+          "tone": "neutral"
+        },
+        {
+          "id": "reply",
+          "x": 510,
+          "y": 76,
+          "w": 180,
+          "h": 98,
+          "title": "Reply model",
+          "subtitle": "Response + proposals",
+          "tag": "GENERATE",
+          "tone": "neutral"
+        },
+        {
+          "id": "commit",
+          "x": 750,
+          "y": 76,
+          "w": 180,
+          "h": 98,
+          "title": "Validate & commit",
+          "subtitle": "Quotes · policy · revisions",
+          "tag": "WRITE",
+          "tone": "neutral"
+        },
+        {
+          "id": "output",
+          "x": 990,
+          "y": 76,
+          "w": 180,
+          "h": 98,
+          "title": "Back to the person",
+          "subtitle": "Text · speech · video",
+          "tag": "DELIVER",
+          "tone": "neutral"
+        },
+        {
+          "id": "original",
+          "x": 30,
+          "y": 300,
+          "w": 208,
+          "h": 98,
+          "title": "Original evidence",
+          "subtitle": "Who said what, and when",
+          "tag": "SOURCE OF RECORD",
+          "tone": "memory"
+        },
+        {
+          "id": "semantic",
+          "x": 270,
+          "y": 300,
+          "w": 208,
+          "h": 98,
+          "title": "Semantic memory",
+          "subtitle": "Facts · preferences · boundaries",
+          "tag": "WHAT IS KNOWN",
+          "tone": "memory"
+        },
+        {
+          "id": "episodic",
+          "x": 510,
+          "y": 300,
+          "w": 208,
+          "h": 98,
+          "title": "Episodic memory",
+          "subtitle": "Cited accounts of shared events",
+          "tag": "WHAT HAPPENED",
+          "tone": "memory"
+        },
+        {
+          "id": "core",
+          "x": 750,
+          "y": 300,
+          "w": 208,
+          "h": 98,
+          "title": "Core notebook",
+          "subtitle": "Merged, cited continuity",
+          "tag": "COMPACT CONTEXT",
+          "tone": "memory"
+        },
+        {
+          "id": "emotion",
+          "x": 958,
+          "y": 510,
+          "w": 212,
+          "h": 98,
+          "title": "Emotional state",
+          "subtitle": "PAD + relationship axes",
+          "tag": "CHARACTER",
+          "tone": "emotion"
+        },
+        {
+          "id": "consolidate",
+          "x": 290,
+          "y": 510,
+          "w": 420,
+          "h": 98,
+          "title": "Consolidation cycle",
+          "subtitle": "Summarize · cite · index · refresh",
+          "tag": "MAINTENANCE",
+          "tone": "memory"
+        }
+      ],
+      "edges": [
+        {
+          "d": "M210 125H270",
+          "stages": [
+            1
+          ]
+        },
+        {
+          "d": "M450 125H510",
+          "stages": [
+            2
+          ]
+        },
+        {
+          "d": "M690 125H750",
+          "stages": [
+            3
+          ]
+        },
+        {
+          "d": "M930 125H990",
+          "stages": [
+            3
+          ]
+        },
+        {
+          "d": "M800 174V232H134V300",
+          "stages": [
+            3
+          ]
+        },
+        {
+          "d": "M850 174V250H374V300",
+          "stages": [
+            3
+          ]
+        },
+        {
+          "d": "M134 398V559H290",
+          "stages": [
+            4
+          ]
+        },
+        {
+          "d": "M500 510V464H614V398",
+          "stages": [
+            4
+          ]
+        },
+        {
+          "d": "M550 510V482H854V398",
+          "stages": [
+            4
+          ]
+        },
+        {
+          "d": "M374 300V210H330V174",
+          "stages": [
+            1,
+            5
+          ]
+        },
+        {
+          "d": "M614 300V216H390V174",
+          "stages": [
+            1,
+            5
+          ]
+        },
+        {
+          "d": "M958 559H918V450H448V174",
+          "stages": [
+            5
+          ]
+        },
+        {
+          "d": "M900 174V275H1090V510",
+          "stages": [
+            5
+          ]
+        },
+        {
+          "d": "M134 300V198H300V174",
+          "stages": [
+            1,
+            5
+          ]
+        },
+        {
+          "d": "M854 300V198H420V174",
+          "stages": [
+            1,
+            5
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "label": "Receive",
+          "title": "Begin with what was actually said.",
+          "text": "Reserve an owner- and character-scoped turn. Keep the current message and recent dialogue distinct from stored summaries and inferred state.",
+          "example": "“My interview moved to Monday. Please skip the pep talk today.”",
+          "detail": "Originals preserve wording, speaker, timestamp and source ID.",
+          "active": [
+            "input",
+            "original"
+          ]
+        },
+        {
+          "label": "Recall",
+          "title": "Retrieve context, with its sources.",
+          "text": "Semantic facts answer what is currently known. Episodic summaries recall what happened together. Their originals remain available for checking. Core notes, open loops, recent exchanges and character state complete the bounded context.",
+          "example": "Current fact: interview on Monday. Episode: a previous practice session. Preference: quiet support today.",
+          "detail": "Pinned boundaries and updated facts precede matching memories; optional follow-up lookup can recover sources.",
+          "active": [
+            "recall",
+            "original",
+            "semantic",
+            "episodic",
+            "core",
+            "emotion"
+          ]
+        },
+        {
+          "label": "Respond",
+          "title": "Answer the person, with continuity.",
+          "text": "Your model receives the assembled context, persona and response guidance. It returns a reply, cited memory proposals and optional attunement/appraisal fields.",
+          "example": "“Monday, got it. Want to leave interview stuff alone for a bit?”",
+          "detail": "Attunement describes the current cue and response intention; it is not a permanent personality fact.",
+          "active": [
+            "reply",
+            "recall"
+          ]
+        },
+        {
+          "label": "Commit",
+          "title": "One turn, several kinds of memory.",
+          "text": "Validate structure and source quotes, then atomically store the conversation and permitted fact changes. Keep superseded revisions separate from current knowledge. Deliver the committed reply through the host.",
+          "example": "Friday → Monday updates the current fact. The original Friday message still belongs to history.",
+          "detail": "Automatic / review / off policies govern memory proposals. Provenance checks do not prove semantic truth.",
+          "active": [
+            "commit",
+            "original",
+            "semantic",
+            "output"
+          ]
+        },
+        {
+          "label": "Consolidate",
+          "title": "Turn history into useful continuity.",
+          "text": "When consolidation is due, a host or configured worker produces a cited episode and refreshed core. Optional notes, links and vectors make these records easier to retrieve.",
+          "example": "One practice session becomes an episode; the current interview date stays in the core notebook.",
+          "detail": "Consolidation derives records; it does not erase the original conversation.",
+          "active": [
+            "original",
+            "consolidate",
+            "episodic",
+            "core"
+          ]
+        },
+        {
+          "label": "Continue",
+          "title": "Two loops feed the next reply.",
+          "text": "Memory preserves events and changing knowledge. Character emotion follows a separate bounded state update with time decay. Both return to the next context.",
+          "example": "Remember the reschedule without treating a stressful afternoon as a permanent trait.",
+          "detail": "Character emotion is fictional writing state. It is separate from user memory and from attunement evaluation.",
+          "active": [
+            "emotion",
+            "semantic",
+            "episodic",
+            "core",
+            "recall"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "retrieval",
+      "label": "Retrieval & recency",
+      "eyebrow": "02 / TWO DIFFERENT RANKING JOBS",
+      "description": "Original evidence, archive memories and open threads use distinct rankings.",
+      "nodes": [
+        {
+          "id": "query",
+          "x": 30,
+          "y": 230,
+          "w": 210,
+          "h": 98,
+          "title": "Current message",
+          "subtitle": "Scoped to this owner + character",
+          "tag": "QUERY",
+          "tone": "neutral"
+        },
+        {
+          "id": "lexical",
+          "x": 310,
+          "y": 76,
+          "w": 240,
+          "h": 98,
+          "title": "Lexical candidates",
+          "subtitle": "FTS5 · BM25 rank",
+          "tag": "KEYWORDS",
+          "tone": "memory"
+        },
+        {
+          "id": "vector",
+          "x": 310,
+          "y": 270,
+          "w": 240,
+          "h": 98,
+          "title": "Vector candidates",
+          "subtitle": "Positive cosine · configured model",
+          "tag": "SEMANTIC SIMILARITY",
+          "tone": "memory"
+        },
+        {
+          "id": "rrf",
+          "x": 660,
+          "y": 160,
+          "w": 250,
+          "h": 98,
+          "title": "Evidence / archive",
+          "subtitle": "RRF / weighted relevance",
+          "tag": "RELEVANCE",
+          "tone": "memory"
+        },
+        {
+          "id": "loops",
+          "x": 310,
+          "y": 500,
+          "w": 300,
+          "h": 98,
+          "title": "Open follow-up items",
+          "subtitle": "I(1+A) exp(−t/(14+30A)) + U",
+          "tag": "RECENCY / URGENCY",
+          "tone": "emotion"
+        },
+        {
+          "id": "context",
+          "x": 950,
+          "y": 270,
+          "w": 220,
+          "h": 98,
+          "title": "Budgeted context",
+          "subtitle": "Facts · sources · recent turns",
+          "tag": "DELIVERED TO MODEL",
+          "tone": "neutral"
+        }
+      ],
+      "edges": [
+        {
+          "d": "M240 255H275V125H310",
+          "stages": [
+            0
+          ]
+        },
+        {
+          "d": "M240 280H310",
+          "stages": [
+            0
+          ]
+        },
+        {
+          "d": "M550 125H610V190H660",
+          "stages": [
+            1
+          ]
+        },
+        {
+          "d": "M550 319H610V230H660",
+          "stages": [
+            1
+          ]
+        },
+        {
+          "d": "M910 209H1060V270",
+          "stages": [
+            1,
+            3
+          ]
+        },
+        {
+          "d": "M610 549H1060V368",
+          "stages": [
+            2,
+            3
+          ]
+        },
+        {
+          "d": "M134 328V549H310",
+          "stages": [
+            2
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "label": "Find",
+          "title": "Search originals and derived memory.",
+          "text": "Originals use raw contextual vectors, separate note vectors and lexical matches. Keep top 32 raw, 16 note and 60 lexical candidates. Facts and episodes have their own archive search.",
+          "example": "A semantically similar message can be found even when it uses different words.",
+          "detail": "Vectors are optional; layered search additionally has a bounded CJK substring channel.",
+          "active": [
+            "query",
+            "lexical",
+            "vector"
+          ]
+        },
+        {
+          "label": "Fuse",
+          "title": "Preserve evidence; rank archive memories.",
+          "text": "Evidence uses RRF: sum 1/(40 + rank), with bounded one-hop links. Archive facts and episodes use 0.6 relevance + 0.25 exp(-age_days/45) + 0.15 importance/10.",
+          "example": "Keyword rank 1 + raw-vector rank 4 → 1/41 + 1/44 = 0.04712.",
+          "detail": "Archive age uses event/reinforcement time for facts and source-span end for episodes. No age penalty on original evidence.",
+          "active": [
+            "lexical",
+            "vector",
+            "rrf"
+          ]
+        },
+        {
+          "label": "Prioritize",
+          "title": "Recency belongs to the follow-up queue.",
+          "text": "Open facts marked followup=ask are ranked by importance, arousal, age since update and event-date proximity. The queue selects up to 12 items. It does not initiate an unsolicited message.",
+          "example": "An important interview tomorrow can outrank a similarly important but older loose end.",
+          "detail": "Age is measured in days. An absent event date contributes no urgency bonus.",
+          "active": [
+            "loops",
+            "query"
+          ]
+        },
+        {
+          "label": "Assemble",
+          "title": "Selection is more than a single score.",
+          "text": "Pinned boundaries, corrections and recent turns also enter context. Core notes and matched episodes retain source IDs. Whole-entry budgets bound the payload; optional follow-up tools expand related originals.",
+          "example": "A recent correction can be included even if an older statement had a higher similarity rank.",
+          "detail": "Observation-date filtering applies to original recall. Fact validity/event dates use a separate temporal lookup.",
+          "active": [
+            "context",
+            "rrf",
+            "loops"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "consolidation",
+      "label": "Consolidation",
+      "eyebrow": "03 / HISTORY BECOMES STRUCTURE",
+      "description": "Compress the context. Keep the evidence.",
+      "nodes": [
+        {
+          "id": "backlog",
+          "x": 30,
+          "y": 76,
+          "w": 230,
+          "h": 98,
+          "title": "Committed originals",
+          "subtitle": "Unprocessed excerpts + updates",
+          "tag": "DURABLE BACKLOG",
+          "tone": "memory"
+        },
+        {
+          "id": "due",
+          "x": 340,
+          "y": 76,
+          "w": 265,
+          "h": 98,
+          "title": "Is a summary due?",
+          "subtitle": "4 turns / 12k chars / 5 min idle",
+          "tag": "CONFIGURABLE DEFAULTS",
+          "tone": "neutral"
+        },
+        {
+          "id": "writer",
+          "x": 740,
+          "y": 76,
+          "w": 335,
+          "h": 98,
+          "title": "One summary writer",
+          "subtitle": "Active host OR background worker",
+          "tag": "EXCLUSIVE MODES",
+          "tone": "neutral"
+        },
+        {
+          "id": "check",
+          "x": 740,
+          "y": 300,
+          "w": 335,
+          "h": 98,
+          "title": "Validate before writing",
+          "subtitle": "Citation IDs + unchanged snapshot",
+          "tag": "GUARD",
+          "tone": "neutral"
+        },
+        {
+          "id": "episode",
+          "x": 350,
+          "y": 300,
+          "w": 260,
+          "h": 98,
+          "title": "Episodic summary",
+          "subtitle": "What happened in this batch",
+          "tag": "APPEND EPISODE",
+          "tone": "memory"
+        },
+        {
+          "id": "core",
+          "x": 30,
+          "y": 300,
+          "w": 260,
+          "h": 98,
+          "title": "Core notebook",
+          "subtitle": "Merge current knowledge + sources",
+          "tag": "REPLACE CURRENT CORE",
+          "tone": "memory"
+        },
+        {
+          "id": "index",
+          "x": 350,
+          "y": 510,
+          "w": 350,
+          "h": 98,
+          "title": "Refresh search indexes",
+          "subtitle": "Notes · links · optional vectors",
+          "tag": "NEXT RETRIEVAL",
+          "tone": "memory"
+        },
+        {
+          "id": "correction",
+          "x": 825,
+          "y": 510,
+          "w": 250,
+          "h": 98,
+          "title": "A fact changes",
+          "subtitle": "Invalidate dependent summaries",
+          "tag": "REVISION",
+          "tone": "emotion"
+        }
+      ],
+      "edges": [
+        {
+          "d": "M260 125H340",
+          "stages": [
+            0
+          ]
+        },
+        {
+          "d": "M605 125H740",
+          "stages": [
+            1
+          ]
+        },
+        {
+          "d": "M907 174V300",
+          "stages": [
+            1,
+            2
+          ]
+        },
+        {
+          "d": "M740 349H610",
+          "stages": [
+            2
+          ]
+        },
+        {
+          "d": "M840 300V250H160V300",
+          "stages": [
+            2
+          ]
+        },
+        {
+          "d": "M160 398V559H350",
+          "stages": [
+            3
+          ]
+        },
+        {
+          "d": "M480 398V510",
+          "stages": [
+            3
+          ]
+        },
+        {
+          "d": "M825 559H700",
+          "stages": [
+            3
+          ]
+        },
+        {
+          "d": "M950 510V452H690V220H452V174",
+          "stages": [
+            3
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "label": "Trigger",
+          "title": "A durable backlog makes work repeatable.",
+          "text": "New SDK characters consolidate after 20 pending exchanges, 12k characters, 300 seconds idle, or a knowledge invalidation. Busy chat retains the newest 10 exchanges; idle flush handles short conversations.",
+          "example": "A running worker checks the durable backlog; reaching an idle threshold does not wake a stopped process.",
+          "detail": "Thresholds are configurable. A running host or worker must act on due work.",
+          "active": [
+            "backlog",
+            "due"
+          ]
+        },
+        {
+          "label": "Write",
+          "title": "Let one writer own the summary.",
+          "text": "SDK defaults enable configured background writers; MCP defaults use host authoring. Each batch evolves grounded notes and writes episodes, a cited user notebook and optional separate character core.",
+          "example": "Episode: the rehearsal and reschedule. Notebook: current commitments and grounded response preferences.",
+          "detail": "Host and background summary modes are mutually exclusive. Character self-core is optional and kept separate.",
+          "active": [
+            "writer",
+            "due"
+          ]
+        },
+        {
+          "label": "Commit",
+          "title": "Citations survive compression.",
+          "text": "Validate the supplied original IDs and snapshot/version before committing. Append the episode, replace the current core, record processed sources and preserve the originals. Reject a stale write if facts changed.",
+          "example": "A summary can be traced back to the exact original message, not just another summary.",
+          "detail": "Citation validation establishes provenance, not independent factual verification.",
+          "active": [
+            "check",
+            "episode",
+            "core",
+            "backlog"
+          ]
+        },
+        {
+          "label": "Refresh",
+          "title": "Corrections close the cycle.",
+          "text": "Fact changes invalidate current core and affected cited documents. With no source turn, invalidation is broader. Search indexes update with records; changed text or notes invalidate vectors for re-indexing.",
+          "example": "Monday replaces Friday in current knowledge. The old transcript remains historical evidence with a knowledge-update marker.",
+          "detail": "Embeddings need a configured provider. Corrections are not silent rewrites of original dialogue.",
+          "active": [
+            "index",
+            "correction",
+            "due",
+            "core"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "emotion",
+      "label": "Emotion & continuity",
+      "eyebrow": "04 / FAST MOOD, SLOWER RELATIONSHIPS",
+      "description": "A character has continuity, not a mood reset.",
+      "nodes": [
+        {
+          "id": "cue",
+          "x": 30,
+          "y": 76,
+          "w": 270,
+          "h": 98,
+          "title": "The conversational cue",
+          "subtitle": "Short attunement record + feedback",
+          "tag": "TURN INTERPRETATION",
+          "tone": "neutral"
+        },
+        {
+          "id": "appraisal",
+          "x": 30,
+          "y": 300,
+          "w": 270,
+          "h": 98,
+          "title": "Optional appraisal",
+          "subtitle": "Emotion · intensity · axis changes",
+          "tag": "MODEL PROPOSAL",
+          "tone": "emotion"
+        },
+        {
+          "id": "decay",
+          "x": 400,
+          "y": 76,
+          "w": 300,
+          "h": 98,
+          "title": "Elapsed-time decay",
+          "subtitle": "PAD: 12h · tension: 72h half-life",
+          "tag": "TIME",
+          "tone": "emotion"
+        },
+        {
+          "id": "rules",
+          "x": 400,
+          "y": 300,
+          "w": 300,
+          "h": 98,
+          "title": "Bounded state update",
+          "subtitle": "Habituation · saturation · daily cap",
+          "tag": "DETERMINISTIC RULES",
+          "tone": "emotion"
+        },
+        {
+          "id": "state",
+          "x": 850,
+          "y": 300,
+          "w": 320,
+          "h": 98,
+          "title": "Character state",
+          "subtitle": "PAD + five relationship axes",
+          "tag": "PERSISTED",
+          "tone": "emotion"
+        },
+        {
+          "id": "next",
+          "x": 850,
+          "y": 76,
+          "w": 320,
+          "h": 98,
+          "title": "Next-turn guidance",
+          "subtitle": "Tone continuity + current boundaries",
+          "tag": "BACK TO THE READER",
+          "tone": "neutral"
+        },
+        {
+          "id": "gates",
+          "x": 350,
+          "y": 510,
+          "w": 400,
+          "h": 98,
+          "title": "Consent & pacing",
+          "subtitle": "Romance opt-in + familiarity > 0.2",
+          "tag": "GATES",
+          "tone": "neutral"
+        }
+      ],
+      "edges": [
+        {
+          "d": "M165 174V300",
+          "stages": [
+            0
+          ]
+        },
+        {
+          "d": "M300 349H400",
+          "stages": [
+            2
+          ]
+        },
+        {
+          "d": "M550 174V300",
+          "stages": [
+            1,
+            2
+          ]
+        },
+        {
+          "d": "M700 349H850",
+          "stages": [
+            2
+          ]
+        },
+        {
+          "d": "M1010 300V174",
+          "stages": [
+            3
+          ]
+        },
+        {
+          "d": "M1010 300V245H760V125H700",
+          "stages": [
+            1,
+            3
+          ]
+        },
+        {
+          "d": "M550 510V398",
+          "stages": [
+            2
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "label": "Interpret",
+          "title": "Read the moment without making it a trait.",
+          "text": "A short attunement record captures the cue, intent and uncertainty. An optional appraisal proposes a character emotion and relationship-axis changes. These are separate from factual user memory.",
+          "example": "“They sound tired; offer a little space” describes this turn, not the user’s personality.",
+          "detail": "Appraisals are model proposals. They are not psychological measurements.",
+          "active": [
+            "cue",
+            "appraisal"
+          ]
+        },
+        {
+          "label": "Decay",
+          "title": "Time softens mood and tension differently.",
+          "text": "PAD moves toward baseline with a 12-hour half-life. Tension halves over 72 hours. Warmth above 0.6 × familiarity cools after 7 absent days, with a 35-day half-life.",
+          "example": "After 12 hours, half of a PAD deviation remains; tension retains about 89%.",
+          "detail": "Small seeded daily character weather is applied once per UTC day during preparation.",
+          "active": [
+            "decay",
+            "state"
+          ]
+        },
+        {
+          "label": "Update",
+          "title": "Warmth is earned; boundaries remain current.",
+          "text": "Appraisal intensity pulls PAD toward an emotion target. Relationship deltas saturate, repeated positive warmth is reduced, trust loss is asymmetric and each axis has a 0.12 daily movement budget.",
+          "example": "Romance cannot grow without opt-in or until familiarity exceeds 0.2 after this turn’s familiarity update.",
+          "detail": "Axes: trust, warmth, familiarity, tension, romance. Band hysteresis avoids flip-flopping.",
+          "active": [
+            "appraisal",
+            "rules",
+            "gates",
+            "state"
+          ]
+        },
+        {
+          "label": "Carry",
+          "title": "Let the next answer inherit the state.",
+          "text": "Persist the bounded state and turn interpretation separately. The next context can include a relationship note, recent attunement records and linked user feedback. Current corrections and boundaries take priority.",
+          "example": "A slightly guarded character can still offer respectful support and follow the user’s request for space.",
+          "detail": "The chart below isolates decay; it omits new appraisals, daily weather and absence cooling.",
+          "active": [
+            "state",
+            "next",
+            "cue"
+          ]
+        }
+      ]
+    }
+  ]
+}

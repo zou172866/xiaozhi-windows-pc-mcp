@@ -1,0 +1,19 @@
+:root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+body { margin: 0; }
+main { max-width: 680px; margin: 40px auto; padding: 0 24px 40px; }
+h1 { font-size: 24px; }
+p { opacity: .85; }
+details { border: 1px solid #8886; border-radius: 6px; margin: 16px 0; padding: 16px; }
+summary { font-weight: 600; cursor: pointer; min-height: 28px; }
+label { display: block; margin: 16px 0; }
+input:not([type="checkbox"]), select { box-sizing: border-box; width: 100%; padding: 10px;
+  margin-top: 6px; font: inherit; border: 1px solid #8889; border-radius: 4px; }
+input[type="checkbox"] { margin-right: 8px; }
+small { display: block; opacity: .75; margin: 4px 0; }
+.clear { font-size: 14px; margin-top: 4px; }
+.actions { display: flex; gap: 12px; flex-wrap: wrap; }
+button { font: inherit; padding: 10px 16px; cursor: pointer; border: 1px solid #8889;
+  border-radius: 4px; min-height: 44px; }
+:focus-visible { outline: 2px solid Highlight; outline-offset: 3px; }
+#status[data-error="true"] { color: light-dark(#a11, #ff9d9d); }
+[hidden] { display: none !important; }

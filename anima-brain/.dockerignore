@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+output
+tests
+docs/assets/demos
+examples/showcase/node_modules
+examples/showcase/dist

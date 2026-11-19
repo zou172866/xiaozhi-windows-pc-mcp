@@ -1,0 +1,9 @@
+{
+  "command": "python",
+  "args": [
+    "C:\\path\\to\\xiaozhi-server\\pc-mcp\\agy_sidecar_worker.py"
+  ],
+  "restart_policy": "always",
+  "display_name": "小智语音派单桥接 (Xiaozhi Bridge)",
+  "description": "接收 ESP32 小智语音助手转发的 L3 复杂电脑任务，通过官方 agentapi 在本地已登录的 Antigravity 客户端中自动新建任务会话并执行。"
+}

@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1150" viewBox="0 0 1000 1150" lang="zh-CN" role="img" aria-labelledby="title desc">
+<title id="title">Anima Brain 的记忆与情绪架构</title>
+<desc id="desc">消息经过上下文组装、模型回复与校验写入。原始证据、语义事实、事件摘要与核心笔记服务后续对话。巩固循环更新派生记忆，情绪状态单独演化。原始证据与记忆档案使用不同的排序公式。</desc>
+<rect width="1000" height="1150" rx="20" fill="#f8f7f2"/>
+<style>text{font-family:"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;fill:#25382f}.muted{fill:#5e6c65}.label{font-size:15px;letter-spacing:1px}.heading{font-size:23px;font-weight:600}.body{font-size:18px}</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10" fill="#6a8274"/></marker></defs>
+<text x="32" y="38" class="label muted" >ANIMA / BRAIN ATLAS</text>
+<text x="32" y="85" class="body" style="font-size:32px;font-weight:600">让每一次对话，都接得上</text>
+<text x="32" y="117" class="body muted" >保留原始证据，更新长期知识，让情绪与关系延续</text>
+<rect x="32" y="155" width="176" height="142" rx="12" fill="#fffefa" stroke="#d5ddd5"/>
+<text x="46" y="182" class="label muted" >01</text>
+<text x="46" y="214" class="body" style="font-size:19px;font-weight:600">收到新消息</text>
+<text x="46" y="277" class="body" style="font-size:16px;fill:#5e6c65">文字／语音／图片</text>
+<path d="M208 222H221" fill="none" stroke="#6a8274" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="222" y="155" width="176" height="142" rx="12" fill="#fffefa" stroke="#d5ddd5"/>
+<text x="236" y="182" class="label muted" >02</text>
+<text x="236" y="214" class="body" style="font-size:19px;font-weight:600">组装上下文</text>
+<text x="236" y="277" class="body" style="font-size:16px;fill:#5e6c65">记忆＋当前状态</text>
+<path d="M398 222H411" fill="none" stroke="#6a8274" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="412" y="155" width="176" height="142" rx="12" fill="#fffefa" stroke="#d5ddd5"/>
+<text x="426" y="182" class="label muted" >03</text>
+<text x="426" y="214" class="body" style="font-size:19px;font-weight:600">模型生成回复</text>
+<text x="426" y="277" class="body" style="font-size:16px;fill:#5e6c65">接入你选择的模型</text>
+<path d="M588 222H601" fill="none" stroke="#6a8274" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="602" y="155" width="176" height="142" rx="12" fill="#fffefa" stroke="#d5ddd5"/>
+<text x="616" y="182" class="label muted" >04</text>
+<text x="616" y="214" class="body" style="font-size:19px;font-weight:600">校验并提交</text>
+<text x="616" y="277" class="body" style="font-size:16px;fill:#5e6c65">引用校验＋版本记录</text>
+<path d="M778 222H791" fill="none" stroke="#6a8274" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="792" y="155" width="176" height="142" rx="12" fill="#fffefa" stroke="#d5ddd5"/>
+<text x="806" y="182" class="label muted" >05</text>
+<text x="806" y="214" class="body" style="font-size:19px;font-weight:600">把回复交给用户</text>
+<text x="806" y="277" class="body" style="font-size:16px;fill:#5e6c65">文字／语音／视频</text>
+<text x="32" y="342" class="label muted" >检索并组装下一轮上下文</text>
+<text x="32" y="373" class="body" >近期对话＋检索到的证据＋角色指引，按上下文预算组装</text>
+<path d="M968 392H986V318H310V298" fill="none" stroke="#6a8274" stroke-width="1.8" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<rect x="32" y="404" width="456" height="129" rx="12" fill="#eff3ed" stroke="#d5ddd5"/>
+<text x="52" y="438" class="heading" >原始对话</text>
+<text x="52" y="473" class="body muted" >原话、说话者、时间与出处</text>
+<text x="52" y="501" class="body muted" >上下文向量、检索注释与原文关联</text>
+<rect x="512" y="404" width="456" height="129" rx="12" fill="#eff3ed" stroke="#d5ddd5"/>
+<text x="532" y="438" class="heading" >语义记忆</text>
+<text x="532" y="473" class="body muted" >事实、偏好与边界</text>
+<text x="532" y="501" class="body muted" >区分当前事实、历史变更与错误纠正</text>
+<rect x="32" y="557" width="456" height="129" rx="12" fill="#eff3ed" stroke="#d5ddd5"/>
+<text x="52" y="591" class="heading" >情景记忆</text>
+<text x="52" y="626" class="body muted" >带来源引用的共同经历摘要</text>
+<text x="52" y="654" class="body muted" >摘要不替代原文，仍可回查证据</text>
+<rect x="512" y="557" width="456" height="129" rx="12" fill="#eff3ed" stroke="#d5ddd5"/>
+<text x="532" y="591" class="heading" >核心笔记</text>
+<text x="532" y="626" class="body muted" >合并用户笔记，保留独立的角色核心</text>
+<text x="532" y="654" class="body muted" >提供紧凑上下文，纠错后同步刷新</text>
+<text x="32" y="733" class="label muted" >两条独立的连续性循环</text>
+<rect x="32" y="754" width="576" height="171" rx="12" fill="#e7eee4" stroke="#d5ddd5"/>
+<text x="52" y="790" class="heading" >记忆巩固循环</text>
+<text x="52" y="826" class="body" >总结 → 校验引用 → 重建索引 → 刷新</text>
+<text x="52" y="857" class="body muted" >由配置的后台任务或宿主触发，原始对话保留</text>
+<text x="52" y="888" class="body muted" >事实纠正后，失效的派生摘要也会更新</text>
+<path d="M32 469H20V840H31" fill="none" stroke="#6a8274" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M585 754V710H730V687" fill="none" stroke="#6a8274" stroke-width="1.8" marker-end="url(#arrow)"/>
+<path d="M585 710H400V687" fill="none" stroke="#6a8274" stroke-width="1.8" marker-end="url(#arrow)"/>
+<rect x="632" y="754" width="336" height="171" rx="12" fill="#edf0f5" stroke="#cdd6df"/>
+<text x="652" y="790" class="heading" >角色的情绪状态</text>
+<text x="652" y="826" class="body" >PAD 情绪＋关系维度</text>
+<text x="652" y="857" class="body muted" >有边界的更新＋时间衰减</text>
+<text x="652" y="888" class="body muted" >与用户事实记忆分开保存</text>
+<path d="M968 840H986V392" fill="none" stroke="#6a8274" stroke-width="1.8" stroke-dasharray="6 5" marker-end="url(#arrow)"/>
+<path d="M32 955H968" stroke="#d5ddd5"/>
+<text x="32" y="989" class="label muted" >不同检索对象，使用不同排序</text>
+<text x="32" y="1023" class="body" >原始证据：关键词＋上下文向量＋注释向量 → RRF 融合，k = 40</text>
+<text x="32" y="1055" class="body" >事实／事件档案：0.60 × 相关度＋0.25 × 时效性＋0.15 × 重要性</text>
+<text x="32" y="1100" class="body" style="font-size:16px;fill:#5e6c65">模型服务与后台能力按配置启用 · 详细公式和边界见 docs/brain-flow.md</text>
+</svg>

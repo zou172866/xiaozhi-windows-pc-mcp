@@ -1,0 +1,29 @@
+# Python & virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Secrets, ESP32 Wi-Fi NVS backups, personal memory DB & chat history (NEVER COMMIT)
+.env
+*.bin
+data/nvs*
+data/chat_history.json
+data/anima/
+data/agy_tasks/
+data/bin/
+data/*.log
+data/last_som_grounding.jpg
+
+# Large local model weights & voice reference audio
+models/
+data/voices/
+data/*.wav
+data/*.mp3
+data/*.ckpt
+data/*.pth
+data/*.onnx
+data/*.pt
+tmp/

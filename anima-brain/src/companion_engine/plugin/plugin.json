@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "companion-engine",
+  "version": "0.6.0",
+  "description": "Consented persistent character memory and emotional continuity through an existing Companion Engine MCP connection."
+}

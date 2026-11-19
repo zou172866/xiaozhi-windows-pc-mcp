@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Companion Engine · Provider settings</title>
+  <link rel="stylesheet" href="/settings.css">
+  <script src="/settings.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Provider settings</h1>
+    <p>Configure this Companion Engine process. This page runs on your computer;
+      credentials are not sent through your agent's conversation.</p>
+    <p id="storage"></p>
+    <form id="settings-form" hidden autocomplete="off">
+      <div id="fields"></div>
+      <div class="actions">
+        <button type="submit" data-persist="false">Apply to this process</button>
+        <button type="submit" data-persist="true">Save for future starts</button>
+      </div>
+      <p>Saving also updates this process immediately. Other running processes need a restart.
+        Environment variables override saved values on restart. No provider request is made.</p>
+    </form>
+    <p id="status" role="status" aria-live="polite">Loading settings…</p>
+  </main>
+</body>
+</html>

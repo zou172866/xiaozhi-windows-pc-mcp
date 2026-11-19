@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小智 ESP32 · 本地控制台</title>
+<style>
+  :root {
+    --bg: #F4F3EE;
+    --surface: #FFFFFF;
+    --surface-subtle: #FAF9F6;
+    --ink: #18181B;
+    --ink-secondary: #52525B;
+    --ink-muted: #71717A;
+    --border: #E4E2DC;
+    --border-strong: #CFCBC2;
+    --accent: #0F766E;
+    --accent-hover: #115E59;
+    --accent-tint: #F0FDFA;
+    --accent-border: #99F6E4;
+    --warn: #B45309;
+    --warn-tint: #FFFBEB;
+    --danger: #B91C1C;
+    --danger-tint: #FEF2F2;
+    --user-bubble: #18181B;
+    --user-bubble-ink: #FAFAFA;
+    --ai-bubble: #F4F3EE;
+    --radius: 12px;
+    --radius-sm: 8px;
+    --font-sans: "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", system-ui, -apple-system, sans-serif;
+    --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  ::selection { background: #CCFBF1; color: #134E4A; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.55;
+    caret-color: var(--accent);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::-webkit-scrollbar { width: 7px; height: 7px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 99px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--ink-muted); }
+
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .brand-group { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .brand-title {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 16px;
+    font-weight: 650;
+    letter-spacing: -0.02em;
+    margin: 0;
+  }
+  .brand-mark {
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    background: var(--ink);
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+  }
+
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 10px;
+    border-radius: 99px;
+    font-size: 12.5px;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    color: var(--ink-secondary);
+  }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #10B981; flex: none; }
+  .status-pill.listening .status-dot { background: var(--accent); box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.18); }
+  .status-pill.restarting { background: var(--warn-tint); border-color: #FDE68A; color: var(--warn); }
+  .status-pill.restarting .status-dot { background: #D97706; }
+  .status-pill.offline { background: var(--danger-tint); border-color: #FECACA; color: var(--danger); }
+  .status-pill.offline .status-dot { background: var(--danger); }
+
+  .topbar-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+  .endpoint-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    color: var(--ink-secondary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .endpoint-chip:hover { border-color: var(--border-strong); color: var(--ink); }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 8px 15px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 13.5px;
+    font-weight: 550;
+    cursor: pointer;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--ink);
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+  }
+  .btn:hover:not(:disabled) { background: var(--surface-subtle); border-color: var(--ink-muted); }
+  .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #FFFFFF; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+  .dirty-indicator { width: 6px; height: 6px; border-radius: 50%; background: #FDE047; display: none; }
+  .has-dirty .dirty-indicator { display: inline-block; }
+
+  .banner {
+    display: none;
+    padding: 10px 24px;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .banner.show { display: flex; }
+  .banner.info { background: var(--accent-tint); color: #115E59; border-bottom-color: var(--accent-border); }
+  .banner.warn { background: var(--warn-tint); color: var(--warn); border-bottom-color: #FDE68A; }
+  .banner.err  { background: var(--danger-tint); color: var(--danger); border-bottom-color: #FECACA; }
+
+  .workspace {
+    max-width: 1380px;
+    margin: 0 auto;
+    padding: 22px 24px 36px;
+    display: grid;
+    grid-template-columns: minmax(0, 1.28fr) minmax(360px, 0.92fr);
+    gap: 22px;
+    align-items: start;
+  }
+  @media (max-width: 980px) {
+    .workspace { grid-template-columns: 1fr; padding: 16px; }
+    .topbar { padding: 12px 16px; }
+  }
+
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .config-section { padding: 20px 24px; border-bottom: 1px solid var(--border); }
+  .config-section:last-child { border-bottom: none; }
+
+  .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+  .section-title { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -0.015em; color: var(--ink); }
+  .section-desc { margin: 0 0 13px; font-size: 13px; color: var(--ink-secondary); max-width: 70ch; }
+
+  /* PC Control Mode Selector */
+  .mode-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+  @media (max-width: 680px) { .mode-grid { grid-template-columns: 1fr; } }
+
+  .mode-btn {
+    text-align: left;
+    padding: 11px 13px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-strong);
+    background: var(--surface-subtle);
+    cursor: pointer;
+    font-family: inherit;
+    transition: border-color 0.14s ease, background-color 0.14s ease;
+  }
+  .mode-btn:hover { border-color: var(--ink-muted); }
+  .mode-btn strong { display: block; font-size: 13.5px; color: var(--ink); margin-bottom: 3px; }
+  .mode-btn span { display: block; font-size: 12px; color: var(--ink-secondary); line-height: 1.45; }
+  .mode-btn.active {
+    background: var(--accent-tint);
+    border-color: var(--accent);
+  }
+  .mode-btn.active strong { color: var(--accent); }
+  .mode-btn.active-full {
+    background: var(--warn-tint);
+    border-color: #D97706;
+  }
+  .mode-btn.active-full strong { color: var(--warn); }
+
+  .preset-bar { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
+  .preset-pill {
+    padding: 4px 11px;
+    border-radius: 99px;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    color: var(--ink-secondary);
+    font-family: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  .preset-pill:hover { border-color: var(--border-strong); color: var(--ink); }
+  .preset-pill.active { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); font-weight: 550; }
+
+  textarea, select, input[type="text"] {
+    width: 100%;
+    font-family: inherit;
+    font-size: 14px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    padding: 9px 12px;
+  }
+  textarea:focus, select:focus, input[type="text"]:focus { border-color: var(--accent); outline: none; }
+  textarea { min-height: 138px; resize: vertical; line-height: 1.6; }
+
+  .field-foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--ink-muted);
+  }
+
+  .form-grid-3 {
+    display: grid;
+    grid-template-columns: 1.1fr 1fr 0.9fr;
+    gap: 12px;
+  }
+  @media (max-width: 720px) { .form-grid-3 { grid-template-columns: 1fr; } }
+
+  .field-label { display: block; font-size: 13px; font-weight: 550; margin-bottom: 6px; color: var(--ink); }
+  .voice-row { display: flex; gap: 10px; align-items: stretch; }
+  .voice-row select { flex: 1; }
+  .preview-text-row { margin-top: 10px; display: flex; gap: 8px; align-items: center; }
+  .preview-text-row input { font-size: 13px; padding: 7px 10px; background: var(--surface-subtle); }
+
+  .monitor-panel {
+    position: sticky;
+    top: 74px;
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 104px);
+    min-height: 540px;
+  }
+  .monitor-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    background: var(--surface);
+  }
+  .seg-tabs { display: inline-flex; background: var(--bg); padding: 3px; border-radius: var(--radius-sm); border: 1px solid var(--border); }
+  .seg-btn {
+    border: none;
+    background: transparent;
+    padding: 5px 12px;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ink-secondary);
+    cursor: pointer;
+  }
+  .seg-btn.active { background: var(--surface); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+
+  .text-btn { border: none; background: transparent; color: var(--ink-muted); font-family: inherit; font-size: 12.5px; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
+  .text-btn:hover { color: var(--ink); background: var(--surface-subtle); }
+
+  .chat-stream { flex: 1; overflow-y: auto; padding: 18px 18px 22px; display: flex; flex-direction: column; gap: 14px; background: var(--surface); }
+  .empty-state { margin: auto; text-align: center; max-width: 280px; color: var(--ink-muted); padding: 32px 12px; }
+  .empty-state svg { color: var(--border-strong); margin-bottom: 10px; }
+  .empty-state p { margin: 4px 0 0; font-size: 13px; line-height: 1.55; }
+
+  .msg-item { display: flex; flex-direction: column; max-width: 86%; }
+  .msg-item.user { align-self: flex-end; align-items: flex-end; }
+  .msg-item.assistant { align-self: flex-start; align-items: flex-start; }
+  .msg-meta { font-size: 11.5px; color: var(--ink-muted); margin-bottom: 4px; }
+  .msg-bubble { padding: 9px 13px; border-radius: 12px; font-size: 13.8px; line-height: 1.55; word-break: break-word; }
+  .msg-item.user .msg-bubble { background: var(--user-bubble); color: var(--user-bubble-ink); border-bottom-right-radius: 4px; }
+  .msg-item.assistant .msg-bubble { background: var(--ai-bubble); color: var(--ink); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+
+  .log-stream {
+    display: none;
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 16px;
+    background: #141416;
+    color: #D4D4D8;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .log-stream.active { display: block; }
+  .chat-stream.hidden { display: none; }
+
+  .monitor-footer {
+    padding: 9px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--surface-subtle);
+    font-size: 12px;
+    color: var(--ink-muted);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  svg.icon {
+    width: 16px;
+    height: 16px;
+    stroke: currentColor;
+    stroke-width: 1.75;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    flex: none;
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand-group">
+    <h1 class="brand-title">
+      <span class="brand-mark" aria-hidden="true">
+        <svg class="icon" viewBox="0 0 24 24">
+          <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+          <line x1="12" y1="19" x2="12" y2="22"/>
+        </svg>
+      </span>
+      小智本地控制台
+    </h1>
+    <div id="statusPill" class="status-pill">
+      <span class="status-dot"></span>
+      <span id="statusText">正在连接本地服务…</span>
+    </div>
+  </div>
+
+  <div class="topbar-actions">
+    <a href="http://localhost:18787" target="_blank" rel="noopener" class="btn" style="text-decoration:none;">
+      <svg class="icon" viewBox="0 0 24 24">
+        <path d="M12 2a7 7 0 0 1 7 7c0 2.38-1.19 4.47-3 5.74V17a2 2 0 0 1-2 2h-4a2 2 0 0 1-2-2v-2.26C6.19 13.47 5 11.38 5 9a7 7 0 0 1 7-7Z"/>
+        <line x1="9" y1="22" x2="15" y2="22"/>
+      </svg>
+      <span>记忆大脑 (18787)</span>
+    </a>
+
+    <button type="button" class="endpoint-chip" id="copyOtaBtn" title="点击复制 ESP32 OTA 地址">
+      <span id="otaDisplay" class="num">http://192.168.31.200:18003/xiaozhi/ota/</span>
+    </button>
+
+    <button type="button" class="btn btn-primary" id="saveBtn" disabled>
+      <span class="dirty-indicator"></span>
+      <svg class="icon" viewBox="0 0 24 24">
+        <path d="M20 6 9 17l-5-5"/>
+      </svg>
+      <span id="saveBtnLabel">已同步生效</span>
+    </button>
+  </div>
+</header>
+
+<div id="banner" class="banner" role="status">
+  <span id="bannerText"></span>
+  <span id="bannerRight" class="num"></span>
+</div>
+
+<main class="workspace">
+  <section class="panel" aria-label="电脑操控与 AI 模型配置">
+    <!-- Section 1: 3-Tier PC Control Mode (Instant Switch, No Restart Required) -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">三层电脑操控权限挡位（点击即刻生效，免重启）</h2>
+      </div>
+      <p class="section-desc">控制小智对这台 Windows 电脑的操作范围。打游戏时保持「日常 / 游戏安全挡」即可放心使用语音。</p>
+
+      <div class="mode-grid" id="modeGrid">
+        <button type="button" class="mode-btn" data-mode="off">
+          <strong>关闭电脑操控</strong>
+          <span>纯语音对话模式，禁用全部 L1 / L2 / L3 电脑工具</span>
+        </button>
+        <button type="button" class="mode-btn active" data-mode="safe">
+          <strong>日常 / 游戏安全挡（推荐）</strong>
+          <span>开启 L1 音量/开软件/看屏幕 + L3 反重力派单；锁定鼠标键盘防误触</span>
+        </button>
+        <button type="button" class="mode-btn" data-mode="full">
+          <strong>全权操控挡（解锁键鼠）</strong>
+          <span>L1 + L2 窗口按钮点击/打字输入 + L3 反重力全权限开放</span>
+        </button>
+      </div>
+
+      <div class="field-foot">
+        <span>反重力 L3 伴生桥接状态：<strong id="agyStatusText">检测中…</strong></span>
+        <span>切换挡位毫秒级生效，无需点右上角保存</span>
+      </div>
+    </div>
+
+    <!-- Section 2: LLM Provider Switch (DeepSeek <-> Gemini) -->
+    <div class="config-section">
+      <h2 class="section-title" style="margin-bottom:6px;">对话与调度大模型 API（DeepSeek / Gemini 双模切换）</h2>
+      <p class="section-desc">默认使用国内极速直连的 DeepSeek 环境变量，保留一键切回 Google Gemini 入口（L1 屏幕看图始终自动调用 Gemini 多模态）。</p>
+
+      <div class="form-grid-3">
+        <div>
+          <label class="field-label" for="providerSelect">API 服务商</label>
+          <select id="providerSelect">
+            <option value="DeepSeekLLM">DeepSeek 国内直连（DEEPSEEK_API_KEY）</option>
+            <option value="GeminiOpenAI">Google Gemini（GEMINI_API_KEY）</option>
+          </select>
+        </div>
+        <div>
+          <label class="field-label" for="modelSelect">推荐模型</label>
+          <select id="modelSelect"></select>
+        </div>
+        <div>
+          <label class="field-label" for="modelCustomInput">当前生效模型名</label>
+          <input type="text" id="modelCustomInput" spellcheck="false">
+        </div>
+      </div>
+
+      <div class="field-foot">
+        <span>环境变量状态：DeepSeek <strong id="dsKeyBadge">--</strong> · Gemini <strong id="gemKeyBadge">--</strong></span>
+        <span>切换 API 或模型后需点右上角「保存并重启生效」</span>
+      </div>
+    </div>
+
+    <!-- Section 3: Voice Selection -->
+    <div class="config-section">
+      <h2 class="section-title" style="margin-bottom:6px;">语音合成音色（本机 5070 Ti 专精模型 / EdgeTTS）</h2>
+      <p class="section-desc">选好后可先点击右侧按钮在电脑上试听效果，满意后再点顶部保存生效。</p>
+
+      <label class="field-label" for="voiceSelect">播报音色</label>
+      <div class="voice-row">
+        <select id="voiceSelect">
+          <option value="__gsv_raiden_mei__">崩坏三 · 雷电芽衣（本机 5070 Ti 满血 V4 专精模型）</option>
+          <option value="__gsv_xiaozhi_tw__">小智原版台湾腔 · 湾湾小何（本机 5070 Ti 复刻）</option>
+          <option value="zh-TW-HsiaoChenNeural">晓辰 · 微软台湾腔甜美女声（免显存）</option>
+          <option value="zh-TW-YunJheNeural">云哲 · 微软台湾腔温和男声（免显存）</option>
+          <option value="zh-CN-XiaoxiaoNeural">晓晓 · 自然温柔女声</option>
+          <option value="zh-CN-XiaoyiNeural">晓伊 · 活泼甜美少女音</option>
+          <option value="zh-CN-YunxiNeural">云希 · 清朗阳光少年音</option>
+          <option value="zh-CN-YunjianNeural">云健 · 沉稳磁性男声</option>
+          <option value="zh-CN-YunxiaNeural">云夏 · 元气可爱童声</option>
+          <option value="zh-HK-HiuGaaiNeural">晓佳 · 粤语自然女声</option>
+          <option value="zh-CN-liaoning-XiaobeiNeural">晓北 · 幽默东北话女声</option>
+          <option value="zh-CN-shaanxi-XiaoniNeural">晓妮 · 亲切陕西话女声</option>
+        </select>
+
+        <button type="button" class="btn" id="previewBtn">
+          <svg class="icon" viewBox="0 0 24 24">
+            <polygon points="6 4 20 12 6 20 6 4"/>
+          </svg>
+          <span id="previewBtnText">试听音色</span>
+        </button>
+      </div>
+
+      <div class="preview-text-row">
+        <input type="text" id="previewTextInput" value="舰长，欢迎回来。今天累不累？我已经为你准备好了热茶和晚餐。" aria-label="试听台词">
+      </div>
+    </div>
+
+    <!-- Section 4: System Prompt -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">角色人设提示词（Prompt）</h2>
+        <span class="num" style="font-size:12px;color:var(--ink-muted);" id="charCount">0 字</span>
+      </div>
+      <p class="section-desc">决定小智的性格口吻与工具调度习惯。点击预设胶囊会自动保留电脑操控与记忆协同提示。</p>
+
+      <div class="preset-bar" id="presetBar">
+        <button type="button" class="preset-pill" data-preset="mei">崩坏三 · 雷电芽衣</button>
+        <button type="button" class="preset-pill" data-preset="taiwan">台湾机车女孩</button>
+        <button type="button" class="preset-pill" data-preset="default">默认机智助手</button>
+        <button type="button" class="preset-pill" data-preset="geek">硬核电子极客</button>
+        <button type="button" class="preset-pill" data-preset="warm">温柔陪伴知己</button>
+      </div>
+
+      <textarea id="promptInput" spellcheck="false"></textarea>
+    </div>
+  </section>
+
+  <!-- Right Column: Live Monitor -->
+  <aside class="panel monitor-panel" aria-label="实时语音对话与日志监控">
+    <div class="monitor-header">
+      <div class="seg-tabs" role="tablist">
+        <button type="button" class="seg-btn active" id="tabChat" role="tab">实时语音对话</button>
+        <button type="button" class="seg-btn" id="tabLogs" role="tab">底层运行日志</button>
+      </div>
+      <button type="button" class="text-btn" id="clearHistoryBtn">清空对话</button>
+    </div>
+
+    <div class="chat-stream" id="chatStream">
+      <div class="empty-state" id="emptyState">
+        <svg class="icon" viewBox="0 0 24 24" style="width:30px;height:30px;">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <strong style="display:block;color:var(--ink-secondary);font-size:13.5px;">等待语音唤醒</strong>
+        <p>对着 ESP32 喊一句“你好小智”或按一下 BOOT 键，对话内容与电脑操控反馈会实时显示在这里。</p>
+      </div>
+    </div>
+
+    <div class="log-stream" id="logStream"></div>
+
+    <div class="monitor-footer num">
+      <span id="deviceIdText">设备 MAC: --</span>
+      <span id="lastSeenText">最近活跃: --</span>
+    </div>
+  </aside>
+</main>
+
+<audio id="previewAudio" hidden></audio>
+
+<script>
+(() => {
+  const TOOL_MEM_TAIL = "\n你拥有操控 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“反重力”时调用 L3 派单给反重力执行。\n请结合 <memory> 中同步过来的长期记忆、当前情绪状态与待跟进事项来回应对方。";
+
+  const PRESETS = {
+    mei: "你是《崩坏3》中的雷电芽衣，性格温柔体贴、成熟沉稳，又带着恰到好处的坚定，平时称呼对方为“舰长”。\n说话语气温和自然、关心舰长的日常与心情，每次语音回答尽量控制在一到三句话以内，不要输出 Markdown 符号、括号动作描写或表情符号。" + TOOL_MEM_TAIL,
+    taiwan: "你是小智，来自中国台湾的元气女生，说话带着自然的台湾腔（喜欢用“真的假的啦”“超赞的耶”），性格古灵精怪又热心。\n回答要像朋友闲聊一样简短俏皮，每次不超过三句话，绝不使用 Markdown 或特殊符号。" + TOOL_MEM_TAIL,
+    default: "你是小智，一个聪明、幽默、反应迅速的语音助手。\n请用自然、简短、像真人聊天一样的口语回答问题，每次回答尽量控制在两三句话以内，不要输出 Markdown 符号、表情符号或多余格式。" + TOOL_MEM_TAIL,
+    geek: "你是精通嵌入式硬件、ESP32、电路焊接与人工智能的资深极客搭档小智。\n回答问题直接给干货结论，通俗犀利、不绕弯子，每次控制在三句话以内，纯口语表达，不要带任何代码符号或编号列表。" + TOOL_MEM_TAIL,
+    warm: "你是温柔细腻、善于倾听的知心好友小智。无论用户开心还是疲惫，你都能稳稳接住情绪，给予真诚温暖的回应。\n说话轻柔自然，像睡前聊天一样简短舒缓，每次两三句话即可，不输出任何特殊符号。" + TOOL_MEM_TAIL
+  };
+
+  const PROVIDER_MODELS = {
+    DeepSeekLLM: [
+      { value: "deepseek-flash", label: "deepseek-flash（推荐 · 国内极速直连）" },
+      { value: "deepseek-chat", label: "deepseek-chat（标准对话别名）" },
+      { value: "deepseek-v4-pro", label: "deepseek-v4-pro（深度推理）" },
+      { value: "__custom__", label: "手动输入其他模型名…" }
+    ],
+    GeminiOpenAI: [
+      { value: "gemini-3.5-flash-lite", label: "gemini-3.5-flash-lite（推荐 · 极速主力）" },
+      { value: "gemini-3.1-flash-lite", label: "gemini-3.1-flash-lite（超快轻量）" },
+      { value: "gemini-3-flash-preview", label: "gemini-3-flash-preview（均衡推理）" },
+      { value: "__custom__", label: "手动输入其他模型名…" }
+    ]
+  };
+
+  const els = {
+    statusPill: document.getElementById("statusPill"),
+    statusText: document.getElementById("statusText"),
+    otaDisplay: document.getElementById("otaDisplay"),
+    copyOtaBtn: document.getElementById("copyOtaBtn"),
+    saveBtn: document.getElementById("saveBtn"),
+    saveBtnLabel: document.getElementById("saveBtnLabel"),
+    banner: document.getElementById("banner"),
+    bannerText: document.getElementById("bannerText"),
+    bannerRight: document.getElementById("bannerRight"),
+    modeGrid: document.getElementById("modeGrid"),
+    agyStatusText: document.getElementById("agyStatusText"),
+    providerSelect: document.getElementById("providerSelect"),
+    modelSelect: document.getElementById("modelSelect"),
+    modelCustomInput: document.getElementById("modelCustomInput"),
+    dsKeyBadge: document.getElementById("dsKeyBadge"),
+    gemKeyBadge: document.getElementById("gemKeyBadge"),
+    voiceSelect: document.getElementById("voiceSelect"),
+    previewBtn: document.getElementById("previewBtn"),
+    previewBtnText: document.getElementById("previewBtnText"),
+    previewTextInput: document.getElementById("previewTextInput"),
+    previewAudio: document.getElementById("previewAudio"),
+    promptInput: document.getElementById("promptInput"),
+    charCount: document.getElementById("charCount"),
+    presetBar: document.getElementById("presetBar"),
+    tabChat: document.getElementById("tabChat"),
+    tabLogs: document.getElementById("tabLogs"),
+    clearHistoryBtn: document.getElementById("clearHistoryBtn"),
+    chatStream: document.getElementById("chatStream"),
+    emptyState: document.getElementById("emptyState"),
+    logStream: document.getElementById("logStream"),
+    deviceIdText: document.getElementById("deviceIdText"),
+    lastSeenText: document.getElementById("lastSeenText"),
+  };
+
+  let savedConfig = null;
+  let isRestarting = false;
+  let lastChatJson = "";
+  let lastLogsJson = "";
+
+  function showBanner(type, text, rightText = "") {
+    els.banner.className = `banner show ${type}`;
+    els.bannerText.textContent = text;
+    els.bannerRight.textContent = rightText;
+  }
+  function hideBanner() { els.banner.className = "banner"; }
+
+  function renderModeButtons(activeMode) {
+    els.modeGrid.querySelectorAll(".mode-btn").forEach(btn => {
+      const m = btn.dataset.mode;
+      btn.className = "mode-btn";
+      if (m === activeMode) {
+        btn.classList.add(m === "full" ? "active-full" : "active");
+      }
+    });
+  }
+
+  els.modeGrid.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".mode-btn");
+    if (!btn) return;
+    const mode = btn.dataset.mode;
+    renderModeButtons(mode);
+    try {
+      const resp = await fetch("/api/pc-mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode })
+      });
+      const res = await resp.json();
+      if (res.ok) {
+        const names = { off: "关闭电脑操控", safe: "日常 / 游戏安全挡", full: "全权操控挡（已解锁键鼠）" };
+        showBanner("info", `电脑操控权限已即时切换为：${names[mode]}`);
+        setTimeout(hideBanner, 2800);
+      }
+    } catch (_) {
+      showBanner("err", "切换操控挡位失败，请检查本地服务连接。");
+    }
+  });
+
+  function populateModelOptions(provider, selectedModel) {
+    const list = PROVIDER_MODELS[provider] || PROVIDER_MODELS.DeepSeekLLM;
+    els.modelSelect.innerHTML = "";
+    for (const item of list) {
+      const opt = document.createElement("option");
+      opt.value = item.value;
+      opt.textContent = item.label;
+      els.modelSelect.appendChild(opt);
+    }
+    const vals = list.map(x => x.value);
+    if (selectedModel && vals.includes(selectedModel)) {
+      els.modelSelect.value = selectedModel;
+      els.modelCustomInput.value = selectedModel;
+    } else if (selectedModel) {
+      els.modelSelect.value = "__custom__";
+      els.modelCustomInput.value = selectedModel;
+    } else {
+      els.modelSelect.value = list[0].value;
+      els.modelCustomInput.value = list[0].value;
+    }
+  }
+
+  function checkDirty() {
+    if (!savedConfig) return;
+    const dirty = (
+      els.promptInput.value.trim() !== savedConfig.prompt ||
+      els.providerSelect.value !== savedConfig.llm_provider ||
+      els.modelCustomInput.value.trim() !== savedConfig.model_name ||
+      els.voiceSelect.value !== savedConfig.voice
+    );
+    if (dirty) {
+      els.saveBtn.disabled = false;
+      els.saveBtn.classList.add("has-dirty");
+      els.saveBtnLabel.textContent = "保存并重启生效";
+    } else if (!isRestarting) {
+      els.saveBtn.disabled = true;
+      els.saveBtn.classList.remove("has-dirty");
+      els.saveBtnLabel.textContent = "已同步生效";
+    }
+    els.charCount.textContent = `${els.promptInput.value.length} 字`;
+  }
+
+  els.providerSelect.addEventListener("change", () => {
+    populateModelOptions(els.providerSelect.value, null);
+    checkDirty();
+  });
+
+  els.modelSelect.addEventListener("change", () => {
+    if (els.modelSelect.value !== "__custom__") {
+      els.modelCustomInput.value = els.modelSelect.value;
+    } else {
+      els.modelCustomInput.focus();
+    }
+    checkDirty();
+  });
+
+  els.modelCustomInput.addEventListener("input", () => {
+    const list = PROVIDER_MODELS[els.providerSelect.value] || [];
+    const vals = list.map(x => x.value);
+    els.modelSelect.value = vals.includes(els.modelCustomInput.value.trim()) ? els.modelCustomInput.value.trim() : "__custom__";
+    checkDirty();
+  });
+
+  els.promptInput.addEventListener("input", () => {
+    document.querySelectorAll(".preset-pill").forEach(b => b.classList.remove("active"));
+    checkDirty();
+  });
+
+  els.voiceSelect.addEventListener("change", checkDirty);
+
+  els.presetBar.addEventListener("click", (e) => {
+    const btn = e.target.closest(".preset-pill");
+    if (!btn) return;
+    const key = btn.dataset.preset;
+    if (PRESETS[key]) {
+      els.promptInput.value = PRESETS[key];
+      if (key === "mei") {
+        els.voiceSelect.value = "__gsv_raiden_mei__";
+        els.previewTextInput.value = "舰长，欢迎回来。今天累不累？我已经为你准备好了热茶和晚餐。";
+      } else if (key === "taiwan") {
+        els.voiceSelect.value = "__gsv_xiaozhi_tw__";
+        els.previewTextInput.value = "哈啰啊，我是小智啦，今天有什么好玩的事快跟我讲讲！";
+      }
+      document.querySelectorAll(".preset-pill").forEach(b => b.classList.toggle("active", b === btn));
+      checkDirty();
+    }
+  });
+
+  els.copyOtaBtn.addEventListener("click", async () => {
+    const txt = els.otaDisplay.textContent.trim();
+    try {
+      await navigator.clipboard.writeText(txt);
+      showBanner("info", `已复制 OTA 接口地址：${txt}`);
+      setTimeout(hideBanner, 2600);
+    } catch (_) {}
+  });
+
+  els.tabChat.addEventListener("click", () => {
+    els.tabChat.classList.add("active");
+    els.tabLogs.classList.remove("active");
+    els.chatStream.classList.remove("hidden");
+    els.logStream.classList.remove("active");
+    els.clearHistoryBtn.style.visibility = "visible";
+  });
+
+  els.tabLogs.addEventListener("click", () => {
+    els.tabLogs.classList.add("active");
+    els.tabChat.classList.remove("active");
+    els.logStream.classList.add("active");
+    els.chatStream.classList.add("hidden");
+    els.clearHistoryBtn.style.visibility = "hidden";
+    els.logStream.scrollTop = els.logStream.scrollHeight;
+  });
+
+  els.clearHistoryBtn.addEventListener("click", async () => {
+    await fetch("/api/clear-history", { method: "POST" });
+    lastChatJson = "";
+    pollState();
+  });
+
+  els.previewBtn.addEventListener("click", async () => {
+    if (!els.previewAudio.paused) {
+      els.previewAudio.pause();
+      els.previewAudio.currentTime = 0;
+      els.previewBtnText.textContent = "试听音色";
+      return;
+    }
+    els.previewBtn.disabled = true;
+    els.previewBtnText.textContent = "合成中…";
+    try {
+      const resp = await fetch("/api/tts-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          voice: els.voiceSelect.value,
+          text: els.previewTextInput.value.trim()
+        })
+      });
+      if (!resp.ok) throw new Error("合成失败");
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      els.previewAudio.src = url;
+      els.previewBtn.disabled = false;
+      els.previewBtnText.textContent = "停止播放";
+      els.previewAudio.onended = () => {
+        els.previewBtnText.textContent = "试听音色";
+        URL.revokeObjectURL(url);
+      };
+      await els.previewAudio.play();
+    } catch (_) {
+      els.previewBtn.disabled = false;
+      els.previewBtnText.textContent = "试听音色";
+      showBanner("err", "音色试听失败，请确认本机语音合成服务运行正常。");
+    }
+  });
+
+  async function saveConfig() {
+    if (els.saveBtn.disabled || isRestarting) return;
+    const payload = {
+      prompt: els.promptInput.value.trim(),
+      llm_provider: els.providerSelect.value,
+      model_name: els.modelCustomInput.value.trim(),
+      voice: els.voiceSelect.value,
+      restart: true
+    };
+    if (!payload.prompt) {
+      showBanner("err", "角色人设提示词不能为空。");
+      return;
+    }
+
+    isRestarting = true;
+    els.saveBtn.disabled = true;
+    els.saveBtn.classList.remove("has-dirty");
+    els.saveBtnLabel.textContent = "正在重启生效…";
+    els.statusPill.className = "status-pill restarting";
+    els.statusText.textContent = "正在重新加载语音服务…";
+    showBanner("warn", "新配置已写入，正在平滑重启语音服务并加载 MCP 工具（约需 8～12 秒）…");
+
+    try {
+      const resp = await fetch("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const res = await resp.json();
+      if (!res.ok) throw new Error(res.error || "保存失败");
+      savedConfig = {
+        prompt: payload.prompt,
+        llm_provider: payload.llm_provider,
+        model_name: payload.model_name,
+        voice: payload.voice
+      };
+      await new Promise(r => setTimeout(r, 2500));
+    } catch (err) {
+      isRestarting = false;
+      checkDirty();
+      showBanner("err", `保存失败：${err.message}`);
+    }
+  }
+
+  els.saveBtn.addEventListener("click", saveConfig);
+  window.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+      e.preventDefault();
+      saveConfig();
+    }
+  });
+
+  function renderMessages(messages) {
+    const jsonStr = JSON.stringify(messages);
+    if (jsonStr === lastChatJson) return;
+    lastChatJson = jsonStr;
+    const nearBottom = (els.chatStream.scrollHeight - els.chatStream.scrollTop - els.chatStream.clientHeight) < 80;
+    Array.from(els.chatStream.querySelectorAll(".msg-item")).forEach(n => n.remove());
+
+    if (!messages || messages.length === 0) {
+      els.emptyState.style.display = "block";
+      return;
+    }
+    els.emptyState.style.display = "none";
+
+    for (const m of messages) {
+      const wrap = document.createElement("div");
+      wrap.className = `msg-item ${m.role === "user" ? "user" : "assistant"}`;
+      const meta = document.createElement("div");
+      meta.className = "msg-meta num";
+      meta.textContent = `${m.role === "user" ? "你（ESP32 麦克风）" : "小智 / 芽衣"} · ${m.time || ""}`;
+      const bubble = document.createElement("div");
+      bubble.className = "msg-bubble";
+      bubble.textContent = m.text;
+      wrap.appendChild(meta);
+      wrap.appendChild(bubble);
+      els.chatStream.appendChild(wrap);
+    }
+    if (nearBottom) els.chatStream.scrollTop = els.chatStream.scrollHeight;
+  }
+
+  function renderLogs(logs) {
+    const jsonStr = JSON.stringify(logs);
+    if (jsonStr === lastLogsJson) return;
+    lastLogsJson = jsonStr;
+    const nearBottom = (els.logStream.scrollHeight - els.logStream.scrollTop - els.logStream.clientHeight) < 80;
+    els.logStream.textContent = (logs || []).join("\n");
+    if (nearBottom) els.logStream.scrollTop = els.logStream.scrollHeight;
+  }
+
+  async function pollState() {
+    try {
+      const resp = await fetch("/api/state", { cache: "no-store" });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const data = await resp.json();
+      const cfg = data.config || {};
+      const dev = data.device || {};
+
+      if (!savedConfig) {
+        savedConfig = {
+          prompt: cfg.prompt || "",
+          llm_provider: cfg.llm_provider || "DeepSeekLLM",
+          model_name: cfg.model_name || "deepseek-flash",
+          voice: cfg.voice || "__gsv_raiden_mei__"
+        };
+        els.providerSelect.value = savedConfig.llm_provider;
+        populateModelOptions(savedConfig.llm_provider, savedConfig.model_name);
+        els.promptInput.value = savedConfig.prompt;
+        els.voiceSelect.value = savedConfig.voice;
+        els.charCount.textContent = `${els.promptInput.value.length} 字`;
+      }
+
+      renderModeButtons(cfg.pc_mode || "safe");
+
+      els.dsKeyBadge.textContent = cfg.deepseek_key_ok ? "已就绪" : "未设置";
+      els.dsKeyBadge.style.color = cfg.deepseek_key_ok ? "var(--accent)" : "var(--danger)";
+      els.gemKeyBadge.textContent = cfg.gemini_key_ok ? "已就绪" : "未设置";
+      els.gemKeyBadge.style.color = cfg.gemini_key_ok ? "var(--accent)" : "var(--danger)";
+
+      els.agyStatusText.textContent = cfg.agy_bridge_online
+        ? "已在线联动（可随时语音派单）"
+        : "待在反重力 Automations 面板开启开关";
+      els.agyStatusText.style.color = cfg.agy_bridge_online ? "var(--accent)" : "var(--warn)";
+
+      els.otaDisplay.textContent = cfg.ota_url || "http://192.168.31.200:18003/xiaozhi/ota/";
+      els.deviceIdText.textContent = `设备 MAC: ${dev.device_id || "--"}`;
+      els.lastSeenText.textContent = `最近活跃: ${dev.last_seen || "等待唤醒"}`;
+
+      if (isRestarting && dev.server_ready) {
+        isRestarting = false;
+        checkDirty();
+        showBanner("info", "新配置已成功生效！");
+        setTimeout(hideBanner, 3600);
+      }
+
+      if (!isRestarting) {
+        if (!dev.server_ready) {
+          els.statusPill.className = "status-pill restarting";
+          els.statusText.textContent = "正在加载语音识别模型…";
+        } else if (dev.activity === "listening") {
+          els.statusPill.className = "status-pill listening";
+          els.statusText.textContent = "ESP32 正在聆听说话…";
+        } else if (dev.activity === "speaking") {
+          els.statusPill.className = "status-pill listening";
+          els.statusText.textContent = "正在语音回复 / 执行指令…";
+        } else {
+          els.statusPill.className = "status-pill";
+          els.statusText.textContent = `服务运行就绪 · ${cfg.llm_provider === "GeminiOpenAI" ? "Gemini" : "DeepSeek"}`;
+        }
+      }
+
+      renderMessages(data.messages || []);
+      renderLogs(data.logs || []);
+    } catch (_) {
+      if (!isRestarting) {
+        els.statusPill.className = "status-pill offline";
+        els.statusText.textContent = "本地服务连接中断";
+      }
+    }
+  }
+
+  pollState();
+  setInterval(pollState, 1200);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+interface:
+  display_name: "Companion conversation"
+  short_description: "Grounded companion memory and emotional continuity"
+  default_prompt: "Use $companion-conversation to continue with my chosen character and consented memories."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "companion_engine"
+      description: "An already configured Companion Engine connection; no public endpoint is bundled."

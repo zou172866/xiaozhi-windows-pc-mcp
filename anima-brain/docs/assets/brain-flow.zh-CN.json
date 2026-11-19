@@ -1,0 +1,455 @@
+{
+  "version": 2,
+  "locale": "zh-CN",
+  "views": {
+    "overview": {
+      "label": "系统全貌",
+      "eyebrow": "01 / 一轮对话，如何走完整个系统",
+      "description": "记忆各有分工，对话始终连贯。",
+      "nodes": {
+        "input": {
+          "title": "收到新消息",
+          "subtitle": "文字 · 语音 · 图片",
+          "tag": "输入"
+        },
+        "recall": {
+          "title": "组装上下文",
+          "subtitle": "原文 + 事实 + 角色状态",
+          "tag": "读取"
+        },
+        "reply": {
+          "title": "模型生成回复",
+          "subtitle": "回复 + 待校验的更新",
+          "tag": "生成"
+        },
+        "commit": {
+          "title": "校验并提交",
+          "subtitle": "引用 · 写入策略 · 版本",
+          "tag": "写入"
+        },
+        "output": {
+          "title": "把回复交给用户",
+          "subtitle": "文字 · 语音 · 视频",
+          "tag": "送达"
+        },
+        "original": {
+          "title": "原始对话",
+          "subtitle": "谁在何时说了什么",
+          "tag": "可追溯的来源"
+        },
+        "semantic": {
+          "title": "语义记忆",
+          "subtitle": "事实 · 偏好 · 边界",
+          "tag": "目前知道什么"
+        },
+        "episodic": {
+          "title": "情景记忆",
+          "subtitle": "带原文引用的共同经历",
+          "tag": "一起经历过什么"
+        },
+        "core": {
+          "title": "核心笔记",
+          "subtitle": "整合当前信息，保留来源",
+          "tag": "精简上下文"
+        },
+        "emotion": {
+          "title": "角色的情绪状态",
+          "subtitle": "PAD + 关系维度",
+          "tag": "角色连续性"
+        },
+        "consolidate": {
+          "title": "记忆巩固循环",
+          "subtitle": "整理摘要 · 保留引用 · 建索引 · 随变化刷新",
+          "tag": "维护"
+        }
+      },
+      "steps": [
+        {
+          "label": "接收",
+          "title": "先记清楚，用户到底说了什么。",
+          "text": "为当前用户与角色建立独立的一轮对话。当前消息和近期聊天保留原貌，与已有摘要、推断出的状态分开处理。",
+          "example": "“面试改到周一了，今天先别给我打鸡血。”",
+          "detail": "原始记录保留原话、说话人、时间戳和来源 ID。"
+        },
+        {
+          "label": "检索",
+          "title": "取回记忆，也带上它的出处。",
+          "text": "语义记忆提供当前事实，情景记忆带回共同经历，需要时还能查原文。核心笔记、待跟进事项、近期对话和角色状态一起组成有长度限制的上下文。",
+          "example": "当前事实：周一面试。共同经历：之前练习过面试。此刻偏好：安静陪着就好。",
+          "detail": "固定边界与已更新事实优先于匹配到的旧记忆；可选的补查工具能进一步找回原文。"
+        },
+        {
+          "label": "回复",
+          "title": "接住眼前的人，也接得上以前的话。",
+          "text": "模型收到整理好的上下文、角色设定和回复指引，生成回复，并提出带引用的记忆更新；也可输出本轮情绪承接记录与角色情绪评估。",
+          "example": "“好，周一。那我们先不聊面试了？”",
+          "detail": "情绪承接记录描述这一轮的线索与回应意图，不把一时的反应当成永久性格。"
+        },
+        {
+          "label": "提交",
+          "title": "同一轮对话，留下不同层次的记忆。",
+          "text": "校验输出结构和原文引用后，在同一事务中保存对话与获准的事实更新。旧版本保留为历史，当前知识另行更新，再由宿主把已提交的回复交给用户。",
+          "example": "当前面试日期从周五改为周一，但“周五面试”的原话仍保留在历史中。",
+          "detail": "记忆更新可设为自动写入、人工审核或关闭。来源校验不等于证明内容一定正确。"
+        },
+        {
+          "label": "巩固",
+          "title": "把聊过的事，整理成以后用得上的记忆。",
+          "text": "达到巩固条件后，由宿主或已配置的后台任务生成带引用的情景摘要，并更新核心笔记。可选的检索笔记、关联与向量索引帮助后续查找。",
+          "example": "一次面试练习被整理为情景摘要；当前的面试日期则保留在核心笔记里。",
+          "detail": "巩固产生派生记录，不会抹掉原始对话。"
+        },
+        {
+          "label": "延续",
+          "title": "记忆和情绪，各自更新，再回到下一轮。",
+          "text": "记忆保存经历与变化中的事实；角色情绪通过独立规则更新，并随时间衰减。两者都会进入后续上下文，让回复接得上过去，也留得住当下的分寸。",
+          "example": "记得面试改期，但不把一个焦虑的下午当成用户的固定性格。",
+          "detail": "角色情绪是虚构角色的表达状态，与用户记忆、情绪承接评估分别保存。"
+        }
+      ]
+    },
+    "retrieval": {
+      "label": "检索与时效",
+      "eyebrow": "02 / 两种排序，解决不同问题",
+      "description": "原始证据、事实与经历、待跟进事项，各有适合的排序方式",
+      "nodes": {
+        "query": {
+          "title": "当前消息",
+          "subtitle": "限定当前用户与角色",
+          "tag": "查询"
+        },
+        "lexical": {
+          "title": "关键词候选",
+          "subtitle": "FTS5 · BM25 排名",
+          "tag": "字面匹配"
+        },
+        "vector": {
+          "title": "向量候选",
+          "subtitle": "正余弦相似度 · 需配置模型",
+          "tag": "语义相似"
+        },
+        "rrf": {
+          "title": "证据融合与档案排序",
+          "subtitle": "RRF / 相关性＋时效＋重要性",
+          "tag": "相关性排序"
+        },
+        "loops": {
+          "title": "待跟进事项",
+          "subtitle": "I(1+A) exp(−t/(14+30A)) + U",
+          "tag": "时效与紧迫性"
+        },
+        "context": {
+          "title": "受长度限制的上下文",
+          "subtitle": "事实 · 原文 · 近期对话",
+          "tag": "交给回复模型"
+        }
+      },
+      "steps": [
+        {
+          "label": "找候选",
+          "title": "原文和派生记忆，分别检索。",
+          "text": "原文保留说话者、时间和前两条消息，分别建立原文向量与笔记向量。候选上限为原文向量 32、笔记向量 16、关键词 60 条。事实和经历另行检索。",
+          "example": "哪怕这次换了一种说法，也可能通过语义相似度找到之前的消息。",
+          "detail": "向量检索为可选项；分层检索还包含有数量上限的中日韩文字子串匹配通道。"
+        },
+        {
+          "label": "合并排名",
+          "title": "原文不因久远失分，事实与经历考虑时效",
+          "text": "原文按 Σ 1/(40+rank) 融合，并有限扩展一跳关联。事实与经历按 0.6×相关性＋0.25×exp(-天数/45)＋0.15×重要性/10 排序",
+          "example": "关键词第 1 名＋原文向量第 4 名：1/41＋1/44＝0.04712",
+          "detail": "事实使用事件时间或最近强化时间，经历使用原始消息跨度的结束时间，不用重新整理的时间冒充新鲜度"
+        },
+        {
+          "label": "排跟进顺序",
+          "title": "时效性单独用于待跟进队列。",
+          "text": "状态为未完成、且标记 followup=ask 的事实，按重要性、唤醒度、距更新时间和距事件日期排序，最多选取 12 条。这只提供上下文，不会自行向用户发消息。",
+          "example": "同样重要的两件事，明天的面试可能排在一件很久没更新的旧事之前。",
+          "detail": "记录年龄以天计算；没有事件日期，就不加紧迫性分数。"
+        },
+        {
+          "label": "组装上下文",
+          "title": "最终选什么，不只看一个分数。",
+          "text": "固定边界、更正内容和近期对话各有纳入规则。核心笔记与命中的情景摘要保留来源 ID，长度预算按整条记录取舍；可选工具可继续展开相关原文。",
+          "example": "即使旧说法的相似度排名更高，新近更正的事实也可以优先进入上下文。",
+          "detail": "原文检索可以按记录时间筛选；事实有效期和事件日期通过另一套时间查询处理。"
+        }
+      ]
+    },
+    "consolidation": {
+      "label": "记忆巩固",
+      "eyebrow": "03 / 从聊天记录，到有结构的记忆",
+      "description": "压缩上下文，保留来龙去脉。",
+      "nodes": {
+        "backlog": {
+          "title": "已提交的原始记录",
+          "subtitle": "待整理片段 + 知识更新",
+          "tag": "持久保存的待处理记录"
+        },
+        "due": {
+          "title": "到整理的时候了吗？",
+          "subtitle": "4 轮 / 1.2 万字符 / 空闲 5 分钟",
+          "tag": "默认阈值，可配置"
+        },
+        "writer": {
+          "title": "由一个执行方生成摘要",
+          "subtitle": "当前宿主 或 后台任务",
+          "tag": "两种模式互斥"
+        },
+        "check": {
+          "title": "写入前校验",
+          "subtitle": "引用 ID 合法 + 快照未被修改",
+          "tag": "校验关口"
+        },
+        "episode": {
+          "title": "情景摘要",
+          "subtitle": "这批对话里发生了什么",
+          "tag": "追加新的情景记录"
+        },
+        "core": {
+          "title": "核心笔记",
+          "subtitle": "整合当前知识，保留出处",
+          "tag": "替换当前核心笔记"
+        },
+        "index": {
+          "title": "刷新检索索引",
+          "subtitle": "检索笔记 · 关联 · 可选向量",
+          "tag": "供下次检索"
+        },
+        "correction": {
+          "title": "事实发生变化",
+          "subtitle": "使依赖旧事实的摘要失效",
+          "tag": "修订"
+        }
+      },
+      "steps": [
+        {
+          "label": "触发",
+          "title": "从已保存的原文出发，整理过程可以重做。",
+          "text": "新建 SDK 角色在积累 20 轮、1.2 万字符、空闲 300 秒，或知识发生变更时触发整理。聊天进行中保留最近 10 轮，空闲时也可整理短对话。",
+          "example": "后台进程检查已保存的数据；程序关闭时不会自动执行。",
+          "detail": "阈值可以调整，实际整理需要运行中的宿主或后台任务来执行。"
+        },
+        {
+          "label": "生成",
+          "title": "一份摘要，交给一个执行方。",
+          "text": "SDK 默认由配置好的模型在后台整理，MCP 默认让宿主模型完成。每批会演化检索笔记、生成有出处的经历和用户核心笔记，并可单独更新角色自我记忆。",
+          "example": "情景摘要记录练习与改期的经过；核心笔记保留当前安排和有依据的回应偏好。",
+          "detail": "宿主摘要与后台摘要不能同时开启。角色自我笔记是可选项，另行保存。"
+        },
+        {
+          "label": "提交",
+          "title": "内容可以精简，引用不能丢。",
+          "text": "提交前检查原文 ID 和快照版本，追加情景摘要、替换当前核心笔记，并标记已处理来源。原文始终保留；如果事实已变化，就拒绝这次过期写入。",
+          "example": "从摘要能追溯到具体的原始消息，而不只是另一份摘要。",
+          "detail": "校验引用能确认出处，不能独立证明摘要内容真实无误。"
+        },
+        {
+          "label": "刷新",
+          "title": "事实更新，相关摘要也要跟着更新。",
+          "text": "事实改变时，当前核心笔记与引用受影响来源的文档会失效；如果没有来源轮次，失效范围会更广。记录变化会更新检索索引，文本或笔记变化会使旧向量失效。",
+          "example": "当前知识改为周一面试，旧聊天仍作为历史保留，并标记对应的知识更新。",
+          "detail": "重新生成向量需要配置嵌入模型；事实更正不会悄悄改写原始对话。"
+        }
+      ]
+    },
+    "emotion": {
+      "label": "情绪与关系",
+      "eyebrow": "04 / 心情变化快，关系积累慢",
+      "description": "下一轮开始时，角色不会把情绪清零。",
+      "nodes": {
+        "cue": {
+          "title": "读懂这一轮的线索",
+          "subtitle": "简短的情绪承接记录 + 反馈",
+          "tag": "当下的解读"
+        },
+        "appraisal": {
+          "title": "可选的角色情绪评估",
+          "subtitle": "情绪 · 强度 · 关系变化建议",
+          "tag": "模型提出建议"
+        },
+        "decay": {
+          "title": "随时间衰减",
+          "subtitle": "半衰期：PAD 12 小时 · 紧张 72 小时",
+          "tag": "时间的影响"
+        },
+        "rules": {
+          "title": "有边界的状态更新",
+          "subtitle": "习惯化 · 饱和 · 每日变化上限",
+          "tag": "确定性规则"
+        },
+        "state": {
+          "title": "角色状态",
+          "subtitle": "PAD + 五个关系维度",
+          "tag": "持久保存"
+        },
+        "next": {
+          "title": "下一轮的回应指引",
+          "subtitle": "延续语气，遵守当前边界",
+          "tag": "回到回复模型"
+        },
+        "gates": {
+          "title": "同意与关系推进节奏",
+          "subtitle": "浪漫关系需主动开启，且熟悉度 > 0.2",
+          "tag": "前置条件"
+        }
+      },
+      "steps": [
+        {
+          "label": "理解当下",
+          "title": "看见此刻的情绪，不急着给人贴标签。",
+          "text": "简短的情绪承接记录保存线索、回应意图与不确定性。可选评估提出角色情绪和关系变化建议。这些状态与用户的事实记忆分开存储。",
+          "example": "“听起来有点累，给对方一点空间”描述的是这一轮，不是用户的性格。",
+          "detail": "情绪评估是模型的建议，不是心理测量结果。"
+        },
+        {
+          "label": "时间衰减",
+          "title": "心情和紧张感，平复的速度不同。",
+          "text": "PAD 以 12 小时半衰期回到基线，紧张度以 72 小时半衰期下降。连续 7 天未互动后，高于 0.6 × 熟悉度的亲近感开始冷却，超出部分的半衰期为 35 天。",
+          "example": "12 小时后，PAD 偏离量剩下一半，紧张度则仍保留约 89%。",
+          "detail": "准备上下文时，每个 UTC 日还会施加一次带固定种子的轻微角色心情波动。"
+        },
+        {
+          "label": "有界更新",
+          "title": "关系慢慢积累，边界始终生效。",
+          "text": "评估强度决定 PAD 向目标情绪靠近多少。关系变化随状态饱和，重复正向互动的亲近感增益递减，信任损失不对称；每个关系维度每天的累计变化幅度上限为 0.12。",
+          "example": "只有主动开启浪漫关系，且本轮更新后的熟悉度超过 0.2，浪漫维度才允许增长。",
+          "detail": "五个维度是信任、亲近、熟悉、紧张和浪漫。区间切换的缓冲机制避免状态标签反复跳变。"
+        },
+        {
+          "label": "带入下轮",
+          "title": "让下一次回复，带着刚刚发生过的事。",
+          "text": "按规则更新后的角色状态与本轮解读分别保存。后续上下文可以带入关系说明、近期情绪承接记录和关联的用户反馈；当前更正与边界始终优先。",
+          "example": "角色即使有些保留，也能尊重地提供支持，并遵守用户想要独处的请求。",
+          "detail": "下方图表仅演示时间衰减，不计新评估、每日心情波动和久未互动的亲近感冷却。"
+        }
+      ]
+    }
+  },
+  "ui": {
+    "Retrieval formula explorer": "检索公式交互演示",
+    "OPEN THE EQUATION": "把公式展开看看",
+    "Two scores, two purposes.": "两个分数，各管一件事。",
+    "These calculate the current Python formulas on illustrative inputs. They do not query your memories.": "用示例参数运行当前 Python 实现中的公式，不会查询你的个人记忆。",
+    "Evidence relevance": "证据相关性",
+    "Each available ranking channel adds a vote. The example uses keyword and optional vector ranks.": "每个命中的检索通道贡献一份分数。这里演示关键词排名与可选的向量排名。",
+    "Keyword rank": "关键词排名",
+    "Vector rank": "向量排名",
+    "Include vector match": "计入向量匹配",
+    "Fused relevance": "融合后的相关性",
+    "Higher ranks first within this search pool": "同一检索池内，分数越高越靠前",
+    "Rank starts at 1. Missing channels contribute 0. Derived memory also has a CJK candidate channel. Recency is not part of RRF.": "排名从 1 开始，未命中贡献 0。派生记忆另有中日韩文字候选通道。RRF 本身不考虑时效性。",
+    "Open-loop priority": "待跟进事项的优先级",
+    "TIME-AWARE": "考虑时间",
+    "I = importance, A = arousal, t = days since update. U = 2 / (1 + |days to event|), or 0 without a date.": "I 为重要性，A 为该事项记录的唤醒度，t 为距更新的天数。U = 2 / (1 + |距事件的天数|)，无日期时为 0。",
+    "Importance": "重要性",
+    "Arousal": "事项唤醒度",
+    "Age since update": "距更新天数",
+    "d": " 天",
+    "Days to event": "距事件天数",
+    "Has an event date": "有明确的事件日期",
+    "Follow-up priority": "跟进优先级",
+    "aged importance +": "（衰减后的重要性）+",
+    "urgency": "（紧迫性）",
+    "Top 12 eligible open items; higher arousal slows age decay. This queue supplies context, not automatic outreach.": "最多选取 12 条符合条件的未完成事项。唤醒度越高，时间衰减越慢。队列只提供上下文，不会自动发起联系。",
+    "Context assembly adds priorities beyond ranking.": "组装上下文时，还有独立的优先规则。",
+    "Pinned boundaries, revised facts, core notes and recent conversation have their own inclusion rules. Observation dates can filter original evidence; event dates and fact validity are handled separately.": "固定边界、修订事实、核心笔记和近期对话各有纳入规则。原文可按记录时间筛选；事件日期与事实有效期分别处理。",
+    "Emotion decay explorer": "情绪衰减交互演示",
+    "TIME IS PART OF THE STATE": "时间，也是状态的一部分",
+    "A feeling fades. History stays.": "情绪会淡下去，经历仍然留着。",
+    "Isolated decay, with no new messages or daily weather. These are character-writing controls, not measurements of human emotion.": "这里只演示衰减，不加入新消息或每日心情波动。这些参数用于塑造角色，不是对真人情绪的测量。",
+    "Different half-lives": "不同状态，不同半衰期",
+    "PAD deviation halves every 12 hours. Tension halves every 72 hours. Both approach zero over elapsed time.": "PAD 偏离量每 12 小时减半，紧张度每 72 小时减半，二者随时间逐渐趋于零。",
+    "h": " 小时",
+    "Hours since state update": "距状态更新的小时数",
+    "PAD deviation remaining": "剩余 PAD 偏离量",
+    "Tension remaining": "剩余紧张度",
+    "PAD baseline b = (0.15, −0.15, 0.05). Pleasure, arousal and dominance relax toward that baseline.": "PAD 基线 b = (0.15, −0.15, 0.05)。愉悦度、唤醒度和支配感随时间向这个基线回归。",
+    "What happens when a new turn arrives?": "新一轮对话来了，状态怎么变？",
+    "Appraise the moment": "评估当下",
+    "12 emotion targets. PAD pull = 0.3 × intensity / 3, applied toward the selected target.": "从 12 个情绪目标中选择一个。PAD 以 0.3 × intensity / 3 的比例向该目标靠近。",
+    "Update five relationship axes": "更新五个关系维度",
+    "Trust, warmth, familiarity, tension and romance. Repeated positive warmth is reduced; trust losses are amplified.": "分别是信任、亲近、熟悉、紧张和浪漫。重复正向互动的亲近感增益递减，信任损失则被放大。",
+    "Apply boundaries and pacing": "控制边界与推进节奏",
+    "Each axis is clamped to [0, 1], with total absolute movement capped at 0.12 per UTC day. Romance growth requires opt-in and familiarity > 0.2.": "各维度限制在 [0, 1] 内，每个 UTC 日的累计变化幅度不超过 0.12。浪漫维度增长需主动开启，且熟悉度 > 0.2。",
+    "Carry a stable description forward": "让状态描述保持稳定",
+    "Band hysteresis of 0.035 reduces abrupt label changes. After 7 absent days, excess warmth cools toward 0.6 × familiarity over a 35-day half-life.": "区间切换保留 0.035 的缓冲，避免标签突然跳变。7 天未互动后，亲近感高于 0.6 × 熟悉度的部分按 35 天半衰期冷却。",
+    "ONE HISTORY, DISTINCT REPRESENTATIONS": "同一段经历，不同的记录方式",
+    "Knowing a fact is different from remembering a moment.": "知道一件事，和记得一段经历，不是一回事。",
+    "SEMANTIC": "语义记忆",
+    "What is true now?": "现在的事实是什么？",
+    "Current assertions, preferences and boundaries, with subject, source quote, revision and temporal details.": "记录当前事实、偏好和边界，同时保留主体、原文引用、修订与时间信息。",
+    "Interview: Monday.": "面试时间：周一。",
+    "Preference: skip pep talks today.": "当下偏好：今天先别打鸡血。",
+    "A correction changes current knowledge while preserving its revision history.": "更正会更新当前知识，旧版本仍留在修订历史中。",
+    "EPISODIC": "情景记忆",
+    "What happened together?": "我们一起经历过什么？",
+    "Derived accounts of events and exchanges, tied to the original evidence by source IDs.": "把发生过的事情和交流整理成摘要，用来源 ID 关联到原始记录。",
+    "We practised for the interview; later, the user rescheduled it.": "之前一起练习过面试，后来用户说面试改期了。",
+    "Summaries are interpretations. Inspect the original when details matter.": "摘要包含整理者的理解。细节重要时，应回查原文。",
+    "EMOTIONAL CONTINUITY": "情绪连续性",
+    "How does the character carry it?": "角色会带着怎样的状态回应？",
+    "PAD and relationship state guide the next reply. Recent attunement records describe cues and feedback separately.": "PAD 与关系状态影响下一轮表达；近期情绪承接记录则单独描述对话线索和反馈。",
+    "Keep the tone light, familiar and unpressured.": "语气轻一点，熟悉一点，不给对方压力。",
+    "Character state is not a stored diagnosis or a factual claim about the user.": "角色状态不是对用户的诊断，也不作为用户事实存储。",
+    "Illustrative representations of one conversation. Source evidence underlies memory; core notes are a compact synthesis, not a third kind of ground truth.": "以上用同一段对话举例。记忆以原始证据为依据；核心笔记只是精简整合，不是另一套独立事实。",
+    "THE CYCLE, IN PRACTICE": "用一次改期，看看循环如何运转",
+    "Keep the moment. Update the meaning.": "经历留下来，当前认识及时更新。",
+    "01 / BEFORE": "01 / 变化之前",
+    "A Friday plan": "原本约在周五",
+    "An original message and a cited fact say the interview is on Friday. A previous episode and core may mention it.": "原始消息和对应事实都记录着周五面试，先前的情景摘要与核心笔记也可能提到它。",
+    "“The interview’s on Friday.”": "“面试定在周五。”",
+    "02 / CHANGE": "02 / 收到更正",
+    "A Monday correction": "现在改到周一",
+    "Commit the new statement and the permitted fact update. Invalidate the core and documents citing the changed source.": "提交新消息与获准的事实更新，使核心笔记和引用受影响来源的文档失效。",
+    "“They moved it to Monday.”": "“他们把面试改到周一了。”",
+    "03 / AFTER": "03 / 更新之后",
+    "Continuity without contradiction": "分清过去与现在",
+    "Rebuild cited summaries from the updated snapshot. Retain both originals with knowledge-update markers, and refresh affected indexes.": "基于新快照重建带引用的摘要。两条原话都保留，标记对应的知识更新，并刷新受影响的索引。",
+    "Current plan: Monday.": "当前安排：周一。",
+    "Historical plan: Friday.": "历史安排：周五。",
+    "Due does not mean already completed.": "达到整理条件，不等于已经整理完。",
+    "Hosts without an explicit policy request host summaries; SDK-created characters start with maintenance disabled by default. An active host must prepare and commit host summaries. Background model summaries are an explicit alternative. Optional embedding jobs require a configured provider and running worker.": "未指定策略的宿主会请求宿主摘要；SDK 默认创建的角色则先关闭自动维护。启用后，宿主需要实际准备并提交摘要，也可显式选择后台模型模式。向量任务还需要配置服务商并运行工作进程。",
+    "Source: automation.py · host_memory.py · memory.py · engine.py. Thresholds shown above are configurable defaults, not a universal schedule.": "实现见 automation.py、host_memory.py、memory.py 和 engine.py。上面的阈值是可调整的默认值，并非固定日程。",
+    "From Anima Lab": "来自 Anima Lab",
+    "THE BRAIN ATLAS / AN INTERACTIVE FIELD GUIDE": "陪伴引擎架构 / 交互式导览",
+    "A moment becomes": "每一次交流，",
+    "continuity.": "都接得上以后。",
+    "Inside the memory and emotion systems that make the next conversation feel connected.": "看清记忆如何整理、情绪如何延续，以及它们怎样一起影响下一次回复。",
+    "Originals → knowledge → shared history → the next turn": "原始对话 → 当前知识 → 共同经历 → 下一轮回应",
+    "Architecture views": "架构视图",
+    "Companion brain architecture": "陪伴引擎系统架构",
+    "Memory": "记忆",
+    "Emotion": "情绪",
+    "Illustrative flow": "示例流程",
+    "Scroll sideways to explore the full diagram →": "左右滑动，查看完整架构图 →",
+    "Scrollable architecture diagram": "可横向滚动的架构图",
+    "THE CONVERSATION": "一轮对话的路径",
+    "MEMORY / EVERY DERIVED RECORD KEEPS ITS SOURCES": "记忆层 / 每条派生记录都保留来源",
+    "CONTINUITY LOOPS": "让下一轮接得上这一轮",
+    "Pause animation": "暂停动画",
+    "Play animation": "播放动画",
+    "Pause": "暂停",
+    "Play the flow": "播放流程",
+    "Restart explanation": "从头查看",
+    "Previous step": "上一步",
+    "Next step": "下一步",
+    "Step details": "步骤说明",
+    "Architecture stages": "流程步骤",
+    "ONE CONVERSATION, FOLLOWED THROUGH": "沿着同一个对话例子看下去",
+    "Based on this Python implementation. Optional features depend on configuration.": "对应当前 Python 实现，可选能力需按配置启用。",
+    "This walkthrough makes no model calls and reads no private conversations.": "这个导览不会调用模型，也不会读取任何私人对话。",
+    "Back to Companion Studio": "返回体验页",
+    "Architecture language": "架构页语言",
+    "Companion brain: semantic memory, episodic memory, consolidation and emotion": "陪伴引擎：语义记忆、情景记忆、记忆巩固与情绪状态",
+    "A turn retrieves scoped evidence, facts, episodes and character state. The model replies, validates and commits. Cited consolidation derives episodes and core notes; bounded emotional state feeds the next turn. Relevance search uses RRF; recency is applied separately to open follow-up items.": "每轮在用户与角色范围内检索原文、事实、经历和状态，生成回复后校验并提交。记忆巩固生成带引用的情景摘要与核心笔记；有边界的情绪更新进入下一轮。相关性通过 RRF 融合，时效性则单独用于待跟进事项。",
+    "ANIMA LAB / THE BRAIN ATLAS": "ANIMA LAB / 陪伴引擎架构",
+    "A moment becomes continuity.": "每一次交流，都接得上以后。",
+    "Original evidence. Semantic facts. Episodic accounts. A character state that evolves.": "保留对话原文，区分事实与经历，让角色状态随互动自然延续。",
+    "Relevance: Σ 1/(60 + rank). Open-loop priority: importance × (1 + arousal) × age decay + date urgency.": "相关性：Σ 1/(60 + rank)。待跟进优先级：重要性 × (1 + 唤醒度) × 时间衰减 + 日期紧迫性。",
+    "Explore four interactive views for exact formulas, cited consolidation and PAD / relationship decay. Optional features depend on configuration.": "交互页包含四个视图，可查看完整公式、带引用的记忆巩固，以及 PAD 与关系的衰减规则。可选能力需按配置启用。",
+    "Evidence uses RRF; archive memories also use recency and importance.": "原文用 RRF；事实与经历另加时效和重要性权重",
+    "Archive: 0.6 relevance + 0.25 exp(-age/45) + 0.15 importance/10": "事实与经历：0.6×相关性＋0.25×exp(-天数/45)＋0.15×重要性/10",
+    "A turn retrieves scoped evidence, facts, episodes and character state. The model replies, validates and commits. Cited consolidation derives episodes and core notes; bounded emotional state feeds the next turn. Evidence uses RRF; archive ranking uses relevance, recency and importance.": "每轮检索原始证据、事实、经历和角色状态；回复后更新记忆并保留来源。原文用 RRF 融合，事实与经历考虑相关性、时间衰减和重要性。",
+    "Evidence: Σ 1/(40 + rank). Archive: 0.6 relevance + 0.25 recency + 0.15 importance. Open loops: arousal + urgency.": "原文：Σ 1/(40+排名)　事实与经历：0.6×相关性＋0.25×时效＋0.15×重要性　待跟进：唤醒度与日期紧迫性"
+  }
+}

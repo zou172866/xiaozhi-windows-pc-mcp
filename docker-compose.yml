@@ -1,0 +1,62 @@
+services:
+  anima-brain:
+    build:
+      context: ./anima-brain
+      dockerfile: Dockerfile
+    image: xiaozhi-anima-brain:local
+    container_name: xiaozhi-anima-brain
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+      - ANIMA_PORT=18787
+      - ANIMA_DATA_DIR=/data/anima
+      - ANIMA_DEFAULT_CHARACTER=xiaozhi
+      - ANIMA_LAN_IP=192.168.31.200
+      - COMPANION_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+      - COMPANION_MODEL=gemini-3.5-flash-lite
+      - COMPANION_API_KEY=${GEMINI_API_KEY}
+      - COMPANION_SUMMARY_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+      - COMPANION_SUMMARY_MODEL=gemini-3.5-flash-lite
+      - COMPANION_SUMMARY_KEY=${GEMINI_API_KEY}
+      - COMPANION_EMBEDDING_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+      - COMPANION_EMBEDDING_MODEL=gemini-embedding-001
+      - COMPANION_EMBEDDING_KEY=${GEMINI_API_KEY}
+      # 如果未开启全局 TUN 代理，可取消下面三行注释填写宿主机代理端口：
+      # - HTTP_PROXY=http://host.docker.internal:7890
+      # - HTTPS_PROXY=http://host.docker.internal:7890
+      # - NO_PROXY=localhost,127.0.0.1,xiaozhi-esp32-server,192.168.31.0/24
+    ports:
+      # Companion Studio 网页控制台端口
+      - "18787:18787"
+    volumes:
+      # 持久化 Anima Brain SQLite 数据库与访问令牌
+      - ./data/anima:/data/anima
+
+  xiaozhi-esp32-server:
+    image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest
+    container_name: xiaozhi-esp32-server
+    restart: always
+    depends_on:
+      - anima-brain
+    security_opt:
+      - seccomp:unconfined
+    command: ["python", "data/start_with_env.py"]
+    environment:
+      - TZ=Asia/Shanghai
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # 如果容器内无法直连 Google API（未开启全局 TUN 模式），取消下面三行注释并改成你本地软件的代理端口：
+      # - HTTP_PROXY=http://host.docker.internal:7890
+      # - HTTPS_PROXY=http://host.docker.internal:7890
+      # - NO_PROXY=localhost,127.0.0.1,anima-brain,192.168.31.0/24
+    ports:
+      # 使用 >15000 的高位端口，彻底避开 Windows Hyper-V 动态端口占用区间 (1024-15000)
+      - "18000:8000"
+      - "18003:8003"
+      # 小智语音与音色本地控制台端口 -> http://localhost:18080
+      - "18080:18080"
+    volumes:
+      # 配置文件与 Anima Brain 记忆插件目录
+      - ./data:/opt/xiaozhi-esp32-server/data
+      # 本地离线语音识别模型文件挂载
+      - ./models/SenseVoiceSmall/model.pt:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall/model.pt

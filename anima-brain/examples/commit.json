@@ -1,0 +1,12 @@
+{
+  "assistant_reply": "Got it — tea is your go-to.",
+  "memories": [
+    {
+      "key": "preferred_drink",
+      "text": "Prefers tea",
+      "category": "preference",
+      "source_quote": "I prefer tea"
+    }
+  ],
+  "appraisal": null
+}
