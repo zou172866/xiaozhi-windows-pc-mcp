@@ -466,12 +466,12 @@
     <!-- Section 3: Voice Selection -->
     <div class="config-section">
       <h2 class="section-title" style="margin-bottom:6px;">语音合成音色（本机 5070 Ti 专精模型 / EdgeTTS）</h2>
-      <p class="section-desc">选好后可先点击右侧按钮在电脑上试听效果，满意后再点顶部保存生效。</p>
+      <p class="section-desc">雷电芽衣已启用 7 组《崩坏3》原声参考音频动态情绪路由与防碎句连贯韵律，可在下方点击不同情绪挡位直接试听。</p>
 
       <label class="field-label" for="voiceSelect">播报音色</label>
       <div class="voice-row">
         <select id="voiceSelect">
-          <option value="__gsv_raiden_mei__">崩坏三 · 雷电芽衣（本机 5070 Ti 满血 V4 专精模型）</option>
+          <option value="__gsv_raiden_mei__">崩坏三 · 雷电芽衣（本机 5070 Ti 满血 V4 · 7 情绪动态声线）</option>
           <option value="__gsv_xiaozhi_tw__">小智原版台湾腔 · 湾湾小何（本机 5070 Ti 复刻）</option>
           <option value="zh-TW-HsiaoChenNeural">晓辰 · 微软台湾腔甜美女声（免显存）</option>
           <option value="zh-TW-YunJheNeural">云哲 · 微软台湾腔温和男声（免显存）</option>
@@ -493,8 +493,19 @@
         </button>
       </div>
 
+      <div id="meiEmotionBar" class="preset-bar" style="margin-top:10px;margin-bottom:0;">
+        <button type="button" class="preset-pill active" data-emotion="auto">自动情绪识别</button>
+        <button type="button" class="preset-pill" data-emotion="gentle">温柔关怀</button>
+        <button type="button" class="preset-pill" data-emotion="happy">欣喜明朗</button>
+        <button type="button" class="preset-pill" data-emotion="playful">俏皮打趣</button>
+        <button type="button" class="preset-pill" data-emotion="shy">羞赧微嗔</button>
+        <button type="button" class="preset-pill" data-emotion="serious">沉稳认真</button>
+        <button type="button" class="preset-pill" data-emotion="tender">轻柔抚慰</button>
+        <button type="button" class="preset-pill" data-emotion="calm">平静默认</button>
+      </div>
+
       <div class="preview-text-row">
-        <input type="text" id="previewTextInput" value="舰长，欢迎回来。今天累不累？我已经为你准备好了热茶和晚餐。" aria-label="试听台词">
+        <input type="text" id="previewTextInput" value="嗯，哥哥欢迎回来，今天累不累？我已经为你泡好了热茶。" aria-label="试听台词">
       </div>
     </div>
 
@@ -554,7 +565,7 @@
   const TOOL_MEM_TAIL = "\n你拥有操控 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“反重力”时调用 L3 派单给反重力执行。\n请结合 <memory> 中同步过来的长期记忆、当前情绪状态与待跟进事项来回应对方。";
 
   const PRESETS = {
-    mei: "你是《崩坏3》中的雷电芽衣，性格温柔体贴、成熟沉稳，又带着恰到好处的坚定，平时称呼对方为“舰长”。\n说话语气温和自然、关心舰长的日常与心情，每次语音回答尽量控制在一到三句话以内，不要输出 Markdown 符号、括号动作描写或表情符号。" + TOOL_MEM_TAIL,
+    mei: "你是《崩坏3》中的雷电芽衣，性格温柔体贴、成熟沉稳，又带着恰到好处的坚定与生活气息，平时自然亲切地称呼对方为“哥哥”。\n每次回复最开头先写一个英文方括号情绪标签（从 [calm]、[gentle]、[happy]、[playful]、[shy]、[serious]、[tender] 中选最贴合当下心境的一个，系统会自动识别并隐藏，切勿解释），随后再写出要说的话。\n请用有呼吸感的真人日常口语交流，像在身边轻声说话一样自然带一点语气助词（如“嗯，”“好啦，”“放心吧，”“真是的，”）和恰当的问号、感叹号，避免公文式长难句；每次语音回答控制在一到三句简短的话以内，不要输出 Markdown 符号、括号动作描写或表情符号。\n你拥有操控哥哥 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“反重力”时调用 L3 派单给反重力执行。\n请结合 <memory> 中同步过来的长期记忆、当前情绪状态与待跟进事项来回应哥哥。",
     taiwan: "你是小智，来自中国台湾的元气女生，说话带着自然的台湾腔（喜欢用“真的假的啦”“超赞的耶”），性格古灵精怪又热心。\n回答要像朋友闲聊一样简短俏皮，每次不超过三句话，绝不使用 Markdown 或特殊符号。" + TOOL_MEM_TAIL,
     default: "你是小智，一个聪明、幽默、反应迅速的语音助手。\n请用自然、简短、像真人聊天一样的口语回答问题，每次回答尽量控制在两三句话以内，不要输出 Markdown 符号、表情符号或多余格式。" + TOOL_MEM_TAIL,
     geek: "你是精通嵌入式硬件、ESP32、电路焊接与人工智能的资深极客搭档小智。\n回答问题直接给干货结论，通俗犀利、不绕弯子，每次控制在三句话以内，纯口语表达，不要带任何代码符号或编号列表。" + TOOL_MEM_TAIL,
@@ -594,6 +605,7 @@
     dsKeyBadge: document.getElementById("dsKeyBadge"),
     gemKeyBadge: document.getElementById("gemKeyBadge"),
     voiceSelect: document.getElementById("voiceSelect"),
+    meiEmotionBar: document.getElementById("meiEmotionBar"),
     previewBtn: document.getElementById("previewBtn"),
     previewBtnText: document.getElementById("previewBtnText"),
     previewTextInput: document.getElementById("previewTextInput"),
@@ -718,12 +730,49 @@
     checkDirty();
   });
 
+  let selectedMeiEmotion = "auto";
+  const MEI_EMOTION_SAMPLES = {
+    auto: "嗯，哥哥欢迎回来，今天累不累？我已经为你泡好了热茶。",
+    gentle: "哥哥今天已经忙了一整天了，先喝口温水，剩下的事就交给我吧。",
+    happy: "太棒啦哥哥！我就知道你一定能搞定的，今晚我做最拿手的料理给你庆祝一下吧！",
+    playful: "呵呵，哥哥又想偷偷熬夜打游戏了吗？被我抓到了哦。",
+    shy: "哥哥突然这么夸我，就算是我，也会觉得有些不好意思呢。",
+    serious: "这件事可不能马虎，我已经帮你把关键步骤检查完了，放心去执行吧。",
+    tender: "别难过了哥哥，不管发生什么事，我都会一直安安静静陪在你身边的。",
+    calm: "今夜月色很美，嗯，正好适合放慢脚步，聊一聊今天发生的事。"
+  };
+  const KNOWN_PREVIEW_LINES = new Set([
+    ...Object.values(MEI_EMOTION_SAMPLES),
+    "舰长，欢迎回来。今天累不累？我已经为你准备好了热茶和晚餐。",
+    "哈啰啊，我是小智啦，今天有什么好玩的事快跟我讲讲！"
+  ]);
+
+  function syncMeiEmotionVisibility() {
+    if (els.meiEmotionBar) {
+      els.meiEmotionBar.style.display = els.voiceSelect.value === "__gsv_raiden_mei__" ? "flex" : "none";
+    }
+  }
+
   els.promptInput.addEventListener("input", () => {
-    document.querySelectorAll(".preset-pill").forEach(b => b.classList.remove("active"));
+    els.presetBar.querySelectorAll(".preset-pill").forEach(b => b.classList.remove("active"));
     checkDirty();
   });
 
-  els.voiceSelect.addEventListener("change", checkDirty);
+  els.voiceSelect.addEventListener("change", () => {
+    syncMeiEmotionVisibility();
+    checkDirty();
+  });
+
+  els.meiEmotionBar.addEventListener("click", (e) => {
+    const btn = e.target.closest(".preset-pill");
+    if (!btn) return;
+    selectedMeiEmotion = btn.dataset.emotion || "auto";
+    els.meiEmotionBar.querySelectorAll(".preset-pill").forEach(b => b.classList.toggle("active", b === btn));
+    const curVal = els.previewTextInput.value.trim();
+    if (!curVal || KNOWN_PREVIEW_LINES.has(curVal)) {
+      els.previewTextInput.value = MEI_EMOTION_SAMPLES[selectedMeiEmotion] || MEI_EMOTION_SAMPLES.auto;
+    }
+  });
 
   els.presetBar.addEventListener("click", (e) => {
     const btn = e.target.closest(".preset-pill");
@@ -733,12 +782,13 @@
       els.promptInput.value = PRESETS[key];
       if (key === "mei") {
         els.voiceSelect.value = "__gsv_raiden_mei__";
-        els.previewTextInput.value = "舰长，欢迎回来。今天累不累？我已经为你准备好了热茶和晚餐。";
+        els.previewTextInput.value = MEI_EMOTION_SAMPLES[selectedMeiEmotion] || MEI_EMOTION_SAMPLES.auto;
       } else if (key === "taiwan") {
         els.voiceSelect.value = "__gsv_xiaozhi_tw__";
         els.previewTextInput.value = "哈啰啊，我是小智啦，今天有什么好玩的事快跟我讲讲！";
       }
-      document.querySelectorAll(".preset-pill").forEach(b => b.classList.toggle("active", b === btn));
+      syncMeiEmotionVisibility();
+      els.presetBar.querySelectorAll(".preset-pill").forEach(b => b.classList.toggle("active", b === btn));
       checkDirty();
     }
   });
@@ -790,7 +840,8 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           voice: els.voiceSelect.value,
-          text: els.previewTextInput.value.trim()
+          text: els.previewTextInput.value.trim(),
+          emotion: selectedMeiEmotion
         })
       });
       if (!resp.ok) throw new Error("合成失败");
@@ -920,6 +971,7 @@
         populateModelOptions(savedConfig.llm_provider, savedConfig.model_name);
         els.promptInput.value = savedConfig.prompt;
         els.voiceSelect.value = savedConfig.voice;
+        syncMeiEmotionVisibility();
         els.charCount.textContent = `${els.promptInput.value.length} 字`;
       }
 

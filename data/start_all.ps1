@@ -100,7 +100,7 @@ try {
         Start-Sleep -Seconds 1
     }
     $warm = @{
-        text = "预热。"; text_lang = "zh"; text_split_method = "cut5"; batch_size = 1; media_type = "wav"
+        text = "预热。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"
         ref_audio_path = "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav"
         prompt_text = "今夜月色很美，呵...适合与朋友小聚一番。"; prompt_lang = "zh"
     } | ConvertTo-Json -Compress

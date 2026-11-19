@@ -114,6 +114,13 @@ try:
 except Exception as _w_exc:
     print(f"[NMCWeather] 补丁加载异常: {_w_exc}", flush=True)
 
+# 5. Mount Raiden Mei multi-emotion dynamic reference audio routing & smooth prosodic clause splitter
+try:
+    import mei_emotion_router
+    mei_emotion_router.apply_xiaozhi_emotion_and_prosody_patches()
+except Exception as _m_exc:
+    print(f"[MeiEmotionRouter] 补丁加载异常: {_m_exc}", flush=True)
+
 if __name__ == "__main__":
     try:
         import console_server

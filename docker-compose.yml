@@ -31,6 +31,7 @@ services:
     volumes:
       # 持久化 Anima Brain SQLite 数据库与访问令牌
       - ./data/anima:/data/anima
+      - ./anima-brain/xiaozhi_anima_service.py:/app/xiaozhi_anima_service.py:ro
 
   xiaozhi-esp32-server:
     image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest

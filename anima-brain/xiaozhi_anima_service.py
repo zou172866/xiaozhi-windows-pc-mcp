@@ -169,8 +169,26 @@ def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: s
                 json.loads(row["state"]), now, f"{engine.owner}:{character_id}"
             )
             rel_note = emotion.note(state, now, romance_enabled=spec.romance_enabled)
-            mood_label = state.get("last_emotion") or "calm"
-            stage_label = state.get("stage") or ""
+            fam_band = max(0, min(3, int((state.get("bands") or {}).get("familiarity", 0))))
+            stage_label = ("stranger", "acquaintance", "familiar", "close")[fam_band]
+            mood_label = state.get("last_emotion") or ""
+            if not mood_label:
+                last_app_row = engine.db.execute(
+                    "SELECT p.data, t.created_at FROM turn_appraisals p "
+                    "JOIN turns t ON t.id = p.turn_id "
+                    "WHERE t.owner=? AND t.character_id=? AND t.status='committed' "
+                    "ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1",
+                    (engine.owner, character_id),
+                ).fetchone()
+                if last_app_row and (now - float(last_app_row["created_at"] or 0.0)) <= 6 * 3600:
+                    try:
+                        mood_label = str(json.loads(last_app_row["data"]).get("emotion") or "")
+                    except Exception:
+                        mood_label = ""
+            if not mood_label:
+                pad_p = float((state.get("pad") or [0.0])[0])
+                warmth_band = int((state.get("bands") or {}).get("warmth", 0))
+                mood_label = "warm" if (warmth_band >= 2 and pad_p >= 0.35) else "calm"
             mood_summary = f"stage={stage_label}, last_emotion={mood_label}"
 
         # 2. Pinned boundaries/style + layered retrieval + lexical FTS5 search

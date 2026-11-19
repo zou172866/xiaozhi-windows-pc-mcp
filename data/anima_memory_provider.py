@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import httpx
+import mei_emotion_router
 from core.providers.memory.base import MemoryProviderBase, logger
 
 TAG = __name__
@@ -91,7 +92,9 @@ def extract_clean_pairs(messages) -> list:
             cur_user = content
             cur_assistant_parts = []
         elif role == "assistant" and content and cur_user:
-            cur_assistant_parts.append(content)
+            clean_reply = mei_emotion_router.strip_emotion_tags(content).strip()
+            if clean_reply:
+                cur_assistant_parts.append(clean_reply)
 
     if cur_user and cur_assistant_parts:
         pairs.append(
@@ -135,6 +138,8 @@ class MemoryProvider(MemoryProviderBase):
             )
             if resp.status_code == 200:
                 data = resp.json()
+                mood_str = str(data.get("mood") or "")
+                mei_emotion_router.set_anima_mood(mood_str)
                 ctx = (data.get("context_text") or "").strip()
                 # 剥离重复的【角色身份设定】段落，以小智主配置 prompt 为唯一人设权威，避免双倍 Token 与人设冲突
                 ctx = re.sub(

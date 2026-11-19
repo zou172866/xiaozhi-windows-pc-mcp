@@ -13,6 +13,8 @@ import edge_tts
 import httpx
 import yaml
 
+import mei_emotion_router
+
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 CONFIG_PATH = os.path.join(DATA_DIR, ".config.yaml")
@@ -42,8 +44,8 @@ GSV_PROFILES = {
             "prompt_lang": "zh",
             "top_k": 12,
             "top_p": 1,
-            "temperature": 1,
-            "text_split_method": "cut5",
+            "temperature": 0.98,
+            "text_split_method": "cut0",
             "batch_size": 1,
             "batch_threshold": 0.75,
             "split_bucket": True,
@@ -70,8 +72,8 @@ GSV_PROFILES = {
             "prompt_lang": "zh",
             "top_k": 12,
             "top_p": 1,
-            "temperature": 1,
-            "text_split_method": "cut5",
+            "temperature": 0.98,
+            "text_split_method": "cut0",
             "batch_size": 1,
             "batch_threshold": 0.75,
             "split_bucket": True,
@@ -84,7 +86,34 @@ GSV_PROFILES = {
         },
     },
 }
+_gsv_weights_lock = threading.RLock()
 _active_gsv_loaded = None
+
+
+def _detect_boot_gsv_voice() -> str | None:
+    if os.path.exists(GSV_INFER_YAML):
+        try:
+            with open(GSV_INFER_YAML, "r", encoding="utf-8") as rf:
+                boot_cfg = yaml.safe_load(rf) or {}
+            t2s = str((boot_cfg.get("custom") or {}).get("t2s_weights_path") or "")
+            for vid, prof in GSV_PROFILES.items():
+                if prof["gpt_weights"] == t2s:
+                    return vid
+        except Exception:
+            pass
+    return None
+
+
+def _get_configured_gsv_voice() -> str | None:
+    try:
+        cfg = _read_raw_yaml()
+        selected = cfg.get("selected_module", {})
+        if selected.get("TTS") != "GPT_SOVITS_V2":
+            return None
+        ref_p = str((cfg.get("TTS", {}).get("GPT_SOVITS_V2") or {}).get("ref_audio_path") or "")
+        return "__gsv_raiden_mei__" if "raiden_mei" in ref_p else "__gsv_xiaozhi_tw__"
+    except Exception:
+        return None
 
 
 def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
@@ -92,13 +121,22 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
     prof = GSV_PROFILES.get(voice_id)
     if not prof:
         return
-    if _active_gsv_loaded != voice_id:
-        httpx.get(f"{GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=25.0)
-        httpx.get(f"{GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=30.0)
-        _active_gsv_loaded = voice_id
-    if persist_boot_yaml:
-        boot_cfg = {
-            "custom": {
+    with _gsv_weights_lock:
+        if _active_gsv_loaded is None:
+            _active_gsv_loaded = _detect_boot_gsv_voice()
+        if _active_gsv_loaded != voice_id:
+            httpx.get(f"{GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=25.0)
+            httpx.get(f"{GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=30.0)
+            _active_gsv_loaded = voice_id
+        if persist_boot_yaml:
+            boot_cfg = {}
+            if os.path.exists(GSV_INFER_YAML):
+                try:
+                    with open(GSV_INFER_YAML, "r", encoding="utf-8") as rf:
+                        boot_cfg = yaml.safe_load(rf) or {}
+                except Exception:
+                    boot_cfg = {}
+            boot_cfg["custom"] = {
                 "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
                 "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
                 "device": "cuda",
@@ -107,9 +145,8 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
                 "version": prof["version"],
                 "vits_weights_path": prof["sovits_weights"],
             }
-        }
-        with open(GSV_INFER_YAML, "w", encoding="utf-8") as f:
-            yaml.safe_dump(boot_cfg, f, allow_unicode=True, sort_keys=False)
+            with open(GSV_INFER_YAML, "w", encoding="utf-8") as f:
+                yaml.safe_dump(boot_cfg, f, allow_unicode=True, sort_keys=False)
 
 
 _state_lock = threading.Lock()
@@ -227,13 +264,18 @@ def _process_log_line(line: str):
 
         m_ai = _RE_AI_SENTENCE.search(s)
         if m_ai:
-            stype, content = m_ai.group(1), m_ai.group(2).strip()
+            stype, raw_content = m_ai.group(1), m_ai.group(2).strip()
+            content = (
+                "None"
+                if raw_content == "None"
+                else mei_emotion_router.strip_emotion_tags(raw_content).strip()
+            )
             _device_info["last_seen"] = ts_short
             if stype == "LAST" or content == "None":
                 _current_ai_turn_open = False
                 _device_info["activity"] = "idle"
                 _save_history()
-            else:
+            elif content:
                 _device_info["activity"] = "speaking"
                 if _current_ai_turn_open and _chat_messages and _chat_messages[-1]["role"] == "assistant":
                     _chat_messages[-1]["text"] = _join_cn_clauses(_chat_messages[-1]["text"], content)
@@ -311,11 +353,12 @@ def _sync_persona_to_anima(prompt: str):
             if not target_spec:
                 return
             new_name = _infer_character_name(clean_prompt)
-            if target_spec.get("name") == new_name and (target_spec.get("persona") or "").strip() == clean_prompt:
+            anima_persona = mei_emotion_router.strip_voice_tag_instruction_for_anima(clean_prompt)
+            if target_spec.get("name") == new_name and (target_spec.get("persona") or "").strip() == anima_persona:
                 return
             updated = dict(target_spec)
             updated["name"] = new_name
-            updated["persona"] = clean_prompt
+            updated["persona"] = anima_persona
             r = client.post(f"{ANIMA_HOST}/api/update_character", headers=headers, json={"spec": updated})
             if r.status_code == 200:
                 print(f"[WebConsole] 已自动同步角色设定至 Anima Brain: name={new_name}", flush=True)
@@ -463,6 +506,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "gemini_key_ok": gem_ok,
                         "pc_mode": _read_pc_mode(),
                         "agy_bridge_online": _check_agy_bridge_online(),
+                        "mei_emotions": [
+                            {"id": k, "label": v.get("label_zh", k)}
+                            for k, v in mei_emotion_router.load_mei_emotions().items()
+                        ],
                     },
                     "device": dev,
                     "messages": msgs,
@@ -531,17 +578,53 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_body_json()
                 voice = str(body.get("voice") or "__gsv_raiden_mei__").strip()
-                text = str(body.get("text") or "舰长，欢迎回来，今天的工作辛苦了，稍微休息一下吧。").strip()
+                raw_text = str(body.get("text") or "嗯，哥哥欢迎回来，今天的工作辛苦了，我已经为你泡好了热茶。").strip()
+                req_emotion = str(body.get("emotion") or "auto").strip().lower()
+                tag_emo, stripped_text = mei_emotion_router.extract_and_strip_emotion(
+                    raw_text, flush_incomplete=True
+                )
+                clean_text = mei_emotion_router.clean_segment_for_tts(stripped_text) or "欢迎回来，今天辛苦了。"
                 if voice in GSV_PROFILES:
-                    _ensure_gsv_weights(voice, persist_boot_yaml=False)
-                    req_payload = dict(GSV_PROFILES[voice]["block"])
-                    req_payload["text"] = text[:120]
-                    for drop_k in ("type", "url", "output_dir"):
-                        req_payload.pop(drop_k, None)
-                    r = httpx.post(f"{GSV_Host}/tts", json=req_payload, timeout=25.0)
-                    if r.status_code != 200:
-                        raise RuntimeError(f"本地 GPT-SoVITS 未就绪或返回异常 ({r.status_code})")
-                    wav_bytes = r.content
+                    configured_gsv = _get_configured_gsv_voice()
+                    with _gsv_weights_lock:
+                        _ensure_gsv_weights(voice, persist_boot_yaml=False)
+                        try:
+                            req_payload = dict(GSV_PROFILES[voice]["block"])
+                            req_payload["text"] = clean_text[:120]
+                            req_payload["text_split_method"] = "cut0"
+                            if voice == "__gsv_raiden_mei__":
+                                explicit_emo = None
+                                if req_emotion and req_emotion != "auto":
+                                    norm_emo, _ = mei_emotion_router.normalize_emotion_name(req_emotion)
+                                    explicit_emo = norm_emo or req_emotion
+                                elif tag_emo:
+                                    explicit_emo = tag_emo
+                                emo_key = mei_emotion_router.resolve_mei_emotion(
+                                    clean_text,
+                                    explicit_segment_emotion=explicit_emo,
+                                )
+                                emo_prof = mei_emotion_router.get_mei_emotion_profile(emo_key)
+                                req_payload["ref_audio_path"] = emo_prof["ref_audio_path"]
+                                req_payload["aux_ref_audio_paths"] = []
+                                req_payload["prompt_text"] = emo_prof["prompt_text"]
+                                req_payload["prompt_lang"] = emo_prof.get("prompt_lang", "zh")
+                                req_payload["speed_factor"] = emo_prof["speed_factor"]
+                                req_payload["temperature"] = emo_prof["temperature"]
+                                req_payload["top_k"] = emo_prof["top_k"]
+                                req_payload["top_p"] = emo_prof["top_p"]
+                            for drop_k in ("type", "url", "output_dir"):
+                                req_payload.pop(drop_k, None)
+                            r = httpx.post(f"{GSV_Host}/tts", json=req_payload, timeout=25.0)
+                            if r.status_code != 200:
+                                raise RuntimeError(f"本地 GPT-SoVITS 未就绪或返回异常 ({r.status_code})")
+                            wav_bytes = r.content
+                        finally:
+                            # Restore live configured ESP32 GSV weights if user only previewed another GSV voice
+                            if configured_gsv and configured_gsv != voice:
+                                try:
+                                    _ensure_gsv_weights(configured_gsv, persist_boot_yaml=False)
+                                except Exception:
+                                    pass
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "audio/wav")
                     self.send_header("Cache-Control", "no-store")
@@ -549,7 +632,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(wav_bytes)
                 else:
-                    mp3_bytes = asyncio.run(_synthesize_mp3(text=text[:120], voice=voice))
+                    mp3_bytes = asyncio.run(_synthesize_mp3(text=clean_text[:120], voice=voice))
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "audio/mpeg")
                     self.send_header("Cache-Control", "no-store")
