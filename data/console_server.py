@@ -273,6 +273,56 @@ def _read_raw_yaml() -> dict:
         return yaml.safe_load(f) or {}
 
 
+ANIMA_HOST = "http://anima-brain:18787"
+ANIMA_TOKEN_PATH = os.path.join(DATA_DIR, "anima", "studio_token.txt")
+
+
+def _infer_character_name(prompt: str) -> str:
+    p = (prompt or "").strip()
+    if "雷电芽衣" in p:
+        return "雷电芽衣"
+    if "芽衣" in p:
+        return "芽衣"
+    m = re.search(r"你是(?:《[^》]+》中的)?([\u4e00-\u9fa5A-Za-z0-9]{2,8}?)(?:[，,。！!、\s]|$)", p)
+    if m:
+        cand = m.group(1).strip()
+        if cand and not cand.startswith(("一个", "一名", "一位", "住在")):
+            return cand
+    return "小智"
+
+
+def _sync_persona_to_anima(prompt: str):
+    """将 18080 控制台的角色姓名与提示词自动同步至 18787 Anima Brain 数据库，确保双端一致。"""
+    clean_prompt = (prompt or "").strip()
+    if not clean_prompt or not os.path.isfile(ANIMA_TOKEN_PATH):
+        return
+    try:
+        with open(ANIMA_TOKEN_PATH, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+        if not token:
+            return
+        headers = {"Authorization": f"Bearer {token}"}
+        with httpx.Client(timeout=5.0, trust_env=False) as client:
+            boot = client.get(f"{ANIMA_HOST}/api/bootstrap", headers=headers)
+            if boot.status_code != 200:
+                return
+            chars = boot.json().get("characters") or []
+            target_spec = next((c for c in chars if c.get("id") == "xiaozhi"), None)
+            if not target_spec:
+                return
+            new_name = _infer_character_name(clean_prompt)
+            if target_spec.get("name") == new_name and (target_spec.get("persona") or "").strip() == clean_prompt:
+                return
+            updated = dict(target_spec)
+            updated["name"] = new_name
+            updated["persona"] = clean_prompt
+            r = client.post(f"{ANIMA_HOST}/api/update_character", headers=headers, json={"spec": updated})
+            if r.status_code == 200:
+                print(f"[WebConsole] 已自动同步角色设定至 Anima Brain: name={new_name}", flush=True)
+    except Exception as exc:
+        print(f"[WebConsole] 同步 Anima Brain 设定跳过: {exc}", flush=True)
+
+
 def _write_updated_yaml(prompt: str, llm_provider: str, model_name: str, voice: str):
     cfg = _read_raw_yaml()
     cfg["prompt"] = prompt.strip() + "\n"
@@ -322,6 +372,7 @@ def _write_updated_yaml(prompt: str, llm_provider: str, model_name: str, voice: 
     body = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         f.write(header + body)
+    threading.Thread(target=_sync_persona_to_anima, args=(prompt,), daemon=True).start()
 
 
 async def _synthesize_mp3(text: str, voice: str) -> bytes:
@@ -515,6 +566,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 def start_console_background():
     watcher = threading.Thread(target=_log_watcher_loop, name="console-log-watcher", daemon=True)
     watcher.start()
+
+    def _boot_sync():
+        time.sleep(2.0)
+        cfg = _read_raw_yaml()
+        if cfg.get("prompt"):
+            _sync_persona_to_anima(str(cfg["prompt"]))
+
+    threading.Thread(target=_boot_sync, name="anima-persona-sync", daemon=True).start()
 
     def _serve():
         httpd = ThreadingHTTPServer(("0.0.0.0", CONSOLE_PORT), ConsoleHandler)

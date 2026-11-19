@@ -5,6 +5,7 @@
 """
 
 import os
+import re
 import threading
 import httpx
 from core.providers.memory.base import MemoryProviderBase, logger
@@ -135,6 +136,13 @@ class MemoryProvider(MemoryProviderBase):
             if resp.status_code == 200:
                 data = resp.json()
                 ctx = (data.get("context_text") or "").strip()
+                # 剥离重复的【角色身份设定】段落，以小智主配置 prompt 为唯一人设权威，避免双倍 Token 与人设冲突
+                ctx = re.sub(
+                    r"^【角色身份设定（来自 Companion Studio）】.*?(?=\n\n【|\Z)",
+                    "",
+                    ctx,
+                    flags=re.DOTALL,
+                ).strip()
                 logger.bind(tag=TAG).info(
                     f"Anima Brain 极速召回成功: 事实={data.get('facts_count', 0)}, "
                     f"待跟进={data.get('open_loops_count', 0)}, 状态={data.get('mood', '')}"
