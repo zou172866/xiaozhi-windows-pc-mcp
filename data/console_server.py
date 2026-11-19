@@ -14,6 +14,7 @@ import httpx
 import yaml
 
 import mei_emotion_router
+import pc_audio_router
 
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
 DATA_DIR = os.path.join(ROOT_DIR, "data")
@@ -490,6 +491,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 msgs = list(_chat_messages[-60:])
                 logs = list(_raw_logs)[-100:]
 
+            audio_cfg = pc_audio_router.read_audio_output_config()
+
             self._send_json(
                 {
                     "config": {
@@ -505,6 +508,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "deepseek_key_ok": ds_ok,
                         "gemini_key_ok": gem_ok,
                         "pc_mode": _read_pc_mode(),
+                        "audio_output": audio_cfg["target"],
+                        "pc_audio_volume": audio_cfg["volume"],
+                        "pc_audio_online": pc_audio_router.is_pc_audio_bridge_online(),
                         "agy_bridge_online": _check_agy_bridge_online(),
                         "mei_emotions": [
                             {"id": k, "label": v.get("label_zh", k)}
@@ -532,6 +538,47 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     return
                 _write_pc_mode(mode)
                 self._send_json({"ok": True, "mode": mode})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/audio-output":
+            try:
+                body = self._read_body_json()
+                target = str(body.get("target") or "").strip().lower()
+                volume = body.get("volume", None)
+                if not target:
+                    target = pc_audio_router.read_audio_output_config()["target"]
+                if target not in ("esp32", "pc"):
+                    self._send_json({"ok": False, "error": "无效的音频输出目标"}, HTTPStatus.BAD_REQUEST)
+                    return
+                saved = pc_audio_router.write_audio_output_config(target, volume)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "target": saved["target"],
+                        "volume": saved["volume"],
+                        "pc_audio_online": pc_audio_router.is_pc_audio_bridge_online(force=True),
+                    }
+                )
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/audio-test":
+            try:
+                body = self._read_body_json()
+                vol = body.get("volume", None)
+                ref_wav = os.path.join(DATA_DIR, "voices", "raiden_mei", "mei_gentle_ref.wav")
+                if not os.path.isfile(ref_wav):
+                    ref_wav = os.path.join(DATA_DIR, "wakeup_words_short.wav")
+                with open(ref_wav, "rb") as f:
+                    wav_bytes = f.read()
+                ok, detail = pc_audio_router.play_wav_on_pc_sync(wav_bytes, volume=vol)
+                if ok:
+                    self._send_json({"ok": True})
+                else:
+                    self._send_json({"ok": False, "error": f"电脑音响桥接不可用: {detail}"}, HTTPStatus.BAD_GATEWAY)
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return

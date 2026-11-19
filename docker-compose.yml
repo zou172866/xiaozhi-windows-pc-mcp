@@ -8,6 +8,8 @@ services:
     restart: always
     environment:
       - TZ=Asia/Shanghai
+      - MALLOC_ARENA_MAX=2
+      - OMP_NUM_THREADS=2
       - ANIMA_PORT=18787
       - ANIMA_DATA_DIR=/data/anima
       - ANIMA_DEFAULT_CHARACTER=xiaozhi
@@ -44,6 +46,8 @@ services:
     command: ["python", "data/start_with_env.py"]
     environment:
       - TZ=Asia/Shanghai
+      - MALLOC_ARENA_MAX=2
+      - OMP_NUM_THREADS=2
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       # 如果容器内无法直连 Google API（未开启全局 TUN 模式），取消下面三行注释并改成你本地软件的代理端口：
@@ -59,5 +63,7 @@ services:
     volumes:
       # 配置文件与 Anima Brain 记忆插件目录
       - ./data:/opt/xiaozhi-esp32-server/data
-      # 本地离线语音识别模型文件挂载
+      # 轻量 Sherpa-ONNX SenseVoice int8 本地离线语音识别模型（默认，内存仅 ~350MB）
+      - ./models/sherpa-onnx-sense-voice:/opt/xiaozhi-esp32-server/models/sherpa-onnx-sense-voice:ro
+      # 保留原 FunASR PyTorch 模型挂载以便按需一键回滚
       - ./models/SenseVoiceSmall/model.pt:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall/model.pt

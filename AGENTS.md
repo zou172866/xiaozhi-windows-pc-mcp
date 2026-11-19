@@ -26,7 +26,11 @@
   - `data/anima_memory_provider.py` 召回时必须剥离重复的 `【角色身份设定】` 段落（以 `18080` 主 `prompt` 为唯一人设权威），且 `data/console_server.py` 保存配置时必须自动调用 `/api/update_character` 双端同步角色 `name` 与 `persona`；
 - **防抢话 VAD 阈值**：保留 `VAD.SileroVAD` 的 `min_silence_duration_ms: 1100` 与 `threshold_low: 0.2`（严禁回退至上游默认的 `200ms` 导致用户句中换气被截断）；
 - **免 Key 天气补丁**：保留 `data/nmc_weather_patch.py`（中央气象台 `nmc.cn` 实时与 7 天预报，默认城市 `长沙`，过滤 `9999` 缺测哨兵值），不回退上游已 `401` 失效的和风测试 Key；
-- **冷内存自动裁剪**：保留 `data/start_all.ps1` 启动末尾对 `19880` 进程的 `EmptyWorkingSet` 冷页回收与 WSL2 `drop_caches`。
+- **轻量语音识别与冷内存治理**：
+  - 默认 `selected_module.ASR` 保持 `SherpaASR`（`models/sherpa-onnx-sense-voice/model.int8.onnx`）并保留 `data/start_with_env.py` 中的 `modelscope` 懒加载守卫、异步 `decode_stream` 与定期 `malloc_trim(0)`（容器常驻内存由 `3.54 GB` 降至 `~400 MB`，切勿无故回退 `FunASR` 拖入 PyTorch）；
+  - 保留 `docker-compose.yml` 中的 `MALLOC_ARENA_MAX=2` 与 `OMP_NUM_THREADS=2`；
+  - 保留 `data/start_all.ps1` 中 `19880` 进程的 `GSV_IDLE_TRIM_SECONDS=60` 闲置自动回收、预热后 `EmptyWorkingSet` 与 WSL2 `drop_caches`，以及 `gpt-sovits-studio` 中默认 `G2PWTorchConverter`（CUDA FP16 替代 CPU `g2pW.onnx`）与 `TTS.py` 权重幂等加载；
+- **Windows 电脑音响 48kHz 直通桥接**：保留 `data/pc_audio_router.py`（须于 `mei_emotion_router` 之前挂载 `apply_pc_audio_to_tts_patch`、之后挂载 `apply_pc_audio_playback_patches`）、`pc-mcp/pc_control_mcp.py` 复用的 `18900` 端口 `/audio/*` WinMM 无损播放接口，以及 `18080` 控制台免重启切换开关（`data/audio_output_mode.json`）。
 
 ## 4. 雷电芽衣 7 情绪动态语音与流式切句规范
 - **防流式吞括号念标签**：保留 `data/mei_emotion_router.py` 对 `ConnectionHandler._clean_response_garbage`、`PromptManager.build_enhanced_prompt` 及 `_inject_tool_call_fewshot` 的补丁，严防 `direct_answer` 分块边界误删 `[gentle]` 右括号 `]` 导致 TTS 朗读英文标签，同时保留 `[安全挡]` 等正常正文方括号。

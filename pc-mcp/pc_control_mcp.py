@@ -1,5 +1,10 @@
+import asyncio
 import base64
 import ctypes
+import ctypes.wintypes as wt
+import queue
+import threading
+import wave
 
 # 必须在导入 pyautogui / PIL / uiautomation 之前开启 Per-Monitor DPI V2 感知，
 # 将截图、UIA 控件矩形与鼠标点击统一锁死在 1:1 真实物理像素坐标系（消除 200% 缩放错位）
@@ -1218,8 +1223,289 @@ def antigravity_agent_task(
     return "已成功投递给本机反重力后台队列开始处理，稍后可随时问我进度！"
 
 
+# =====================================================================
+# Windows Native WinMM (waveOut) 48kHz Lossless PC Speaker Audio Bridge
+# Mounted directly on existing 18900 HTTP server (zero extra port/RAM)
+# =====================================================================
+class _WAVEFORMATEX(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("wFormatTag", wt.WORD),
+        ("nChannels", wt.WORD),
+        ("nSamplesPerSec", wt.DWORD),
+        ("nAvgBytesPerSec", wt.DWORD),
+        ("nBlockAlign", wt.WORD),
+        ("wBitsPerSample", wt.WORD),
+        ("cbSize", wt.WORD),
+    ]
+
+
+class _WAVEHDR(ctypes.Structure):
+    _fields_ = [
+        ("lpData", ctypes.c_char_p),
+        ("dwBufferLength", wt.DWORD),
+        ("dwBytesRecorded", wt.DWORD),
+        ("dwUser", ctypes.c_size_t),
+        ("dwFlags", wt.DWORD),
+        ("dwLoops", wt.DWORD),
+        ("lpNext", ctypes.c_void_p),
+        ("reserved", ctypes.c_size_t),
+    ]
+
+
+_winmm = ctypes.windll.winmm
+_winmm.waveOutGetNumDevs.argtypes = []
+_winmm.waveOutGetNumDevs.restype = wt.UINT
+_winmm.waveOutOpen.argtypes = [
+    ctypes.POINTER(ctypes.c_void_p),
+    wt.UINT,
+    ctypes.POINTER(_WAVEFORMATEX),
+    ctypes.c_size_t,
+    ctypes.c_size_t,
+    wt.DWORD,
+]
+_winmm.waveOutOpen.restype = wt.UINT
+_winmm.waveOutPrepareHeader.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WAVEHDR), wt.UINT]
+_winmm.waveOutPrepareHeader.restype = wt.UINT
+_winmm.waveOutWrite.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WAVEHDR), wt.UINT]
+_winmm.waveOutWrite.restype = wt.UINT
+_winmm.waveOutUnprepareHeader.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WAVEHDR), wt.UINT]
+_winmm.waveOutUnprepareHeader.restype = wt.UINT
+_winmm.waveOutReset.argtypes = [ctypes.c_void_p]
+_winmm.waveOutReset.restype = wt.UINT
+_winmm.waveOutClose.argtypes = [ctypes.c_void_p]
+_winmm.waveOutClose.restype = wt.UINT
+
+_WAVE_MAPPER = 0xFFFFFFFF
+_WAVE_FORMAT_PCM = 1
+_WHDR_DONE = 0x00000001
+
+
+def _scale_pcm16(pcm_bytes: bytes, volume: float) -> bytes:
+    if abs(volume - 1.0) <= 0.01 or not pcm_bytes:
+        return pcm_bytes
+    vol = max(0.05, min(1.8, float(volume)))
+    try:
+        import audioop
+        return audioop.mul(pcm_bytes, 2, vol)
+    except Exception:
+        import array
+        arr = array.array("h")
+        arr.frombytes(pcm_bytes)
+        for i, s in enumerate(arr):
+            v = int(s * vol)
+            if v > 32767:
+                v = 32767
+            elif v < -32768:
+                v = -32768
+            arr[i] = v
+        return arr.tobytes()
+
+
+class _WinMMPlayer:
+    """Sequential lossless PCM WAV playback queue for Windows default audio device."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._queue: "queue.Queue[tuple]" = queue.Queue()
+        self._gen = 0
+        self._active_hwo: Optional[ctypes.c_void_p] = None
+        self._active_fmt: Optional[tuple] = None
+        self._playing = False
+        self._idle_event = threading.Event()
+        self._idle_event.set()
+        self._stop_signal = threading.Event()
+        self._worker = threading.Thread(target=self._run_loop, name="winmm-audio-player", daemon=True)
+        self._worker.start()
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "ok": True,
+                "playing": self._playing,
+                "queued": self._queue.qsize(),
+                "devices": int(_winmm.waveOutGetNumDevs()),
+            }
+
+    def enqueue_wav(self, wav_bytes: bytes, turn_id: str = "", volume: float = 1.0) -> int:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            nframes = wf.getnframes()
+            pcm = wf.readframes(nframes)
+        if sampwidth != 2:
+            raise ValueError(f"Only 16-bit PCM WAV is supported, got sampwidth={sampwidth}")
+        if abs(volume - 1.0) > 0.01:
+            pcm = _scale_pcm16(pcm, volume)
+        dur_ms = int(round((nframes / float(framerate)) * 1000.0)) if framerate > 0 else 0
+        with self._lock:
+            gen = self._gen
+            self._idle_event.clear()
+            self._queue.put((gen, turn_id, pcm, channels, framerate, sampwidth * 8))
+        return dur_ms
+
+    def stop(self) -> None:
+        with self._lock:
+            self._gen += 1
+            self._stop_signal.set()
+            while True:
+                try:
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                except queue.Empty:
+                    break
+            hwo = self._active_hwo
+        if hwo is not None:
+            try:
+                _winmm.waveOutReset(hwo)
+            except Exception:
+                pass
+
+    def wait_idle(self, timeout: float = 8.0) -> bool:
+        return self._idle_event.wait(timeout=max(0.1, float(timeout)))
+
+    def _close_device(self):
+        with self._lock:
+            hwo = self._active_hwo
+            self._active_hwo = None
+            self._active_fmt = None
+        if hwo is not None:
+            try:
+                _winmm.waveOutReset(hwo)
+                _winmm.waveOutClose(hwo)
+            except Exception:
+                pass
+
+    def _ensure_device(self, channels: int, sample_rate: int, bits: int) -> ctypes.c_void_p:
+        fmt_key = (channels, sample_rate, bits)
+        with self._lock:
+            if self._active_hwo is not None and self._active_fmt == fmt_key:
+                return self._active_hwo
+        self._close_device()
+        wfx = _WAVEFORMATEX()
+        wfx.wFormatTag = _WAVE_FORMAT_PCM
+        wfx.nChannels = channels
+        wfx.nSamplesPerSec = sample_rate
+        wfx.wBitsPerSample = bits
+        wfx.nBlockAlign = channels * (bits // 8)
+        wfx.nAvgBytesPerSec = sample_rate * wfx.nBlockAlign
+        wfx.cbSize = 0
+        hwo = ctypes.c_void_p()
+        res = _winmm.waveOutOpen(ctypes.byref(hwo), _WAVE_MAPPER, ctypes.byref(wfx), 0, 0, 0)
+        if res != 0:
+            raise RuntimeError(f"waveOutOpen failed with code {res}")
+        with self._lock:
+            self._active_hwo = hwo
+            self._active_fmt = fmt_key
+        return hwo
+
+    def _run_loop(self):
+        while True:
+            try:
+                item = self._queue.get(timeout=0.8)
+            except queue.Empty:
+                # Release audio handle cleanly when idle so Windows sound sleep/switch stays clean
+                self._close_device()
+                with self._lock:
+                    if self._queue.empty() and not self._playing:
+                        self._idle_event.set()
+                continue
+
+            gen, _turn_id, pcm, channels, sample_rate, bits = item
+            try:
+                with self._lock:
+                    if gen != self._gen:
+                        continue
+                    self._playing = True
+                    self._stop_signal.clear()
+
+                hwo = self._ensure_device(channels, sample_rate, bits)
+                buf = ctypes.create_string_buffer(pcm, len(pcm))
+                hdr = _WAVEHDR()
+                hdr.lpData = ctypes.cast(buf, ctypes.c_char_p)
+                hdr.dwBufferLength = len(pcm)
+                hdr.dwFlags = 0
+
+                if _winmm.waveOutPrepareHeader(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
+                    self._close_device()
+                    continue
+                try:
+                    if _winmm.waveOutWrite(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
+                        self._close_device()
+                        continue
+                    while not (hdr.dwFlags & _WHDR_DONE):
+                        with self._lock:
+                            aborted = gen != self._gen
+                        if aborted:
+                            _winmm.waveOutReset(hwo)
+                            break
+                        self._stop_signal.wait(0.012)
+                    # Wait briefly for driver to mark WHDR_DONE after reset before unpreparing
+                    for _ in range(25):
+                        if hdr.dwFlags & _WHDR_DONE:
+                            break
+                        time.sleep(0.005)
+                finally:
+                    _winmm.waveOutUnprepareHeader(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr))
+            except Exception as exc:
+                print(f"[PCAudio] playback error: {exc}", flush=True)
+                self._close_device()
+            finally:
+                self._queue.task_done()
+                with self._lock:
+                    self._playing = False
+                    if self._queue.empty():
+                        self._idle_event.set()
+
+
+_pc_audio_player = _WinMMPlayer()
+
+from starlette.requests import Request as _StarletteRequest
+from starlette.responses import JSONResponse as _StarletteJSONResponse
+
+
+@mcp.custom_route("/audio/status", methods=["GET"])
+async def _audio_status_route(request: _StarletteRequest):
+    return _StarletteJSONResponse(_pc_audio_player.status())
+
+
+@mcp.custom_route("/audio/play", methods=["POST"])
+async def _audio_play_route(request: _StarletteRequest):
+    try:
+        wav_bytes = await request.body()
+        if not wav_bytes:
+            return _StarletteJSONResponse({"ok": False, "error": "empty body"}, status_code=400)
+        turn_id = request.headers.get("X-Turn-Id", "")
+        try:
+            volume = float(request.headers.get("X-Volume", "1.0"))
+        except Exception:
+            volume = 1.0
+        dur_ms = await asyncio.to_thread(_pc_audio_player.enqueue_wav, wav_bytes, turn_id, volume)
+        return _StarletteJSONResponse({"ok": True, "duration_ms": dur_ms})
+    except Exception as exc:
+        return _StarletteJSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@mcp.custom_route("/audio/stop", methods=["POST"])
+async def _audio_stop_route(request: _StarletteRequest):
+    await asyncio.to_thread(_pc_audio_player.stop)
+    return _StarletteJSONResponse({"ok": True})
+
+
+@mcp.custom_route("/audio/wait", methods=["GET"])
+async def _audio_wait_route(request: _StarletteRequest):
+    try:
+        timeout = float(request.query_params.get("timeout", "8.0"))
+    except Exception:
+        timeout = 8.0
+    timeout = max(0.2, min(20.0, timeout))
+    done = await asyncio.to_thread(_pc_audio_player.wait_idle, timeout)
+    return _StarletteJSONResponse({"ok": True, "done": bool(done)})
+
+
 if __name__ == "__main__":
-    print("[xiaozhi-pc-control] Starting L1+L2+L3 MCP server on 0.0.0.0:18900/mcp ...", flush=True)
+    print("[xiaozhi-pc-control] Starting L1+L2+L3 MCP + PC Audio Bridge on 0.0.0.0:18900 ...", flush=True)
     mcp.run(
         transport="streamable-http",
         host="0.0.0.0",

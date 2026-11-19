@@ -193,7 +193,29 @@
     grid-template-columns: repeat(3, 1fr);
     gap: 10px;
   }
-  @media (max-width: 680px) { .mode-grid { grid-template-columns: 1fr; } }
+  .mode-grid-2 {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+  .audio-vol-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 11px;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    flex-wrap: wrap;
+  }
+  .audio-vol-bar input[type="range"] {
+    flex: 1;
+    min-width: 120px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  @media (max-width: 680px) { .mode-grid, .mode-grid-2 { grid-template-columns: 1fr; } }
 
   .mode-btn {
     text-align: left;
@@ -434,6 +456,37 @@
       </div>
     </div>
 
+    <!-- Section 1b: Audio Output Target (ESP32 Speaker <-> Windows PC Speakers, Instant Switch) -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">语音播报输出端（点击即刻生效，免重启）</h2>
+      </div>
+      <p class="section-desc">ESP32 始终负责麦克风收音与 OLED 表情字幕显示；选择「Windows 电脑音响」将直出 GPT-SoVITS 48kHz 原声，自动与桌面声音混音。</p>
+
+      <div class="mode-grid-2" id="audioOutGrid">
+        <button type="button" class="mode-btn" data-target="esp32">
+          <strong>ESP32 本机喇叭</strong>
+          <span>声音从开发板自带的 MAX98357A 小喇叭播出，适合脱离桌面独立使用</span>
+        </button>
+        <button type="button" class="mode-btn active" data-target="pc">
+          <strong>Windows 电脑音响（推荐 · 48kHz 原声）</strong>
+          <span>零硬件直连电脑默认音箱/耳机，高保真满血音质，ESP32 屏幕表情照常同步</span>
+        </button>
+      </div>
+
+      <div class="audio-vol-bar" id="pcAudioVolBar">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;">电脑播报增益</span>
+        <input type="range" id="pcAudioVolRange" min="20" max="150" step="5" value="100" aria-label="电脑播报音量增益">
+        <strong id="pcAudioVolVal" class="num" style="font-size:12.5px;min-width:38px;text-align:right;">100%</strong>
+        <button type="button" class="btn" id="pcAudioTestBtn" style="padding:5px 11px;font-size:12.5px;">电脑音响试播</button>
+      </div>
+
+      <div class="field-foot">
+        <span>电脑音响桥接状态（18900）：<strong id="pcAudioStatusText">检测中…</strong></span>
+        <span>切换后下一句语音立即生效；桥接离线时自动回退 ESP32 喇叭</span>
+      </div>
+    </div>
+
     <!-- Section 2: LLM Provider Switch (DeepSeek <-> Gemini) -->
     <div class="config-section">
       <h2 class="section-title" style="margin-bottom:6px;">对话与调度大模型 API（DeepSeek / Gemini 双模切换）</h2>
@@ -599,6 +652,11 @@
     bannerRight: document.getElementById("bannerRight"),
     modeGrid: document.getElementById("modeGrid"),
     agyStatusText: document.getElementById("agyStatusText"),
+    audioOutGrid: document.getElementById("audioOutGrid"),
+    pcAudioVolRange: document.getElementById("pcAudioVolRange"),
+    pcAudioVolVal: document.getElementById("pcAudioVolVal"),
+    pcAudioTestBtn: document.getElementById("pcAudioTestBtn"),
+    pcAudioStatusText: document.getElementById("pcAudioStatusText"),
     providerSelect: document.getElementById("providerSelect"),
     modelSelect: document.getElementById("modelSelect"),
     modelCustomInput: document.getElementById("modelCustomInput"),
@@ -666,6 +724,84 @@
       showBanner("err", "切换操控挡位失败，请检查本地服务连接。");
     }
   });
+
+  function renderAudioOutButtons(target) {
+    if (!els.audioOutGrid) return;
+    els.audioOutGrid.querySelectorAll(".mode-btn").forEach(btn => {
+      btn.className = "mode-btn";
+      if (btn.dataset.target === target) btn.classList.add("active");
+    });
+  }
+
+  let volDragging = false;
+  if (els.audioOutGrid) {
+    els.audioOutGrid.addEventListener("click", async (e) => {
+      const btn = e.target.closest(".mode-btn");
+      if (!btn) return;
+      const target = btn.dataset.target;
+      renderAudioOutButtons(target);
+      try {
+        const resp = await fetch("/api/audio-output", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target, volume: Number(els.pcAudioVolRange.value) / 100 })
+        });
+        const res = await resp.json();
+        if (res.ok) {
+          const msg = target === "pc"
+            ? "语音播报已即时切换为：Windows 电脑音响（48kHz 原声）"
+            : "语音播报已即时切换为：ESP32 本机喇叭";
+          showBanner("info", msg);
+          setTimeout(hideBanner, 2800);
+        }
+      } catch (_) {
+        showBanner("err", "切换播报输出端失败，请检查本地服务连接。");
+      }
+    });
+  }
+
+  if (els.pcAudioVolRange) {
+    els.pcAudioVolRange.addEventListener("input", () => {
+      volDragging = true;
+      els.pcAudioVolVal.textContent = `${els.pcAudioVolRange.value}%`;
+    });
+    els.pcAudioVolRange.addEventListener("change", async () => {
+      volDragging = false;
+      const vol = Number(els.pcAudioVolRange.value) / 100;
+      els.pcAudioVolVal.textContent = `${els.pcAudioVolRange.value}%`;
+      try {
+        await fetch("/api/audio-output", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ volume: vol })
+        });
+      } catch (_) {}
+    });
+  }
+
+  if (els.pcAudioTestBtn) {
+    els.pcAudioTestBtn.addEventListener("click", async () => {
+      els.pcAudioTestBtn.disabled = true;
+      const oldTxt = els.pcAudioTestBtn.textContent;
+      els.pcAudioTestBtn.textContent = "播报中…";
+      try {
+        const resp = await fetch("/api/audio-test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ volume: Number(els.pcAudioVolRange.value) / 100 })
+        });
+        const res = await resp.json();
+        if (!res.ok) throw new Error(res.error || "试播失败");
+        showBanner("info", "已通过 Windows 电脑音响播放雷电芽衣原声测试片段！");
+        setTimeout(hideBanner, 2600);
+      } catch (err) {
+        showBanner("err", `电脑音响试播失败：${err.message}`);
+      } finally {
+        els.pcAudioTestBtn.disabled = false;
+        els.pcAudioTestBtn.textContent = oldTxt;
+      }
+    });
+  }
 
   function populateModelOptions(provider, selectedModel) {
     const list = PROVIDER_MODELS[provider] || PROVIDER_MODELS.DeepSeekLLM;
@@ -976,6 +1112,18 @@
       }
 
       renderModeButtons(cfg.pc_mode || "safe");
+      renderAudioOutButtons(cfg.audio_output || "esp32");
+      if (!volDragging && els.pcAudioVolRange && typeof cfg.pc_audio_volume === "number") {
+        const pct = Math.round(cfg.pc_audio_volume * 100);
+        els.pcAudioVolRange.value = String(pct);
+        els.pcAudioVolVal.textContent = `${pct}%`;
+      }
+      if (els.pcAudioStatusText) {
+        els.pcAudioStatusText.textContent = cfg.pc_audio_online
+          ? "已在线（48kHz WinMM 直通就绪）"
+          : "离线（请运行 启动或重启服务.bat 拉起 18900）";
+        els.pcAudioStatusText.style.color = cfg.pc_audio_online ? "var(--accent)" : "var(--danger)";
+      }
 
       els.dsKeyBadge.textContent = cfg.deepseek_key_ok ? "已就绪" : "未设置";
       els.dsKeyBadge.style.color = cfg.deepseek_key_ok ? "var(--accent)" : "var(--danger)";

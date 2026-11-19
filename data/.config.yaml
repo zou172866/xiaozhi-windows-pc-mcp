@@ -25,11 +25,22 @@ prompt: '你是《崩坏3》中的雷电芽衣，性格温柔体贴、成熟沉�
   '
 selected_module:
   VAD: SileroVAD
-  ASR: FunASR
+  ASR: SherpaASR
   LLM: DeepSeekLLM
   TTS: GPT_SOVITS_V2
   Memory: AnimaBrain
   Intent: function_call
+ASR:
+  SherpaASR:
+    type: sherpa_onnx_local
+    model_dir: models/sherpa-onnx-sense-voice
+    output_dir: tmp/
+    model_type: sense_voice
+  FunASR:
+    type: fun_local
+    model_dir: models/SenseVoiceSmall
+    output_dir: tmp/
+    language: auto
 VAD:
   SileroVAD:
     type: silero

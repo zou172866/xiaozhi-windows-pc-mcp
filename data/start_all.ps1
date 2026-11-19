@@ -52,7 +52,7 @@ if (-not $gsvListening) {
     $pyExe = "$gsvDir\.venv\Scripts\python.exe"
     $cfgPath = "$serverDir\data\tts_infer_xiaozhi.yaml"
     $logOut = "$serverDir\data\gsv_19880.log"
-    $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && `"$pyExe`" api_v2.py -a 0.0.0.0 -p 19880 -c `"$cfgPath`" > `"$logOut`" 2>&1`""
+    $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set GSV_IDLE_TRIM_SECONDS=60 && `"$pyExe`" api_v2.py -a 0.0.0.0 -p 19880 -c `"$cfgPath`" > `"$logOut`" 2>&1`""
     $hideGsv = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
     Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine; ProcessStartupInformation = $hideGsv } | Out-Null
 } else {
@@ -100,7 +100,7 @@ try {
         Start-Sleep -Seconds 1
     }
     $warm = @{
-        text = "预热。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"
+        text = "预热测试，银行行长今天很开心。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"
         ref_audio_path = "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav"
         prompt_text = "今夜月色很美，呵...适合与朋友小聚一番。"; prompt_lang = "zh"
     } | ConvertTo-Json -Compress
@@ -111,8 +111,8 @@ try {
 }
 try {
     Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class MemTrim { [DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr hProcess); }' -ErrorAction SilentlyContinue
-    $gsvPids = Get-NetTCPConnection -LocalPort 19880 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
-    foreach ($gp in $gsvPids) {
+    $trimPids = Get-NetTCPConnection -LocalPort 19880, 18900 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
+    foreach ($gp in $trimPids) {
         $proc = Get-Process -Id $gp -ErrorAction SilentlyContinue
         if ($proc) { [void][MemTrim]::EmptyWorkingSet($proc.Handle) }
     }
