@@ -28,19 +28,26 @@ LOG_PATH = os.path.join(ROOT_DIR, "tmp", "server.log")
 
 CONSOLE_PORT = int(os.environ.get("CONSOLE_PORT", "18080"))
 GSV_Host = "http://host.docker.internal:19880"
+PC_MCP_HOST = os.environ.get("PC_AUDIO_BRIDGE_URL", "http://host.docker.internal:18900").rstrip("/")
 GSV_INFER_YAML = os.path.join(DATA_DIR, "tts_infer_xiaozhi.yaml")
+L3_CONFIG_PATH = os.path.join(DATA_DIR, "l3_backend_config.json")
+HOST_DATA_DIR = (
+    (os.environ.get("HOST_DATA_DIR") or "").replace("\\", "/").rstrip("/")
+    or "e:/故事/1/xiaozhi-server/data"
+)
+HOST_LAN_IP = (os.environ.get("HOST_LAN_IP") or "").strip() or "192.168.31.200"
 
 GSV_PROFILES = {
     "__gsv_raiden_mei__": {
         "version": "v4",
-        "gpt_weights": "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/v4/芽衣/芽衣-e10.ckpt",
-        "sovits_weights": "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/v4/芽衣/芽衣_e10_s430_l32.pth",
+        "gpt_weights": f"{HOST_DATA_DIR}/voices/raiden_mei/v4/芽衣/芽衣-e10.ckpt",
+        "sovits_weights": f"{HOST_DATA_DIR}/voices/raiden_mei/v4/芽衣/芽衣_e10_s430_l32.pth",
         "block": {
             "type": "gpt_sovits_v2",
             "url": f"{GSV_Host}/tts",
             "output_dir": "tmp/",
             "text_lang": "zh",
-            "ref_audio_path": "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav",
+            "ref_audio_path": "${HOST_DATA_DIR}/voices/raiden_mei/mei_default_ref.wav",
             "aux_ref_audio_paths": [],
             "prompt_text": "今夜月色很美，呵...适合与朋友小聚一番。",
             "prompt_lang": "zh",
@@ -68,8 +75,8 @@ GSV_PROFILES = {
             "url": f"{GSV_Host}/tts",
             "output_dir": "tmp/",
             "text_lang": "zh",
-            "ref_audio_path": "e:/故事/1/xiaozhi-server/data/xiaozhi_taiwan_ref.wav",
-            "aux_ref_audio_paths": ["e:/故事/1/xiaozhi-server/data/xiaozhi_taiwan_aux.wav"],
+            "ref_audio_path": "${HOST_DATA_DIR}/xiaozhi_taiwan_ref.wav",
+            "aux_ref_audio_paths": ["${HOST_DATA_DIR}/xiaozhi_taiwan_aux.wav"],
             "prompt_text": "哈啰啊，我是小智啦，声音好听的台湾女孩一枚，超开心认识你耶，最近在忙啥？",
             "prompt_lang": "zh",
             "top_k": 12,
@@ -211,6 +218,127 @@ def _check_agy_bridge_online() -> bool:
     except Exception:
         pass
     return False
+
+
+_l3_cache_lock = threading.Lock()
+_l3_cache: dict | None = None
+_l3_cache_ts = 0.0
+_L3_CACHE_TTL = 3.0
+
+
+def _read_local_l3_fallback() -> dict:
+    cfg = {
+        "backend": (os.environ.get("L3_BACKEND") or "antigravity").strip().lower(),
+        "workdir": "",
+        "dsh_cmd": "",
+        "workbuddy_cmd": "",
+        "workbuddy_auto_approve": True,
+        "timeout_seconds": 300,
+    }
+    if os.path.isfile(L3_CONFIG_PATH):
+        try:
+            raw = json.loads(open(L3_CONFIG_PATH, "r", encoding="utf-8").read())
+            if isinstance(raw, dict):
+                cfg.update(raw)
+        except Exception:
+            pass
+    agy_on = _check_agy_bridge_online()
+    b = cfg["backend"]
+    labels = {
+        "antigravity": "Google Antigravity（反重力）",
+        "dsh": "DeepSeek DSH（DeepSeek Harness）",
+        "workbuddy": "腾讯 WorkBuddy / CodeBuddy",
+        "none": "关闭 L3 后台派单",
+    }
+    return {
+        "ok": False,
+        "mcp_online": False,
+        "backend": b,
+        "label_zh": labels.get(b, b),
+        "ready": agy_on if b == "antigravity" else (b == "none"),
+        "detail": (
+            "宿主机 18900 MCP 离线（已读取本地配置）"
+            if b != "none"
+            else "已关闭 L3 后台 Agent（仅保留 L1/L2）"
+        ),
+        "workdir": cfg.get("workdir", ""),
+        "effective_workdir": cfg.get("workdir", ""),
+        "dsh_cmd": cfg.get("dsh_cmd", ""),
+        "workbuddy_cmd": cfg.get("workbuddy_cmd", ""),
+        "workbuddy_auto_approve": bool(cfg.get("workbuddy_auto_approve", True)),
+        "timeout_seconds": int(cfg.get("timeout_seconds", 300)),
+        "detected": {
+            "antigravity": {"ready": agy_on, "detail": "伴生桥接在线" if agy_on else "待开启 Antigravity 伴生桥接"},
+            "dsh": {"ready": False, "detail": "待宿主机 18900 MCP 在线探测"},
+            "workbuddy": {"ready": False, "detail": "待宿主机 18900 MCP 在线探测"},
+            "none": {"ready": True, "detail": "已关闭 L3 后台派单"},
+        },
+    }
+
+
+def _fetch_l3_backend_status(force: bool = False) -> dict:
+    global _l3_cache, _l3_cache_ts
+    now = time.monotonic()
+    with _l3_cache_lock:
+        if not force and _l3_cache is not None and (now - _l3_cache_ts) < _L3_CACHE_TTL:
+            return dict(_l3_cache)
+    try:
+        with httpx.Client(timeout=1.6, trust_env=False) as client:
+            resp = client.get(f"{PC_MCP_HOST}/l3/status")
+            if resp.status_code == 200:
+                data = resp.json()
+                data["mcp_online"] = True
+                with _l3_cache_lock:
+                    _l3_cache = dict(data)
+                    _l3_cache_ts = time.monotonic()
+                return data
+    except Exception:
+        pass
+    fb = _read_local_l3_fallback()
+    with _l3_cache_lock:
+        _l3_cache = dict(fb)
+        _l3_cache_ts = time.monotonic()
+    return fb
+
+
+def _update_l3_backend_config(payload: dict) -> tuple[bool, dict | str]:
+    global _l3_cache, _l3_cache_ts
+    try:
+        with httpx.Client(timeout=3.5, trust_env=False) as client:
+            resp = client.post(f"{PC_MCP_HOST}/l3/config", json=payload or {})
+            if resp.status_code == 200:
+                data = resp.json()
+                data["mcp_online"] = True
+                with _l3_cache_lock:
+                    _l3_cache = dict(data)
+                    _l3_cache_ts = time.monotonic()
+                return True, data
+            return False, f"宿主机 MCP 返回 HTTP {resp.status_code}: {resp.text[:160]}"
+    except Exception:
+        # Offline fallback: persist directly to shared data/l3_backend_config.json so next 18900 start picks it up
+        try:
+            cur = _read_local_l3_fallback()
+            new_cfg = {
+                "backend": str(payload.get("backend") or cur["backend"]).strip().lower(),
+                "workdir": str(payload.get("workdir", cur["workdir"]) or "").strip(),
+                "dsh_cmd": str(payload.get("dsh_cmd", cur["dsh_cmd"]) or "").strip(),
+                "workbuddy_cmd": str(payload.get("workbuddy_cmd", cur["workbuddy_cmd"]) or "").strip(),
+                "workbuddy_auto_approve": bool(
+                    payload.get("workbuddy_auto_approve", cur["workbuddy_auto_approve"])
+                ),
+                "timeout_seconds": int(payload.get("timeout_seconds", cur["timeout_seconds"])),
+            }
+            if new_cfg["backend"] not in ("antigravity", "dsh", "workbuddy", "none"):
+                return False, "无效的 L3 后端名称"
+            with open(L3_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(new_cfg, f, ensure_ascii=False, indent=2)
+            fb = _read_local_l3_fallback()
+            with _l3_cache_lock:
+                _l3_cache = dict(fb)
+                _l3_cache_ts = time.monotonic()
+            return True, fb
+        except Exception as exc:
+            return False, str(exc)
 
 
 _RE_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
@@ -583,7 +711,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             llm_cfg = cfg.get("LLM", {}).get(llm_key, {})
             tts_cfg = cfg.get("TTS", {}).get(tts_key, {})
             srv_cfg = cfg.get("server", {})
-            ws_url = srv_cfg.get("websocket", "ws://192.168.31.200:18000/xiaozhi/v1/")
+            raw_ws = str(srv_cfg.get("websocket") or f"ws://{HOST_LAN_IP}:18000/xiaozhi/v1/")
+            ws_url = raw_ws.replace("${HOST_LAN_IP}", HOST_LAN_IP)
             ota_url = ws_url.replace("ws://", "http://").replace(":18000/xiaozhi/v1/", ":18003/xiaozhi/ota/")
 
             ds_env = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -605,6 +734,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             audio_cfg = pc_audio_router.read_audio_output_config()
             reply_len_cfg = reply_length_router.read_reply_length_config()
             rel_cfg = _fetch_anima_relationship(force=False, cfg=cfg)
+            l3_cfg = _fetch_l3_backend_status(force=False)
 
             self._send_json(
                 {
@@ -626,6 +756,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "pc_audio_online": pc_audio_router.is_pc_audio_bridge_online(),
                         "reply_length": reply_len_cfg,
                         "relationship": rel_cfg,
+                        "l3_backend": l3_cfg,
                         "agy_bridge_online": _check_agy_bridge_online(),
                         "mei_emotions": [
                             {"id": k, "label": v.get("label_zh", k)}
@@ -642,6 +773,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/relationship":
             rel_cfg = _fetch_anima_relationship(force=True)
             self._send_json({"ok": bool(rel_cfg.get("online")), "relationship": rel_cfg})
+            return
+
+        if parsed.path == "/api/l3-backend":
+            l3_cfg = _fetch_l3_backend_status(force=True)
+            self._send_json({"ok": True, "l3_backend": l3_cfg})
             return
 
         self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
@@ -706,6 +842,18 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     self._send_json({"ok": True, "relationship": result})
                 else:
                     self._send_json({"ok": False, "error": str(result)}, HTTPStatus.BAD_GATEWAY)
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/l3-backend":
+            try:
+                body = self._read_body_json()
+                ok, result = _update_l3_backend_config(body)
+                if ok:
+                    self._send_json({"ok": True, "l3_backend": result})
+                else:
+                    self._send_json({"ok": False, "error": str(result)}, HTTPStatus.BAD_REQUEST)
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -782,6 +930,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         _ensure_gsv_weights(voice, persist_boot_yaml=False)
                         try:
                             req_payload = dict(GSV_PROFILES[voice]["block"])
+                            if isinstance(req_payload.get("ref_audio_path"), str):
+                                req_payload["ref_audio_path"] = req_payload["ref_audio_path"].replace(
+                                    "${HOST_DATA_DIR}", HOST_DATA_DIR
+                                )
+                            if isinstance(req_payload.get("aux_ref_audio_paths"), list):
+                                req_payload["aux_ref_audio_paths"] = [
+                                    str(p).replace("${HOST_DATA_DIR}", HOST_DATA_DIR)
+                                    for p in req_payload["aux_ref_audio_paths"]
+                                ]
                             req_payload["text"] = clean_text[:120]
                             req_payload["text_split_method"] = "cut0"
                             if voice == "__gsv_raiden_mei__":

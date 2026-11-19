@@ -715,6 +715,51 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
                     },
                 )
 
+    def test_live_l3_backend_hot_switch_and_env_expansion(self):
+        import httpx
+        import yaml
+        import start_with_env
+
+        cfg_path = os.path.join(DATA_DIR, ".config.yaml")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f) or {}
+        expanded = start_with_env._expand_env(raw_cfg)
+        ws_url = str((expanded.get("server") or {}).get("websocket") or "")
+        self.assertTrue(ws_url.startswith("ws://") and "${" not in ws_url, f"Unexpanded ws_url: {ws_url}")
+        ref_path = str(((expanded.get("TTS") or {}).get("GPT_SOVITS_V2") or {}).get("ref_audio_path") or "")
+        self.assertNotIn("${", ref_path, f"Unexpanded ref_audio_path: {ref_path}")
+
+        with httpx.Client(timeout=4.0, trust_env=False) as client:
+            r0 = client.get("http://127.0.0.1:18080/api/l3-backend")
+            self.assertEqual(r0.status_code, 200)
+            orig = r0.json()["l3_backend"]
+            self.assertTrue(orig.get("mcp_online"), "Expected host 18900 MCP /l3/status online")
+            self.assertIn("dsh", orig.get("detected") or {})
+            self.assertIn("workbuddy", orig.get("detected") or {})
+            self.assertIn("antigravity", orig.get("detected") or {})
+
+            try:
+                for b_name in ("dsh", "workbuddy", "none"):
+                    r = client.post(
+                        "http://127.0.0.1:18080/api/l3-backend",
+                        json={"backend": b_name},
+                    )
+                    self.assertEqual(r.status_code, 200)
+                    j = r.json()
+                    self.assertTrue(j.get("ok"))
+                    self.assertEqual(j["l3_backend"]["backend"], b_name)
+            finally:
+                client.post(
+                    "http://127.0.0.1:18080/api/l3-backend",
+                    json={
+                        "backend": orig["backend"],
+                        "workdir": orig.get("workdir", ""),
+                        "dsh_cmd": orig.get("dsh_cmd", ""),
+                        "workbuddy_cmd": orig.get("workbuddy_cmd", ""),
+                        "workbuddy_auto_approve": orig.get("workbuddy_auto_approve", True),
+                    },
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

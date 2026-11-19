@@ -8,13 +8,30 @@ import sys
 import time
 from pathlib import Path
 
-TASKS_ROOT = Path(r"e:\故事\1\xiaozhi-server\data\agy_tasks")
+SERVER_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = SERVER_DIR / "data"
+TASKS_ROOT = DATA_DIR / "agy_tasks"
 PENDING_DIR = TASKS_ROOT / "pending"
 ACTIVE_DIR = TASKS_ROOT / "active"
 HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
+L3_CONFIG_FILE = DATA_DIR / "l3_backend_config.json"
 
 for d in (PENDING_DIR, ACTIVE_DIR):
     d.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_default_workdir() -> str:
+    try:
+        if L3_CONFIG_FILE.is_file():
+            wd = str(json.loads(L3_CONFIG_FILE.read_text(encoding="utf-8")).get("workdir") or "").strip()
+            if wd and Path(wd).exists():
+                return wd
+    except Exception:
+        pass
+    env_wd = os.environ.get("XIAOZHI_L3_WORKDIR", "").strip()
+    if env_wd and Path(env_wd).exists():
+        return env_wd
+    return str(SERVER_DIR.parent)
 
 MY_PID = os.getpid()
 PARENT_PID = os.getppid()
@@ -39,13 +56,15 @@ def _build_agentapi_prefix() -> list[str]:
         if env_exe.lower().endswith("language_server.exe"):
             return [env_exe, "agentapi"]
         return [env_exe]
-    ls_default = r"C:\Users\Administrator\AppData\Local\Programs\antigravity\resources\bin\language_server.exe"
-    if os.path.exists(ls_default):
-        return [ls_default, "agentapi"]
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    if local_app:
+        ls_default = Path(local_app) / "Programs" / "antigravity" / "resources" / "bin" / "language_server.exe"
+        if ls_default.exists():
+            return [str(ls_default), "agentapi"]
     in_path = shutil.which("agentapi.bat") or shutil.which("agentapi")
     if in_path:
         return [in_path]
-    return [r"C:\Users\Administrator\.gemini\antigravity\bin\agentapi.bat"]
+    return [str(Path.home() / ".gemini" / "antigravity" / "bin" / "agentapi.bat")]
 
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
@@ -81,7 +100,8 @@ def _process_task(task_file: Path):
     if target_conv:
         cmd = prefix + ["send-message", f"--title={title}", target_conv, raw_prompt]
     else:
-        enriched_prompt = f"[默认工作目录：e:\\故事\\1]\n{raw_prompt}"
+        default_wd = _resolve_default_workdir()
+        enriched_prompt = f"[默认工作目录：{default_wd}]\n{raw_prompt}"
         cmd = prefix + ["new-conversation", f"--title={title}", enriched_prompt]
 
     try:

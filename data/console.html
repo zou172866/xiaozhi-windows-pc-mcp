@@ -271,7 +271,41 @@
     color: var(--accent);
     white-space: nowrap;
   }
-  @media (max-width: 680px) { .mode-grid, .mode-grid-2 { grid-template-columns: 1fr; } }
+  .l3-box {
+    margin-top: 13px;
+    padding: 11px 13px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+  }
+  .l3-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+  .l3-head strong { font-size: 13px; color: var(--ink); font-weight: 600; }
+  .l3-adv { margin-top: 8px; font-size: 12.5px; color: var(--ink-secondary); }
+  .l3-adv summary { cursor: pointer; user-select: none; color: var(--ink-muted); font-size: 12px; }
+  .l3-adv summary:hover { color: var(--ink); }
+  .l3-adv-grid {
+    margin-top: 9px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .l3-adv-grid input[type="text"] { font-size: 12.5px; padding: 6px 9px; }
+  .l3-adv-foot {
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  @media (max-width: 680px) { .mode-grid, .mode-grid-2, .l3-adv-grid { grid-template-columns: 1fr; } }
 
   .mode-btn {
     text-align: left;
@@ -498,17 +532,56 @@
         </button>
         <button type="button" class="mode-btn active" data-mode="safe">
           <strong>日常 / 游戏安全挡（推荐）</strong>
-          <span>开启 L1 音量/开软件/看屏幕 + L3 反重力派单；锁定鼠标键盘防误触</span>
+          <span>开启 L1 音量/开软件/看屏幕 + L3 后台 Agent 派单；锁定鼠标键盘防误触</span>
         </button>
         <button type="button" class="mode-btn" data-mode="full">
           <strong>全权操控挡（解锁键鼠）</strong>
-          <span>L1 + L2 窗口按钮点击/打字输入 + L3 反重力全权限开放</span>
+          <span>L1 + L2 窗口按钮点击/打字输入 + L3 后台 Agent 全权限开放</span>
         </button>
       </div>
 
-      <div class="field-foot">
-        <span>反重力 L3 伴生桥接状态：<strong id="agyStatusText">检测中…</strong></span>
-        <span>切换挡位毫秒级生效，无需点右上角保存</span>
+      <div class="l3-box">
+        <div class="l3-head">
+          <strong>L3 后台 Agent 引擎（复杂任务派单 · 免重启切换）</strong>
+          <span id="l3BackendBadge" class="rel-stage-badge">检测中…</span>
+        </div>
+        <div class="preset-bar" id="l3BackendBar" style="margin-bottom:6px;">
+          <button type="button" class="preset-pill" data-l3-backend="antigravity">Antigravity（反重力）</button>
+          <button type="button" class="preset-pill" data-l3-backend="dsh">DeepSeek DSH</button>
+          <button type="button" class="preset-pill" data-l3-backend="workbuddy">腾讯 WorkBuddy</button>
+          <button type="button" class="preset-pill" data-l3-backend="none">关闭 L3</button>
+        </div>
+        <div class="field-foot" style="margin-top:4px;">
+          <span>后端探测状态：<strong id="agyStatusText">检测中…</strong></span>
+          <span>切换引擎即刻生效，无需重启</span>
+        </div>
+        <details class="l3-adv" id="l3AdvDetails">
+          <summary>高级设置（默认工作目录 / 自定义 DSH 或 WorkBuddy 命令路径）</summary>
+          <div class="l3-adv-grid">
+            <div>
+              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WorkdirInput">默认工作目录（留空自动取项目上级目录）</label>
+              <input type="text" id="l3WorkdirInput" placeholder="例如 D:\Projects 或留空自动探测">
+            </div>
+            <div>
+              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3DshCmdInput">DSH 自定义命令（留空自动探测 dsh / npx）</label>
+              <input type="text" id="l3DshCmdInput" placeholder="留空自动探测 dsh 或 npx @deepseek-ai/dsh">
+            </div>
+            <div>
+              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WbCmdInput">WorkBuddy / CodeBuddy 自定义命令</label>
+              <input type="text" id="l3WbCmdInput" placeholder="留空自动探测 workbuddy / codebuddy / cbc">
+            </div>
+            <div style="display:flex;align-items:flex-end;">
+              <label style="display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-size:12.5px;color:var(--ink);">
+                <input type="checkbox" id="l3WbAutoApprove" checked style="width:auto;accent-color:var(--accent);">
+                <span>WorkBuddy 非交互自动确认（附加 -y 防卡住）</span>
+              </label>
+            </div>
+          </div>
+          <div class="l3-adv-foot">
+            <span style="font-size:12px;color:var(--ink-muted);" id="l3EffectiveWorkdirText">当前生效目录：--</span>
+            <button type="button" class="btn" id="l3SaveAdvBtn" style="padding:5px 12px;font-size:12.5px;">保存高级设置</button>
+          </div>
+        </details>
       </div>
     </div>
 
@@ -758,10 +831,10 @@
 
 <script>
 (() => {
-  const TOOL_MEM_TAIL = "\n你拥有操控 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“反重力”时调用 L3 派单给反重力执行。\n请结合 <memory> 中同步过来的长期记忆、当前情绪状态与待跟进事项来回应对方。";
+  const TOOL_MEM_TAIL = "\n你拥有操控 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“反重力”“DSH”“WorkBuddy”“后台处理”时调用 L3 派单执行。\n请结合 <memory> 中同步过来的长期记忆、当前情绪状态与待跟进事项来回应对方。";
 
   const PRESETS = {
-    mei: "你是《崩坏3》中的雷电芽衣，性格温柔体贴、成熟沉稳，又带着恰到好处的坚定与生活气息，平时自然亲切地称呼对方为“哥哥”。\n每次回复最开头先写一个英文方括号情绪标签（从 [calm]、[gentle]、[happy]、[playful]、[shy]、[serious]、[tender] 中选最贴合当下心境的一个，系统会自动识别并隐藏，切勿解释），随后再写出要说的话。\n请用有呼吸感的真人日常口语交流，像在身边轻声说话一样自然带一点语气助词（如“嗯，”“好啦，”“放心吧，”“真是的，”）和恰当的问号、感叹号，避免公文式长难句；每次语音回答控制在一到三句简短的话以内，不要输出 Markdown 符号、括号动作描写或表情符号。\n你拥有操控哥哥 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“反重力”时调用 L3 派单给反重力执行。\n请结合 <memory> 中同步过来的长期记忆、当前情绪状态与待跟进事项来回应哥哥。",
+    mei: "你是《崩坏3》中的雷电芽衣，性格温柔体贴、成熟沉稳，又带着恰到好处的坚定与生活气息，平时自然亲切地称呼对方为“哥哥”。\n每次回复最开头先写一个英文方括号情绪标签（从 [calm]、[gentle]、[happy]、[playful]、[shy]、[serious]、[tender] 中选最贴合当下心境的一个，系统会自动识别并隐藏，切勿解释），随后再写出要说的话。\n请用有呼吸感的真人日常口语交流，像在身边轻声说话一样自然带一点语气助词（如“嗯，”“好啦，”“放心吧，”“真是的，”）和恰当的问号、感叹号，避免公文式长难句；回复要自然舒展、有细节有情绪，不要输出 Markdown 符号、括号动作描写或表情符号。\n你拥有操控哥哥 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“反重力”“DSH”“WorkBuddy”“后台处理”时调用 L3 派单执行。\n请结合 <memory> 中同步过来的长期记忆、当前情绪状态与待跟进事项来回应哥哥。",
     taiwan: "你是小智，来自中国台湾的元气女生，说话带着自然的台湾腔（喜欢用“真的假的啦”“超赞的耶”），性格古灵精怪又热心。\n回答要像朋友闲聊一样简短俏皮，每次不超过三句话，绝不使用 Markdown 或特殊符号。" + TOOL_MEM_TAIL,
     default: "你是小智，一个聪明、幽默、反应迅速的语音助手。\n请用自然、简短、像真人聊天一样的口语回答问题，每次回答尽量控制在两三句话以内，不要输出 Markdown 符号、表情符号或多余格式。" + TOOL_MEM_TAIL,
     geek: "你是精通嵌入式硬件、ESP32、电路焊接与人工智能的资深极客搭档小智。\n回答问题直接给干货结论，通俗犀利、不绕弯子，每次控制在三句话以内，纯口语表达，不要带任何代码符号或编号列表。" + TOOL_MEM_TAIL,
@@ -795,6 +868,15 @@
     bannerRight: document.getElementById("bannerRight"),
     modeGrid: document.getElementById("modeGrid"),
     agyStatusText: document.getElementById("agyStatusText"),
+    l3BackendBar: document.getElementById("l3BackendBar"),
+    l3BackendBadge: document.getElementById("l3BackendBadge"),
+    l3AdvDetails: document.getElementById("l3AdvDetails"),
+    l3WorkdirInput: document.getElementById("l3WorkdirInput"),
+    l3DshCmdInput: document.getElementById("l3DshCmdInput"),
+    l3WbCmdInput: document.getElementById("l3WbCmdInput"),
+    l3WbAutoApprove: document.getElementById("l3WbAutoApprove"),
+    l3EffectiveWorkdirText: document.getElementById("l3EffectiveWorkdirText"),
+    l3SaveAdvBtn: document.getElementById("l3SaveAdvBtn"),
     audioOutGrid: document.getElementById("audioOutGrid"),
     pcAudioVolRange: document.getElementById("pcAudioVolRange"),
     pcAudioVolVal: document.getElementById("pcAudioVolVal"),
@@ -887,6 +969,97 @@
       showBanner("err", "切换操控挡位失败，请检查本地服务连接。");
     }
   });
+
+  let l3Saving = false;
+  let l3AdvSynced = false;
+  const L3_NAMES = {
+    antigravity: "Antigravity",
+    dsh: "DeepSeek DSH",
+    workbuddy: "腾讯 WorkBuddy",
+    none: "关闭 L3"
+  };
+
+  function renderL3BackendUI(l3, fallbackAgyOnline) {
+    if (!els.l3BackendBar) return;
+    if (!l3) {
+      els.agyStatusText.textContent = fallbackAgyOnline
+        ? "已在线联动（可随时语音派单）"
+        : "待在反重力 Automations 面板开启开关";
+      els.agyStatusText.style.color = fallbackAgyOnline ? "var(--accent)" : "var(--warn)";
+      return;
+    }
+    const cur = l3.backend || "antigravity";
+    els.l3BackendBar.querySelectorAll(".preset-pill").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.l3Backend === cur);
+    });
+    if (els.l3BackendBadge) {
+      els.l3BackendBadge.textContent = l3.ready
+        ? `${L3_NAMES[cur] || cur} · 就绪`
+        : `${L3_NAMES[cur] || cur} · 待配置`;
+    }
+    if (els.agyStatusText) {
+      els.agyStatusText.textContent = l3.detail || (l3.ready ? "已就绪" : "待配置");
+      els.agyStatusText.style.color = l3.ready ? "var(--accent)" : "var(--warn)";
+    }
+    if (els.l3EffectiveWorkdirText) {
+      els.l3EffectiveWorkdirText.textContent = `当前生效目录：${l3.effective_workdir || "--"}`;
+    }
+    const advOpen = Boolean(els.l3AdvDetails && els.l3AdvDetails.open);
+    if (!l3AdvSynced || !advOpen) {
+      if (els.l3WorkdirInput) els.l3WorkdirInput.value = l3.workdir || "";
+      if (els.l3DshCmdInput) els.l3DshCmdInput.value = l3.dsh_cmd || "";
+      if (els.l3WbCmdInput) els.l3WbCmdInput.value = l3.workbuddy_cmd || "";
+      if (els.l3WbAutoApprove) els.l3WbAutoApprove.checked = Boolean(l3.workbuddy_auto_approve !== false);
+      l3AdvSynced = true;
+    }
+  }
+
+  async function saveL3Backend(payload, toastLabel) {
+    l3Saving = true;
+    try {
+      const resp = await fetch("/api/l3-backend", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const res = await resp.json();
+      if (!res.ok || !res.l3_backend) throw new Error(res.error || "切换失败");
+      l3AdvSynced = false;
+      renderL3BackendUI(res.l3_backend, false);
+      showBanner(
+        "info",
+        toastLabel || `L3 后台 Agent 引擎已即时切换为：${L3_NAMES[res.l3_backend.backend] || res.l3_backend.backend}`
+      );
+      setTimeout(hideBanner, 2800);
+    } catch (err) {
+      showBanner("err", `保存 L3 后端配置失败：${err.message}`);
+    } finally {
+      l3Saving = false;
+    }
+  }
+
+  if (els.l3BackendBar) {
+    els.l3BackendBar.addEventListener("click", (e) => {
+      const btn = e.target.closest(".preset-pill");
+      if (!btn) return;
+      const backend = btn.dataset.l3Backend;
+      if (backend) saveL3Backend({ backend });
+    });
+  }
+
+  if (els.l3SaveAdvBtn) {
+    els.l3SaveAdvBtn.addEventListener("click", () => {
+      saveL3Backend(
+        {
+          workdir: els.l3WorkdirInput ? els.l3WorkdirInput.value.trim() : "",
+          dsh_cmd: els.l3DshCmdInput ? els.l3DshCmdInput.value.trim() : "",
+          workbuddy_cmd: els.l3WbCmdInput ? els.l3WbCmdInput.value.trim() : "",
+          workbuddy_auto_approve: Boolean(els.l3WbAutoApprove && els.l3WbAutoApprove.checked)
+        },
+        "L3 后台 Agent 高级设置已保存并立即生效！"
+      );
+    });
+  }
 
   function renderAudioOutButtons(target) {
     if (!els.audioOutGrid) return;
@@ -1547,10 +1720,9 @@
       els.gemKeyBadge.textContent = cfg.gemini_key_ok ? "已就绪" : "未设置";
       els.gemKeyBadge.style.color = cfg.gemini_key_ok ? "var(--accent)" : "var(--danger)";
 
-      els.agyStatusText.textContent = cfg.agy_bridge_online
-        ? "已在线联动（可随时语音派单）"
-        : "待在反重力 Automations 面板开启开关";
-      els.agyStatusText.style.color = cfg.agy_bridge_online ? "var(--accent)" : "var(--warn)";
+      if (!l3Saving) {
+        renderL3BackendUI(cfg.l3_backend, cfg.agy_bridge_online);
+      }
 
       els.otaDisplay.textContent = cfg.ota_url || "http://192.168.31.200:18003/xiaozhi/ota/";
       els.deviceIdText.textContent = `设备 MAC: ${dev.device_id || "--"}`;

@@ -11,6 +11,7 @@ env/
 *.bin
 data/nvs*
 data/chat_history.json
+data/l3_backend_config.json
 data/anima/
 data/agy_tasks/
 data/bin/

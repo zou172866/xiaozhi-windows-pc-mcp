@@ -13,16 +13,17 @@ services:
       - ANIMA_PORT=18787
       - ANIMA_DATA_DIR=/data/anima
       - ANIMA_DEFAULT_CHARACTER=xiaozhi
-      - ANIMA_LAN_IP=192.168.31.200
-      - COMPANION_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-      - COMPANION_MODEL=gemini-3.5-flash-lite
-      - COMPANION_API_KEY=${GEMINI_API_KEY}
-      - COMPANION_SUMMARY_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-      - COMPANION_SUMMARY_MODEL=gemini-3.5-flash-lite
-      - COMPANION_SUMMARY_KEY=${GEMINI_API_KEY}
-      - COMPANION_EMBEDDING_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-      - COMPANION_EMBEDDING_MODEL=gemini-embedding-001
-      - COMPANION_EMBEDDING_KEY=${GEMINI_API_KEY}
+      - ANIMA_LAN_IP=${HOST_LAN_IP:-192.168.31.200}
+      # 记忆大脑默认走 Gemini；纯国内免梯子部署可在 .env 中将 ANIMA_* 改为 DeepSeek + 国内兼容 Embedding
+      - COMPANION_BASE_URL=${ANIMA_LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}
+      - COMPANION_MODEL=${ANIMA_LLM_MODEL:-gemini-3.5-flash-lite}
+      - COMPANION_API_KEY=${ANIMA_LLM_API_KEY:-${GEMINI_API_KEY:-}}
+      - COMPANION_SUMMARY_BASE_URL=${ANIMA_SUMMARY_BASE_URL:-${ANIMA_LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}}
+      - COMPANION_SUMMARY_MODEL=${ANIMA_SUMMARY_MODEL:-${ANIMA_LLM_MODEL:-gemini-3.5-flash-lite}}
+      - COMPANION_SUMMARY_KEY=${ANIMA_SUMMARY_API_KEY:-${ANIMA_LLM_API_KEY:-${GEMINI_API_KEY:-}}}
+      - COMPANION_EMBEDDING_BASE_URL=${ANIMA_EMBEDDING_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai}
+      - COMPANION_EMBEDDING_MODEL=${ANIMA_EMBEDDING_MODEL:-gemini-embedding-001}
+      - COMPANION_EMBEDDING_KEY=${ANIMA_EMBEDDING_API_KEY:-${GEMINI_API_KEY:-}}
       # 如果未开启全局 TUN 代理，可取消下面三行注释填写宿主机代理端口：
       # - HTTP_PROXY=http://host.docker.internal:7890
       # - HTTPS_PROXY=http://host.docker.internal:7890
@@ -48,8 +49,11 @@ services:
       - TZ=Asia/Shanghai
       - MALLOC_ARENA_MAX=2
       - OMP_NUM_THREADS=2
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - HOST_LAN_IP=${HOST_LAN_IP:-192.168.31.200}
+      - HOST_DATA_DIR=${HOST_DATA_DIR:-e:/故事/1/xiaozhi-server/data}
+      - L3_BACKEND=${L3_BACKEND:-antigravity}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       # 如果容器内无法直连 Google API（未开启全局 TUN 模式），取消下面三行注释并改成你本地软件的代理端口：
       # - HTTP_PROXY=http://host.docker.internal:7890
       # - HTTPS_PROXY=http://host.docker.internal:7890
@@ -65,5 +69,5 @@ services:
       - ./data:/opt/xiaozhi-esp32-server/data
       # 轻量 Sherpa-ONNX SenseVoice int8 本地离线语音识别模型（默认，内存仅 ~350MB）
       - ./models/sherpa-onnx-sense-voice:/opt/xiaozhi-esp32-server/models/sherpa-onnx-sense-voice:ro
-      # 保留原 FunASR PyTorch 模型挂载以便按需一键回滚
-      - ./models/SenseVoiceSmall/model.pt:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall/model.pt
+      # 可选 FunASR PyTorch 模型目录挂载（不遮蔽镜像内置 snakers4_silero-vad，新电脑无 model.pt 也可正常启动）
+      - ./models/SenseVoiceSmall:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall

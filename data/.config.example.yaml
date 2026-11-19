@@ -1,0 +1,101 @@
+# =====================================================================
+# 小智 ESP32 本地服务端通用默认配置模板 (data/.config.example.yaml)
+# 默认：轻量 SherpaASR + DeepSeek 国内直连 + 免显存 EdgeTTS + Anima Brain 记忆
+# 密钥与 IP 全部由环境变量内存展开，不落盘明文密钥
+# =====================================================================
+
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  websocket: ws://${HOST_LAN_IP}:18000/xiaozhi/v1/
+  vision_explain: http://${HOST_LAN_IP}:18003/mcp/vision/explain
+  timezone_offset: 8
+  auth:
+    enabled: false
+wakeup_words:
+  - 你好小智
+  - 嘿你好呀
+interrupt_words:
+  - 听我说
+prompt: '你是小智，住在桌面小屏幕音箱里的贴心 AI 语音伙伴。性格温和聪慧、自然真诚，平时像熟悉的老朋友一样用带呼吸感的口语交流。
+
+  请避免公文式长难句，不要输出 Markdown 符号、括号动作描写或表情符号；日常闲聊自然展开，遇到讲故事、解释知识或分析问题时充分讲透。
+
+  你拥有操控用户 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“DSH”“WorkBuddy”“反重力”“后台处理”时调用 L3 派单执行。
+
+  请结合 <memory> 中同步过来的长期记忆、当前情绪状态与待跟进事项来自然回应对方。
+  '
+selected_module:
+  VAD: SileroVAD
+  ASR: SherpaASR
+  LLM: DeepSeekLLM
+  TTS: EdgeTTS
+  Memory: AnimaBrain
+  Intent: function_call
+ASR:
+  SherpaASR:
+    type: sherpa_onnx_local
+    model_dir: models/sherpa-onnx-sense-voice
+    output_dir: tmp/
+    model_type: sense_voice
+  FunASR:
+    type: fun_local
+    model_dir: models/SenseVoiceSmall
+    output_dir: tmp/
+    language: auto
+VAD:
+  SileroVAD:
+    type: silero
+    threshold: 0.5
+    threshold_low: 0.2
+    model_dir: models/snakers4_silero-vad
+    min_silence_duration_ms: 1100
+Memory:
+  AnimaBrain:
+    type: anima_brain
+    service_url: http://anima-brain:18787
+    character_id: xiaozhi
+LLM:
+  DeepSeekLLM:
+    type: openai
+    base_url: https://api.deepseek.com
+    model_name: deepseek-flash
+    api_key: ${DEEPSEEK_API_KEY}
+    max_tokens: 1024
+  GeminiOpenAI:
+    type: openai
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    model_name: gemini-3.5-flash-lite
+    api_key: ${GEMINI_API_KEY}
+    max_tokens: 1024
+TTS:
+  EdgeTTS:
+    type: edge
+    voice: zh-CN-XiaoxiaoNeural
+    output_dir: tmp/
+  GPT_SOVITS_V2:
+    type: gpt_sovits_v2
+    url: http://host.docker.internal:19880/tts
+    output_dir: tmp/
+    text_lang: zh
+    ref_audio_path: ${HOST_DATA_DIR}/voices/raiden_mei/mei_default_ref.wav
+    aux_ref_audio_paths: []
+    prompt_text: 今夜月色很美，呵...适合与朋友小聚一番。
+    prompt_lang: zh
+    top_k: 12
+    top_p: 1
+    temperature: 0.98
+    text_split_method: cut0
+    batch_size: 1
+    batch_threshold: 0.75
+    split_bucket: true
+    return_fragment: false
+    speed_factor: 1.0
+    streaming_mode: false
+    seed: -1
+    parallel_infer: true
+    repetition_penalty: 1.35
+plugins:
+  get_weather:
+    default_location: 北京

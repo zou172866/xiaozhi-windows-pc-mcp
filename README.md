@@ -19,19 +19,25 @@
     1. 明确文字按钮走 **18 层 UIA 无障碍树**直点（`0.15s` 零误差）；
     2. 方位/视觉描述（如“点开第一个视频封面”）自动绘制 **Set-of-Mark 红底数字角标** + 防颠倒 `x_min/y_min/x_max/y_max`（`0~1000` 归一化框）；
     3. 小图标自动触发 `768×512` 1:1 原图裁剪二次精修，并生成带绿十字准星的落点核验图。
-- **L3 反重力（Google Antigravity）异步重任务桥接（`pc-mcp/agy_sidecar_worker.py`）**
-  - 通过官方 Sidecar 机制与 `agentapi` 通讯，一句话把复杂代码编写、多文件整理、深度网页调研派单给本机已登录的 Antigravity 客户端后台执行，并支持随时语音追问进度。
+- **L3 可插拔重装后台 Agent 调度（`pc-mcp/l3_backends/`，18080 控制台免重启四选一）**
+  - **DeepSeek DSH（`@deepseek-ai/dsh`，国内直连）**：自动探测本机 `dsh` 或 `npx @deepseek-ai/dsh`，后台非交互执行 `--profile headless`，支持多轮上下文续接；
+  - **腾讯 WorkBuddy / CodeBuddy CLI（国内直连）**：自动探测 `workbuddy` / `codebuddy` / `cbc`，后台非交互执行 `-p ... --output-format text`，支持 `-c` 会话续接与 `-y` 自动确认开关；
+  - **Google Antigravity（反重力）**：通过官方 Sidecar 与 `agentapi` 通讯，在本地已登录的 Antigravity 客户端中新建/续接任务会话；
+  - **关闭 L3**：纯保留 L1 系统控制 + L2 视觉键鼠。
 
 ### 2. 本地 Web 控制台（`http://localhost:18080`）
-- 一键实时切换 **关闭 / 日常游戏安全挡 / 全权操控挡**；
+- 一键实时切换 **关闭 / 日常游戏安全挡 / 全权操控挡** 与 **L3 后台 Agent 引擎（Antigravity / DSH / WorkBuddy / 关闭）**；
+- 一键免重启切换 **ESP32 本机喇叭 / Windows 电脑音响 48kHz 原声直通** 与播报增益；
+- 免重启热调 **日常/讲故事字数滑块** 与 **Anima Brain 亲密度/浪漫尺度（3 档预设 + 四轴滑块）**；
 - 一键热切换 **DeepSeek API（`deepseek-flash`）** 与 **Gemini API（`gemini-3.5-flash-lite`）**（环境变量占位注入，密钥零明文落盘）；
-- 一键热切换本地显卡 **GPT-SoVITS 微调音色** 与 EdgeTTS 音色并支持网页试听。
+- 一键热切换本地显卡 **GPT-SoVITS 微调音色** 与免显存 **EdgeTTS** 并支持网页试听。
 
-### 3. 开箱即用的稳定性优化
-- **高位端口设计（`>15000`）**：`18000`（WS）、`18003`（OTA）、`18080`（控制台）、`18787`（Anima Brain）、`18900`（PC MCP）、`19880`（GPT-SoVITS），彻底避开 Windows Hyper-V 动态保留端口冲突；
-- **防抢话 VAD 调优**：`SileroVAD` 静默断句阈值优化至 `1100ms`，句中自然换气不被打断；
+### 3. 跨电脑开箱即用与稳定性优化
+- **纯国内免梯子 & 无独显友好**：提供 `.env.example`、`data/.config.example.yaml` 与 **`一键初始化配置.bat`**，自动探测本机局域网 IP、无独显电脑自动跳过 `19880` GPU 引擎走内置 EdgeTTS、支持 Anima Brain 纯国内模型配置；
+- **高位端口设计（`>15000`）**：`18000`（WS）、`18003`（OTA）、`18080`（控制台）、`18787`（Anima Brain）、`18900`（PC MCP + 48kHz 音频桥接）、`19880`（可选 GPU GPT-SoVITS），彻底避开 Windows Hyper-V 动态保留端口冲突；
+- **防抢话 VAD 与离线打断词**：`SileroVAD` 静默断句阈值优化至 `1100ms`，支持 ESP32-S3 MultiNet7 自定义唤醒词与离线打断词（如“听我说”）毫秒级静音切入聆听；
 - **免 Key 中央气象台插件（`data/nmc_weather_patch.py`）**：直连 `nmc.cn` 查询全国 34 省级行政区近 2800 个市县实时天气、降雨与 7 天预报，永不过期；
-- **无损冷内存回收**：启动后自动裁剪 `GPT-SoVITS` PyTorch CPU 启动期残留冷页缓存（实测立省 `3.5GB+` 物理内存，显卡合成零降速）。
+- **轻量内存治理**：默认 `SherpaASR`（int8 ONNX）+ `malloc_trim` + 闲置冷页回收，双容器常驻内存合计仅 ~450 MB。
 
 ---
 
@@ -61,25 +67,15 @@ xiaozhi-server/
 
 ---
 
-## 快速上手
+## 快速上手（新 Windows 电脑开箱即用）
 
-1. **配置系统环境变量**（PowerShell）：
-   ```powershell
-   [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "你的DeepSeek密钥", "User")
-   [Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "你的Gemini密钥", "User")
-   ```
-2. **安装宿主机电脑操控虚拟环境**：
-   ```powershell
-   cd pc-mcp
-   python -m venv .venv
-   .\.venv\Scripts\pip install -r requirements.txt
-   ```
-3. **准备本地模型目录**：
-   - 将阿里 `SenseVoiceSmall/model.pt` 放入 `models/SenseVoiceSmall/model.pt`；
-   - （可选）配置本地 `GPT-SoVITS` 目录及参考音频路径，或在 `18080` 控制台切换为免显卡的 `EdgeTTS`。
-4. **（可选）启用 L3 反重力桥接**：
-   - 将 `pc-mcp/sidecar.example.json` 复制到 `~/.gemini/config/sidecars/xiaozhi-agy-bridge/sidecar.json` 并填入实际路径，在 Antigravity 设置面板中开启 Sidecar 开关。
-5. **双击 `启动或重启服务.bat`**，打开 http://localhost:18080 即可管理全部功能。
+1. **双击运行 `一键初始化配置.bat`**（自动探测局域网 IP、交互选择 L3 引擎 `DSH / 腾讯 WorkBuddy / Antigravity / 关闭`、选择免显卡 `EdgeTTS` 或本地 GPU `GPT-SoVITS`、创建 `pc-mcp\.venv` 并安全写入系统环境变量 `DEEPSEEK_API_KEY`）；
+2. **（可选）准备本地离线 ASR 模型**：将 `sherpa-onnx-sense-voice` 的 `model.int8.onnx` 与 `tokens.txt` 放入 `models/sherpa-onnx-sense-voice/`（未放入时首次启动按需拉取）；
+3. **（可选）配置 L3 后端**：
+   - **DeepSeek DSH**：安装 Node.js 即可（`npx @deepseek-ai/dsh` 自动可用，或 `npm i -g @deepseek-ai/dsh`）；
+   - **腾讯 WorkBuddy / CodeBuddy**：安装并登录 `workbuddy` / `codebuddy`（`cbc`）CLI 即可自动识别；
+   - **Google Antigravity**：将 `pc-mcp/sidecar.example.json` 复制到 `~/.gemini/config/sidecars/xiaozhi-agy-bridge/sidecar.json` 并填入实际路径，在 Antigravity 设置面板开启 Sidecar；
+4. **双击 `启动或重启服务.bat`**，打开 http://localhost:18080 即可管理全部功能，ESP32 指向 `http://<你的局域网IP>:18003/xiaozhi/ota/`。
 
 ### 单独安装桌面操控 Agent Skill
 

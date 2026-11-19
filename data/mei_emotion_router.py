@@ -21,7 +21,11 @@ import re
 import threading
 from typing import Any, Dict, Optional, Tuple
 
-HOST_DATA_PREFIX = "e:/故事/1/xiaozhi-server/data"
+_LEGACY_HOST_DATA_PREFIX = "e:/故事/1/xiaozhi-server/data"
+HOST_DATA_PREFIX = (
+    (os.environ.get("HOST_DATA_DIR") or "").replace("\\", "/").rstrip("/")
+    or _LEGACY_HOST_DATA_PREFIX
+)
 CONTAINER_DATA_PREFIX = "/opt/xiaozhi-esp32-server/data"
 MEI_DIR_HOST = f"{HOST_DATA_PREFIX}/voices/raiden_mei"
 
@@ -428,10 +432,27 @@ _last_anima_emotion: str = "calm"
 _cached_manifest: Optional[Dict[str, Dict[str, Any]]] = None
 
 
+def _rewrite_host_data_path(raw_path: str) -> str:
+    p = (raw_path or "").replace("\\", "/").strip()
+    if not p:
+        return p
+    if "${HOST_DATA_DIR}" in p:
+        p = p.replace("${HOST_DATA_DIR}", HOST_DATA_PREFIX)
+    if p.lower().startswith(_LEGACY_HOST_DATA_PREFIX.lower()):
+        p = HOST_DATA_PREFIX + p[len(_LEGACY_HOST_DATA_PREFIX) :]
+    elif p.startswith("data/"):
+        p = HOST_DATA_PREFIX + "/" + p[len("data/") :]
+    elif p.startswith("voices/"):
+        p = HOST_DATA_PREFIX + "/" + p
+    return p
+
+
 def _to_local_fs_path(host_or_local_path: str) -> str:
-    p = (host_or_local_path or "").replace("\\", "/")
-    if os.name != "nt" and p.lower().startswith(HOST_DATA_PREFIX.lower()):
-        return CONTAINER_DATA_PREFIX + p[len(HOST_DATA_PREFIX) :]
+    p = _rewrite_host_data_path(host_or_local_path)
+    if os.name != "nt":
+        for pfx in (HOST_DATA_PREFIX, _LEGACY_HOST_DATA_PREFIX):
+            if p.lower().startswith(pfx.lower()):
+                return CONTAINER_DATA_PREFIX + p[len(pfx) :]
     return p
 
 
@@ -467,6 +488,10 @@ def load_mei_emotions(force_reload: bool = False) -> Dict[str, Dict[str, Any]]:
                 break
             except Exception:
                 pass
+
+    for prof in merged.values():
+        if isinstance(prof, dict) and prof.get("ref_audio_path"):
+            prof["ref_audio_path"] = _rewrite_host_data_path(str(prof["ref_audio_path"]))
 
     _cached_manifest = merged
     return merged

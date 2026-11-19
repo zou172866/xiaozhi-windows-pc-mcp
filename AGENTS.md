@@ -31,6 +31,9 @@
   - 保留 `docker-compose.yml` 中的 `MALLOC_ARENA_MAX=2` 与 `OMP_NUM_THREADS=2`；
   - 保留 `data/start_all.ps1` 中 `19880` 进程的 `GSV_IDLE_TRIM_SECONDS=60` 闲置自动回收、预热后 `EmptyWorkingSet` 与 WSL2 `drop_caches`，以及 `gpt-sovits-studio` 中默认 `G2PWTorchConverter`（CUDA FP16 替代 CPU `g2pW.onnx`）与 `TTS.py` 权重幂等加载；
 - **Windows 电脑音响 48kHz 直通桥接**：保留 `data/pc_audio_router.py`（须于 `mei_emotion_router` 之前挂载 `apply_pc_audio_to_tts_patch`、之后挂载 `apply_pc_audio_playback_patches`）、`pc-mcp/pc_control_mcp.py` 复用的 `18900` 端口 `/audio/*` WinMM 无损播放接口，以及 `18080` 控制台免重启切换开关（`data/audio_output_mode.json`）。
+- **可插拔 L3 后端与四处本机硬编码解耦**：
+  - 保留 `pc-mcp/l3_backends/`（`antigravity` / `dsh` / `workbuddy` / `none` 四选一适配器）、`pc_control_mcp.py` 的 `pc_agent_task` + `/l3/status` + `/l3/config`，以及 `18080` 控制台 `/api/l3-backend` 免重启切换面板；
+  - 严禁重新写死盘符路径（`e:\故事\1`）、用户名（`Administrator`）或固定局域网 IP（`192.168.31.200`）；一律通过 `Path(__file__)` 动态推导、`.env`（`HOST_LAN_IP`、`HOST_DATA_DIR`、`ENABLE_LOCAL_GSV`、`ANIMA_*`）与 `${ENV_VAR}` 占位符注入，`data/start_all.ps1` 在无本地 GPU `GPT-SoVITS` 时必须自动优雅跳过 `19880`。
 - **回复字数与亲密度免重启热调**：
   - 保留 `data/reply_length_router.py`（`data/reply_length_config.json`，`18080` 控制台 `/api/reply-length` 双滑块 + 4 档预设，免重启实时注入 `<reply_length_control>` 并动态扩展 `max_tokens`）；
   - 保留 `anima-brain/xiaozhi_anima_service.py` 的 `GET/POST /xiaozhi/relationship` 与中文互动尺度注入，以及 `18080` 控制台 `/api/relationship` 亲密度热调卡片（克制助手 / 温柔知己 / 亲密依恋 3 档预设、`Romance` 开关、熟悉/温暖/信任/浪漫 4 滑块，无滞回卡顿、下一句话立即生效）。
@@ -39,7 +42,7 @@
 - **防流式吞括号与 XML 工具标签漏念**：保留 `data/mei_emotion_router.py` 对 `ConnectionHandler._clean_response_garbage`、`PromptManager.build_enhanced_prompt` 及 `_inject_tool_call_fewshot` 的补丁，严防 `direct_answer` 分块边界误删 `[gentle]` 右括号 `]`，并持续通过 `_LEAKED_XML_TOOL_TAG_RE` 清洗 LLM 偶发吐出的 `</parameter>` / `</invoke>` / `</tool_call>` 残留标签，同时保留 `[安全挡]` 等正常正文方括号。
 - **整句连贯合成**：保持 `TTS.GPT_SOVITS_V2.text_split_method: cut0` 与外层防首句 2～3 字短逗号强切逻辑；普通句尾 `～` 不得覆盖本轮显式情绪标签。
 - **播放级表情同步与试听保护**：ESP32 屏幕表情必须经 `_segment_emotion_queue` 在 `send_tts_message("sentence_start")` 阶段按 `AudioRateController` 真实播放进度发送（严禁在合成线程提前推送）；`18080` 控制台 `/api/tts-preview` 试听非当前 `GPT-SoVITS` 音色后，必须在 `finally` 块自动还原已保存的线上音色权重。
-- **必跑回归自检套件**：修改 TTS、情绪路由、唤醒词/打断词回复、回复字数、亲密度、提示词或记忆代码后，必须运行 `docker exec xiaozhi-esp32-server python3 /opt/xiaozhi-esp32-server/data/test_mei_emotion_and_prosody.py` 确认 21 项测试全通过。
+- **必跑回归自检套件**：修改 TTS、情绪路由、唤醒词/打断词回复、回复字数、亲密度、L3 后端、提示词或记忆代码后，必须运行 `docker exec xiaozhi-esp32-server python3 /opt/xiaozhi-esp32-server/data/test_mei_emotion_and_prosody.py`（22 项）及 `pc-mcp\.venv\Scripts\python.exe -m unittest discover -s pc-mcp -p "test_*.py"`（7 项）确认全通过。
 - **自定义唤醒词、离线打断词与芽衣专属秒回语**：硬件已升级至 `bread-compact-wifi v2.6.0`（`0.91" 128x32`、`partitions/v2/16m.csv`），`0x800000` `assets` 分区搭载原厂 `esp-sr 2.4.7` 的 `mn7_cn` + `fst` 模型并并行配置两条离线命令词：`ni hao ya yi`（`你好芽衣`）与 `ting wo shuo`（`听我说`，`threshold=0.2`）；服务端保留 `data/.config.yaml` 的 `wakeup_words` 与 `interrupt_words` 列表，以及 `start_with_env.py` 在 `pc_audio_router.apply_pc_audio_playback_patches()` 之后挂载的 `mei_emotion_router.apply_mei_wakeup_responses_patch()`（同步覆写 `core.handle.intentHandler.checkWakeupWords` 防首声回退默认音色，并拦截 `ListenTextMessageHandler` 打断词 `detect` 实现零寒暄、零 2 秒 VAD 屏蔽直通聆听）。
 - **硬件刷机与隐私库热备铁律**：对 ESP32-S3 执行 `write-flash` 前必先备份 `0x9000` NVS（16KB）与 `0x0..0x10000` 引导区；直接维护 `data/anima/brain.sqlite3` 前必先停止 `xiaozhi-anima-brain` 容器并留存数据库快照。
 

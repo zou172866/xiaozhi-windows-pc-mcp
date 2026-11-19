@@ -21,11 +21,18 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import uuid
 import webbrowser
 from pathlib import Path
 from typing import Optional
+
+_MCP_DIR = Path(__file__).resolve().parent
+if str(_MCP_DIR) not in sys.path:
+    sys.path.insert(0, str(_MCP_DIR))
+
+import l3_backends
 
 import comtypes
 import httpx
@@ -37,13 +44,13 @@ from PIL import Image, ImageDraw, ImageFont, ImageGrab
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.08
 
-DATA_DIR = Path(r"e:\故事\1\xiaozhi-server\data")
+SERVER_DIR = _MCP_DIR.parent
+DATA_DIR = SERVER_DIR / "data"
 MODE_FILE = DATA_DIR / "pc_control_mode.json"
 TASKS_ROOT = DATA_DIR / "agy_tasks"
 PENDING_DIR = TASKS_ROOT / "pending"
 ACTIVE_DIR = TASKS_ROOT / "active"
 HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
-BRAIN_DIR = Path(r"C:\Users\Administrator\.gemini\antigravity\brain")
 
 for _d in (PENDING_DIR, ACTIVE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
@@ -274,6 +281,18 @@ _COMMON_WEBSITES = {
     "控制台": "http://localhost:18080",
 }
 
+_LOCAL_APPDATA = os.environ.get("LOCALAPPDATA", "")
+_ANTIGRAVITY_EXE = (
+    str(Path(_LOCAL_APPDATA) / "Programs" / "antigravity" / "Antigravity.exe")
+    if _LOCAL_APPDATA
+    else "Antigravity.exe"
+)
+_WORKBUDDY_EXE = (
+    str(Path(_LOCAL_APPDATA) / "Programs" / "WorkBuddy" / "WorkBuddy.exe")
+    if _LOCAL_APPDATA
+    else "WorkBuddy.exe"
+)
+
 _BUILTIN_APPS = {
     "记事本": "notepad.exe",
     "notepad": "notepad.exe",
@@ -289,8 +308,10 @@ _BUILTIN_APPS = {
     "vs code": "code",
     "微信": "weixin",
     "wechat": "weixin",
-    "反重力": r"C:\Users\Administrator\AppData\Local\Programs\antigravity\Antigravity.exe",
-    "antigravity": r"C:\Users\Administrator\AppData\Local\Programs\antigravity\Antigravity.exe",
+    "反重力": _ANTIGRAVITY_EXE,
+    "antigravity": _ANTIGRAVITY_EXE,
+    "workbuddy": _WORKBUDDY_EXE,
+    "腾讯workbuddy": _WORKBUDDY_EXE,
 }
 
 
@@ -1105,55 +1126,17 @@ def pc_ui_action(
     return f"未知的 UI 操作类型: {action}"
 
 
-def _get_last_dispatched_task() -> Optional[dict]:
-    files = sorted(ACTIVE_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        return None
-    try:
-        return json.loads(files[0].read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def _summarize_transcript(conv_id: str) -> str:
-    t_path = BRAIN_DIR / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
-    if not t_path.exists():
-        return f"会话 ({conv_id[:8]}) 已创建，正在初始化或等待执行中。"
-
-    lines = t_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    last_model_reply = ""
-    last_step_type = ""
-    last_status = ""
-    for ln in reversed(lines):
-        if not ln.strip():
-            continue
-        try:
-            obj = json.loads(ln)
-            if not last_step_type:
-                last_step_type = obj.get("type", "")
-                last_status = obj.get("status", "")
-            if obj.get("type") == "PLANNER_RESPONSE" and obj.get("content"):
-                last_model_reply = str(obj["content"]).strip()
-                break
-        except Exception:
-            pass
-
-    if last_model_reply:
-        short = last_model_reply[:280].replace("\n", " ")
-        return f"反重力最新进展（状态 {last_status}）：{short}"
-    return f"反重力正在后台执行工具步骤中（当前步骤类型: {last_step_type}，共 {len(lines)} 步），请稍后再查询。"
-
-
 @mcp.tool()
-def antigravity_agent_task(
+def pc_agent_task(
     action: str = "dispatch",
     task_instruction: str = "",
     follow_up_last: bool = False,
 ) -> str:
-    """[L3 本地反重力重装大脑] 当用户要求执行复杂多步电脑工程任务（如整理归档文件夹、编写/修改代码、操作浏览器深度查询生成报告、运行视频工作流）或明确提到“反重力”时调用。
+    """[L3 本地后台 Agent 重装大脑] 当用户要求执行复杂多步电脑工程任务（如整理归档文件夹、编写/修改代码、深度调研生成报告、运行自动化工作流）或明确提到“反重力”、“DSH”、“WorkBuddy”、“后台处理”时调用。
+    后端引擎可在 18080 控制台免重启切换（支持 Google Antigravity / DeepSeek DSH / 腾讯 WorkBuddy / 关闭）。
     action 可选:
-    - dispatch: 异步派发新任务给本地已登录的反重力客户端执行（follow_up_last=True 则向最近一次派发的任务追加指令）
-    - check_status: 查询最近一次派发给反重力的任务执行完没有及最终结果摘要
+    - dispatch: 异步派发新任务给当前已选的本地 L3 后台 Agent 执行（follow_up_last=True 则向最近一次派发的任务追加指令）
+    - check_status: 查询最近一次派发任务的执行进度与结果摘要
     """
     err = _check_permission("L3")
     if err:
@@ -1161,66 +1144,12 @@ def antigravity_agent_task(
 
     act = (action or "dispatch").strip().lower()
     if act == "check_status":
-        last = _get_last_dispatched_task()
-        if not last:
-            pending = list(PENDING_DIR.glob("*.json"))
-            if pending:
-                return f"当前有 {len(pending)} 个任务在队列中等待反重力伴生桥接领取执行。"
-            return "目前还没有派发过反重力任务。"
-        if last.get("status") != "dispatched" or not last.get("conversation_id"):
-            return f"最近一次任务派发状态异常：{last.get('stderr') or last.get('stdout') or '未知错误'}"
-        return _summarize_transcript(last["conversation_id"])
+        return l3_backends.check_task_status()
 
-    # dispatch
     instr = (task_instruction or "").strip()
     if not instr:
         return "任务内容不能为空。"
-
-    task_id = time.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
-    conv_id = ""
-    if follow_up_last:
-        last = _get_last_dispatched_task()
-        if last and last.get("conversation_id"):
-            conv_id = last["conversation_id"]
-
-    task_obj = {
-        "id": task_id,
-        "title": f"[小智派单] {instr[:24]}",
-        "prompt": instr,
-        "conversation_id": conv_id,
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    pending_file = PENDING_DIR / f"{task_id}.json"
-    pending_file.write_text(json.dumps(task_obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # Check if official Antigravity Sidecar worker is alive
-    worker_alive = False
-    if HEARTBEAT_FILE.exists():
-        try:
-            hb = json.loads(HEARTBEAT_FILE.read_text(encoding="utf-8"))
-            if time.time() - float(hb.get("ts", 0)) < 15.0:
-                worker_alive = True
-        except Exception:
-            pass
-
-    if not worker_alive:
-        return (
-            "任务已为你存入派单队列！不过检测到反重力客户端里的【小智语音派单桥接】伴生服务还没开启，"
-            "请舰长在反重力 Automations 面板点一下启用，启用后队列里的任务就会立刻自动跑起来。"
-        )
-
-    # Wait briefly (up to 3.5s) for worker pickup confirmation
-    active_file = ACTIVE_DIR / f"{task_id}.json"
-    for _ in range(14):
-        if active_file.exists():
-            res = json.loads(active_file.read_text(encoding="utf-8"))
-            if res.get("status") == "dispatched":
-                cid_short = (res.get("conversation_id") or "")[:8]
-                return f"已成功派单给本机反重力后台执行（会话 {cid_short}），不占用语音等待时间，稍后可随时问我执行结果！"
-            return f"派单遇到错误：{res.get('stderr') or '请检查反重力客户端状态'}"
-        time.sleep(0.25)
-
-    return "已成功投递给本机反重力后台队列开始处理，稍后可随时问我进度！"
+    return l3_backends.dispatch_task(instr, follow_up_last=bool(follow_up_last))
 
 
 # =====================================================================
@@ -1502,6 +1431,25 @@ async def _audio_wait_route(request: _StarletteRequest):
     timeout = max(0.2, min(20.0, timeout))
     done = await asyncio.to_thread(_pc_audio_player.wait_idle, timeout)
     return _StarletteJSONResponse({"ok": True, "done": bool(done)})
+
+
+@mcp.custom_route("/l3/status", methods=["GET"])
+async def _l3_status_route(request: _StarletteRequest):
+    data = await asyncio.to_thread(l3_backends.get_status_overview)
+    return _StarletteJSONResponse(data)
+
+
+@mcp.custom_route("/l3/config", methods=["POST"])
+async def _l3_config_route(request: _StarletteRequest):
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            return _StarletteJSONResponse({"ok": False, "error": "invalid json body"}, status_code=400)
+        await asyncio.to_thread(l3_backends.write_l3_config, body)
+        overview = await asyncio.to_thread(l3_backends.get_status_overview)
+        return _StarletteJSONResponse(overview)
+    except Exception as exc:
+        return _StarletteJSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,10 @@ os.chdir(ROOT_DIR)
 import config.config_loader as config_loader
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_ENV_DEFAULTS = {
+    "HOST_LAN_IP": "127.0.0.1",
+    "HOST_DATA_DIR": "/opt/xiaozhi-esp32-server/data",
+}
 _orig_read_config = config_loader.read_config
 
 
@@ -24,7 +28,13 @@ def _expand_env(obj):
     if isinstance(obj, list):
         return [_expand_env(v) for v in obj]
     if isinstance(obj, str) and "${" in obj:
-        return _ENV_PATTERN.sub(lambda m: os.environ.get(m.group(1), m.group(0)), obj)
+        def _repl(m):
+            key = m.group(1)
+            val = os.environ.get(key)
+            if val:
+                return val.replace("\\", "/") if key == "HOST_DATA_DIR" else val
+            return _ENV_DEFAULTS.get(key, m.group(0))
+        return _ENV_PATTERN.sub(_repl, obj)
     return obj
 
 
