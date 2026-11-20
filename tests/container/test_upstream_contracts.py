@@ -44,36 +44,35 @@ class TestUpstreamImageContracts(unittest.TestCase):
             f"Upstream SERVER_VERSION mismatch: got {info.get('actual')!r}, expected {info.get('expected')!r}",
         )
 
-    def test_all_19_patches_registered_ok_with_valid_contracts(self):
-        expected_patches = {
-            "config_env_expand",
-            "mcp_token_injection",
-            "esp32_auth_ota",
-            "esp32_auth_ws",
-            "esp32_auth_vision",
-            "anima_memory_factory",
-            "anima_dialogue_hooks",
-            "nmc_weather",
-            "pc_audio_tts",
-            "mei_prompt_anchors",
-            "mei_emotion_and_prosody",
-            "anima_turn_flush",
-            "pc_audio_playback",
-            "mei_wakeup_responses",
-            "listen_interrupt_handler",
-            "idle_farewell",
-            "reply_length_llm",
-            "llm_prefix_cache",
-            "sherpa_async_asr",
-        }
+    def test_all_20_patches_registered_ok_and_match_catalog(self):
+        catalog = self.patch_registry.get_patch_catalog()
+        catalog_names = [p["name"] for p in catalog]
+        self.assertEqual(len(catalog_names), len(set(catalog_names)), "Duplicate names in PATCH_CATALOG")
+        expected_patches = set(catalog_names)
+        self.assertEqual(len(expected_patches), 20, f"Expected 20 cataloged patches, got {len(expected_patches)}")
+
+        # Verify security category metadata matches SECURITY_PATCH_NAMES 1-to-1
+        for entry in catalog:
+            expected_cat = "security" if entry["name"] in self.patch_registry.SECURITY_PATCH_NAMES else "experience"
+            self.assertEqual(
+                entry["category"],
+                expected_cat,
+                f"PATCH_CATALOG category mismatch for {entry['name']}: got {entry['category']!r}, expected {expected_cat!r}",
+            )
+
         summary = self.patch_registry.get_health_summary()
         self.assertFalse(
             summary["degraded"],
             f"Patch registry degraded: {summary.get('degraded_reasons')}",
         )
         patches = summary.get("patches") or {}
-        missing = sorted(expected_patches - set(patches.keys()))
-        self.assertEqual(missing, [], f"Missing required patches: {missing}")
+        self.assertEqual(
+            set(patches.keys()),
+            expected_patches,
+            f"Live registered patches drifted from PATCH_CATALOG: "
+            f"live_only={sorted(set(patches.keys()) - expected_patches)}, "
+            f"catalog_only={sorted(expected_patches - set(patches.keys()))}",
+        )
         for name in sorted(expected_patches):
             rec = patches[name]
             self.assertEqual(rec["status"], "ok", f"Patch {name} status={rec['status']}: {rec.get('detail')}")

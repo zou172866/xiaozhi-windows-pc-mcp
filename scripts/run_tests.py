@@ -233,7 +233,7 @@ def _build_plan(
         plan.append(
             (
                 "contract",
-                "Upstream image contracts (ephemeral docker run --rm: SERVER_VERSION, 19+1 patches, anchors, zero side-effects)",
+                "Upstream image contracts (ephemeral docker run --rm: SERVER_VERSION, 20 patches + PATCH_CATALOG sync, zero side-effects)",
                 _ephemeral_container_cmd("test_upstream_contracts.py", image=upstream_image),
                 None,
             )
