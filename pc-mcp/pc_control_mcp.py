@@ -1,8 +1,16 @@
+import array
 import asyncio
 import base64
+import contextlib
 import ctypes
 import ctypes.wintypes as wt
+import logging
+import logging.handlers
+import math
 import queue
+import secrets
+import shlex
+import shutil
 import threading
 import wave
 
@@ -28,6 +36,9 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
+# 统一所有线程的 COM 套间为 MTA (COINIT_MULTITHREADED)，防止 pycaw (STA) 与 UIA (MTA) 混用引发 RPC_E_CHANGED_MODE
+sys.coinit_flags = 0
+
 _MCP_DIR = Path(__file__).resolve().parent
 if str(_MCP_DIR) not in sys.path:
     sys.path.insert(0, str(_MCP_DIR))
@@ -39,6 +50,7 @@ import httpx
 import psutil
 import pyautogui
 import pyperclip
+import uvicorn
 from PIL import Image, ImageDraw, ImageFont, ImageGrab
 
 pyautogui.FAILSAFE = False
@@ -47,6 +59,8 @@ pyautogui.PAUSE = 0.08
 SERVER_DIR = _MCP_DIR.parent
 DATA_DIR = SERVER_DIR / "data"
 MODE_FILE = DATA_DIR / "pc_control_mode.json"
+TOKEN_FILE = DATA_DIR / "pc_mcp_token.txt"
+LOG_FILE = DATA_DIR / "pc_mcp_18900.log"
 TASKS_ROOT = DATA_DIR / "agy_tasks"
 PENDING_DIR = TASKS_ROOT / "pending"
 ACTIVE_DIR = TASKS_ROOT / "active"
@@ -54,6 +68,45 @@ HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
 
 for _d in (PENDING_DIR, ACTIVE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+_clipboard_lock = threading.Lock()
+_RPC_E_CHANGED_MODE = -2147417850
+_CF_UNICODETEXT = 13
+
+
+@contextlib.contextmanager
+def _com_mta_scope():
+    """Unified MTA COM initializer safe across worker threads (prevents RPC_E_CHANGED_MODE)."""
+    inited = False
+    try:
+        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        inited = True
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != _RPC_E_CHANGED_MODE:
+            raise
+    try:
+        yield
+    finally:
+        if inited:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+
+def load_or_create_pc_mcp_token(token_file: Optional[Path] = None) -> str:
+    """Load local 18900 Bearer token from data/pc_mcp_token.txt or atomically generate one."""
+    tf = Path(token_file) if token_file is not None else TOKEN_FILE
+    try:
+        if tf.is_file():
+            existing = tf.read_text(encoding="utf-8").strip()
+            if len(existing) >= 24:
+                return existing
+    except Exception:
+        pass
+    token = secrets.token_urlsafe(32)
+    l3_backends.atomic_write_text(tf, token + "\n", encoding="utf-8")
+    return token
 
 
 def _get_mode() -> str:
@@ -78,22 +131,7 @@ def _check_permission(required_level: str) -> Optional[str]:
 
 
 def _get_env_key(name: str) -> str:
-    val = os.environ.get(name, "")
-    if not val:
-        import winreg
-        for root, subkey in [
-            (winreg.HKEY_CURRENT_USER, r"Environment"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
-        ]:
-            try:
-                with winreg.OpenKey(root, subkey) as k:
-                    v, _ = winreg.QueryValueEx(k, name)
-                    if v:
-                        val = str(v)
-                        break
-            except Exception:
-                pass
-    return val.lstrip("\ufeff").strip()
+    return l3_backends.read_env_key(name)
 
 
 # Win32 Virtual-Key Media & Power helpers
@@ -110,8 +148,7 @@ def _tap_vk(vk_code: int):
 
 
 def _set_or_get_volume(action: str, level: Optional[int] = None) -> str:
-    comtypes.CoInitialize()
-    try:
+    with _com_mta_scope():
         from pycaw.pycaw import AudioUtilities
         speakers = AudioUtilities.GetSpeakers()
         vol = speakers.EndpointVolume
@@ -131,8 +168,6 @@ def _set_or_get_volume(action: str, level: Optional[int] = None) -> str:
             vol.SetMute(0, None)
             cur = round(vol.GetMasterVolumeLevelScalar() * 100)
             return f"已取消静音，当前音量为 {cur}%。"
-    finally:
-        comtypes.CoUninitialize()
     return "音量操作完成。"
 
 
@@ -224,8 +259,18 @@ _user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
 _user32.AllowSetForegroundWindow.restype = wintypes.BOOL
 _user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.GetWindowLongW.restype = wintypes.LONG
+_user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+_user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
 _kernel32.GetCurrentThreadId.argtypes = []
 _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+_kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+_kernel32.CreateEventW.restype = wintypes.HANDLE
+_kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+_kernel32.SetEvent.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.WaitForMultipleObjects.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL, wintypes.DWORD]
+_kernel32.WaitForMultipleObjects.restype = wintypes.DWORD
 _shell32.ShellExecuteW.argtypes = [
     wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
     wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int,
@@ -452,12 +497,22 @@ def _get_default_browser_proc() -> str:
 
 def _shell_open(target_str: str, params: Optional[str] = None):
     _user32.AllowSetForegroundWindow(0xFFFFFFFF)
-    res = int(_shell32.ShellExecuteW(None, "open", target_str, params, None, _SW_SHOWNORMAL))
+    res = int(_shell32.ShellExecuteW(None, "open", target_str, params, None, _SW_SHOWNORMAL) or 0)
     if res <= 32:
-        if target_str.startswith("http"):
+        if target_str.lower().startswith(("http://", "https://")):
             webbrowser.open(target_str)
-        else:
-            subprocess.Popen(target_str, shell=True)
+            return
+        if not params:
+            try:
+                os.startfile(target_str)
+                return
+            except OSError:
+                pass
+        resolved = target_str if os.path.isfile(target_str) else shutil.which(target_str)
+        if not resolved:
+            raise FileNotFoundError(f"无法启动目标程序或快捷方式: {target_str}")
+        extra_args = [p.strip('"').strip("'") for p in shlex.split(params, posix=False)] if params else []
+        subprocess.Popen([resolved, *extra_args], shell=False)
 
 
 def _find_start_menu_shortcut(keyword: str) -> Optional[Path]:
@@ -732,11 +787,7 @@ def _parse_json_obj(raw: Optional[str]) -> Optional[dict]:
     return None
 
 
-def _collect_uia_elements(target_win=None, max_items: int = 70) -> list[dict]:
-    """穿透 18 层（支持 Edge/Chrome 网页 DOM DocumentControl）采集当前可见可交互控件及其 1:1 物理像素矩形。"""
-    import uiautomation as auto
-
-    sw, sh = pyautogui.size()
+def _walk_uia_controls(auto, root, max_items: int, sw: int, sh: int) -> list[dict]:
     items: list[dict] = []
     interesting_types = {
         "HyperlinkControl",
@@ -748,56 +799,72 @@ def _collect_uia_elements(target_win=None, max_items: int = 70) -> list[dict]:
         "CheckBoxControl",
         "ComboBoxControl",
     }
-
-    with auto.UIAutomationInitializerInThread():
-        root = target_win or auto.GetForegroundControl()
-        if not root:
-            return items
-        visited = 0
-        for ctrl, _depth in auto.WalkControl(root, includeTop=False, maxDepth=18):
-            visited += 1
-            if visited > 2800 or len(items) >= max_items:
-                break
-            try:
-                ctype = ctrl.ControlTypeName
-                if ctype not in interesting_types:
-                    continue
-                rect = ctrl.BoundingRectangle
-                w = rect.right - rect.left
-                h = rect.bottom - rect.top
-                if w < 12 or h < 12 or w > sw * 0.92 or h > sh * 0.85:
-                    continue
-                cx = (rect.left + rect.right) // 2
-                cy = (rect.top + rect.bottom) // 2
-                if cx < 4 or cy < 4 or cx > sw - 4 or cy > sh - 4:
-                    continue
-                cname = (ctrl.Name or "").strip()
-                # 合并中心点几乎重合的重复父子包装节点
-                dup = False
-                for ex in items:
-                    if abs(ex["cx"] - cx) <= 10 and abs(ex["cy"] - cy) <= 10:
-                        if not ex["name"] and cname:
-                            ex["name"] = cname
-                        dup = True
-                        break
-                if dup:
-                    continue
-                items.append(
-                    {
-                        "id": len(items) + 1,
-                        "type": ctype.replace("Control", ""),
-                        "name": cname,
-                        "left": int(rect.left),
-                        "top": int(rect.top),
-                        "right": int(rect.right),
-                        "bottom": int(rect.bottom),
-                        "cx": int(cx),
-                        "cy": int(cy),
-                    }
-                )
-            except Exception:
+    if not root:
+        return items
+    visited = 0
+    for ctrl, _depth in auto.WalkControl(root, includeTop=False, maxDepth=18):
+        visited += 1
+        if visited > 2800 or len(items) >= max_items:
+            break
+        try:
+            ctype = ctrl.ControlTypeName
+            if ctype not in interesting_types:
                 continue
+            rect = ctrl.BoundingRectangle
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+            if w < 12 or h < 12 or w > sw * 0.92 or h > sh * 0.85:
+                continue
+            cx = (rect.left + rect.right) // 2
+            cy = (rect.top + rect.bottom) // 2
+            if cx < 4 or cy < 4 or cx > sw - 4 or cy > sh - 4:
+                continue
+            cname = (ctrl.Name or "").strip()
+            dup = False
+            for ex in items:
+                if abs(ex["cx"] - cx) <= 10 and abs(ex["cy"] - cy) <= 10:
+                    if not ex["name"] and cname:
+                        ex["name"] = cname
+                    dup = True
+                    break
+            if dup:
+                continue
+            items.append(
+                {
+                    "id": len(items) + 1,
+                    "type": ctype.replace("Control", ""),
+                    "name": cname,
+                    "left": int(rect.left),
+                    "top": int(rect.top),
+                    "right": int(rect.right),
+                    "bottom": int(rect.bottom),
+                    "cx": int(cx),
+                    "cy": int(cy),
+                }
+            )
+        except Exception:
+            continue
     return items
+
+
+def _collect_uia_elements(
+    target_win=None, max_items: int = 70, window_keyword: str = ""
+) -> list[dict]:
+    """穿透 18 层（支持 Edge/Chrome 网页 DOM DocumentControl）采集当前可见可交互控件及其 1:1 物理像素矩形。"""
+    import uiautomation as auto
+
+    sw, sh = pyautogui.size()
+    with _com_mta_scope():
+        root = target_win
+        if root is None and window_keyword.strip():
+            kw_low = window_keyword.strip().lower()
+            for w in auto.GetRootControl().GetChildren():
+                if kw_low in (w.Name or "").lower():
+                    root = w
+                    break
+        if root is None:
+            root = auto.GetForegroundControl()
+        return _walk_uia_controls(auto, root, max_items, sw, sh)
 
 
 def _draw_som_overlay(base_img: Image.Image, elements: list[dict]) -> Image.Image:
@@ -952,7 +1019,9 @@ def _smart_locate_target(target_desc: str) -> Optional[tuple[int, int, str]]:
         d.ellipse([final_x - 16, final_y - 16, final_x + 16, final_y + 16], outline=(16, 185, 129), width=4)
         d.line([final_x - 26, final_y, final_x + 26, final_y], fill=(16, 185, 129), width=3)
         d.line([final_x, final_y - 26, final_x, final_y + 26], fill=(16, 185, 129), width=3)
-        dbg.resize((1280, int(sh * (1280 / sw)))).save(LAST_GROUNDING_IMG, format="JPEG", quality=82)
+        tmp_img = LAST_GROUNDING_IMG.with_name(f".{LAST_GROUNDING_IMG.name}.{os.getpid()}.tmp")
+        dbg.resize((1280, int(sh * (1280 / sw)))).save(tmp_img, format="JPEG", quality=82)
+        os.replace(tmp_img, LAST_GROUNDING_IMG)
     except Exception:
         pass
 
@@ -1020,12 +1089,14 @@ def pc_inspect_window_ui(window_keyword: str = "") -> str:
         return err
 
     import uiautomation as auto
-    target_win = None
-    win_name = "当前窗口"
-    with auto.UIAutomationInitializerInThread():
+
+    sw, sh = pyautogui.size()
+    with _com_mta_scope():
+        target_win = None
         if window_keyword.strip():
+            kw_low = window_keyword.strip().lower()
             for w in auto.GetRootControl().GetChildren():
-                if window_keyword.lower() in (w.Name or "").lower():
+                if kw_low in (w.Name or "").lower():
                     target_win = w
                     break
             if not target_win:
@@ -1033,8 +1104,8 @@ def pc_inspect_window_ui(window_keyword: str = "") -> str:
         else:
             target_win = auto.GetForegroundControl()
         win_name = (target_win.Name or "当前窗口") if target_win else "当前窗口"
+        elems = _walk_uia_controls(auto, target_win, 45, sw, sh)
 
-    elems = _collect_uia_elements(target_win=target_win, max_items=45)
     if not elems:
         return f"窗口「{win_name}」未暴露标准 UIA 子控件，可直接调用 pc_ui_action(action='click', element_name='目标视觉描述') 进行视觉定位点击。"
     lines = [f"- [{e['id']}:{e['type']}] {e['name'][:38] or '(无文字控件)'} @({e['cx']},{e['cy']})" for e in elems]
@@ -1096,20 +1167,29 @@ def pc_ui_action(
             if loc:
                 _move_and_click(loc[0], loc[1], "click")
                 time.sleep(0.15)
-        old_clip = ""
-        try:
-            old_clip = pyperclip.paste()
-        except Exception:
-            pass
-        pyperclip.copy(text)
-        pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.1)
-        if press_enter:
-            pyautogui.press("enter")
-        try:
-            pyperclip.copy(old_clip)
-        except Exception:
-            pass
+        with _clipboard_lock:
+            had_text_clip = False
+            old_clip = ""
+            try:
+                had_text_clip = bool(_user32.IsClipboardFormatAvailable(_CF_UNICODETEXT))
+                if had_text_clip:
+                    old_clip = pyperclip.paste()
+            except Exception:
+                had_text_clip = False
+            try:
+                pyperclip.copy(text)
+                time.sleep(0.04)
+                pyautogui.hotkey("ctrl", "v")
+                time.sleep(0.25)
+                if press_enter:
+                    pyautogui.press("enter")
+            finally:
+                if had_text_clip:
+                    try:
+                        if pyperclip.paste() == text:
+                            pyperclip.copy(old_clip)
+                    except Exception:
+                        pass
         return f"已输入文本：「{text[:30]}」" + (" 并按下回车。" if press_enter else "。")
 
     if act == "hotkey":
@@ -1208,51 +1288,105 @@ _winmm.waveOutClose.restype = wt.UINT
 _WAVE_MAPPER = 0xFFFFFFFF
 _WAVE_FORMAT_PCM = 1
 _WHDR_DONE = 0x00000001
+_CALLBACK_EVENT = 0x00050000
+_SOFT_LIMIT_KNEE = 0.85
+
+_soft_lut_lock = threading.Lock()
+_soft_lut_cache: dict[float, list[int]] = {}
+
+
+def _get_soft_limiter_lut(vol_key: float) -> list[int]:
+    """Build & cache a 65536-entry signed-int16 LUT ordered [0..32767, -32768..-1]
+    so `lut[sample]` directly indexes any signed int16: purely linear when vol <= 1.0,
+    and smooth tanh soft clipping above 0.85 FS when vol > 1.0."""
+    with _soft_lut_lock:
+        cached = _soft_lut_cache.get(vol_key)
+        if cached is not None:
+            return cached
+    if vol_key <= 1.0:
+        def _map_sample(s: int) -> int:
+            v = int(round(s * vol_key))
+            return 32767 if v > 32767 else (-32768 if v < -32768 else v)
+    else:
+        knee = _SOFT_LIMIT_KNEE
+        headroom = 1.0 - knee
+        inv_headroom = 1.0 / headroom
+
+        def _map_sample(s: int) -> int:
+            x = (s / 32768.0) * vol_key
+            ax = abs(x)
+            if ax <= knee:
+                y = x
+            else:
+                y = math.copysign(knee + headroom * math.tanh((ax - knee) * inv_headroom), x)
+            v = int(round(y * 32767.0))
+            return 32767 if v > 32767 else (-32768 if v < -32768 else v)
+
+    lut = [_map_sample(i) for i in range(0, 32768)] + [_map_sample(i) for i in range(-32768, 0)]
+    with _soft_lut_lock:
+        if len(_soft_lut_cache) >= 16:
+            _soft_lut_cache.pop(next(iter(_soft_lut_cache)))
+        _soft_lut_cache[vol_key] = lut
+    return lut
 
 
 def _scale_pcm16(pcm_bytes: bytes, volume: float) -> bytes:
+    """Scale 16-bit signed PCM linearly for vol <= 1.0 and with smooth tanh soft limiter for vol > 1.0."""
     if abs(volume - 1.0) <= 0.01 or not pcm_bytes:
         return pcm_bytes
-    vol = max(0.05, min(1.8, float(volume)))
-    try:
-        import audioop
-        return audioop.mul(pcm_bytes, 2, vol)
-    except Exception:
-        import array
-        arr = array.array("h")
-        arr.frombytes(pcm_bytes)
-        for i, s in enumerate(arr):
-            v = int(s * vol)
-            if v > 32767:
-                v = 32767
-            elif v < -32768:
-                v = -32768
-            arr[i] = v
-        return arr.tobytes()
+    vol = round(max(0.05, min(1.8, float(volume))), 2)
+    lut = _get_soft_limiter_lut(vol)
+    usable_len = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    arr = array.array("h")
+    arr.frombytes(pcm_bytes[:usable_len])
+    out = array.array("h", map(lut.__getitem__, arr))
+    return out.tobytes()
 
 
 class _WinMMPlayer:
-    """Sequential lossless PCM WAV playback queue for Windows default audio device."""
+    """Double-buffered WinMM CALLBACK_EVENT lossless PCM WAV playback queue for Windows audio device."""
 
-    def __init__(self):
+    def __init__(self, max_inflight: int = 2):
+        # Lock hierarchy: ALWAYS acquire _device_lock before _lock if both are ever held (never reverse).
         self._lock = threading.Lock()
+        self._device_lock = threading.Lock()
         self._queue: "queue.Queue[tuple]" = queue.Queue()
         self._gen = 0
         self._active_hwo: Optional[ctypes.c_void_p] = None
         self._active_fmt: Optional[tuple] = None
         self._playing = False
+        self._inflight_count = 0
+        self._has_pending_next = False
+        self._max_inflight = max(1, min(4, int(max_inflight)))
         self._idle_event = threading.Event()
         self._idle_event.set()
-        self._stop_signal = threading.Event()
+        self._closed = False
+
+        self._wave_event = _kernel32.CreateEventW(None, False, False, None)
+        self._wake_event = _kernel32.CreateEventW(None, False, False, None)
+        self._wait_handles = (wt.HANDLE * 2)(self._wave_event, self._wake_event)
+
         self._worker = threading.Thread(target=self._run_loop, name="winmm-audio-player", daemon=True)
         self._worker.start()
+
+    def _signal_wake(self) -> None:
+        if self._wake_event:
+            try:
+                _kernel32.SetEvent(self._wake_event)
+            except Exception:
+                pass
 
     def status(self) -> dict:
         with self._lock:
             return {
                 "ok": True,
                 "playing": self._playing,
-                "queued": self._queue.qsize(),
+                "queued": (
+                    self._queue.qsize()
+                    + (1 if self._has_pending_next else 0)
+                    + max(0, self._inflight_count - (1 if self._playing else 0))
+                ),
+                "inflight": self._inflight_count,
                 "devices": int(_winmm.waveOutGetNumDevs()),
             }
 
@@ -1265,6 +1399,8 @@ class _WinMMPlayer:
             pcm = wf.readframes(nframes)
         if sampwidth != 2:
             raise ValueError(f"Only 16-bit PCM WAV is supported, got sampwidth={sampwidth}")
+        if not pcm:
+            return 0
         if abs(volume - 1.0) > 0.01:
             pcm = _scale_pcm16(pcm, volume)
         dur_ms = int(round((nframes / float(framerate)) * 1000.0)) if framerate > 0 else 0
@@ -1272,33 +1408,48 @@ class _WinMMPlayer:
             gen = self._gen
             self._idle_event.clear()
             self._queue.put((gen, turn_id, pcm, channels, framerate, sampwidth * 8))
+        self._signal_wake()
         return dur_ms
 
     def stop(self) -> None:
         with self._lock:
             self._gen += 1
-            self._stop_signal.set()
             while True:
                 try:
                     self._queue.get_nowait()
                     self._queue.task_done()
                 except queue.Empty:
                     break
+        with self._device_lock:
             hwo = self._active_hwo
-        if hwo is not None:
-            try:
-                _winmm.waveOutReset(hwo)
-            except Exception:
-                pass
+            if hwo is not None:
+                try:
+                    _winmm.waveOutReset(hwo)
+                except Exception:
+                    pass
+        self._signal_wake()
 
     def wait_idle(self, timeout: float = 8.0) -> bool:
         return self._idle_event.wait(timeout=max(0.1, float(timeout)))
 
-    def _close_device(self):
-        with self._lock:
-            hwo = self._active_hwo
-            self._active_hwo = None
-            self._active_fmt = None
+    def close(self) -> None:
+        self._closed = True
+        self.stop()
+        self._worker.join(timeout=2.0)
+        self._close_device()
+        for attr in ("_wave_event", "_wake_event"):
+            h = getattr(self, attr, None)
+            if h:
+                setattr(self, attr, None)
+                try:
+                    _kernel32.CloseHandle(h)
+                except Exception:
+                    pass
+
+    def _close_device_locked(self):
+        hwo = self._active_hwo
+        self._active_hwo = None
+        self._active_fmt = None
         if hwo is not None:
             try:
                 _winmm.waveOutReset(hwo)
@@ -1306,12 +1457,15 @@ class _WinMMPlayer:
             except Exception:
                 pass
 
-    def _ensure_device(self, channels: int, sample_rate: int, bits: int) -> ctypes.c_void_p:
+    def _close_device(self):
+        with self._device_lock:
+            self._close_device_locked()
+
+    def _ensure_device_locked(self, channels: int, sample_rate: int, bits: int) -> ctypes.c_void_p:
         fmt_key = (channels, sample_rate, bits)
-        with self._lock:
-            if self._active_hwo is not None and self._active_fmt == fmt_key:
-                return self._active_hwo
-        self._close_device()
+        if self._active_hwo is not None and self._active_fmt == fmt_key:
+            return self._active_hwo
+        self._close_device_locked()
         wfx = _WAVEFORMATEX()
         wfx.wFormatTag = _WAVE_FORMAT_PCM
         wfx.nChannels = channels
@@ -1321,77 +1475,179 @@ class _WinMMPlayer:
         wfx.nAvgBytesPerSec = sample_rate * wfx.nBlockAlign
         wfx.cbSize = 0
         hwo = ctypes.c_void_p()
-        res = _winmm.waveOutOpen(ctypes.byref(hwo), _WAVE_MAPPER, ctypes.byref(wfx), 0, 0, 0)
+        cb_arg = int(self._wave_event) if self._wave_event else 0
+        flags = _CALLBACK_EVENT if cb_arg else 0
+        res = _winmm.waveOutOpen(ctypes.byref(hwo), _WAVE_MAPPER, ctypes.byref(wfx), cb_arg, 0, flags)
         if res != 0:
             raise RuntimeError(f"waveOutOpen failed with code {res}")
-        with self._lock:
-            self._active_hwo = hwo
-            self._active_fmt = fmt_key
+        self._active_hwo = hwo
+        self._active_fmt = fmt_key
         return hwo
 
-    def _run_loop(self):
-        while True:
-            try:
-                item = self._queue.get(timeout=0.8)
-            except queue.Empty:
-                # Release audio handle cleanly when idle so Windows sound sleep/switch stays clean
-                self._close_device()
-                with self._lock:
-                    if self._queue.empty() and not self._playing:
-                        self._idle_event.set()
-                continue
+    def _reap_done_headers(self, inflight: list) -> None:
+        remaining = []
+        for buf, hdr, gen in inflight:
+            if hdr.dwFlags & _WHDR_DONE:
+                with self._device_lock:
+                    hwo = self._active_hwo
+                    if hwo is not None:
+                        try:
+                            _winmm.waveOutUnprepareHeader(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr))
+                        except Exception:
+                            pass
+                self._queue.task_done()
+            else:
+                remaining.append((buf, hdr, gen))
+        inflight[:] = remaining
 
-            gen, _turn_id, pcm, channels, sample_rate, bits = item
-            try:
+    def _abort_all_inflight(self, inflight: list) -> None:
+        if not inflight:
+            return
+        with self._device_lock:
+            hwo = self._active_hwo
+            if hwo is not None:
+                try:
+                    _winmm.waveOutReset(hwo)
+                except Exception:
+                    pass
+        if hwo is not None:
+            for _ in range(40):
+                if all(hdr.dwFlags & _WHDR_DONE for _, hdr, _ in inflight):
+                    break
+                if self._wave_event:
+                    _kernel32.WaitForMultipleObjects(1, self._wait_handles, False, 10)
+                else:
+                    time.sleep(0.005)
+            with self._device_lock:
+                cur_hwo = self._active_hwo
+                if cur_hwo is not None:
+                    for _, hdr, _ in inflight:
+                        try:
+                            _winmm.waveOutUnprepareHeader(cur_hwo, ctypes.byref(hdr), ctypes.sizeof(hdr))
+                        except Exception:
+                            pass
+        for _ in inflight:
+            self._queue.task_done()
+        inflight.clear()
+
+    def _run_loop(self):
+        inflight: list = []
+        pending_next: Optional[tuple] = None
+        last_idle_ts = time.monotonic()
+
+        while not self._closed:
+            # 1. Reap completed buffers first
+            if inflight:
+                self._reap_done_headers(inflight)
+                with self._lock:
+                    cur_gen = self._gen
+                if any(g != cur_gen for _, _, g in inflight):
+                    self._abort_all_inflight(inflight)
+                    if pending_next is not None:
+                        self._queue.task_done()
+                        pending_next = None
+                        with self._lock:
+                            self._has_pending_next = False
+
+            # 2. Top up WinMM double-buffer slots with same-format items
+            while len(inflight) < self._max_inflight and not self._closed:
+                if pending_next is not None:
+                    item = pending_next
+                    pending_next = None
+                    with self._lock:
+                        self._has_pending_next = False
+                else:
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                gen, _turn_id, pcm, channels, sample_rate, bits = item
                 with self._lock:
                     if gen != self._gen:
+                        self._queue.task_done()
                         continue
-                    self._playing = True
-                    self._stop_signal.clear()
 
-                hwo = self._ensure_device(channels, sample_rate, bits)
-                buf = ctypes.create_string_buffer(pcm, len(pcm))
-                hdr = _WAVEHDR()
-                hdr.lpData = ctypes.cast(buf, ctypes.c_char_p)
-                hdr.dwBufferLength = len(pcm)
-                hdr.dwFlags = 0
+                fmt_key = (channels, sample_rate, bits)
+                with self._device_lock:
+                    active_fmt = self._active_fmt
+                if inflight and active_fmt is not None and active_fmt != fmt_key:
+                    pending_next = item
+                    with self._lock:
+                        self._has_pending_next = True
+                    break
 
-                if _winmm.waveOutPrepareHeader(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
-                    self._close_device()
-                    continue
                 try:
-                    if _winmm.waveOutWrite(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
-                        self._close_device()
-                        continue
-                    while not (hdr.dwFlags & _WHDR_DONE):
+                    buf = ctypes.create_string_buffer(pcm, len(pcm))
+                    hdr = _WAVEHDR()
+                    hdr.lpData = ctypes.cast(buf, ctypes.c_char_p)
+                    hdr.dwBufferLength = len(pcm)
+                    hdr.dwFlags = 0
+
+                    submitted = False
+                    stale = False
+                    with self._device_lock:
+                        # Atomically verify generation with _device_lock so stop() cannot race waveOutWrite
                         with self._lock:
-                            aborted = gen != self._gen
-                        if aborted:
-                            _winmm.waveOutReset(hwo)
-                            break
-                        self._stop_signal.wait(0.012)
-                    # Wait briefly for driver to mark WHDR_DONE after reset before unpreparing
-                    for _ in range(25):
-                        if hdr.dwFlags & _WHDR_DONE:
-                            break
-                        time.sleep(0.005)
-                finally:
-                    _winmm.waveOutUnprepareHeader(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr))
-            except Exception as exc:
-                print(f"[PCAudio] playback error: {exc}", flush=True)
-                self._close_device()
-            finally:
-                self._queue.task_done()
-                with self._lock:
+                            if gen != self._gen or self._closed:
+                                stale = True
+                        if not stale:
+                            hwo = self._ensure_device_locked(channels, sample_rate, bits)
+                            if _winmm.waveOutPrepareHeader(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
+                                if not inflight:
+                                    self._close_device_locked()
+                            elif _winmm.waveOutWrite(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
+                                _winmm.waveOutUnprepareHeader(hwo, ctypes.byref(hdr), ctypes.sizeof(hdr))
+                                if not inflight:
+                                    self._close_device_locked()
+                            else:
+                                submitted = True
+
+                    if stale:
+                        self._queue.task_done()
+                        continue
+                    if not submitted:
+                        self._queue.task_done()
+                        break
+
+                    inflight.append((buf, hdr, gen))
+                    with self._lock:
+                        self._playing = True
+                        self._inflight_count = len(inflight)
+                except Exception as exc:
+                    logging.getLogger("xiaozhi.pcaudio").warning("WinMM playback error: %s", exc)
+                    self._queue.task_done()
+                    self._abort_all_inflight(inflight)
+                    self._close_device()
+                    break
+
+            # 3. Update state & wait efficiently on Win32 events (0% idle spin)
+            with self._lock:
+                self._inflight_count = len(inflight)
+                self._has_pending_next = pending_next is not None
+                if not inflight:
                     self._playing = False
-                    if self._queue.empty():
+                    if self._queue.empty() and pending_next is None:
                         self._idle_event.set()
+
+            if inflight:
+                _kernel32.WaitForMultipleObjects(2, self._wait_handles, False, 50)
+                last_idle_ts = time.monotonic()
+            elif pending_next is not None:
+                continue
+            else:
+                res = _kernel32.WaitForMultipleObjects(2, self._wait_handles, False, 200)
+                if res == 0x00000102 and (time.monotonic() - last_idle_ts) >= 0.8:
+                    # Release audio endpoint cleanly after 0.8s idle
+                    self._close_device()
+                    last_idle_ts = time.monotonic()
 
 
 _pc_audio_player = _WinMMPlayer()
 
+from starlette.datastructures import Headers as _StarletteHeaders
 from starlette.requests import Request as _StarletteRequest
-from starlette.responses import JSONResponse as _StarletteJSONResponse
+from starlette.responses import JSONResponse as _StarletteJSONResponse, Response as _StarletteResponse
 
 
 @mcp.custom_route("/audio/status", methods=["GET"])
@@ -1430,7 +1686,10 @@ async def _audio_wait_route(request: _StarletteRequest):
         timeout = 8.0
     timeout = max(0.2, min(20.0, timeout))
     done = await asyncio.to_thread(_pc_audio_player.wait_idle, timeout)
-    return _StarletteJSONResponse({"ok": True, "done": bool(done)})
+    st = _pc_audio_player.status()
+    return _StarletteJSONResponse(
+        {"ok": True, "done": bool(done), "playing": bool(st["playing"]), "queued": int(st["queued"])}
+    )
 
 
 @mcp.custom_route("/l3/status", methods=["GET"])
@@ -1452,11 +1711,203 @@ async def _l3_config_route(request: _StarletteRequest):
         return _StarletteJSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
-if __name__ == "__main__":
-    print("[xiaozhi-pc-control] Starting L1+L2+L3 MCP + PC Audio Bridge on 0.0.0.0:18900 ...", flush=True)
-    mcp.run(
-        transport="streamable-http",
-        host="0.0.0.0",
-        port=18900,
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+# =====================================================================
+# Localhost Security Hardening (Bearer Token + Host/Origin + DNS Rebinding)
+# & Rotating Log / Polling Access-Log Noise Filter
+# =====================================================================
+_SECRET_PATTERNS = (
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-~+/=]{8,}", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(#token=|api_key=|authorization\s*[:=]\s*)[^\s&\"',;]+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"), "sk-***"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}\b"), "AIza***"),
+)
+
+
+def redact_secrets(text: str, extra_secrets: tuple[str, ...] = ()) -> str:
+    s = str(text)
+    for sec in extra_secrets:
+        if sec and len(sec) >= 8 and sec in s:
+            s = s.replace(sec, "***")
+    for pat, repl in _SECRET_PATTERNS:
+        s = pat.sub(repl, s)
+    return s
+
+
+class _SecretRedactingFilter(logging.Filter):
+    def __init__(self, extra_secrets: tuple[str, ...] = ()):
+        super().__init__()
+        self._extra = tuple(s for s in extra_secrets if s and len(s) >= 8)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact_secrets(record.msg, self._extra)
+        if isinstance(record.args, tuple) and record.args:
+            record.args = tuple(
+                redact_secrets(a, self._extra) if isinstance(a, str) else a
+                for a in record.args
+            )
+        elif isinstance(record.args, dict):
+            record.args = {
+                k: (redact_secrets(v, self._extra) if isinstance(v, str) else v)
+                for k, v in record.args.items()
+            }
+        return True
+
+
+class _AccessLogNoiseFilter(logging.Filter):
+    """Drop routine 200 OK polling logs for /l3/status and /audio/status; keep all errors & mutations."""
+
+    _QUIET_PATHS = frozenset({"/l3/status", "/audio/status"})
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 5:
+            method = str(args[1]).upper()
+            raw_path = str(args[2]).split("?", 1)[0]
+            try:
+                status_code = int(args[4])
+            except Exception:
+                status_code = 0
+            if method == "GET" and raw_path in self._QUIET_PATHS and status_code == 200:
+                return False
+        else:
+            msg = record.getMessage()
+            if '"GET /l3/status' in msg and msg.rstrip().endswith("200"):
+                return False
+            if '"GET /audio/status' in msg and msg.rstrip().endswith("200"):
+                return False
+        return True
+
+
+def _build_allowed_hosts_and_origins(port: int = 18900) -> tuple[list[str], list[str]]:
+    hosts = [
+        f"127.0.0.1:{port}",
+        f"localhost:{port}",
+        f"host.docker.internal:{port}",
+        f"[::1]:{port}",
+    ]
+    origins = [
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+        f"http://host.docker.internal:{port}",
+        f"http://[::1]:{port}",
+        "http://127.0.0.1:18080",
+        "http://localhost:18080",
+        "http://[::1]:18080",
+    ]
+    return hosts, origins
+
+
+class _LocalBearerAndHostMiddleware:
+    """ASGI middleware enforcing Host/Origin allowlist and Bearer Token across ALL 18900 endpoints."""
+
+    def __init__(self, app, token: str, allowed_hosts: list[str], allowed_origins: list[str]):
+        self.app = app
+        self.expected_token = token
+        self.allowed_hosts = {h.lower() for h in allowed_hosts}
+        self.allowed_origins = {o.lower() for o in allowed_origins}
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = _StarletteHeaders(scope=scope)
+        host = (headers.get("host") or "").strip().lower()
+        if not host or host not in self.allowed_hosts:
+            resp = _StarletteResponse("Invalid Host header", status_code=421)
+            await resp(scope, receive, send)
+            return
+
+        origin = (headers.get("origin") or "").strip().lower()
+        if origin and origin not in self.allowed_origins:
+            resp = _StarletteResponse("Invalid Origin header", status_code=403)
+            await resp(scope, receive, send)
+            return
+
+        auth = (headers.get("authorization") or "").strip()
+        scheme, sep, supplied_token = auth.partition(" ")
+        if not sep or scheme.lower() != "bearer" or not secrets.compare_digest(supplied_token.strip(), self.expected_token):
+            resp = _StarletteJSONResponse(
+                {"ok": False, "error": "Unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await resp(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+def create_secured_asgi_app(token: str, port: int = 18900, bind_host: str = "127.0.0.1"):
+    allowed_hosts, allowed_origins = _build_allowed_hosts_and_origins(port)
+    sec_settings = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
     )
+    inner_app = mcp.streamable_http_app(
+        transport_security=sec_settings,
+        host=bind_host,
+    )
+    return _LocalBearerAndHostMiddleware(inner_app, token, allowed_hosts, allowed_origins)
+
+
+def _configure_logging(active_token: str) -> logging.Logger:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    extra_secrets = (
+        active_token,
+        _get_env_key("DEEPSEEK_API_KEY"),
+        _get_env_key("GEMINI_API_KEY"),
+    )
+    redact_filter = _SecretRedactingFilter(extra_secrets)
+    noise_filter = _AccessLogNoiseFilter()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    file_handler = logging.handlers.RotatingFileHandler(
+        str(LOG_FILE),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(fmt)
+    file_handler.addFilter(redact_filter)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(file_handler)
+
+    for lname in ("uvicorn", "uvicorn.error", "mcp"):
+        lg = logging.getLogger(lname)
+        lg.handlers.clear()
+        lg.addHandler(file_handler)
+        lg.propagate = False
+        lg.setLevel(logging.INFO)
+
+    acc = logging.getLogger("uvicorn.access")
+    acc.handlers.clear()
+    acc.filters.clear()
+    acc.addFilter(noise_filter)
+    acc.addHandler(file_handler)
+    acc.propagate = False
+    acc.setLevel(logging.INFO)
+
+    return logging.getLogger("xiaozhi.pc_mcp")
+
+
+if __name__ == "__main__":
+    bind_host = (os.environ.get("PC_MCP_BIND_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    bind_port = int(os.environ.get("PC_MCP_PORT") or "18900")
+    bearer_token = load_or_create_pc_mcp_token()
+    log = _configure_logging(bearer_token)
+    reaped = l3_backends.reap_stale_running_tasks()
+    if reaped:
+        log.info("Startup reaped %d stale zombie running L3 task(s).", reaped)
+    log.info(
+        "[xiaozhi-pc-control] Starting secured L1+L2+L3 MCP + WinMM PC Audio Bridge on %s:%d (Bearer auth + DNS rebinding protection enabled)",
+        bind_host,
+        bind_port,
+    )
+    app = create_secured_asgi_app(bearer_token, port=bind_port, bind_host=bind_host)
+    uvicorn.run(app, host=bind_host, port=bind_port, log_config=None)

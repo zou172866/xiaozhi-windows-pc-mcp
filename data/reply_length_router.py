@@ -113,8 +113,23 @@ def write_reply_length_config(
         "story_chars": norm["story_chars"],
     }
     os.makedirs(os.path.dirname(REPLY_LEN_PATH), exist_ok=True)
-    with open(REPLY_LEN_PATH, "w", encoding="utf-8") as f:
-        json.dump(disk_data, f, ensure_ascii=False, indent=2)
+    tmp_path = f"{REPLY_LEN_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(disk_data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, REPLY_LEN_PATH)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     with _cfg_lock:
         _cfg_cache = dict(norm)
         try:
@@ -136,8 +151,8 @@ def build_length_directive(cfg: Optional[dict] = None) -> str:
         "<reply_length_control>\n"
         "实时字数与篇幅控制（由用户在控制台实时微调，优先级高于前文默认句数描述）：\n"
         f"- 日常聊天、问答、关心与互动：自然展开到约 {chat_n} 字（大致 {chat_lo}~{chat_hi} 字），保持口语顺畅有温度，不要用极短一两句敷衍，也不要生硬凑字。\n"
-        f"- 讲故事、睡前故事、科普讲解或哥哥要求多讲一点时：充分展开讲足约 {story_n} 字（大致 {story_lo}~{story_hi} 字），写好细节、场景与情绪起伏，不要刚开个头就匆忙收尾。\n"
-        "- 若哥哥在当前这句里临时口头指定了字数（如“简短说”或“讲个八百字的故事”），优先听哥哥当次口头要求。\n"
+        f"- 讲故事、睡前故事、科普讲解或对方要求多讲一点时：充分展开讲足约 {story_n} 字（大致 {story_lo}~{story_hi} 字），写好细节、场景与情绪起伏，不要刚开个头就匆忙收尾。\n"
+        "- 若对方在当前这句里临时口头指定了字数（如“简短说”或“讲个八百字的故事”），优先听对方当次口头要求。\n"
         "</reply_length_control>"
     )
 

@@ -22,11 +22,11 @@ import threading
 from typing import Any, Dict, Optional, Tuple
 
 _LEGACY_HOST_DATA_PREFIX = "e:/故事/1/xiaozhi-server/data"
+CONTAINER_DATA_PREFIX = "/opt/xiaozhi-esp32-server/data"
 HOST_DATA_PREFIX = (
     (os.environ.get("HOST_DATA_DIR") or "").replace("\\", "/").rstrip("/")
-    or _LEGACY_HOST_DATA_PREFIX
+    or CONTAINER_DATA_PREFIX
 )
-CONTAINER_DATA_PREFIX = "/opt/xiaozhi-esp32-server/data"
 MEI_DIR_HOST = f"{HOST_DATA_PREFIX}/voices/raiden_mei"
 
 DEFAULT_MEI_EMOTIONS: Dict[str, Dict[str, Any]] = {
@@ -430,6 +430,42 @@ _LEXICAL_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 _anima_lock = threading.Lock()
 _last_anima_emotion: str = "calm"
 _cached_manifest: Optional[Dict[str, Dict[str, Any]]] = None
+
+_gsv_session_lock = threading.Lock()
+_gsv_session = None
+
+
+def _get_gsv_http_session():
+    """Return a persistent keep-alive requests.Session with trust_env=False for local 19880 TTS."""
+    global _gsv_session
+    if _gsv_session is None:
+        with _gsv_session_lock:
+            if _gsv_session is None:
+                import requests
+
+                sess = requests.Session()
+                sess.trust_env = False
+                _gsv_session = sess
+    return _gsv_session
+
+
+def _resolve_gsv_sample_steps(provider, chosen_prof: Optional[Dict[str, Any]], is_mei: bool) -> Optional[int]:
+    cand = None
+    if isinstance(chosen_prof, dict) and chosen_prof.get("sample_steps") is not None:
+        cand = chosen_prof.get("sample_steps")
+    elif getattr(provider, "sample_steps", None) is not None:
+        cand = getattr(provider, "sample_steps")
+    elif isinstance(getattr(provider, "config", None), dict) and provider.config.get("sample_steps") is not None:
+        cand = provider.config.get("sample_steps")
+    elif is_mei:
+        env_raw = (os.environ.get("GSV_V4_SAMPLE_STEPS") or "").strip()
+        cand = env_raw if env_raw else 16
+    if cand in (None, ""):
+        return None
+    try:
+        return max(4, min(64, int(cand)))
+    except Exception:
+        return 16 if is_mei else None
 
 
 def _rewrite_host_data_path(raw_path: str) -> str:
@@ -1094,7 +1130,22 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     TTSProviderBase.to_tts_stream = _patched_to_tts_stream
     TTSProviderBase.to_tts = _patched_to_tts
 
-    # 2. Patch GPT_SOVITS_V2.TTSProvider.text_to_speak for dynamic multi-emotion reference routing + cut0
+    # 2. Patch GPT_SOVITS_V2.TTSProvider for dynamic multi-emotion reference routing + cut0 + V4 sample_steps + Session keep-alive
+    _orig_gsv_init = gsv_mod.TTSProvider.__init__
+
+    def _patched_gsv_init(self, config, delete_audio_file):
+        _orig_gsv_init(self, config, delete_audio_file)
+        raw_steps = (config or {}).get("sample_steps")
+        if raw_steps not in (None, ""):
+            try:
+                self.sample_steps = max(4, min(64, int(raw_steps)))
+            except Exception:
+                self.sample_steps = None
+        else:
+            self.sample_steps = None
+
+    gsv_mod.TTSProvider.__init__ = _patched_gsv_init
+
     async def _patched_gsv_text_to_speak(self, text, output_file):
         seg_emo, stripped = extract_and_strip_emotion(text or "", flush_incomplete=True)
         clean_text = clean_segment_for_tts(stripped)
@@ -1117,7 +1168,8 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         split_method = "cut0" if self.text_split_method in ("cut5", "cut0", "", None) else self.text_split_method
 
         chosen_prof = None
-        if is_raiden_mei_voice(self.ref_audio_path):
+        is_mei = is_raiden_mei_voice(self.ref_audio_path)
+        if is_mei:
             emo_key = resolve_mei_emotion(
                 clean_text,
                 explicit_segment_emotion=explicit_seg,
@@ -1160,8 +1212,12 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
             "parallel_infer": self.parallel_infer,
             "repetition_penalty": self.repetition_penalty,
         }
+        sample_steps = _resolve_gsv_sample_steps(self, chosen_prof, is_mei)
+        if sample_steps is not None:
+            request_json["sample_steps"] = sample_steps
 
-        resp = requests.post(self.url, json=request_json, timeout=self.tts_timeout)
+        sess = _get_gsv_http_session()
+        resp = sess.post(self.url, json=request_json, timeout=self.tts_timeout)
         if resp.status_code == 200:
             # Clear pending segment emotion only after synthesis succeeds (safe across retries)
             self._pending_segment_emotion = None
@@ -1494,11 +1550,16 @@ def apply_mei_wakeup_responses_patch() -> None:
                         conn.reset_audio_states()
                         conn.last_activity_time = time.time() * 1000
                         conn.just_woken_up = False
-                        if getattr(conn, "client_is_speaking", False):
+                        if (
+                            getattr(conn, "client_is_speaking", False)
+                            or getattr(conn, "_pc_audio_active_sid", None) is not None
+                        ):
                             try:
                                 await abort_mod.handleAbortMessage(conn)
                             except Exception:
                                 pass
+                            if hasattr(conn, "_pc_audio_active_sid"):
+                                conn._pc_audio_active_sid = None
                         await listen_mod.send_stt_message(conn, original_text)
                         await hello_mod.send_tts_message(conn, "stop", None)
                         conn.client_is_speaking = False

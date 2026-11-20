@@ -498,7 +498,7 @@
     </a>
 
     <button type="button" class="endpoint-chip" id="copyOtaBtn" title="点击复制 ESP32 OTA 地址">
-      <span id="otaDisplay" class="num">http://192.168.31.200:18003/xiaozhi/ota/</span>
+      <span id="otaDisplay" class="num">http://localhost:18003/xiaozhi/ota/</span>
     </button>
 
     <button type="button" class="btn btn-primary" id="saveBtn" disabled>
@@ -1540,7 +1540,11 @@
   });
 
   els.clearHistoryBtn.addEventListener("click", async () => {
-    await fetch("/api/clear-history", { method: "POST" });
+    await fetch("/api/clear-history", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
     lastChatJson = "";
     pollState();
   });
@@ -1672,7 +1676,12 @@
     if (nearBottom) els.logStream.scrollTop = els.logStream.scrollHeight;
   }
 
+  let pollTimer = null;
+  let pollInFlight = false;
+
   async function pollState() {
+    if (pollInFlight) return;
+    pollInFlight = true;
     try {
       const resp = await fetch("/api/state", { cache: "no-store" });
       if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -1724,7 +1733,7 @@
         renderL3BackendUI(cfg.l3_backend, cfg.agy_bridge_online);
       }
 
-      els.otaDisplay.textContent = cfg.ota_url || "http://192.168.31.200:18003/xiaozhi/ota/";
+      els.otaDisplay.textContent = cfg.ota_url || "http://localhost:18003/xiaozhi/ota/";
       els.deviceIdText.textContent = `设备 MAC: ${dev.device_id || "--"}`;
       els.lastSeenText.textContent = `最近活跃: ${dev.last_seen || "等待唤醒"}`;
 
@@ -1758,11 +1767,37 @@
         els.statusPill.className = "status-pill offline";
         els.statusText.textContent = "本地服务连接中断";
       }
+    } finally {
+      pollInFlight = false;
     }
   }
 
-  pollState();
-  setInterval(pollState, 1200);
+  function startPolling() {
+    if (pollTimer !== null) return;
+    pollState();
+    pollTimer = setInterval(() => {
+      if (!document.hidden) pollState();
+    }, 1200);
+  }
+
+  function stopPolling() {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopPolling();
+    } else {
+      startPolling();
+    }
+  });
+
+  if (!document.hidden) {
+    startPolling();
+  }
 })();
 </script>
 </body>

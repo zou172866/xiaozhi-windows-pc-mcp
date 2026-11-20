@@ -14,27 +14,46 @@ foreach ($relDir in @("models\sherpa-onnx-sense-voice", "models\SenseVoiceSmall"
     if (-not (Test-Path $fullD)) { New-Item -ItemType Directory -Path $fullD -Force | Out-Null }
 }
 
-if (-not (Test-Path (Join-Path $serverDir "data\.config.yaml")) -and (Test-Path (Join-Path $serverDir "data\.config.example.yaml"))) {
-    Copy-Item (Join-Path $serverDir "data\.config.example.yaml") (Join-Path $serverDir "data\.config.yaml")
-    Write-Host "[初始化] 已从 data\.config.example.yaml 生成默认配置文件 data\.config.yaml" -ForegroundColor Yellow
+$runtimeTemplates = @(
+    @{ Tpl = "data\.config.example.yaml";             Dst = "data\.config.yaml" },
+    @{ Tpl = "data\pc_control_mode.example.json";     Dst = "data\pc_control_mode.json" },
+    @{ Tpl = "data\audio_output_mode.example.json";   Dst = "data\audio_output_mode.json" },
+    @{ Tpl = "data\reply_length_config.example.json"; Dst = "data\reply_length_config.json" },
+    @{ Tpl = "data\tts_infer_xiaozhi.example.yaml";   Dst = "data\tts_infer_xiaozhi.yaml" },
+    @{ Tpl = "data\.wakeup_words.example.yaml";       Dst = "data\.wakeup_words.yaml" }
+)
+foreach ($rt in $runtimeTemplates) {
+    $tplP = Join-Path $serverDir $rt.Tpl
+    $dstP = Join-Path $serverDir $rt.Dst
+    if (-not (Test-Path $dstP) -and (Test-Path $tplP)) {
+        Copy-Item $tplP $dstP
+        Write-Host "[初始化] 已从 $($rt.Tpl) 生成默认运行文件 $($rt.Dst)" -ForegroundColor Yellow
+    }
 }
 
 $dotEnvPath = Join-Path $serverDir ".env"
+$explicitEmptyEnvKeys = @{}
 if (Test-Path $dotEnvPath) {
     foreach ($rawLine in (Get-Content -Path $dotEnvPath -Encoding UTF8)) {
-        $line = $rawLine.Trim()
+        $line = $rawLine.TrimStart([char]0xfeff).Trim()
         if (-not $line -or $line.StartsWith("#")) { continue }
         $idx = $line.IndexOf("=")
         if ($idx -le 0) { continue }
         $k = $line.Substring(0, $idx).Trim()
         $v = $line.Substring($idx + 1).Trim().Trim('"').Trim("'")
-        if ($k -and $v -and -not [Environment]::GetEnvironmentVariable($k, "Process")) {
+        if (-not $k) { continue }
+        if ($v -eq "") {
+            # Explicit `KEY=` in .env must take precedence over stale User/Process env for docker compose
+            $explicitEmptyEnvKeys[$k] = $true
+            Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue
+        } elseif (-not [Environment]::GetEnvironmentVariable($k, "Process")) {
             Set-Item -Path "Env:$k" -Value $v
         }
     }
 }
 
 foreach ($envName in @("DEEPSEEK_API_KEY", "GEMINI_API_KEY", "ANIMA_LLM_API_KEY", "ANIMA_SUMMARY_API_KEY", "ANIMA_EMBEDDING_API_KEY")) {
+    if ($explicitEmptyEnvKeys.ContainsKey($envName)) { continue }
     $val = [Environment]::GetEnvironmentVariable($envName, "User")
     if (-not $val) { $val = [Environment]::GetEnvironmentVariable($envName, "Machine") }
     if ($val) {
@@ -83,18 +102,18 @@ if ($LASTEXITCODE -ne 0 -or -not $ver) {
 }
 Write-Host "[1/4] Docker 引擎已就绪 (v$ver)" -ForegroundColor Green
 
-# 2. 启动本机三层电脑操控 MCP 服务 (端口 18900)
+# 2. 启动本机三层电脑操控 MCP 服务 (端口 18900，仅绑定 127.0.0.1 + 自动 Bearer Token + 日志轮转)
 $mcpListening = Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue
 if (-not $mcpListening) {
-    Write-Host "[2/4] 正在后台启动三层电脑操控 MCP + 电脑音响直通服务 (端口 18900)..." -ForegroundColor Cyan
+    Write-Host "[2/4] 正在后台启动三层电脑操控 MCP + 电脑音响直通服务 (127.0.0.1:18900)..." -ForegroundColor Cyan
     $mcpPy = Join-Path $serverDir "pc-mcp\.venv\Scripts\python.exe"
     if (-not (Test-Path $mcpPy)) { $mcpPy = "python" }
     $mcpScript = Join-Path $serverDir "pc-mcp\pc_control_mcp.py"
-    $mcpLog = Join-Path $serverDir "data\pc_mcp_18900.log"
-    $mcpCmd = "cmd.exe /c `"`"$mcpPy`" `"$mcpScript`" > `"$mcpLog`" 2>&1`""
+    $mcpBootLog = Join-Path $serverDir "data\pc_mcp_18900_boot.log"
+    $mcpCmd = "cmd.exe /c `"set PYTHONUTF8=1&& `"$mcpPy`" -X utf8 `"$mcpScript`" > `"$mcpBootLog`" 2>&1`""
     $hideSi = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
     Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $mcpCmd; ProcessStartupInformation = $hideSi } | Out-Null
-    for ($m = 0; $m -lt 10; $m++) {
+    for ($m = 0; $m -lt 14; $m++) {
         if (Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue) { break }
         Start-Sleep -Milliseconds 500
     }
@@ -102,7 +121,7 @@ if (-not $mcpListening) {
     Write-Host "[2/4] 三层电脑操控 MCP 服务已在运行中 (端口 18900)" -ForegroundColor Green
 }
 
-# 3. 可选：启动本机 GPU GPT-SoVITS 语音合成服务 (端口 19880)；无独显/未安装则自动优雅跳过并走 EdgeTTS
+# 3. 可选：启动本机 GPU GPT-SoVITS 语音合成服务 (127.0.0.1:19880)；无独显/未安装则自动优雅跳过并走 EdgeTTS
 $gsvEnabled = $true
 if ($env:ENABLE_LOCAL_GSV -and $env:ENABLE_LOCAL_GSV.ToLower() -in @("false", "0", "no", "off")) {
     $gsvEnabled = $false
@@ -115,10 +134,10 @@ $hasLocalGsv = $gsvEnabled -and (Test-Path $gsvPy) -and (Test-Path $gsvApi)
 if ($hasLocalGsv) {
     $gsvListening = Get-NetTCPConnection -LocalPort 19880 -State Listen -ErrorAction SilentlyContinue
     if (-not $gsvListening) {
-        Write-Host "[3/4] 正在后台启动本机 GPU GPT-SoVITS 语音引擎 (端口 19880)..." -ForegroundColor Cyan
+        Write-Host "[3/4] 正在后台启动本机 GPU GPT-SoVITS 语音引擎 (127.0.0.1:19880)..." -ForegroundColor Cyan
         $cfgPath = Join-Path $serverDir "data\tts_infer_xiaozhi.yaml"
         $logOut = Join-Path $serverDir "data\gsv_19880.log"
-        $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set GSV_IDLE_TRIM_SECONDS=60 && `"$gsvPy`" api_v2.py -a 0.0.0.0 -p 19880 -c `"$cfgPath`" > `"$logOut`" 2>&1`""
+        $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set PYTHONUTF8=1&& set GSV_IDLE_TRIM_SECONDS=60&& `"$gsvPy`" -X utf8 api_v2.py -a 127.0.0.1 -p 19880 -c `"$cfgPath`" > `"$logOut`" 2>&1`""
         $hideGsv = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
         Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine; ProcessStartupInformation = $hideGsv } | Out-Null
     } else {
@@ -165,7 +184,7 @@ if ($hasLocalGsv) {
                 Start-Sleep -Seconds 1
             }
             $warm = @{
-                text = "预热测试，银行行长今天很开心。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"
+                text = "预热测试，银行行长今天很开心。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"; sample_steps = 16
                 ref_audio_path = $warmRef.Replace("\", "/")
                 prompt_text = "今夜月色很美，呵...适合与朋友小聚一番。"; prompt_lang = "zh"
             } | ConvertTo-Json -Compress

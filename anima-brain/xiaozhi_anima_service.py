@@ -52,7 +52,37 @@ TOKEN_PATH = DATA_DIR / "studio_token.txt"
 URL_PATH = DATA_DIR / "studio_url.txt"
 FRONTEND_DIR = Path("/app/examples/showcase/dist")
 DEFAULT_CHARACTER_ID = os.environ.get("ANIMA_DEFAULT_CHARACTER", "xiaozhi")
-LAN_IP = os.environ.get("ANIMA_LAN_IP", "192.168.31.200").strip()
+LAN_IP = os.environ.get("ANIMA_LAN_IP", "").strip()
+
+def _env_int(name: str, default: int, lo: int, hi: int | None = None) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        val = int(raw) if raw else default
+    except ValueError:
+        val = default
+    val = max(lo, val)
+    return min(hi, val) if hi is not None else val
+
+
+def _env_float(name: str, default: float, lo: float, hi: float | None = None) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        val = float(raw) if raw else default
+    except ValueError:
+        val = default
+    val = max(lo, val)
+    return min(hi, val) if hi is not None else val
+
+
+SUMMARY_BATCH_MESSAGES = _env_int("ANIMA_SUMMARY_BATCH_MESSAGES", 8, 2, 60)
+KEEP_TURN_DRAFTS = _env_int("ANIMA_KEEP_TURN_DRAFTS", 40, 5)
+OP_EMBED_PRUNE_AGE_SECONDS = _env_int("ANIMA_OP_PRUNE_AGE_SECONDS", 3600, 60)
+MAX_AUTO_REVIEW_RETRIES = _env_int("ANIMA_MAX_AUTO_RETRIES", 5, 1)
+REVIEW_BACKOFF_BASE_SECONDS = _env_int("ANIMA_REVIEW_BACKOFF_BASE_SECONDS", 300, 30)
+REVIEW_BACKOFF_MAX_SECONDS = _env_int("ANIMA_REVIEW_BACKOFF_MAX_SECONDS", 7200, 300)
+SHUTDOWN_DRAIN_SECONDS = _env_float("ANIMA_SHUTDOWN_DRAIN_SECONDS", 15.0, 1.0)
+DEFAULT_TIMEOUT_SECONDS = _env_float("COMPANION_TIMEOUT_SECONDS", 150.0, 10.0, 600.0)
+TERMINAL_REVIEW_ERROR = "auto_retry_exhausted"
 
 DEFAULT_PERSONA = (
     "你是小智，住在桌面小屏幕音箱里的贴心 AI 伙伴。说话自然、真诚、简短有温度，"
@@ -183,27 +213,257 @@ def ensure_default_character(brain: CompanionBrain) -> None:
         log.info("Created default Anima Brain character: %s (小智)", DEFAULT_CHARACTER_ID)
 
 
-def clear_stale_review_jobs(brain: CompanionBrain, max_age_seconds: int = 600) -> int:
-    """Auto-clear transient failed automation jobs stuck in 'review' so summaries/indexing never stall forever."""
+def _count_consecutive_failures(engine, character_id: str, kind: str) -> int:
+    """Count consecutive failed/retried jobs since the last succeeded or manually acknowledged job."""
+    rows = engine.db.execute(
+        "SELECT state FROM memory_jobs "
+        "WHERE owner=? AND character_id=? AND kind=? "
+        "ORDER BY created DESC LIMIT 30",
+        (engine.owner, character_id, kind),
+    ).fetchall()
+    streak = 0
+    for r in rows:
+        st = r["state"]
+        if st in ("succeeded", "acknowledged"):
+            break
+        if st in ("review", "auto_retried"):
+            streak += 1
+    return streak
+
+
+def clear_stale_review_jobs(
+    brain: CompanionBrain,
+    max_age_seconds: int | None = None,
+    *,
+    is_startup: bool = False,
+) -> int:
+    """Release transient 'review' jobs using exponential backoff without deleting rows.
+
+    Preserving rows in memory_jobs keeps Automation's daily_jobs circuit breaker intact.
+    After MAX_AUTO_REVIEW_RETRIES consecutive failures of the same kind, the active review job
+    is marked with TERMINAL_REVIEW_ERROR and left in 'review' so background claims stay paused
+    until the user fixes the provider and manually acknowledges it in Companion Studio.
+    """
     engine = brain.engine
-    cutoff = time.time() - max_age_seconds
-    cleared = 0
+    now = time.time()
+    base_backoff = REVIEW_BACKOFF_BASE_SECONDS if max_age_seconds is None else max(1, int(max_age_seconds))
+    released = 0
     try:
         with engine._lock:
+            if is_startup:
+                # Before the automation worker starts, any 'running' row belongs to a dead prior process.
+                # Transition it to 'review' ('interrupted_outcome_unknown') so startup recovery handles it immediately.
+                with engine._transaction():
+                    engine.db.execute(
+                        "UPDATE memory_jobs SET state='review', error='interrupted_outcome_unknown' "
+                        "WHERE owner=? AND state='running'",
+                        (engine.owner,),
+                    )
             rows = engine.db.execute(
                 "SELECT id, character_id, kind, error, created FROM memory_jobs "
-                "WHERE owner=? AND state='review' AND (created IS NULL OR created < ?)",
-                (engine.owner, cutoff),
+                "WHERE owner=? AND state='review'",
+                (engine.owner,),
             ).fetchall()
-            if rows:
+            for r in rows:
+                jid = r["id"]
+                cid = r["character_id"]
+                kind = r["kind"]
+                err = str(r["error"] or "")
+                if err == TERMINAL_REVIEW_ERROR:
+                    continue
+
+                streak = max(1, _count_consecutive_failures(engine, cid, kind))
+                if streak >= MAX_AUTO_REVIEW_RETRIES:
+                    with engine._transaction():
+                        engine.db.execute(
+                            "UPDATE memory_jobs SET error=? WHERE id=? AND state='review'",
+                            (TERMINAL_REVIEW_ERROR, jid),
+                        )
+                        engine.db.execute(
+                            "UPDATE operations SET status='failed_unknown' "
+                            "WHERE owner=? AND character_id=? AND request_id=? AND status='running'",
+                            (engine.owner, cid, "auto-" + jid),
+                        )
+                    log.warning(
+                        "Memory job %s (%s for %s) failed %d times consecutively; marked terminal (%s). "
+                        "Check provider/logs and acknowledge manually in Companion Studio to resume.",
+                        jid[:8],
+                        kind,
+                        cid,
+                        streak,
+                        TERMINAL_REVIEW_ERROR,
+                    )
+                    continue
+
+                try:
+                    policy = brain.runtime.automation.policy(cid)
+                    used_24h = engine.db.execute(
+                        "SELECT count(*) FROM memory_jobs WHERE owner=? AND character_id=? AND created>?",
+                        (engine.owner, cid, now - 86400),
+                    ).fetchone()[0]
+                    if used_24h >= policy.daily_jobs:
+                        continue
+                except Exception:
+                    pass
+
+                if is_startup and err == "interrupted_outcome_unknown":
+                    backoff = 0
+                else:
+                    backoff = min(base_backoff * (3 ** (streak - 1)), REVIEW_BACKOFF_MAX_SECONDS)
+
+                age = now - float(r["created"] or 0.0)
+                if age < backoff:
+                    continue
+
                 with engine._transaction():
-                    for r in rows:
-                        engine.db.execute("DELETE FROM memory_jobs WHERE id=?", (r["id"],))
-                        cleared += 1
-                log.info("Auto-cleared %d stale review memory_job(s) so background indexing/summaries can resume", cleared)
+                    changed = engine.db.execute(
+                        "UPDATE memory_jobs SET state='auto_retried' WHERE id=? AND state='review'",
+                        (jid,),
+                    ).rowcount
+                    if changed:
+                        engine.db.execute(
+                            "UPDATE operations SET status='failed_unknown' "
+                            "WHERE owner=? AND character_id=? AND request_id=? AND status='running'",
+                            (engine.owner, cid, "auto-" + jid),
+                        )
+                        released += 1
+                if changed:
+                    next_backoff = min(base_backoff * (3 ** streak), REVIEW_BACKOFF_MAX_SECONDS)
+                    log.info(
+                        "Auto-retried review memory_job %s (%s for %s, attempt %d/%d after %ds backoff; next backoff %ds)",
+                        jid[:8],
+                        kind,
+                        cid,
+                        streak,
+                        MAX_AUTO_REVIEW_RETRIES,
+                        int(backoff),
+                        int(next_backoff),
+                    )
     except Exception as exc:
         log.warning("clear_stale_review_jobs skipped: %s", exc)
-    return cleared
+    return released
+
+
+def _prune_old_turn_drafts_tx(engine, keep_turn_drafts: int = KEEP_TURN_DRAFTS) -> int:
+    """Delete excess committed turn_drafts beyond the newest N while preserving pending turns and image turns."""
+    keep = max(1, int(keep_turn_drafts))
+    cur = engine.db.execute(
+        "DELETE FROM turn_drafts WHERE turn_id IN ("
+        "  SELECT d.turn_id FROM turn_drafts d "
+        "  JOIN turns t ON t.id = d.turn_id "
+        "  WHERE t.owner=? AND t.status='committed' "
+        "  AND instr(coalesce(d.payload, ''), '\"image_result\"') = 0 "
+        "  ORDER BY t.created_at DESC, t.rowid DESC "
+        "  LIMIT -1 OFFSET ?"
+        ")",
+        (engine.owner, keep),
+    )
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+
+def prune_database_bloat(
+    brain: CompanionBrain,
+    *,
+    keep_turn_drafts: int = KEEP_TURN_DRAFTS,
+    embed_max_age_seconds: int = OP_EMBED_PRUNE_AGE_SECONDS,
+    allow_vacuum: bool = False,
+) -> dict[str, int]:
+    """Compact old large embedding payloads in operations and cap committed turn_drafts."""
+    engine = brain.engine
+    now = time.time()
+    stats = {"ops_pruned": 0, "ops_deleted": 0, "drafts_deleted": 0, "jobs_deleted": 0, "vacuumed": 0}
+    try:
+        with engine._lock:
+            with engine._transaction():
+                # 1. Strip multi-kilobyte raw float vectors from aged embedding operation receipts
+                cur = engine.db.execute(
+                    "UPDATE operations SET result='{\"pruned\":true}' "
+                    "WHERE owner=? AND kind IN ('note_query_embedding','query_embedding') "
+                    "AND created_at < ? AND result IS NOT NULL AND length(result) > 1024 "
+                    "AND NOT (kind='query_embedding' AND EXISTS ("
+                    "  SELECT 1 FROM turns t "
+                    "  WHERE t.owner=operations.owner AND t.character_id=operations.character_id "
+                    "  AND ('turn-' || t.id)=operations.request_id AND t.status!='committed'"
+                    "))",
+                    (engine.owner, now - embed_max_age_seconds),
+                )
+                stats["ops_pruned"] = max(0, cur.rowcount or 0)
+
+                # 2. Delete very old (>30d) non-artifact operation rows beyond newest 200
+                cur = engine.db.execute(
+                    "DELETE FROM operations WHERE id IN ("
+                    "  SELECT id FROM operations "
+                    "  WHERE owner=? AND kind NOT IN ('speech','image') "
+                    "  AND status != 'running' AND created_at < ? "
+                    "  ORDER BY created_at DESC LIMIT -1 OFFSET 200"
+                    ")",
+                    (engine.owner, now - 30 * 86400),
+                )
+                stats["ops_deleted"] = max(0, cur.rowcount or 0)
+
+                # 3. Cap committed turn_drafts to the most recent N turns
+                stats["drafts_deleted"] = _prune_old_turn_drafts_tx(engine, keep_turn_drafts)
+
+                # 4. Drop archived memory_jobs older than 30 days (never touches last 24h daily_jobs)
+                cur = engine.db.execute(
+                    "DELETE FROM memory_jobs "
+                    "WHERE owner=? AND state NOT IN ('running','review') AND created < ?",
+                    (engine.owner, now - 30 * 86400),
+                )
+                stats["jobs_deleted"] = max(0, cur.rowcount or 0)
+
+            if allow_vacuum and not engine.db.in_transaction:
+                freelist = engine.db.execute("PRAGMA freelist_count").fetchone()[0]
+                page_size = engine.db.execute("PRAGMA page_size").fetchone()[0]
+                if freelist * page_size >= 1024 * 1024:
+                    engine.db.execute("VACUUM")
+                    stats["vacuumed"] = 1
+                # In WAL mode, VACUUM writes compacted pages into -wal; TRUNCATE commits them and shrinks main DB + -wal
+                engine.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+        if any(stats.values()):
+            log.info(
+                "Pruned Anima DB bloat: ops_pruned=%d ops_deleted=%d drafts_deleted=%d jobs_deleted=%d vacuumed=%d",
+                stats["ops_pruned"],
+                stats["ops_deleted"],
+                stats["drafts_deleted"],
+                stats["jobs_deleted"],
+                stats["vacuumed"],
+            )
+    except Exception as exc:
+        log.warning("prune_database_bloat skipped: %s", exc)
+    return stats
+
+
+def tighten_legacy_summary_batch_size(brain: CompanionBrain) -> None:
+    """Migrate old hardcoded default summary_batch_messages=16 down to SUMMARY_BATCH_MESSAGES."""
+    if SUMMARY_BATCH_MESSAGES >= 16:
+        return
+    engine = brain.engine
+    try:
+        with engine._lock:
+            row = engine.db.execute(
+                "SELECT config FROM memory_automation WHERE owner=? AND character_id=?",
+                (engine.owner, DEFAULT_CHARACTER_ID),
+            ).fetchone()
+            if not row:
+                return
+            cfg = json.loads(row["config"])
+            if cfg.get("summary_batch_messages") == 16:
+                cfg["summary_batch_messages"] = SUMMARY_BATCH_MESSAGES
+                policy = MemoryAutomation.model_validate(cfg)
+                with engine._transaction():
+                    engine.db.execute(
+                        "UPDATE memory_automation SET config=? WHERE owner=? AND character_id=?",
+                        (policy.model_dump_json(), engine.owner, DEFAULT_CHARACTER_ID),
+                    )
+                log.info(
+                    "Migrated %s memory_automation summary_batch_messages: 16 -> %d",
+                    DEFAULT_CHARACTER_ID,
+                    SUMMARY_BATCH_MESSAGES,
+                )
+    except Exception as exc:
+        log.warning("tighten_legacy_summary_batch_size skipped: %s", exc)
 
 
 RELATIONSHIP_PRESETS: dict[str, dict[str, Any]] = {
@@ -894,6 +1154,7 @@ def extract_and_commit_turn(
                 "INSERT OR REPLACE INTO turn_drafts VALUES(?,?)",
                 (ctx.turn_id, json.dumps(draft_payload, ensure_ascii=False)),
             )
+            _prune_old_turn_drafts_tx(engine, KEEP_TURN_DRAFTS)
 
     log.info(
         "Committed ESP32 voice turn %s: +%d memories, +%d corrections, emotion=%s",
@@ -951,12 +1212,18 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
     heal_task: asyncio.Task | None = None
 
     async def review_healer():
+        tick = 0
         while True:
             await asyncio.sleep(180)
+            tick += 1
             try:
-                await asyncio.to_thread(clear_stale_review_jobs, brain, 180)
-            except Exception:
-                pass
+                await asyncio.to_thread(clear_stale_review_jobs, brain)
+                if tick % 5 == 0:
+                    await asyncio.to_thread(prune_database_bloat, brain, allow_vacuum=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("review_healer iteration failed: %s", exc)
 
     async def combined_app(scope, receive, send):
         nonlocal worker_task, heal_task
@@ -968,10 +1235,38 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
                     worker_task = asyncio.create_task(ingest_worker())
                     heal_task = asyncio.create_task(review_healer())
                 elif msg["type"] == "lifespan.shutdown":
-                    if worker_task:
-                        worker_task.cancel()
                     if heal_task:
                         heal_task.cancel()
+                        try:
+                            await heal_task
+                        except asyncio.CancelledError:
+                            pass
+                    if worker_task and not worker_task.done():
+                        pending_cnt = max(
+                            ingest_queue.qsize(),
+                            int(getattr(ingest_queue, "_unfinished_tasks", 0) or 0),
+                        )
+                        if pending_cnt:
+                            log.info(
+                                "Draining %d pending ingest turn(s) before shutdown (timeout=%.1fs)...",
+                                pending_cnt,
+                                SHUTDOWN_DRAIN_SECONDS,
+                            )
+                        try:
+                            await asyncio.wait_for(
+                                ingest_queue.join(), timeout=SHUTDOWN_DRAIN_SECONDS
+                            )
+                        except asyncio.TimeoutError:
+                            log.warning(
+                                "Shutdown ingest drain timed out after %.1fs (%d turn(s) remaining)",
+                                SHUTDOWN_DRAIN_SECONDS,
+                                ingest_queue.qsize(),
+                            )
+                        worker_task.cancel()
+                        try:
+                            await worker_task
+                        except asyncio.CancelledError:
+                            pass
                 return msg
 
             await studio_app(scope, wrapped_receive, send)
@@ -996,10 +1291,32 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
                     await resp(scope, receive, send)
                     return
 
-                try:
-                    body = await req.json()
-                except Exception:
+                raw_bytes = await req.body()
+                if not raw_bytes or not raw_bytes.strip():
+                    raw_body: Any = {}
+                else:
+                    try:
+                        raw_body = json.loads(raw_bytes)
+                    except (ValueError, UnicodeDecodeError):
+                        if req.method == "POST":
+                            resp = JSONResponse(
+                                {"error": "Invalid JSON request body"},
+                                status_code=400,
+                            )
+                            await resp(scope, receive, send)
+                            return
+                        raw_body = {}
+                if not isinstance(raw_body, dict):
+                    if req.method == "POST":
+                        resp = JSONResponse(
+                            {"error": "Request body must be a JSON object"},
+                            status_code=400,
+                        )
+                        await resp(scope, receive, send)
+                        return
                     body = {}
+                else:
+                    body = raw_body
 
                 char_id = str(
                     body.get("character_id")
@@ -1080,16 +1397,18 @@ def main():
     # Keep reader_enabled off by default for fast single-hop chat in Companion Studio too
     if "COMPANION_READER_ENABLED" not in os.environ:
         settings.reader_enabled = False
+    if "COMPANION_TIMEOUT_SECONDS" not in os.environ and settings.timeout_seconds < DEFAULT_TIMEOUT_SECONDS:
+        settings.timeout_seconds = DEFAULT_TIMEOUT_SECONDS
 
     automation = MemoryAutomation(
         embedding=bool(settings.embedding_base_url and settings.embedding_model),
         semantic_retrieval=bool(settings.embedding_base_url and settings.embedding_model),
         summaries=True,
         reconcile=True,
-        summary_turns=12,
-        summary_batch_messages=16,
-        retain_recent_turns=8,
-        idle_seconds=180,
+        summary_turns=8,
+        summary_batch_messages=SUMMARY_BATCH_MESSAGES,
+        retain_recent_turns=6,
+        idle_seconds=300,
     )
 
     with CompanionBrain(
@@ -1108,12 +1427,14 @@ def main():
         ),
     ) as brain:
         ensure_default_character(brain)
-        clear_stale_review_jobs(brain)
+        tighten_legacy_summary_batch_size(brain)
+        prune_database_bloat(brain, allow_vacuum=True)
+        clear_stale_review_jobs(brain, is_startup=True)
         app = create_combined_asgi_app(brain, token)
         log.info("==========================================================")
         log.info("Anima Brain + Companion Studio is READY on port %d", PORT)
         log.info("Database: %s", DB_PATH)
-        log.info("Studio URL: %s", studio_url)
+        log.info("Studio URL: http://localhost:%d/#token=*** (full URL saved to %s)", PORT, URL_PATH)
         log.info("==========================================================")
         uvicorn.run(
             app,

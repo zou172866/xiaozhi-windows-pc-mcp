@@ -45,6 +45,74 @@ def _patched_read_config(config_path):
 
 config_loader.read_config = _patched_read_config
 
+# 1b. Inject local 18900 Bearer Token into ServerMCPManager.load_config in memory (zero secret on disk in .mcp_server_settings.json)
+PC_MCP_TOKEN_PATH = os.path.join(DATA_DIR, "pc_mcp_token.txt")
+
+
+def _read_pc_mcp_token(token_path: str = PC_MCP_TOKEN_PATH) -> str:
+    try:
+        if os.path.isfile(token_path):
+            with open(token_path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_local_pc_mcp_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        p = urlparse(str(url).strip())
+        host = (p.hostname or "").lower()
+        port = p.port
+        return host in ("host.docker.internal", "127.0.0.1", "localhost") and port == 18900
+    except Exception:
+        return False
+
+
+def inject_pc_mcp_auth_headers(servers_cfg: dict, token_path: str = PC_MCP_TOKEN_PATH) -> dict:
+    if not isinstance(servers_cfg, dict):
+        return servers_cfg
+    token = _read_pc_mcp_token(token_path)
+    if not token:
+        return servers_cfg
+    out = {}
+    for name, cfg in servers_cfg.items():
+        if isinstance(cfg, dict) and _is_local_pc_mcp_url(str(cfg.get("url") or "")):
+            new_cfg = dict(cfg)
+            headers = dict(new_cfg.get("headers") or {})
+            headers["Authorization"] = f"Bearer {token}"
+            new_cfg["headers"] = headers
+            out[name] = new_cfg
+        else:
+            out[name] = cfg
+    return out
+
+
+def install_mcp_token_injection_patch() -> None:
+    try:
+        from core.providers.tools.server_mcp import mcp_manager as _mcp_mgr_mod
+
+        cls = _mcp_mgr_mod.ServerMCPManager
+        if getattr(cls, "_pc_mcp_token_patched", False):
+            return
+        _orig_load_config = cls.load_config
+
+        def _patched_load_config(self):
+            servers = _orig_load_config(self)
+            return inject_pc_mcp_auth_headers(servers)
+
+        cls.load_config = _patched_load_config
+        cls._pc_mcp_token_patched = True
+    except Exception as _mcp_exc:
+        print(f"[MCPAuth] 注入本地 18900 Bearer Token 补丁跳过: {_mcp_exc}", flush=True)
+
+
+install_mcp_token_injection_patch()
+
 # 2. Register custom Anima Brain memory provider without modifying container image
 import core.utils.memory as memory_factory
 import anima_memory_provider
@@ -197,43 +265,44 @@ def _install_memory_optimizations():
         sys.modules["modelscope.hub"] = _ms_hub
         sys.modules["modelscope.hub.file_download"] = _ms_dl
 
-        # 6b. Offload Sherpa-ONNX CPU decode_stream to worker thread so asyncio loop stays responsive
-        try:
-            import core.providers.asr.sherpa_onnx_local as _sherpa_mod
+    # 6b. Offload Sherpa-ONNX CPU decode_stream to worker thread so asyncio loop stays responsive
+    #     Always installed (including first-boot auto-download when local files don't exist yet).
+    try:
+        import core.providers.asr.sherpa_onnx_local as _sherpa_mod
 
-            _TAG_RE = re.compile(r"<\|[^|]+\|>")
+        _TAG_RE = re.compile(r"<\|[^|]+\|>")
 
-            async def _async_speech_to_text(self, opus_data, session_id, artifacts=None):
-                file_path = None
-                try:
-                    if artifacts is None:
-                        return "", None
-                    file_path = artifacts.file_path
-                    start_time = time.time()
+        async def _async_speech_to_text(self, opus_data, session_id, artifacts=None):
+            file_path = None
+            try:
+                if artifacts is None:
+                    return "", None
+                file_path = artifacts.file_path
+                start_time = time.time()
 
-                    def _decode():
-                        s = self.model.create_stream()
-                        samples, sample_rate = self.read_wave(file_path)
-                        s.accept_waveform(sample_rate, samples)
-                        self.model.decode_stream(s)
-                        return s.result.text
+                def _decode():
+                    s = self.model.create_stream()
+                    samples, sample_rate = self.read_wave(file_path)
+                    s.accept_waveform(sample_rate, samples)
+                    self.model.decode_stream(s)
+                    return s.result.text
 
-                    text = await asyncio.to_thread(_decode)
-                    if text:
-                        text = _TAG_RE.sub("", text).strip()
-                    _sherpa_mod.logger.bind(tag=_sherpa_mod.TAG).debug(
-                        f"语音识别耗时: {time.time() - start_time:.3f}s | 结果: {text}"
-                    )
-                    return text, file_path
-                except Exception as exc:
-                    _sherpa_mod.logger.bind(tag=_sherpa_mod.TAG).error(
-                        f"语音识别失败: {exc}", exc_info=True
-                    )
-                    return "", file_path
+                text = await asyncio.to_thread(_decode)
+                if text:
+                    text = _TAG_RE.sub("", text).strip()
+                _sherpa_mod.logger.bind(tag=_sherpa_mod.TAG).debug(
+                    f"语音识别耗时: {time.time() - start_time:.3f}s | 结果: {text}"
+                )
+                return text, file_path
+            except Exception as exc:
+                _sherpa_mod.logger.bind(tag=_sherpa_mod.TAG).error(
+                    f"语音识别失败: {exc}", exc_info=True
+                )
+                return "", file_path
 
-            _sherpa_mod.ASRProvider.speech_to_text = _async_speech_to_text
-        except Exception as _s_exc:
-            print(f"[MemOpt] SherpaASR 异步补丁跳过: {_s_exc}", flush=True)
+        _sherpa_mod.ASRProvider.speech_to_text = _async_speech_to_text
+    except Exception as _s_exc:
+        print(f"[MemOpt] SherpaASR 异步补丁跳过: {_s_exc}", flush=True)
 
     # 6c. Periodic glibc malloc_trim(0) so transient Python/ONNX heap returns to Linux/WSL2
     try:

@@ -13,12 +13,14 @@ from . import (
     HEARTBEAT_FILE,
     L3Backend,
     PENDING_DIR,
+    atomic_write_json,
     load_last_active_task,
+    read_env_key,
 )
 
 
 def _get_brain_dir() -> Path:
-    custom = os.environ.get("ANTIGRAVITY_BRAIN_DIR", "").strip()
+    custom = read_env_key("ANTIGRAVITY_BRAIN_DIR")
     if custom:
         return Path(custom).expanduser()
     return Path.home() / ".gemini" / "antigravity" / "brain"
@@ -100,7 +102,7 @@ class AntigravityBackend(L3Backend):
         }
         PENDING_DIR.mkdir(parents=True, exist_ok=True)
         pending_file = PENDING_DIR / f"{task_id}.json"
-        pending_file.write_text(json.dumps(task_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(pending_file, task_obj)
 
         if not _is_worker_alive():
             return (

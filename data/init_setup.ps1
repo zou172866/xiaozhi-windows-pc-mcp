@@ -84,7 +84,8 @@ if ($memChoice -eq "2") {
         "ANIMA_LLM_MODEL=deepseek-chat",
         "# 若需要长期语义向量检索，可填入国内兼容 Embedding 地址并把 Key 存入系统环境变量 ANIMA_EMBEDDING_API_KEY",
         "ANIMA_EMBEDDING_BASE_URL=",
-        "ANIMA_EMBEDDING_MODEL="
+        "ANIMA_EMBEDDING_MODEL=",
+        "ANIMA_EMBEDDING_API_KEY="
     )
 }
 
@@ -105,14 +106,34 @@ $l3Json = @{
 [System.IO.File]::WriteAllText($l3CfgPath, $l3Json, [System.Text.UTF8Encoding]::new($false))
 Write-Host "[已生成] L3 引擎配置:  $l3CfgPath" -ForegroundColor Green
 
-# 若缺少 data/.config.yaml，则从通用模板拷贝（绝不覆盖已有个人配置）
+# 按需从 .example 模板生成缺失的运行态配置文件（绝不覆盖已有个人设定）
+$runtimeTemplates = @(
+    @{ Tpl = "data\.config.example.yaml";           Dst = "data\.config.yaml";           Label = "默认小智主配置" },
+    @{ Tpl = "data\pc_control_mode.example.json";   Dst = "data\pc_control_mode.json";   Label = "电脑操控权限挡位" },
+    @{ Tpl = "data\audio_output_mode.example.json"; Dst = "data\audio_output_mode.json"; Label = "语音播报输出端配置" },
+    @{ Tpl = "data\reply_length_config.example.json"; Dst = "data\reply_length_config.json"; Label = "回复字数控制配置" },
+    @{ Tpl = "data\tts_infer_xiaozhi.example.yaml"; Dst = "data\tts_infer_xiaozhi.yaml"; Label = "GPT-SoVITS 推理配置" },
+    @{ Tpl = "data\.wakeup_words.example.yaml";     Dst = "data\.wakeup_words.yaml";     Label = "唤醒词缓存索引" }
+)
+foreach ($item in $runtimeTemplates) {
+    $tplFull = Join-Path $serverDir $item.Tpl
+    $dstFull = Join-Path $serverDir $item.Dst
+    if (-not (Test-Path $dstFull) -and (Test-Path $tplFull)) {
+        Copy-Item $tplFull $dstFull
+        Write-Host "[已生成] $($item.Label): $($item.Dst)" -ForegroundColor Green
+    }
+}
+
+# 若用户选择免显卡 EdgeTTS，同步确保 data\.config.yaml 的 selected_module.TTS 为 EdgeTTS（不改动其余个人设定）
 $cfgPath = Join-Path $serverDir "data\.config.yaml"
-$tplPath = Join-Path $serverDir "data\.config.example.yaml"
-if (-not (Test-Path $cfgPath) -and (Test-Path $tplPath)) {
-    Copy-Item $tplPath $cfgPath
-    Write-Host "[已生成] 默认小智配置: $cfgPath（默认 EdgeTTS，可在 18080 控制台自由修改）" -ForegroundColor Green
-} else {
-    Write-Host "[保留]   检测到已有 data\.config.yaml，未覆盖你的个人设定。" -ForegroundColor DarkGray
+if ($enableGsv -eq "false" -and (Test-Path $cfgPath)) {
+    $cfgRaw = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8)
+    $ttsPat = '(?m)^(\s*TTS:\s*)["'']?GPT_SOVITS_V2["'']?(\s*(?:#.*)?\r?)$'
+    if ($cfgRaw -match $ttsPat) {
+        $cfgUpdated = [regex]::Replace($cfgRaw, $ttsPat, '${1}EdgeTTS${2}')
+        [System.IO.File]::WriteAllText($cfgPath, $cfgUpdated, [System.Text.UTF8Encoding]::new($false))
+        Write-Host "[已同步] data\.config.yaml 中 TTS 已设为 EdgeTTS（免显卡模式）" -ForegroundColor Green
+    }
 }
 
 # 5. 检查 Python 虚拟环境与 API Key 环境变量
@@ -134,16 +155,44 @@ if (-not $dsKey) {
     Write-Host "  [提示] 尚未检测到 DEEPSEEK_API_KEY 环境变量。" -ForegroundColor Yellow
     $inputKey = (Read-Host "可直接粘贴 DeepSeek API Key 写入当前 Windows 用户环境变量（留空跳过）").Trim()
     if ($inputKey) {
+        $dsKey = $inputKey
         [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", $inputKey, "User")
-        if ($memChoice -ne "2") {
-            [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $inputKey, "User")
-        }
-        Write-Host "  [OK] 已安全写入 Windows 用户环境变量（零明文落盘）" -ForegroundColor Green
+        Write-Host "  [OK] 已安全写入 DEEPSEEK_API_KEY 到 Windows 用户环境变量（零明文落盘）" -ForegroundColor Green
     }
 } else {
     Write-Host "  [OK] DEEPSEEK_API_KEY 环境变量已配置" -ForegroundColor Green
-    if ($memChoice -ne "2" -and -not [Environment]::GetEnvironmentVariable("ANIMA_LLM_API_KEY", "User")) {
+}
+
+if ($memChoice -eq "2") {
+    # 切换至 Google Gemini 时清理可能残留的旧 ANIMA_LLM_API_KEY（避免把 DeepSeek Key 误发给 Gemini）
+    $oldAnimaKey = [Environment]::GetEnvironmentVariable("ANIMA_LLM_API_KEY", "User")
+    if ($oldAnimaKey) {
+        [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $null, "User")
+        Write-Host "  [已清理] 已移除旧的 ANIMA_LLM_API_KEY 用户环境变量，记忆大脑将使用 GEMINI_API_KEY" -ForegroundColor Yellow
+    }
+    [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $null, "Process")
+    $machineAnimaKey = [Environment]::GetEnvironmentVariable("ANIMA_LLM_API_KEY", "Machine")
+    if ($machineAnimaKey) {
+        Write-Host "  [注意] 检测到系统级 (Machine) 环境变量 ANIMA_LLM_API_KEY，请在系统环境变量中手动删除以免覆盖 GEMINI_API_KEY" -ForegroundColor Yellow
+    }
+    $gemKey = [Environment]::GetEnvironmentVariable("GEMINI_API_KEY", "User")
+    if (-not $gemKey) { $gemKey = [Environment]::GetEnvironmentVariable("GEMINI_API_KEY", "Machine") }
+    if (-not $gemKey) {
+        Write-Host "  [提示] 尚未检测到 GEMINI_API_KEY 环境变量。" -ForegroundColor Yellow
+        $inputGem = (Read-Host "可直接粘贴 Google Gemini API Key 写入当前 Windows 用户环境变量（留空跳过）").Trim()
+        if ($inputGem) {
+            [Environment]::SetEnvironmentVariable("GEMINI_API_KEY", $inputGem, "User")
+            [Environment]::SetEnvironmentVariable("GEMINI_API_KEY", $inputGem, "Process")
+            Write-Host "  [OK] 已安全写入 GEMINI_API_KEY 到 Windows 用户环境变量（零明文落盘）" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  [OK] GEMINI_API_KEY 环境变量已配置" -ForegroundColor Green
+    }
+} else {
+    if ($dsKey) {
         [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $dsKey, "User")
+        [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $dsKey, "Process")
+        Write-Host "  [OK] 已将 ANIMA_LLM_API_KEY 同步为当前 DEEPSEEK_API_KEY（纯国内免梯子模式）" -ForegroundColor Green
     }
 }
 

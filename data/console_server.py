@@ -1,9 +1,13 @@
 import asyncio
+import io
 import json
+import math
 import os
 import re
+import struct
 import threading
 import time
+import wave
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +26,7 @@ DATA_DIR = os.path.join(ROOT_DIR, "data")
 CONFIG_PATH = os.path.join(DATA_DIR, ".config.yaml")
 HTML_PATH = os.path.join(DATA_DIR, "console.html")
 HISTORY_PATH = os.path.join(DATA_DIR, "chat_history.json")
+LOG_CURSOR_PATH = os.path.join(DATA_DIR, ".console_log_cursor.json")
 MODE_PATH = os.path.join(DATA_DIR, "pc_control_mode.json")
 AGY_HB_PATH = os.path.join(DATA_DIR, "agy_tasks", "worker_heartbeat.json")
 LOG_PATH = os.path.join(ROOT_DIR, "tmp", "server.log")
@@ -33,9 +38,9 @@ GSV_INFER_YAML = os.path.join(DATA_DIR, "tts_infer_xiaozhi.yaml")
 L3_CONFIG_PATH = os.path.join(DATA_DIR, "l3_backend_config.json")
 HOST_DATA_DIR = (
     (os.environ.get("HOST_DATA_DIR") or "").replace("\\", "/").rstrip("/")
-    or "e:/故事/1/xiaozhi-server/data"
+    or DATA_DIR
 )
-HOST_LAN_IP = (os.environ.get("HOST_LAN_IP") or "").strip() or "192.168.31.200"
+HOST_LAN_IP = (os.environ.get("HOST_LAN_IP") or "").strip() or "127.0.0.1"
 
 GSV_PROFILES = {
     "__gsv_raiden_mei__": {
@@ -64,6 +69,7 @@ GSV_PROFILES = {
             "seed": -1,
             "parallel_infer": True,
             "repetition_penalty": 1.35,
+            "sample_steps": 16,
         },
     },
     "__gsv_xiaozhi_tw__": {
@@ -125,6 +131,107 @@ def _get_configured_gsv_voice() -> str | None:
         return None
 
 
+_SECRET_PATTERNS = (
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-~+/=]{8,}", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(#token=|api_key=|authorization\s*[:=]\s*)[^\s&\"',;]+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"), "sk-***"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}\b"), "AIza***"),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    s = str(text or "")
+    for pat, repl in _SECRET_PATTERNS:
+        s = pat.sub(repl, s)
+    return s
+
+
+def _atomic_write_text(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def validate_console_request(method: str, headers: dict, port: int = CONSOLE_PORT) -> tuple[bool, int, str]:
+    """Validate Host and browser CSRF guards (Origin / Referer / Sec-Fetch-Site / Content-Type) on 18080."""
+    norm_headers = {str(k).lower(): str(v).strip() for k, v in (headers or {}).items()}
+    allowed_hosts = {
+        f"localhost:{port}",
+        f"127.0.0.1:{port}",
+        f"[::1]:{port}",
+        f"xiaozhi-esp32-server:{port}",
+        "localhost",
+        "127.0.0.1",
+        "[::1]",
+        "xiaozhi-esp32-server",
+    }
+    allowed_origins = {
+        f"http://localhost:{port}",
+        f"http://127.0.0.1:{port}",
+        f"http://[::1]:{port}",
+    }
+
+    host = norm_headers.get("host", "").lower()
+    if not host or host not in allowed_hosts:
+        return False, int(HTTPStatus.MISDIRECTED_REQUEST), "Invalid Host header"
+
+    if str(method).upper() == "POST":
+        origin = norm_headers.get("origin", "").lower()
+        if origin:
+            if origin not in allowed_origins:
+                return False, int(HTTPStatus.FORBIDDEN), "Cross-origin POST rejected"
+        else:
+            referer = norm_headers.get("referer", "").lower()
+            if referer and not any(referer == o or referer.startswith(o + "/") for o in allowed_origins):
+                return False, int(HTTPStatus.FORBIDDEN), "Cross-origin Referer rejected"
+
+        sec_fetch_site = norm_headers.get("sec-fetch-site", "").lower()
+        if sec_fetch_site and sec_fetch_site not in ("same-origin", "none"):
+            return False, int(HTTPStatus.FORBIDDEN), "Cross-site POST rejected"
+
+        content_type = norm_headers.get("content-type", "").lower()
+        media_type = content_type.split(";", 1)[0].strip()
+        if media_type != "application/json":
+            return False, int(HTTPStatus.UNSUPPORTED_MEDIA_TYPE), "POST Content-Type must be application/json"
+
+    return True, int(HTTPStatus.OK), ""
+
+
+_console_http_lock = threading.Lock()
+_console_http_client: httpx.Client | None = None
+
+
+def _get_console_http_client() -> httpx.Client:
+    """Shared persistent keep-alive httpx.Client (trust_env=False) for local 18900/18787/19880 calls."""
+    global _console_http_client
+    with _console_http_lock:
+        if _console_http_client is None or _console_http_client.is_closed:
+            _console_http_client = httpx.Client(
+                trust_env=False,
+                limits=httpx.Limits(max_connections=12, max_keepalive_connections=6),
+            )
+        return _console_http_client
+
+
+class _BadRequestError(ValueError):
+    """Raised when a POST request body is malformed, oversized, or not a JSON object."""
+
+
 def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
     global _active_gsv_loaded
     prof = GSV_PROFILES.get(voice_id)
@@ -134,8 +241,13 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
         if _active_gsv_loaded is None:
             _active_gsv_loaded = _detect_boot_gsv_voice()
         if _active_gsv_loaded != voice_id:
-            httpx.get(f"{GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=25.0)
-            httpx.get(f"{GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=30.0)
+            client = _get_console_http_client()
+            r1 = client.get(f"{GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=25.0)
+            if r1.status_code != 200:
+                raise RuntimeError(f"切换 GPT 权重失败 (HTTP {r1.status_code}): {r1.text[:160]}")
+            r2 = client.get(f"{GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=30.0)
+            if r2.status_code != 200:
+                raise RuntimeError(f"切换 SoVITS 权重失败 (HTTP {r2.status_code}): {r2.text[:160]}")
             _active_gsv_loaded = voice_id
         if persist_boot_yaml:
             boot_cfg = {}
@@ -154,21 +266,38 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
                 "version": prof["version"],
                 "vits_weights_path": prof["sovits_weights"],
             }
-            with open(GSV_INFER_YAML, "w", encoding="utf-8") as f:
-                yaml.safe_dump(boot_cfg, f, allow_unicode=True, sort_keys=False)
+            _atomic_write_text(GSV_INFER_YAML, yaml.safe_dump(boot_cfg, allow_unicode=True, sort_keys=False))
 
 
 _state_lock = threading.Lock()
 _chat_messages = []
 _raw_logs = deque(maxlen=150)
 _device_info = {
-    "device_id": "cc:68:c7:a8:19:dc",
+    "device_id": "",
     "last_seen": "",
     "activity": "idle",
     "server_ready": False,
 }
 _current_ai_turn_open = False
 _log_offset = 0
+
+
+def _dedup_chat_items(items: list) -> list:
+    deduped = []
+    seen_recent = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("role") or ""),
+            str(item.get("time") or ""),
+            str(item.get("text") or ""),
+        )
+        if key in seen_recent:
+            continue
+        seen_recent.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def _load_history():
@@ -178,15 +307,17 @@ def _load_history():
             with open(HISTORY_PATH, "r", encoding="utf-8") as f:
                 items = json.load(f)
                 if isinstance(items, list):
-                    _chat_messages = items[-100:]
+                    _chat_messages = _dedup_chat_items(items)[-100:]
         except Exception:
             _chat_messages = []
 
 
 def _save_history():
     try:
-        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
-            json.dump(_chat_messages[-100:], f, ensure_ascii=False, indent=2)
+        _atomic_write_text(
+            HISTORY_PATH,
+            json.dumps(_chat_messages[-100:], ensure_ascii=False, indent=2),
+        )
     except Exception:
         pass
 
@@ -204,9 +335,7 @@ def _read_pc_mode() -> str:
 
 
 def _write_pc_mode(mode: str):
-    os.makedirs(os.path.dirname(MODE_PATH), exist_ok=True)
-    with open(MODE_PATH, "w", encoding="utf-8") as f:
-        json.dump({"mode": mode}, f, ensure_ascii=False, indent=2)
+    _atomic_write_text(MODE_PATH, json.dumps({"mode": mode}, ensure_ascii=False, indent=2))
 
 
 def _check_agy_bridge_online() -> bool:
@@ -283,15 +412,19 @@ def _fetch_l3_backend_status(force: bool = False) -> dict:
         if not force and _l3_cache is not None and (now - _l3_cache_ts) < _L3_CACHE_TTL:
             return dict(_l3_cache)
     try:
-        with httpx.Client(timeout=1.6, trust_env=False) as client:
-            resp = client.get(f"{PC_MCP_HOST}/l3/status")
-            if resp.status_code == 200:
-                data = resp.json()
-                data["mcp_online"] = True
-                with _l3_cache_lock:
-                    _l3_cache = dict(data)
-                    _l3_cache_ts = time.monotonic()
-                return data
+        client = _get_console_http_client()
+        resp = client.get(
+            f"{PC_MCP_HOST}/l3/status",
+            headers=pc_audio_router.get_pc_mcp_auth_headers(),
+            timeout=1.6,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            data["mcp_online"] = True
+            with _l3_cache_lock:
+                _l3_cache = dict(data)
+                _l3_cache_ts = time.monotonic()
+            return data
     except Exception:
         pass
     fb = _read_local_l3_fallback()
@@ -304,16 +437,21 @@ def _fetch_l3_backend_status(force: bool = False) -> dict:
 def _update_l3_backend_config(payload: dict) -> tuple[bool, dict | str]:
     global _l3_cache, _l3_cache_ts
     try:
-        with httpx.Client(timeout=3.5, trust_env=False) as client:
-            resp = client.post(f"{PC_MCP_HOST}/l3/config", json=payload or {})
-            if resp.status_code == 200:
-                data = resp.json()
-                data["mcp_online"] = True
-                with _l3_cache_lock:
-                    _l3_cache = dict(data)
-                    _l3_cache_ts = time.monotonic()
-                return True, data
-            return False, f"宿主机 MCP 返回 HTTP {resp.status_code}: {resp.text[:160]}"
+        client = _get_console_http_client()
+        resp = client.post(
+            f"{PC_MCP_HOST}/l3/config",
+            headers=pc_audio_router.get_pc_mcp_auth_headers(),
+            json=payload or {},
+            timeout=3.5,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            data["mcp_online"] = True
+            with _l3_cache_lock:
+                _l3_cache = dict(data)
+                _l3_cache_ts = time.monotonic()
+            return True, data
+        return False, f"宿主机 MCP 返回 HTTP {resp.status_code}: {resp.text[:160]}"
     except Exception:
         # Offline fallback: persist directly to shared data/l3_backend_config.json so next 18900 start picks it up
         try:
@@ -330,8 +468,7 @@ def _update_l3_backend_config(payload: dict) -> tuple[bool, dict | str]:
             }
             if new_cfg["backend"] not in ("antigravity", "dsh", "workbuddy", "none"):
                 return False, "无效的 L3 后端名称"
-            with open(L3_CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(new_cfg, f, ensure_ascii=False, indent=2)
+            _atomic_write_text(L3_CONFIG_PATH, json.dumps(new_cfg, ensure_ascii=False, indent=2))
             fb = _read_local_l3_fallback()
             with _l3_cache_lock:
                 _l3_cache = dict(fb)
@@ -356,14 +493,73 @@ def _join_cn_clauses(prev: str, nxt: str) -> str:
     return prev + "，" + nxt
 
 
-def _process_log_line(line: str):
+def _is_duplicate_chat_message(
+    role: str, ts_short: str, text: str, *, exclude_last: bool = False
+) -> bool:
+    pool = _chat_messages[:-1] if exclude_last else _chat_messages
+    for m in pool:
+        if (
+            m.get("role") == role
+            and m.get("time") == ts_short
+            and m.get("text") == text
+        ):
+            return True
+    return False
+
+
+def _finalize_open_ai_turn() -> None:
+    global _current_ai_turn_open
+    if _current_ai_turn_open:
+        if _chat_messages and _chat_messages[-1].get("role") == "assistant":
+            last = _chat_messages[-1]
+            if _is_duplicate_chat_message(
+                "assistant",
+                str(last.get("time") or ""),
+                str(last.get("text") or ""),
+                exclude_last=True,
+            ):
+                _chat_messages.pop()
+        _current_ai_turn_open = False
+
+
+def _trim_chat_messages() -> None:
+    if len(_chat_messages) > 100:
+        del _chat_messages[:-100]
+
+
+def _load_log_cursor() -> tuple[int | None, int]:
+    try:
+        if os.path.isfile(LOG_CURSOR_PATH):
+            with open(LOG_CURSOR_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                ino = data.get("inode")
+                off = int(data.get("offset", 0))
+                if ino is not None and off >= 0:
+                    return int(ino), off
+    except Exception:
+        pass
+    return None, 0
+
+
+def _save_log_cursor(inode: int, offset: int) -> None:
+    try:
+        _atomic_write_text(
+            LOG_CURSOR_PATH,
+            json.dumps({"inode": int(inode), "offset": int(offset)}),
+        )
+    except Exception:
+        pass
+
+
+def _process_log_line(line: str, *, status_only: bool = False):
     global _current_ai_turn_open
     s = line.strip()
     if not s:
         return
 
     with _state_lock:
-        _raw_logs.append(s)
+        _raw_logs.append(_redact_secrets(s))
 
         m_time = _RE_TIME.match(s)
         ts_short = m_time.group(1)[11:19] if m_time else time.strftime("%H:%M:%S")
@@ -376,20 +572,24 @@ def _process_log_line(line: str):
             _device_info["device_id"] = m_dev.group(1)
             _device_info["last_seen"] = ts_short
 
+        if status_only:
+            return
+
         if _RE_LISTEN_START.search(s):
+            _finalize_open_ai_turn()
             _device_info["activity"] = "listening"
             _device_info["last_seen"] = ts_short
-            _current_ai_turn_open = False
             return
 
         m_user = _RE_USER_MSG.search(s)
         if m_user:
+            _finalize_open_ai_turn()
             text = m_user.group(1).strip()
             _device_info["activity"] = "speaking"
             _device_info["last_seen"] = ts_short
-            _current_ai_turn_open = False
-            _chat_messages.append({"role": "user", "text": text, "time": ts_short})
-            _save_history()
+            if not _is_duplicate_chat_message("user", ts_short, text):
+                _chat_messages.append({"role": "user", "text": text, "time": ts_short})
+                _save_history()
             return
 
         m_ai = _RE_AI_SENTENCE.search(s)
@@ -402,7 +602,7 @@ def _process_log_line(line: str):
             )
             _device_info["last_seen"] = ts_short
             if stype == "LAST" or content == "None":
-                _current_ai_turn_open = False
+                _finalize_open_ai_turn()
                 _device_info["activity"] = "idle"
                 _save_history()
             elif content:
@@ -415,24 +615,165 @@ def _process_log_line(line: str):
             return
 
 
-def _log_watcher_loop():
+def _stream_status_prefix(log_path: str, limit_bytes: int) -> None:
+    """Replay [0..limit_bytes] in streaming fashion updating only status flags & raw logs."""
+    remaining = max(0, int(limit_bytes))
+    if not remaining:
+        return
+    with open(log_path, "rb") as f:
+        buf = b""
+        while remaining > 0:
+            chunk = f.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            buf += chunk
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                ln = buf[:nl].decode("utf-8", errors="replace")
+                buf = buf[nl + 1 :]
+                _process_log_line(ln, status_only=True)
+        if buf:
+            _process_log_line(buf.decode("utf-8", errors="replace"), status_only=True)
+
+
+def _replay_boot_lines_merged(lines: list[str]) -> None:
+    """Replay a full log on cursor-less boot without duplicating or scrambling existing history."""
+    global _current_ai_turn_open
+    replayed_msgs: list[dict] = []
+    open_ai = False
+    last_activity: str | None = None
+    last_seen: str | None = None
+
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        _process_log_line(s, status_only=True)
+
+        m_time = _RE_TIME.match(s)
+        ts_short = m_time.group(1)[11:19] if m_time else time.strftime("%H:%M:%S")
+
+        if _RE_LISTEN_START.search(s):
+            open_ai = False
+            last_activity = "listening"
+            last_seen = ts_short
+            continue
+
+        m_user = _RE_USER_MSG.search(s)
+        if m_user:
+            open_ai = False
+            text = m_user.group(1).strip()
+            last_activity = "speaking"
+            last_seen = ts_short
+            replayed_msgs.append({"role": "user", "text": text, "time": ts_short})
+            continue
+
+        m_ai = _RE_AI_SENTENCE.search(s)
+        if m_ai:
+            stype, raw_content = m_ai.group(1), m_ai.group(2).strip()
+            content = (
+                "None"
+                if raw_content == "None"
+                else mei_emotion_router.strip_emotion_tags(raw_content).strip()
+            )
+            last_seen = ts_short
+            if stype == "LAST" or content == "None":
+                open_ai = False
+                last_activity = "idle"
+            elif content:
+                last_activity = "speaking"
+                if open_ai and replayed_msgs and replayed_msgs[-1]["role"] == "assistant":
+                    replayed_msgs[-1]["text"] = _join_cn_clauses(replayed_msgs[-1]["text"], content)
+                else:
+                    replayed_msgs.append({"role": "assistant", "text": content, "time": ts_short})
+                    open_ai = True
+
+    with _state_lock:
+        if last_activity is not None:
+            _device_info["activity"] = last_activity
+        if last_seen is not None:
+            _device_info["last_seen"] = last_seen
+
+        # Cap replayed window to newest 100 turns so aged log lines already rotated out of
+        # chat_history.json are never appended out of order behind newer persisted turns.
+        recent_replayed = replayed_msgs[-100:]
+        existing_keys = {
+            (str(m.get("role") or ""), str(m.get("time") or ""), str(m.get("text") or ""))
+            for m in _chat_messages
+        }
+        changed = False
+        last_added = False
+        for idx, item in enumerate(recent_replayed):
+            k = (item["role"], item["time"], item["text"])
+            if k in existing_keys:
+                last_added = False
+                continue
+            existing_keys.add(k)
+            _chat_messages.append(item)
+            changed = True
+            last_added = idx == len(recent_replayed) - 1
+        _current_ai_turn_open = bool(open_ai and last_added)
+        if changed:
+            _trim_chat_messages()
+            _save_history()
+
+
+def _poll_log_once(watcher_state: dict) -> None:
     global _log_offset
+    if not os.path.exists(LOG_PATH):
+        return
+    st = os.stat(LOG_PATH)
+    is_boot_replay = False
+    if not watcher_state.get("initialized"):
+        watcher_state["initialized"] = True
+        saved_ino = watcher_state.get("saved_inode")
+        saved_off = int(watcher_state.get("saved_offset") or 0)
+        if saved_ino == st.st_ino and 0 < saved_off <= st.st_size:
+            _stream_status_prefix(LOG_PATH, saved_off)
+            _log_offset = saved_off
+            watcher_state["last_inode"] = st.st_ino
+        else:
+            _log_offset = 0
+            watcher_state["last_inode"] = st.st_ino
+            is_boot_replay = True
+    elif watcher_state.get("last_inode") != st.st_ino or st.st_size < _log_offset:
+        _log_offset = 0
+        watcher_state["last_inode"] = st.st_ino
+
+    if st.st_size > _log_offset:
+        with open(LOG_PATH, "rb") as f:
+            f.seek(_log_offset)
+            raw = f.read()
+        last_nl = raw.rfind(b"\n")
+        if last_nl >= 0:
+            to_consume = raw[: last_nl + 1]
+            _log_offset += len(to_consume)
+            lines = to_consume.decode("utf-8", errors="replace").splitlines()
+            if is_boot_replay and _chat_messages:
+                _replay_boot_lines_merged(lines)
+            else:
+                for ln in lines:
+                    _process_log_line(ln, status_only=False)
+                with _state_lock:
+                    _trim_chat_messages()
+            _save_log_cursor(st.st_ino, _log_offset)
+
+
+def _log_watcher_loop():
     _load_history()
-    last_inode = None
+    saved_ino, saved_off = _load_log_cursor()
+    watcher_state = {
+        "initialized": False,
+        "last_inode": None,
+        "saved_inode": saved_ino,
+        "saved_offset": saved_off,
+    }
     while True:
         try:
-            if os.path.exists(LOG_PATH):
-                st = os.stat(LOG_PATH)
-                if last_inode != st.st_ino or st.st_size < _log_offset:
-                    _log_offset = 0
-                    last_inode = st.st_ino
-                if st.st_size > _log_offset:
-                    with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-                        f.seek(_log_offset)
-                        chunk = f.read()
-                        _log_offset = f.tell()
-                    for ln in chunk.splitlines():
-                        _process_log_line(ln)
+            _poll_log_once(watcher_state)
         except Exception:
             pass
         time.sleep(0.4)
@@ -478,7 +819,7 @@ def _default_offline_relationship(char_id: str = "xiaozhi") -> dict:
     return {
         "online": False,
         "character_id": char_id,
-        "character_name": "雷电芽衣",
+        "character_name": "小智",
         "relationship_enabled": True,
         "romance_enabled": True,
         "preset": "custom",
@@ -508,19 +849,20 @@ def _fetch_anima_relationship(force: bool = False, cfg: dict | None = None) -> d
     if not token:
         return _default_offline_relationship(char_id)
     try:
-        with httpx.Client(timeout=1.8, trust_env=False) as client:
-            resp = client.get(
-                f"{ANIMA_HOST}/xiaozhi/relationship",
-                params={"character_id": char_id},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                data["online"] = True
-                with _anima_rel_lock:
-                    _anima_rel_cache = dict(data)
-                    _anima_rel_ts = time.monotonic()
-                return data
+        client = _get_console_http_client()
+        resp = client.get(
+            f"{ANIMA_HOST}/xiaozhi/relationship",
+            params={"character_id": char_id},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=1.8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            data["online"] = True
+            with _anima_rel_lock:
+                _anima_rel_cache = dict(data)
+                _anima_rel_ts = time.monotonic()
+            return data
     except Exception:
         pass
     with _anima_rel_lock:
@@ -541,20 +883,21 @@ def _update_anima_relationship(payload: dict) -> tuple[bool, dict | str]:
     req_body = dict(payload or {})
     req_body.setdefault("character_id", char_id)
     try:
-        with httpx.Client(timeout=4.0, trust_env=False) as client:
-            resp = client.post(
-                f"{ANIMA_HOST}/xiaozhi/relationship",
-                headers={"Authorization": f"Bearer {token}"},
-                json=req_body,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                data["online"] = True
-                with _anima_rel_lock:
-                    _anima_rel_cache = dict(data)
-                    _anima_rel_ts = time.monotonic()
-                return True, data
-            return False, f"Anima Brain 返回 HTTP {resp.status_code}: {resp.text[:160]}"
+        client = _get_console_http_client()
+        resp = client.post(
+            f"{ANIMA_HOST}/xiaozhi/relationship",
+            headers={"Authorization": f"Bearer {token}"},
+            json=req_body,
+            timeout=4.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            data["online"] = True
+            with _anima_rel_lock:
+                _anima_rel_cache = dict(data)
+                _anima_rel_ts = time.monotonic()
+            return True, data
+        return False, f"Anima Brain 返回 HTTP {resp.status_code}: {resp.text[:160]}"
     except Exception as exc:
         return False, f"无法连接 Anima Brain (18787): {exc}"
 
@@ -653,9 +996,38 @@ def _write_updated_yaml(prompt: str, llm_provider: str, model_name: str, voice: 
         "# =====================================================================\n\n"
     )
     body = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        f.write(header + body)
+    _atomic_write_text(CONFIG_PATH, header + body)
     threading.Thread(target=_sync_persona_to_anima, args=(prompt,), daemon=True).start()
+
+
+def _generate_test_chime_wav(duration_sec: float = 0.4, sample_rate: int = 48000) -> bytes:
+    """Generate a clean 0.4s 48kHz mono 16-bit sine chime WAV in memory as audio-test fallback."""
+    n_samples = max(1, int(sample_rate * duration_sec))
+    fade_in = max(1, int(sample_rate * 0.02))
+    fade_out = max(1, int(sample_rate * 0.06))
+    half = n_samples // 2
+    amp = 0.28 * 32767.0
+    frames = bytearray()
+    phase = 0.0
+    two_pi_over_sr = 2.0 * math.pi / float(sample_rate)
+    for i in range(n_samples):
+        freq = 587.33 if i < half else 880.0
+        env = 1.0
+        if i < fade_in:
+            env = 0.5 * (1.0 - math.cos(math.pi * i / fade_in))
+        elif i >= n_samples - fade_out:
+            rem = n_samples - 1 - i
+            env = 0.5 * (1.0 - math.cos(math.pi * rem / fade_out))
+        sample = int(max(-32767, min(32767, round(amp * env * math.sin(phase)))))
+        phase += two_pi_over_sr * freq
+        frames.extend(struct.pack("<h", sample))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(bytes(frames))
+    return buf.getvalue()
 
 
 async def _synthesize_mp3(text: str, voice: str) -> bytes:
@@ -681,14 +1053,40 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _read_body_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise _BadRequestError("Invalid Content-Length header") from exc
+        if length < 0 or length > 2 * 1024 * 1024:
+            raise _BadRequestError("Request body size out of range")
+        if length == 0:
             return {}
         raw = self.rfile.read(length)
-        return json.loads(raw.decode("utf-8"))
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise _BadRequestError(f"Invalid JSON body: {exc}") from exc
+        if not isinstance(data, dict):
+            raise _BadRequestError("JSON body must be an object")
+        return data
+
+    def _enforce_security(self, method: str) -> bool:
+        hdrs = {k: v for k, v in self.headers.items()}
+        ok, status_code, err_msg = validate_console_request(method, hdrs, port=CONSOLE_PORT)
+        if not ok:
+            self._send_json({"ok": False, "error": err_msg}, HTTPStatus(status_code))
+            return False
+        return True
 
     def do_GET(self):
+        if not self._enforce_security("GET"):
+            return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            with _state_lock:
+                ready = bool(_device_info.get("server_ready"))
+            self._send_json({"ok": True, "server_ready": ready})
+            return
         if parsed.path in ("/", "/index.html"):
             if not os.path.exists(HTML_PATH):
                 self._send_json({"error": "console.html not found"}, HTTPStatus.NOT_FOUND)
@@ -783,7 +1181,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
+        if not self._enforce_security("POST"):
+            return
         parsed = urlparse(self.path)
+        try:
+            self._handle_post(parsed)
+        except _BadRequestError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def _handle_post(self, parsed):
 
         if parsed.path == "/api/pc-mode":
             try:
@@ -794,6 +1200,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     return
                 _write_pc_mode(mode)
                 self._send_json({"ok": True, "mode": mode})
+            except _BadRequestError:
+                raise
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -817,6 +1225,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "pc_audio_online": pc_audio_router.is_pc_audio_bridge_online(force=True),
                     }
                 )
+            except _BadRequestError:
+                raise
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -830,6 +1240,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     preset=body.get("preset", None),
                 )
                 self._send_json({"ok": True, "reply_length": saved})
+            except _BadRequestError:
+                raise
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -842,6 +1254,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     self._send_json({"ok": True, "relationship": result})
                 else:
                     self._send_json({"ok": False, "error": str(result)}, HTTPStatus.BAD_GATEWAY)
+            except _BadRequestError:
+                raise
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -854,6 +1268,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     self._send_json({"ok": True, "l3_backend": result})
                 else:
                     self._send_json({"ok": False, "error": str(result)}, HTTPStatus.BAD_REQUEST)
+            except _BadRequestError:
+                raise
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -865,13 +1281,18 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 ref_wav = os.path.join(DATA_DIR, "voices", "raiden_mei", "mei_gentle_ref.wav")
                 if not os.path.isfile(ref_wav):
                     ref_wav = os.path.join(DATA_DIR, "wakeup_words_short.wav")
-                with open(ref_wav, "rb") as f:
-                    wav_bytes = f.read()
+                if os.path.isfile(ref_wav):
+                    with open(ref_wav, "rb") as f:
+                        wav_bytes = f.read()
+                else:
+                    wav_bytes = _generate_test_chime_wav(0.4)
                 ok, detail = pc_audio_router.play_wav_on_pc_sync(wav_bytes, volume=vol)
                 if ok:
                     self._send_json({"ok": True})
                 else:
                     self._send_json({"ok": False, "error": f"电脑音响桥接不可用: {detail}"}, HTTPStatus.BAD_GATEWAY)
+            except _BadRequestError:
+                raise
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -903,11 +1324,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         os._exit(0)
 
                     threading.Thread(target=_delayed_restart, daemon=True).start()
+            except _BadRequestError:
+                raise
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         if parsed.path == "/api/clear-history":
+            self._read_body_json()
             with _state_lock:
                 _chat_messages.clear()
                 _save_history()
@@ -963,7 +1387,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                                 req_payload["top_p"] = emo_prof["top_p"]
                             for drop_k in ("type", "url", "output_dir"):
                                 req_payload.pop(drop_k, None)
-                            r = httpx.post(f"{GSV_Host}/tts", json=req_payload, timeout=25.0)
+                            client = _get_console_http_client()
+                            r = client.post(f"{GSV_Host}/tts", json=req_payload, timeout=25.0)
                             if r.status_code != 200:
                                 raise RuntimeError(f"本地 GPT-SoVITS 未就绪或返回异常 ({r.status_code})")
                             wav_bytes = r.content
@@ -988,6 +1413,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Length", str(len(mp3_bytes)))
                     self.end_headers()
                     self.wfile.write(mp3_bytes)
+            except _BadRequestError:
+                raise
             except Exception as e:
                 self._send_json({"ok": False, "error": f"音色试听合成失败: {e}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return

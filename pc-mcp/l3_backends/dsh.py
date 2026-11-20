@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,8 +13,10 @@ from . import (
     load_last_active_task,
     read_env_key,
     resolve_workdir,
+    run_subprocess_with_tree_kill,
     save_active_task,
     split_command,
+    start_worker_thread,
     summarize_text_for_voice,
 )
 
@@ -89,6 +90,7 @@ class DshBackend(L3Backend):
                     f"上一轮结果摘要：{prev_out}\n\n本次追加指令：{instr}"
                 )
 
+        timeout_sec = int(cfg.get("timeout_seconds", 300))
         task_record: Dict[str, Any] = {
             "id": task_id,
             "backend": "dsh",
@@ -97,30 +99,34 @@ class DshBackend(L3Backend):
             "workdir": str(workdir),
             "command_source": source,
             "status": "running",
+            "owner_pid": os.getpid(),
+            "pid": None,
+            "timeout_seconds": timeout_sec,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_ts": time.time(),
         }
         save_active_task(task_id, task_record)
 
         cmd = self._build_command(prefix, full_prompt)
-        timeout_sec = int(cfg.get("timeout_seconds", 300))
+
+        def _on_spawn(child_pid: int) -> None:
+            task_record["pid"] = child_pid
+            save_active_task(task_id, task_record)
 
         def _worker():
             env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
             ds_key = read_env_key("DEEPSEEK_API_KEY")
             if ds_key:
                 env["DEEPSEEK_API_KEY"] = ds_key
             try:
-                proc = subprocess.run(
+                proc = run_subprocess_with_tree_kill(
                     cmd,
                     cwd=str(workdir),
                     env=env,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
                     timeout=timeout_sec,
                     creationflags=_CREATE_NO_WINDOW,
+                    on_spawn=_on_spawn,
                 )
                 stdout = (proc.stdout or "").strip()
                 stderr = (proc.stderr or "").strip()
@@ -131,7 +137,7 @@ class DshBackend(L3Backend):
                 task_record["status"] = "completed" if proc.returncode == 0 else "error"
             except subprocess.TimeoutExpired:
                 task_record["status"] = "error"
-                task_record["stderr"] = f"执行超过 {timeout_sec} 秒已自动中止"
+                task_record["stderr"] = f"执行超过 {timeout_sec} 秒已自动中止并清理子进程树"
                 task_record["summary"] = task_record["stderr"]
             except Exception as exc:
                 task_record["status"] = "error"
@@ -141,7 +147,7 @@ class DshBackend(L3Backend):
                 task_record["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 save_active_task(task_id, task_record)
 
-        threading.Thread(target=_worker, name=f"l3-dsh-{task_id}", daemon=True).start()
+        start_worker_thread(task_id, f"l3-dsh-{task_id}", _worker)
         return f"已成功派单给本机 DeepSeek DSH 后台执行（工作目录 {workdir.name}），不占用语音等待时间，稍后可随时问我进展！"
 
     def check_status(self, cfg: Dict[str, Any]) -> str:

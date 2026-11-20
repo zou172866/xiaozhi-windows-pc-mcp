@@ -238,9 +238,17 @@ try:
 except Exception:
     _HAS_XIAOZHI_CORE = False
 
+if "--live" in sys.argv:
+    sys.argv.remove("--live")
+    os.environ["XIAOZHI_RUN_LIVE_TESTS"] = "1"
+
+_RUN_LIVE_TESTS = os.environ.get("XIAOZHI_RUN_LIVE_TESTS", "").strip().lower() in ("1", "true", "yes")
+
 
 @unittest.skipUnless(_HAS_XIAOZHI_CORE, "Requires xiaozhi-esp32-server container environment")
-class TestLiveContainerTTSPipeline(unittest.TestCase):
+class TestContainerOfflinePipeline(unittest.TestCase):
+    """Offline container pipeline tests (ZERO network/GPU calls, ZERO production DB/config mutation)."""
+
     def test_token_stream_multi_emotion_and_no_tag_leak(self):
         import asyncio
         from unittest.mock import patch, MagicMock
@@ -293,8 +301,10 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
             "再熬夜的话我可要没收键盘了哦！",
         ]
 
+        sess = router._get_gsv_http_session()
+        self.assertFalse(sess.trust_env, "GSV requests.Session must disable proxy env lookup")
         emitted_segments = []
-        with patch("requests.post", side_effect=_fake_post):
+        with patch.object(sess, "post", side_effect=_fake_post):
             for idx, tok in enumerate(tokens):
                 provider.tts_text_buff.append(tok)
                 seg = provider._get_segment_text()
@@ -321,13 +331,15 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
             ],
         )
         self.assertEqual(len(captured_payloads), 2)
-        # Verify 1st sentence routed to mei_gentle_ref.wav + cut0 + no tags
+        # Verify 1st sentence routed to mei_gentle_ref.wav + cut0 + V4 sample_steps=16 + no tags
         self.assertTrue(captured_payloads[0]["ref_audio_path"].endswith("mei_gentle_ref.wav"))
         self.assertEqual(captured_payloads[0]["text_split_method"], "cut0")
+        self.assertEqual(captured_payloads[0]["sample_steps"], 16)
         self.assertEqual(captured_payloads[0]["text"], "哥哥，今天工作累不累？")
         # Verify 2nd sentence shifted to mei_playful_ref.wav + cut0 + exclamation preserved
         self.assertTrue(captured_payloads[1]["ref_audio_path"].endswith("mei_playful_ref.wav"))
         self.assertEqual(captured_payloads[1]["text_split_method"], "cut0")
+        self.assertEqual(captured_payloads[1]["sample_steps"], 16)
         self.assertEqual(captured_payloads[1]["text"], "呵呵，再熬夜的话我可要没收键盘了哦！")
 
         # Verify Anima Brain pair extractor strips tags cleanly
@@ -341,27 +353,6 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
         self.assertEqual(len(pairs), 1)
         self.assertNotIn("[gentle]", pairs[0]["assistant_reply"])
         self.assertNotIn("[playful]", pairs[0]["assistant_reply"])
-
-    def test_real_gsv_19880_synthesis_from_container(self):
-        import asyncio
-        from core.providers.tts.gpt_sovits_v2 import TTSProvider
-
-        router.apply_xiaozhi_emotion_and_prosody_patches()
-        cfg = {
-            "url": "http://host.docker.internal:19880/tts",
-            "output_dir": "/tmp/",
-            "text_lang": "zh",
-            "ref_audio_path": "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav",
-            "prompt_text": "今夜月色很美，呵...适合与朋友小聚一番。",
-            "prompt_lang": "zh",
-            "text_split_method": "cut0",
-        }
-        provider = TTSProvider(cfg, delete_audio_file=True)
-        wav_bytes = asyncio.run(
-            provider.text_to_speak("[gentle] 嗯，哥哥今天辛苦啦，先喝口热茶休息一下吧。", None)
-        )
-        self.assertTrue(wav_bytes.startswith(b"RIFF"), "Expected valid RIFF WAV header from 19880")
-        self.assertGreater(len(wav_bytes), 50000, "Synthesized WAV unexpectedly tiny")
 
     def test_playback_synced_esp32_emotion_and_prompt_harmony(self):
         import asyncio
@@ -451,7 +442,7 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
                 content = b"RIFF\x24\x00\x00\x00WAVEfmt "
                 text = "ok"
 
-            with patch("requests.post", return_value=_FakeResp()):
+            with patch.object(router._get_gsv_http_session(), "post", return_value=_FakeResp()):
                 # Sentence 1 synthesizes (gentle -> loving)
                 provider._turn_explicit_emotion = "gentle"
                 provider._pending_segment_emotion = "gentle"
@@ -476,42 +467,6 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
                 self.assertEqual(emotions_after_s2_play, ["loving", "winking"])
 
         asyncio.run(_run_sync_check())
-
-    def test_live_anima_brain_18787_recall_real_last_emotion(self):
-        import asyncio
-        import httpx
-        import anima_memory_provider
-
-        token = anima_memory_provider._read_token()
-        self.assertTrue(token, "Expected studio_token.txt to be readable")
-        with httpx.Client(timeout=3.0, trust_env=False) as client:
-            r = client.post(
-                "http://anima-brain:18787/xiaozhi/recall",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"character_id": "xiaozhi", "query": "今天天气真好"},
-            )
-        self.assertEqual(r.status_code, 200)
-        mood_raw = r.json().get("mood") or ""
-        # Must NOT be the broken empty `stage=, last_emotion=calm`
-        self.assertNotIn("stage=,", mood_raw, f"Anima Brain returned empty stage: {mood_raw!r}")
-        self.assertRegex(mood_raw, r"stage=(stranger|acquaintance|familiar|close),\s*last_emotion=[a-z_]+")
-
-        mp = anima_memory_provider.MemoryProvider(
-            {"service_url": "http://anima-brain:18787", "character_id": "xiaozhi"}
-        )
-
-        async def _recall():
-            try:
-                return await mp.query_memory("今天天气真好")
-            finally:
-                await mp._client.aclose()
-
-        ctx = asyncio.run(_recall())
-        self.assertIsInstance(ctx, str)
-        self.assertIn(
-            router.get_anima_mood(),
-            {"calm", "gentle", "happy", "playful", "shy", "serious", "tender"},
-        )
 
     def test_mei_wakeup_word_config_and_fallback_wav(self):
         import yaml
@@ -582,145 +537,431 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
                 pass
 
         async def _run():
+            import core.handle.abortHandle as abort_mod
+
             conn = _DummyConn()
+            conn._pc_audio_active_sid = "sid-pc-still-playing"
             handler = listen_mod.ListenTextMessageHandler()
             with (
+                patch.object(abort_mod, "handleAbortMessage", new=AsyncMock()) as m_abort,
                 patch.object(listen_mod, "send_stt_message", new=AsyncMock()) as m_stt,
                 patch.object(hello_mod, "send_tts_message", new=AsyncMock()) as m_tts,
                 patch.object(listen_mod, "startToChat", new=AsyncMock()) as m_chat,
             ):
                 await handler.handle(conn, {"type": "listen", "state": "detect", "text": "听我说"})
+                # Even when client_is_speaking=False, active _pc_audio_active_sid MUST trigger abort stop!
+                m_abort.assert_awaited_once_with(conn)
                 m_stt.assert_awaited_once_with(conn, "听我说")
                 m_tts.assert_awaited_once_with(conn, "stop", None)
                 m_chat.assert_not_awaited()
                 self.assertFalse(conn.just_woken_up)
                 self.assertFalse(conn.client_is_speaking)
+                self.assertIsNone(conn._pc_audio_active_sid)
 
         asyncio.run(_run())
 
     def test_reply_length_hot_config_and_prompt_injection(self):
+        import tempfile
+        from unittest.mock import patch
         import reply_length_router as rl
 
-        orig = rl.read_reply_length_config()
-        try:
-            saved = rl.write_reply_length_config(chat_chars=220, story_chars=900)
-            self.assertEqual(saved["chat_chars"], 220)
-            self.assertEqual(saved["story_chars"], 900)
-            self.assertGreaterEqual(saved["dynamic_max_tokens"], 2200)
-
-            msgs = [{"role": "system", "content": "你是雷电芽衣。"}, {"role": "user", "content": "讲个故事"}]
-            rl.inject_reply_length_into_messages(msgs)
-            self.assertIn("220 字", msgs[0]["content"])
-            self.assertIn("900 字", msgs[0]["content"])
-            self.assertEqual(msgs[0]["content"].count("<reply_length_control>"), 1)
-
-            # Updating again must replace previous block idempotently without duplicating tags
-            rl.write_reply_length_config(preset="storyteller")
-            rl.inject_reply_length_into_messages(msgs)
-            self.assertEqual(msgs[0]["content"].count("<reply_length_control>"), 1)
-            self.assertIn("1000 字", msgs[0]["content"])
-        finally:
-            rl.write_reply_length_config(chat_chars=orig["chat_chars"], story_chars=orig["story_chars"])
-
-    def test_live_relationship_hot_control_roundtrip(self):
-        import httpx
-        import anima_memory_provider
-
-        token = anima_memory_provider._read_token()
-        self.assertTrue(token, "Expected studio_token.txt to be readable")
-        headers = {"Authorization": f"Bearer {token}"}
-
-        with httpx.Client(timeout=4.0, trust_env=False) as client:
-            r0 = client.get(
-                "http://anima-brain:18787/xiaozhi/relationship",
-                params={"character_id": "xiaozhi"},
-                headers=headers,
-            )
-            self.assertEqual(r0.status_code, 200)
-            orig = r0.json()
-            orig_axes = orig["axes"]
-
+        with tempfile.TemporaryDirectory() as td:
+            tmp_cfg = os.path.join(td, "reply_length_config.json")
+            orig_cache = dict(rl._cfg_cache)
+            orig_mtime = rl._cfg_mtime
             try:
-                # 1. Switch to restrained preset via 18080 console API
-                r1 = client.post(
-                    "http://127.0.0.1:18080/api/relationship",
-                    json={"preset": "restrained"},
-                )
-                self.assertEqual(r1.status_code, 200)
-                j1 = r1.json()
-                self.assertTrue(j1.get("ok"))
-                rel1 = j1["relationship"]
-                self.assertEqual(rel1["preset"], "restrained")
-                self.assertFalse(rel1["romance_enabled"])
-                self.assertAlmostEqual(rel1["axes"]["familiarity"], 0.30, places=2)
+                with patch.object(rl, "REPLY_LEN_PATH", tmp_cfg):
+                    rl._cfg_mtime = -1.0
+                    saved = rl.write_reply_length_config(chat_chars=220, story_chars=900)
+                    self.assertEqual(saved["chat_chars"], 220)
+                    self.assertEqual(saved["story_chars"], 900)
+                    self.assertGreaterEqual(saved["dynamic_max_tokens"], 2200)
 
-                rec1 = client.post(
-                    "http://anima-brain:18787/xiaozhi/recall",
-                    headers=headers,
-                    json={"character_id": "xiaozhi", "query": "你好"},
-                ).json()
-                self.assertIn("克制得体", rec1.get("context_text", ""))
+                    msgs = [{"role": "system", "content": "你是雷电芽衣。"}, {"role": "user", "content": "讲个故事"}]
+                    rl.inject_reply_length_into_messages(msgs)
+                    self.assertIn("220 字", msgs[0]["content"])
+                    self.assertIn("900 字", msgs[0]["content"])
+                    self.assertEqual(msgs[0]["content"].count("<reply_length_control>"), 1)
 
-                # 2. Switch to intimate preset via 18080 console API -> immediate Lv.3 close
-                r2 = client.post(
-                    "http://127.0.0.1:18080/api/relationship",
-                    json={"preset": "intimate"},
-                )
-                self.assertEqual(r2.status_code, 200)
-                rel2 = r2.json()["relationship"]
-                self.assertEqual(rel2["preset"], "intimate")
-                self.assertTrue(rel2["romance_enabled"])
-                self.assertEqual(rel2["stage"], "close")
-                self.assertEqual(rel2["bands"]["familiarity"], 3)
-                self.assertAlmostEqual(rel2["axes"]["romance"], 0.85, places=2)
-
-                rec2 = client.post(
-                    "http://anima-brain:18787/xiaozhi/recall",
-                    headers=headers,
-                    json={"character_id": "xiaozhi", "query": "晚安"},
-                ).json()
-                self.assertIn("深度亲密依恋", rec2.get("context_text", ""))
-                self.assertIn("stage=close", rec2.get("mood", ""))
-
-                # 3. Custom slider right above 0.75 must snap immediately to Lv.3 without hysteresis lag
-                r3 = client.post(
-                    "http://127.0.0.1:18080/api/relationship",
-                    json={
-                        "romance_enabled": False,
-                        "familiarity": 0.76,
-                        "warmth": 0.76,
-                        "trust": 0.76,
-                        "romance": 0.40,
-                    },
-                )
-                self.assertEqual(r3.status_code, 200)
-                rel3 = r3.json()["relationship"]
-                self.assertEqual(rel3["preset"], "custom")
-                self.assertFalse(rel3["romance_enabled"])
-                self.assertEqual(rel3["bands"]["familiarity"], 3)
-                self.assertAlmostEqual(rel3["axes"]["romance"], 0.40, places=2)
+                    # Updating again must replace previous block idempotently without duplicating tags
+                    rl.write_reply_length_config(preset="storyteller")
+                    rl.inject_reply_length_into_messages(msgs)
+                    self.assertEqual(msgs[0]["content"].count("<reply_length_control>"), 1)
+                    self.assertIn("1000 字", msgs[0]["content"])
+                    self.assertNotIn("哥哥", rl.build_length_directive())
+                    # Verify atomic write left no stray .tmp files
+                    self.assertEqual([f for f in os.listdir(td) if f.endswith(".tmp")], [])
             finally:
-                client.post(
-                    "http://anima-brain:18787/xiaozhi/relationship",
-                    headers=headers,
-                    json={
-                        "character_id": "xiaozhi",
-                        "relationship_enabled": orig["relationship_enabled"],
-                        "romance_enabled": orig["romance_enabled"],
-                        "familiarity": orig_axes["familiarity"],
-                        "warmth": orig_axes["warmth"],
-                        "trust": orig_axes["trust"],
-                        "romance": orig_axes["romance"],
-                        "tension": orig_axes.get("tension", 0.0),
-                    },
-                )
+                rl._cfg_cache = orig_cache
+                rl._cfg_mtime = orig_mtime
 
-    def test_live_l3_backend_hot_switch_and_env_expansion(self):
-        import httpx
+    def test_console_log_cursor_dedup_audio_fallback_and_portable_defaults(self):
+        import io
+        import json
+        import tempfile
+        from unittest.mock import patch
+        import console_server as cs
+
+        # 1. Verify no hardcoded personal MAC / LAN IP in console_server defaults
+        with open(os.path.join(DATA_DIR, "console_server.py"), "r", encoding="utf-8") as _f:
+            src = _f.read()
+        self.assertNotIn("cc:68:c7:a8:19:dc", src)
+        self.assertNotIn("192.168.31.200", src)
+        self.assertNotIn("e:/故事/1", src)
+
+        # 2. Verify in-memory 0.4s sine chime WAV fallback produces valid 48kHz mono 16-bit PCM WAV
+        chime = cs._generate_test_chime_wav(0.4, 48000)
+        self.assertTrue(chime.startswith(b"RIFF"))
+        with wave.open(io.BytesIO(chime), "rb") as wf:
+            self.assertEqual(wf.getnchannels(), 1)
+            self.assertEqual(wf.getsampwidth(), 2)
+            self.assertEqual(wf.getframerate(), 48000)
+            self.assertAlmostEqual(wf.getnframes() / 48000.0, 0.4, places=2)
+
+        # 3. Verify restart log watcher preserves server_ready/device_id without duplicating chat turns
+        with tempfile.TemporaryDirectory() as td:
+            log_p = os.path.join(td, "server.log")
+            hist_p = os.path.join(td, "chat_history.json")
+            cur_p = os.path.join(td, ".console_log_cursor.json")
+
+            sample_lines = (
+                "2026-11-19 10:00:01 INFO ASR模块初始化完成\n"
+                "2026-11-19 10:00:02 INFO OTA请求设备ID: aa:bb:cc:dd:ee:ff\n"
+                "2026-11-19 10:00:05 INFO 大模型收到用户消息: 你好呀\n"
+                "2026-11-19 10:00:06 INFO 发送音频消息: SentenceType.FIRST, 你好\n"
+                "2026-11-19 10:00:07 INFO 发送音频消息: SentenceType.MIDDLE, 今天过得怎么样？\n"
+                "2026-11-19 10:00:08 INFO 发送音频消息: SentenceType.LAST, None\n"
+            )
+            with open(log_p, "w", encoding="utf-8") as f:
+                f.write(sample_lines)
+
+            orig_msgs = list(cs._chat_messages)
+            orig_dev = dict(cs._device_info)
+            orig_off = cs._log_offset
+            orig_open = cs._current_ai_turn_open
+            try:
+                with (
+                    patch.object(cs, "LOG_PATH", log_p),
+                    patch.object(cs, "HISTORY_PATH", hist_p),
+                    patch.object(cs, "LOG_CURSOR_PATH", cur_p),
+                ):
+                    # Boot 1: reads from offset 0
+                    cs._chat_messages = []
+                    cs._device_info = {"device_id": "", "last_seen": "", "activity": "idle", "server_ready": False}
+                    cs._log_offset = 0
+                    cs._current_ai_turn_open = False
+                    st1 = {"initialized": False, "last_inode": None, "saved_inode": None, "saved_offset": 0}
+                    cs._poll_log_once(st1)
+                    self.assertTrue(cs._device_info["server_ready"])
+                    self.assertEqual(cs._device_info["device_id"], "aa:bb:cc:dd:ee:ff")
+                    self.assertEqual(len(cs._chat_messages), 2)
+                    self.assertEqual(cs._chat_messages[1]["text"], "你好，今天过得怎么样？")
+                    self.assertTrue(os.path.isfile(cur_p))
+
+                    # Boot 2 (simulated restart with persisted cursor): keeps status, ZERO duplicate messages
+                    cs._chat_messages = []
+                    cs._device_info = {"device_id": "", "last_seen": "", "activity": "idle", "server_ready": False}
+                    cs._log_offset = 0
+                    cs._current_ai_turn_open = False
+                    cs._load_history()
+                    s_ino, s_off = cs._load_log_cursor()
+                    st2 = {"initialized": False, "last_inode": None, "saved_inode": s_ino, "saved_offset": s_off}
+                    cs._poll_log_once(st2)
+                    self.assertTrue(cs._device_info["server_ready"])
+                    self.assertEqual(cs._device_info["device_id"], "aa:bb:cc:dd:ee:ff")
+                    self.assertEqual(len(cs._chat_messages), 2)
+
+                    # Append a partial (non-newline-terminated) line -> must not emit half line
+                    with open(log_p, "a", encoding="utf-8") as f:
+                        f.write("2026-11-19 10:01:00 INFO 大模型收到用户消息: 帮我查")
+                    cs._poll_log_once(st2)
+                    self.assertEqual(len(cs._chat_messages), 2)
+
+                    # Finish the line + assistant reply -> appends exactly 2 new messages
+                    with open(log_p, "a", encoding="utf-8") as f:
+                        f.write(
+                            "一下天气\n"
+                            "2026-11-19 10:01:02 INFO 发送音频消息: SentenceType.FIRST, 今天晴天。\n"
+                            "2026-11-19 10:01:03 INFO 发送音频消息: SentenceType.LAST, None\n"
+                        )
+                    cs._poll_log_once(st2)
+                    self.assertEqual(len(cs._chat_messages), 4)
+                    self.assertEqual(cs._chat_messages[2]["text"], "帮我查一下天气")
+
+                    # Boot 3 (upgrade scenario: cursor missing, full log replayed) -> tail dedup prevents duplicates
+                    os.remove(cur_p)
+                    cs._chat_messages = []
+                    cs._device_info = {"device_id": "", "last_seen": "", "activity": "idle", "server_ready": False}
+                    cs._log_offset = 0
+                    cs._current_ai_turn_open = False
+                    cs._load_history()
+                    st3 = {"initialized": False, "last_inode": None, "saved_inode": None, "saved_offset": 0}
+                    cs._poll_log_once(st3)
+                    self.assertTrue(cs._device_info["server_ready"])
+                    self.assertEqual(cs._device_info["device_id"], "aa:bb:cc:dd:ee:ff")
+                    self.assertEqual(len(cs._chat_messages), 4)
+
+                    # Boot 4 (60-message history > old 40-item window, cursor missing) -> ZERO cascade duplication
+                    big_lines = ["2026-11-19 10:00:00 INFO ASR模块初始化完成\n"]
+                    for i in range(60):  # 60 turns = 120 messages (> 100 cap!)
+                        mm, ss = divmod(i, 60)
+                        big_lines.append(f"2026-11-19 10:{mm+1:02d}:{ss:02d} INFO 大模型收到用户消息: 问题{i}\n")
+                        big_lines.append(f"2026-11-19 10:{mm+1:02d}:{ss:02d} INFO 发送音频消息: SentenceType.FIRST, 回答{i}\n")
+                        big_lines.append(f"2026-11-19 10:{mm+1:02d}:{ss:02d} INFO 发送音频消息: SentenceType.LAST, None\n")
+                    with open(log_p, "w", encoding="utf-8") as f:
+                        f.write("".join(big_lines))
+                    cs._chat_messages = []
+                    cs._log_offset = 0
+                    cs._current_ai_turn_open = False
+                    st4 = {"initialized": False, "last_inode": None, "saved_inode": None, "saved_offset": 0}
+                    cs._poll_log_once(st4)
+                    self.assertEqual(len(cs._chat_messages), 100)
+                    self.assertEqual(cs._chat_messages[-1]["text"], "回答59")
+                    # Delete cursor and append 1 new turn -> replay must NOT duplicate any of the 100 messages
+                    os.remove(cur_p)
+                    with open(log_p, "a", encoding="utf-8") as f:
+                        f.write(
+                            "2026-11-19 10:09:01 INFO 大模型收到用户消息: 最新问题60\n"
+                            "2026-11-19 10:09:02 INFO 发送音频消息: SentenceType.FIRST, 最新回答60\n"
+                            "2026-11-19 10:09:03 INFO 发送音频消息: SentenceType.LAST, None\n"
+                        )
+                    cs._chat_messages = []
+                    cs._log_offset = 0
+                    cs._current_ai_turn_open = False
+                    cs._load_history()
+                    self.assertEqual(len(cs._chat_messages), 100)
+                    st5 = {"initialized": False, "last_inode": None, "saved_inode": None, "saved_offset": 0}
+                    cs._poll_log_once(st5)
+                    self.assertEqual(len(cs._chat_messages), 100)
+                    self.assertEqual(cs._chat_messages[-2]["text"], "最新问题60")
+                    self.assertEqual(cs._chat_messages[-1]["text"], "最新回答60")
+                    keys = [(m["role"], m["time"], m["text"]) for m in cs._chat_messages]
+                    self.assertEqual(len(keys), len(set(keys)), "Duplicate chat items detected after cursorless replay")
+            finally:
+                cs._chat_messages = orig_msgs
+                cs._device_info = orig_dev
+                cs._log_offset = orig_off
+                cs._current_ai_turn_open = orig_open
+
+    def test_console_csrf_host_guard_secret_redaction_and_frontend_visibility(self):
+        import console_server as cs
+
+        # 1. Host & CSRF guard matrix
+        ok_get, st_get, _ = cs.validate_console_request("GET", {"Host": "localhost:18080"})
+        self.assertTrue(ok_get)
+        self.assertEqual(st_get, 200)
+
+        ok_bad_host, st_bad_host, _ = cs.validate_console_request("GET", {"Host": "evil.example:18080"})
+        self.assertFalse(ok_bad_host)
+        self.assertEqual(st_bad_host, 421)
+
+        # no-cors text/plain or spoofed prefix application/json-evil POST must be rejected (415)
+        ok_ct, st_ct, _ = cs.validate_console_request(
+            "POST", {"Host": "127.0.0.1:18080", "Content-Type": "text/plain"}
+        )
+        self.assertFalse(ok_ct)
+        self.assertEqual(st_ct, 415)
+
+        ok_ct_spoof, st_ct_spoof, _ = cs.validate_console_request(
+            "POST", {"Host": "127.0.0.1:18080", "Content-Type": "application/json-evil"}
+        )
+        self.assertFalse(ok_ct_spoof)
+        self.assertEqual(st_ct_spoof, 415)
+
+        # Origin: null (sandboxed iframe / file://) must be rejected (403)
+        ok_null_orig, st_null_orig, _ = cs.validate_console_request(
+            "POST", {"Host": "127.0.0.1:18080", "Origin": "null", "Content-Type": "application/json"}
+        )
+        self.assertFalse(ok_null_orig)
+        self.assertEqual(st_null_orig, 403)
+
+        # _ensure_gsv_weights must NOT advance _active_gsv_loaded when 19880 returns non-200
+        from unittest.mock import MagicMock, patch
+
+        orig_loaded = cs._active_gsv_loaded
+        try:
+            cs._active_gsv_loaded = "__gsv_raiden_mei__"
+            fake_cli = MagicMock()
+            fake_cli.get.return_value = MagicMock(status_code=400, text="bad weights path")
+            with patch.object(cs, "_get_console_http_client", return_value=fake_cli):
+                with self.assertRaises(RuntimeError):
+                    cs._ensure_gsv_weights("__gsv_xiaozhi_tw__", persist_boot_yaml=False)
+            self.assertEqual(cs._active_gsv_loaded, "__gsv_raiden_mei__")
+        finally:
+            cs._active_gsv_loaded = orig_loaded
+
+        # Cross-origin JSON POST must be rejected (403)
+        ok_orig, st_orig, _ = cs.validate_console_request(
+            "POST",
+            {"Host": "127.0.0.1:18080", "Origin": "https://evil.example", "Content-Type": "application/json"},
+        )
+        self.assertFalse(ok_orig)
+        self.assertEqual(st_orig, 403)
+
+        # Cross-site Sec-Fetch-Site must be rejected (403)
+        ok_sfs, st_sfs, _ = cs.validate_console_request(
+            "POST",
+            {
+                "Host": "localhost:18080",
+                "Origin": "http://localhost:18080",
+                "Sec-Fetch-Site": "cross-site",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertFalse(ok_sfs)
+        self.assertEqual(st_sfs, 403)
+
+        # Same-origin JSON POST passes
+        ok_good, st_good, _ = cs.validate_console_request(
+            "POST",
+            {
+                "Host": "localhost:18080",
+                "Origin": "http://localhost:18080",
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        self.assertTrue(ok_good)
+        self.assertEqual(st_good, 200)
+
+        # 2. Log secret redaction
+        red = cs._redact_secrets(
+            "Authorization: Bearer abcdef1234567890 #token=mysecret sk-1234567890abcdef AIzaSyA12345678901234567890"
+        )
+        self.assertNotIn("abcdef1234567890", red)
+        self.assertNotIn("mysecret", red)
+        self.assertNotIn("sk-1234567890abcdef", red)
+        self.assertNotIn("AIzaSyA12345678901234567890", red)
+
+        # 3. Verify console.html sends application/json on clear-history and pauses polling on visibilitychange
+        with open(os.path.join(DATA_DIR, "console.html"), "r", encoding="utf-8") as f:
+            html_src = f.read()
+        self.assertIn("visibilitychange", html_src)
+        self.assertIn("document.hidden", html_src)
+        self.assertNotIn('fetch("/api/clear-history", { method: "POST" })', html_src)
+
+    def test_pc_audio_router_single_wait_dynamic_poll_queue_lock_and_bearer_auth(self):
+        import asyncio
+        import tempfile
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import core.handle.sendAudioHandle as send_audio_mod
+        import pc_audio_router as par
+
+        par.apply_pc_audio_playback_patches()
+
+        # 1. Verify Bearer token header injection via temp token file
+        with tempfile.TemporaryDirectory() as td:
+            tf = os.path.join(td, "pc_mcp_token.txt")
+            with open(tf, "w", encoding="utf-8") as f:
+                f.write("local-test-bearer-token-1234567890\n")
+            with patch.object(par, "PC_MCP_TOKEN_PATH", tf):
+                par._tok_mtime = -1.0
+                hdrs = par.get_pc_mcp_auth_headers({"X-Turn-Id": "t1"})
+                self.assertEqual(hdrs["Authorization"], "Bearer local-test-bearer-token-1234567890")
+                self.assertEqual(hdrs["X-Turn-Id"], "t1")
+
+        # 2. Verify dynamic multi-slice /audio/wait keeps polling past 20s until done=True
+        async def _check_dynamic_poll_and_single_wait():
+            poll_calls = []
+
+            class _FakeResp:
+                def __init__(self, body):
+                    self.status_code = 200
+                    self.content = b"{}"
+                    self._body = body
+
+                def json(self):
+                    return self._body
+
+            responses = [
+                _FakeResp({"ok": True, "done": False, "playing": True, "queued": 2}),
+                _FakeResp({"ok": True, "done": False, "playing": True, "queued": 1}),
+                _FakeResp({"ok": True, "done": True, "playing": False, "queued": 0}),
+            ]
+
+            class _FakeClient:
+                async def get(self, url, params=None, headers=None, timeout=None):
+                    poll_calls.append((url, params))
+                    return responses.pop(0)
+
+            class _DummyWS:
+                def __init__(self):
+                    self.sent = []
+
+                async def send(self, msg):
+                    self.sent.append(msg)
+
+            class _DummyRC:
+                def __init__(self):
+                    self.queue = []
+                    self.interval_ms = 60
+                    self.queue_empty_event = asyncio.Event()
+                    self.queue_empty_event.set()
+                    self.stopped = False
+
+                def stop_sending(self):
+                    self.stopped = True
+
+            class _DummyConn:
+                def __init__(self):
+                    self.session_id = "s-pc-1"
+                    self.sentence_id = "sid-pc-1"
+                    self.client_abort = False
+                    self.config = {"enable_stop_tts_notify": False}
+                    self.websocket = _DummyWS()
+                    self.audio_rate_controller = _DummyRC()
+                    self.cleared = False
+
+                def clearSpeakStatus(self):
+                    self.cleared = True
+
+            conn = _DummyConn()
+            par._enqueue_pc_clip(conn, "sid-pc-1", "很长的故事第一段", b"RIFF0000WAVE", 28000, 1.0)
+            conn._pc_audio_active_sid = "sid-pc-1"
+            conn._pc_audio_queued_ms = 28000
+
+            with (
+                patch.object(par, "_get_async_client", return_value=_FakeClient()),
+                patch("asyncio.sleep", new=AsyncMock()) as m_sleep,
+            ):
+                await send_audio_mod.send_tts_message(conn, "stop", None)
+                # Multi-slice dynamic wait polled 3 times until done=True!
+                self.assertEqual(len(poll_calls), 3)
+                # ZERO extra 240ms _wait_for_audio_completion sleeps occurred!
+                m_sleep.assert_not_awaited()
+                self.assertTrue(conn.cleared)
+                self.assertTrue(conn.audio_rate_controller.stopped)
+                self.assertIsNone(conn._pc_audio_active_sid)
+
+            # 3. Stale `stop` from sid-1 MUST NOT clobber sid-2 or send stale `stop` after abort/turn-change
+            conn2 = _DummyConn()
+            conn2.sentence_id = "sid-1"
+            conn2._pc_audio_active_sid = "sid-1"
+            conn2._pc_audio_queued_ms = 5000
+
+            async def _switch_turn_mid_wait(**_kwargs):
+                conn2.sentence_id = "sid-2"
+                conn2._pc_audio_active_sid = "sid-2"
+                conn2._pc_audio_queued_ms = 3000
+                return False
+
+            with patch.object(par, "_wait_pc_audio_done", side_effect=_switch_turn_mid_wait):
+                await send_audio_mod.send_tts_message(conn2, "stop", None)
+            self.assertEqual(conn2._pc_audio_active_sid, "sid-2")
+            self.assertEqual(conn2._pc_audio_queued_ms, 3000)
+            self.assertEqual(conn2.websocket.sent, [])
+            self.assertFalse(conn2.cleared)
+            self.assertFalse(conn2.audio_rate_controller.stopped)
+
+        asyncio.run(_check_dynamic_poll_and_single_wait())
+
+    def test_start_with_env_mcp_token_injection_and_env_expansion(self):
+        import tempfile
         import yaml
         import start_with_env
 
-        cfg_path = os.path.join(DATA_DIR, ".config.yaml")
+        # 1. Verify env expansion on example template (never requires private prod keys)
+        cfg_path = os.path.join(DATA_DIR, ".config.example.yaml")
         with open(cfg_path, "r", encoding="utf-8") as f:
             raw_cfg = yaml.safe_load(f) or {}
         expanded = start_with_env._expand_env(raw_cfg)
@@ -729,36 +970,199 @@ class TestLiveContainerTTSPipeline(unittest.TestCase):
         ref_path = str(((expanded.get("TTS") or {}).get("GPT_SOVITS_V2") or {}).get("ref_audio_path") or "")
         self.assertNotIn("${", ref_path, f"Unexpanded ref_audio_path: {ref_path}")
 
-        with httpx.Client(timeout=4.0, trust_env=False) as client:
-            r0 = client.get("http://127.0.0.1:18080/api/l3-backend")
-            self.assertEqual(r0.status_code, 200)
-            orig = r0.json()["l3_backend"]
-            self.assertTrue(orig.get("mcp_online"), "Expected host 18900 MCP /l3/status online")
-            self.assertIn("dsh", orig.get("detected") or {})
-            self.assertIn("workbuddy", orig.get("detected") or {})
-            self.assertIn("antigravity", orig.get("detected") or {})
+        # 2. Verify in-memory Bearer token injection into ServerMCPManager.load_config
+        with tempfile.TemporaryDirectory() as td:
+            tf = os.path.join(td, "pc_mcp_token.txt")
+            with open(tf, "w", encoding="utf-8") as f:
+                f.write("injected-mcp-bearer-token-9876543210\n")
+            sample_servers = {
+                "windows_pc_control": {
+                    "url": "http://host.docker.internal:18900/mcp",
+                    "transport": "streamable-http",
+                },
+                "remote_other": {
+                    "url": "https://example.com/mcp",
+                    "transport": "streamable-http",
+                },
+            }
+            injected = start_with_env.inject_pc_mcp_auth_headers(sample_servers, token_path=tf)
+            self.assertEqual(
+                injected["windows_pc_control"]["headers"]["Authorization"],
+                "Bearer injected-mcp-bearer-token-9876543210",
+            )
+            self.assertNotIn("headers", injected["remote_other"])
+            # Original dict must not be mutated
+            self.assertNotIn("headers", sample_servers["windows_pc_control"])
 
+
+@unittest.skipUnless(
+    _HAS_XIAOZHI_CORE and _RUN_LIVE_TESTS,
+    "Live integration tests skipped in offline mode (pass --live or XIAOZHI_RUN_LIVE_TESTS=1)",
+)
+class TestLiveOnlineIntegration(unittest.TestCase):
+    """Read-only live integration checks against 18080 / 18787 / 18900 / 19880 (never mutates prod DB)."""
+
+    def test_live_gsv_19880_synthesis_from_container(self):
+        import asyncio
+        from core.providers.tts.gpt_sovits_v2 import TTSProvider
+
+        router.apply_xiaozhi_emotion_and_prosody_patches()
+        cfg = {
+            "url": "http://host.docker.internal:19880/tts",
+            "output_dir": "/tmp/",
+            "text_lang": "zh",
+            "ref_audio_path": f"{router.MEI_DIR_HOST}/mei_default_ref.wav",
+            "prompt_text": "今夜月色很美，呵...适合与朋友小聚一番。",
+            "prompt_lang": "zh",
+            "text_split_method": "cut0",
+            "sample_steps": 16,
+        }
+        provider = TTSProvider(cfg, delete_audio_file=True)
+        wav_bytes = asyncio.run(
+            provider.text_to_speak("[gentle] 嗯，哥哥今天辛苦啦，先喝口热茶休息一下吧。", None)
+        )
+        self.assertTrue(wav_bytes.startswith(b"RIFF"), "Expected valid RIFF WAV header from 19880")
+        self.assertGreater(len(wav_bytes), 50000, "Synthesized WAV unexpectedly tiny")
+
+    def test_live_anima_brain_18787_readonly_recall_and_relationship(self):
+        import asyncio
+        import httpx
+        import anima_memory_provider
+
+        token = anima_memory_provider._read_token()
+        self.assertTrue(token, "Expected studio_token.txt to be readable")
+        with httpx.Client(timeout=3.0, trust_env=False) as client:
+            r = client.post(
+                "http://anima-brain:18787/xiaozhi/recall",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"character_id": "xiaozhi", "query": "今天天气真好"},
+            )
+            self.assertEqual(r.status_code, 200)
+            mood_raw = r.json().get("mood") or ""
+            self.assertNotIn("stage=,", mood_raw, f"Anima Brain returned empty stage: {mood_raw!r}")
+            self.assertRegex(mood_raw, r"stage=(stranger|acquaintance|familiar|close),\s*last_emotion=[a-z_]+")
+
+            r_rel = client.get(
+                "http://anima-brain:18787/xiaozhi/relationship",
+                params={"character_id": "xiaozhi"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(r_rel.status_code, 200)
+            self.assertIn("axes", r_rel.json())
+
+        mp = anima_memory_provider.MemoryProvider(
+            {"service_url": "http://anima-brain:18787", "character_id": "xiaozhi"}
+        )
+
+        async def _recall():
             try:
-                for b_name in ("dsh", "workbuddy", "none"):
-                    r = client.post(
-                        "http://127.0.0.1:18080/api/l3-backend",
-                        json={"backend": b_name},
-                    )
-                    self.assertEqual(r.status_code, 200)
-                    j = r.json()
-                    self.assertTrue(j.get("ok"))
-                    self.assertEqual(j["l3_backend"]["backend"], b_name)
+                return await mp.query_memory("今天天气真好")
             finally:
-                client.post(
-                    "http://127.0.0.1:18080/api/l3-backend",
-                    json={
-                        "backend": orig["backend"],
-                        "workdir": orig.get("workdir", ""),
-                        "dsh_cmd": orig.get("dsh_cmd", ""),
-                        "workbuddy_cmd": orig.get("workbuddy_cmd", ""),
-                        "workbuddy_auto_approve": orig.get("workbuddy_auto_approve", True),
-                    },
-                )
+                await mp._client.aclose()
+
+        ctx = asyncio.run(_recall())
+        self.assertIsInstance(ctx, str)
+        self.assertIn(
+            router.get_anima_mood(),
+            {"calm", "gentle", "happy", "playful", "shy", "serious", "tender"},
+        )
+
+    def test_live_18900_auth_dns_rebinding_and_mcp_client_connect(self):
+        import asyncio
+        import httpx
+        import start_with_env
+        from core.providers.tools.server_mcp.mcp_manager import ServerMCPManager
+
+        start_with_env.install_mcp_token_injection_patch()
+        tok = start_with_env._read_pc_mcp_token()
+        self.assertTrue(tok, "Expected data/pc_mcp_token.txt to exist")
+
+        with httpx.Client(timeout=4.0, trust_env=False) as client:
+            self.assertEqual(client.get("http://host.docker.internal:18900/audio/status").status_code, 401)
+            self.assertEqual(
+                client.get(
+                    "http://host.docker.internal:18900/audio/status",
+                    headers={"Host": "evil.example:18900", "Authorization": f"Bearer {tok}"},
+                ).status_code,
+                421,
+            )
+            self.assertEqual(
+                client.get(
+                    "http://host.docker.internal:18900/audio/status",
+                    headers={"Origin": "https://evil.example", "Authorization": f"Bearer {tok}"},
+                ).status_code,
+                403,
+            )
+            r_ok = client.get(
+                "http://host.docker.internal:18900/l3/status",
+                headers={"Authorization": f"Bearer {tok}"},
+            )
+            self.assertEqual(r_ok.status_code, 200)
+            self.assertTrue(r_ok.json().get("ok"))
+
+        class _DummyConn:
+            pass
+
+        async def _verify_mcp():
+            mgr = ServerMCPManager(_DummyConn())
+            await mgr.initialize_servers()
+            try:
+                names = [t["function"]["name"] for t in mgr.get_all_tools()]
+                self.assertIn("pc_system_control", names)
+                self.assertIn("pc_agent_task", names)
+            finally:
+                await mgr.cleanup_all()
+
+        asyncio.run(_verify_mcp())
+
+    def test_live_18080_state_and_csrf_protection(self):
+        import httpx
+
+        with httpx.Client(timeout=4.0, trust_env=False) as client:
+            r_hlth = client.get("http://127.0.0.1:18080/api/health")
+            self.assertEqual(r_hlth.status_code, 200)
+            self.assertTrue(r_hlth.json().get("ok"))
+
+            r_st = client.get("http://127.0.0.1:18080/api/state")
+            self.assertEqual(r_st.status_code, 200)
+            cfg = r_st.json()["config"]
+            self.assertTrue(cfg.get("pc_audio_online"))
+            self.assertTrue((cfg.get("l3_backend") or {}).get("mcp_online"))
+
+            r_ct = client.post(
+                "http://127.0.0.1:18080/api/pc-mode",
+                content="mode=full",
+                headers={"Content-Type": "text/plain"},
+            )
+            self.assertEqual(r_ct.status_code, 415)
+
+            r_ct_spoof = client.post(
+                "http://127.0.0.1:18080/api/pc-mode",
+                content='{"mode":"full"}',
+                headers={"Content-Type": "application/json-evil"},
+            )
+            self.assertEqual(r_ct_spoof.status_code, 415)
+
+            r_bad_arr = client.post(
+                "http://127.0.0.1:18080/api/pc-mode",
+                content="[]",
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(r_bad_arr.status_code, 400)
+
+            r_bad_json = client.post(
+                "http://127.0.0.1:18080/api/pc-mode",
+                content="{bad",
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(r_bad_json.status_code, 400)
+
+            r_orig = client.post(
+                "http://127.0.0.1:18080/api/pc-mode",
+                json={"mode": "full"},
+                headers={"Origin": "https://evil.example"},
+            )
+            self.assertEqual(r_orig.status_code, 403)
 
 
 if __name__ == "__main__":

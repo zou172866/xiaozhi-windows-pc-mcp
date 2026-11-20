@@ -11,11 +11,20 @@ env/
 *.bin
 data/nvs*
 data/chat_history.json
+data/.console_log_cursor.json
 data/l3_backend_config.json
+data/.config.yaml
+data/pc_control_mode.json
+data/tts_infer_xiaozhi.yaml
+data/.wakeup_words.yaml
+data/audio_output_mode.json
+data/reply_length_config.json
+data/pc_mcp_token.txt
 data/anima/
 data/agy_tasks/
 data/bin/
 data/*.log
+data/*.log.*
 data/last_som_grounding.jpg
 
 # Large local model weights & voice reference audio

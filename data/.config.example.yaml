@@ -96,6 +96,7 @@ TTS:
     seed: -1
     parallel_infer: true
     repetition_penalty: 1.35
+    sample_steps: 16
 plugins:
   get_weather:
     default_location: 北京

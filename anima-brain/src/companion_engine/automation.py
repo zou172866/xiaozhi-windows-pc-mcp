@@ -7,6 +7,8 @@ The SQLite queue is for a local owner, not a distributed cloud scheduler.
 """
 
 import json
+import logging
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -15,6 +17,41 @@ from uuid import uuid4
 from pydantic import Field, model_validator
 
 from .models import Model
+
+_log = logging.getLogger("companion_engine.automation")
+
+_SECRET_PATTERNS = (
+    (
+        re.compile(
+            r"(?i)((?:[\"']?authorization[\"']?\s*[:=]\s*[\"']?\s*)?(?:bearer|basic)\s+)[A-Za-z0-9._\-~+/=]+"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)([\"']?(?:x-[a-z0-9\-]*key|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|secret|password)[\"']?\s*[=:]\s*[\"']?)[^\s,;\"'&}\]]+"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (re.compile(r"(?i)([?&]key=)[^\s&\"'<>]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(https?://)([^/\s:@]+):([^/\s@]+)@"), r"\1[REDACTED]@"),
+    (
+        re.compile(
+            r"\b(?:sk-[A-Za-z0-9_\-]{12,}|AIza[0-9A-Za-z_\-]{16,}|AQ\.[A-Za-z0-9._\-]{14,}[A-Za-z0-9_\-])\b"
+        ),
+        "[REDACTED]",
+    ),
+)
+
+
+def _sanitize_error_for_log(exc: BaseException, limit: int = 220) -> str:
+    """Return a short, secret-scrubbed summary safe for local operational logs."""
+    msg = " ".join(str(exc or "").split())
+    for pat, repl in _SECRET_PATTERNS:
+        msg = pat.sub(repl, msg)
+    if len(msg) > limit:
+        msg = msg[:limit].rstrip() + "..."
+    return msg or "(no message)"
 
 
 class MemoryAutomation(Model):
@@ -46,6 +83,7 @@ class Automation:
     def __init__(self, runtime):
         self.runtime = runtime
         self.engine = runtime.engine
+        self._daily_cap_logged: dict[str, float] = {}
         with self.engine._transaction():
             self.engine.db.execute(
                 "CREATE TABLE IF NOT EXISTS memory_automation (owner TEXT, character_id TEXT, "
@@ -222,6 +260,15 @@ class Automation:
                     (self.engine.owner, cid, now - 86400),
                 ).fetchone()[0]
                 if used >= p.daily_jobs:
+                    last_logged = self._daily_cap_logged.get(cid, 0.0)
+                    if now - last_logged >= 600:
+                        self._daily_cap_logged[cid] = now
+                        _log.warning(
+                            "Memory automation daily cap reached for character=%s (%d/%d jobs in 24h); pausing claims",
+                            cid,
+                            used,
+                            p.daily_jobs,
+                        )
                     continue
                 issues = self.availability(p)
                 backlog = self.backlog(cid)
@@ -294,9 +341,17 @@ class Automation:
                 "auto-" + job["id"],
                 **({"flush": False} if job["kind"] == "maintenance" else {}),
             )
-        except Exception:
+        except Exception as exc:
             # Never expose provider response text/credentials through the status UI.
             state, error = "review", "provider_or_validation_failed_outcome_unknown"
+            _log.warning(
+                "Memory automation job %s (%s for character=%s) failed and entered review: %s: %s",
+                job["id"][:8],
+                job["kind"],
+                job["character_id"],
+                type(exc).__name__,
+                _sanitize_error_for_log(exc),
+            )
         finally:
             stop.set()
             thread.join()
@@ -315,8 +370,13 @@ class Automation:
             while not stop.is_set():
                 try:
                     worked = self.run_once()
-                except Exception:
+                except Exception as exc:
                     worked = False
+                    _log.warning(
+                        "Memory automation worker iteration failed: %s: %s",
+                        type(exc).__name__,
+                        _sanitize_error_for_log(exc),
+                    )
                 stop.wait(0.1 if worked else 5)
 
         thread = threading.Thread(target=run, daemon=True, name="companion-memory")
