@@ -2,151 +2,21 @@ import ctypes
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-
-_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-_BAT_EXE_RE = re.compile(r'"([^"\r\n]+\.exe)"([^\r\n]*)%\*', flags=re.IGNORECASE)
-_SAFE_CLI_FLAG_RE = re.compile(r"^--?[A-Za-z0-9][A-Za-z0-9._-]*$")
-_FLAG_KEY_VAL_RE = re.compile(r"^(--?[A-Za-z0-9][A-Za-z0-9._-]*=)(.*)$", flags=re.DOTALL)
-
-
-def _expand_batch_dp0(text: str, shim_dir: Path) -> str:
-    prefix = str(shim_dir).rstrip("\\/") + "\\"
-    out = re.sub(r"%~dp0[\\/]*", lambda _: prefix, text, flags=re.IGNORECASE)
-    out = re.sub(r"%dp0%[\\/]*", lambda _: prefix, out, flags=re.IGNORECASE)
-    return out
-
-
-def _atomic_write_json(path: Path, payload: dict, indent: int | None = 2) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{os.urandom(3).hex()}.tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=indent)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-
-
-def _unwrap_bat_prefix(prefix: list[str]) -> list[str]:
-    if not prefix or os.name != "nt":
-        return list(prefix)
-    exe = prefix[0]
-    resolved = exe if os.path.isfile(exe) else (shutil.which(exe) or exe)
-    if not resolved.lower().endswith((".bat", ".cmd")) or not os.path.isfile(resolved):
-        return list(prefix)
-    shim_dir = Path(resolved).parent
-    try:
-        content = Path(resolved).read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return list(prefix)
-    for m in _BAT_EXE_RE.finditer(content):
-        raw_exe = _expand_batch_dp0(m.group(1), shim_dir)
-        if os.path.isfile(raw_exe):
-            extra_raw = _expand_batch_dp0((m.group(2) or "").strip(), shim_dir)
-            if "%" in extra_raw:
-                continue
-            extra = [p.strip('"').strip("'") for p in shlex.split(extra_raw, posix=False)] if extra_raw else []
-            return [raw_exe, *extra, *prefix[1:]]
-    return list(prefix)
-
-
-def _sanitize_batch_text(text: str) -> str:
-    s = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    for bad, rep in (
-        ("%", "％"),
-        ("!", "！"),
-        ('"', "”"),
-        ("&", "＆"),
-        ("|", "｜"),
-        ("<", "＜"),
-        (">", "＞"),
-        ("^", "＾"),
-    ):
-        s = s.replace(bad, rep)
-    return s
-
-
-def _sanitize_arg_for_batch(arg: str) -> str:
-    s = str(arg)
-    if not s:
-        return s
-    if _SAFE_CLI_FLAG_RE.fullmatch(s):
-        return s
-    if "\n" not in s and "\r" not in s and not any(c in s for c in '%!"&|<>^') and os.path.exists(s):
-        return s
-    m_kv = _FLAG_KEY_VAL_RE.match(s)
-    if m_kv:
-        return m_kv.group(1) + _sanitize_batch_text(m_kv.group(2))
-    return _sanitize_batch_text(s)
-
-
-def _prepare_cmd(cmd: list[str]) -> list[str]:
-    unwrapped = _unwrap_bat_prefix(cmd)
-    if not unwrapped or os.name != "nt":
-        return unwrapped
-    first = unwrapped[0]
-    resolved = first if os.path.isfile(first) else (shutil.which(first) or first)
-    if resolved.lower().endswith((".bat", ".cmd")):
-        return [unwrapped[0], *(_sanitize_arg_for_batch(a) for a in unwrapped[1:])]
-    return unwrapped
-
-
-def _kill_process_tree(pid: int) -> None:
-    if not pid or pid <= 0:
-        return
-    still_alive = True
-    try:
-        import psutil  # type: ignore
-
-        try:
-            root = psutil.Process(pid)
-            targets = list(reversed(root.children(recursive=True))) + [root]
-        except psutil.NoSuchProcess:
-            return
-        for p in targets:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-        _, alive = psutil.wait_procs(targets, timeout=2.0)
-        for p in alive:
-            try:
-                p.kill()
-            except Exception:
-                pass
-        if alive:
-            _, alive = psutil.wait_procs(alive, timeout=1.0)
-        still_alive = bool(alive) or psutil.pid_exists(pid)
-    except Exception:
-        still_alive = True
-    if os.name == "nt" and still_alive:
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True,
-                timeout=5,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-        except Exception:
-            pass
+from typing import Optional
 
 MCP_DIR = Path(__file__).resolve().parent
+if str(MCP_DIR) not in sys.path:
+    sys.path.insert(0, str(MCP_DIR))
+
+import common as _pc_common
+
+_CREATE_NO_WINDOW = _pc_common.CREATE_NO_WINDOW
 SERVER_DIR = MCP_DIR.parent
 STATE_DIR = MCP_DIR / "state"
 TASKS_ROOT = STATE_DIR / "agy_tasks"
@@ -157,70 +27,59 @@ HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
 for d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_WINDOWS_RESERVED_TASK_NAMES = frozenset(
-    {
-        "CON",
-        "PRN",
-        "AUX",
-        "NUL",
-        *(f"COM{i}" for i in range(1, 10)),
-        *(f"LPT{i}" for i in range(1, 10)),
-    }
-)
+TASK_ID_RE = _pc_common.TASK_ID_RE
+_WINDOWS_RESERVED_TASK_NAMES = _pc_common.WINDOWS_RESERVED_TASK_NAMES
+
+
+def _expand_batch_dp0(text: str, shim_dir: Path) -> str:
+    return _pc_common.expand_batch_dp0(text, shim_dir)
+
+
+def _atomic_write_json(path: Path, payload: dict, indent: int | None = 2) -> None:
+    _pc_common.atomic_write_json(path, payload, indent=indent)
+
+
+def _unwrap_bat_prefix(prefix: list[str]) -> list[str]:
+    return _pc_common.unwrap_windows_cmd_shim(prefix)
+
+
+def _sanitize_batch_text(text: str) -> str:
+    return _pc_common.sanitize_batch_text(text)
+
+
+def _sanitize_arg_for_batch(arg: str) -> str:
+    return _pc_common.sanitize_arg_for_windows_batch(arg)
+
+
+def _prepare_cmd(cmd: list[str]) -> list[str]:
+    return _pc_common.prepare_subprocess_command(cmd)
+
+
+def _kill_process_tree(
+    pid: int,
+    grace_seconds: float = 2.0,
+    *,
+    expected_create_time: Optional[float] = None,
+) -> bool:
+    return _pc_common.kill_process_tree(
+        pid,
+        grace_seconds=grace_seconds,
+        expected_create_time=expected_create_time,
+    )
 
 
 def validate_task_id(task_id: object) -> str:
     """Strictly validate sidecar task ID with fullmatch regex + reserved-name rejection."""
-    if not isinstance(task_id, str):
-        raise ValueError("invalid task_id: must be a string")
-    if not TASK_ID_RE.fullmatch(task_id):
-        raise ValueError(f"invalid task_id: {task_id!r}")
-    if task_id.upper() in _WINDOWS_RESERVED_TASK_NAMES:
-        raise ValueError(f"reserved task_id: {task_id!r}")
-    return task_id
+    return _pc_common.validate_task_id(task_id, task_id_re=TASK_ID_RE)
 
 
 def _resolve_task_file(base_dir: Path, task_id: object) -> Path:
     """Resolve `<base_dir>/<task_id>.json` with regex + `.resolve().is_relative_to()` containment."""
-    safe_id = validate_task_id(task_id)
-    root = Path(base_dir).resolve()
-    candidate = (root / f"{safe_id}.json").resolve()
-    if not candidate.is_relative_to(root) or candidate.parent != root:
-        raise ValueError(f"task path escapes base directory: {task_id!r}")
-    return candidate
+    return _pc_common.resolve_task_file(base_dir, task_id, task_id_re=TASK_ID_RE)
 
 
 def _read_dotenv_var(name: str) -> str:
-    env_file = SERVER_DIR / ".env"
-    if not env_file.is_file():
-        return ""
-    found = ""
-    try:
-        for raw_line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = raw_line.lstrip("\ufeff").strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[7:].strip()
-            if "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() != name:
-                continue
-            v = v.strip()
-            if v and v[0] in ('"', "'"):
-                end = v.find(v[0], 1)
-                found = (v[1:end] if end != -1 else v[1:]).strip()
-            else:
-                for idx, ch in enumerate(v):
-                    if ch == "#" and idx > 0 and v[idx - 1].isspace():
-                        v = v[:idx]
-                        break
-                found = v.strip()
-    except Exception:
-        pass
-    return found
+    return _pc_common.read_dotenv_var(SERVER_DIR / ".env", name)
 
 
 def _resolve_default_workdir() -> str:
@@ -286,7 +145,7 @@ def _build_agentapi_prefix() -> list[str]:
 
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
-MAX_ACTIVE_TASK_RECORDS = 50
+MAX_ACTIVE_TASK_RECORDS = _pc_common.MAX_ACTIVE_TASK_RECORDS
 
 
 def _guard_leading_dash_prompt(prompt: str, prefix_tag: str = "[指令]") -> str:
@@ -311,71 +170,11 @@ def _prune_active_tasks(
     archive_dir: Path | None = None,
 ) -> int:
     """Keep at most `max_keep` recent task records in `agy_tasks/active`, archiving older ones cleanly (H-6)."""
-    active = Path(active_dir) if active_dir is not None else ACTIVE_DIR
-    limit = max(1, int(max_keep))
-    try:
-        if not active.exists():
-            return 0
-        task_files = [fp for fp in active.glob("*.json") if not fp.is_symlink()]
-    except Exception:
-        return 0
-
-    if len(task_files) <= limit:
-        return 0
-
-    protected: list[Path] = []
-    archivable: list[tuple[tuple[float, int, str], Path]] = []
-    for fp in task_files:
-        try:
-            st = fp.stat()
-        except OSError:
-            continue
-        obj: dict = {}
-        try:
-            parsed = json.loads(fp.read_text(encoding="utf-8"))
-            if isinstance(parsed, dict):
-                obj = parsed
-        except Exception:
-            obj = {}
-        status = str(obj.get("status") or "").strip().lower()
-        if status in ("running", "queued"):
-            protected.append(fp)
-        else:
-            started = obj.get("started_ts")
-            try:
-                ts = float(started) if started is not None and float(started) > 0 else (st.st_mtime_ns / 1_000_000_000.0)
-            except (TypeError, ValueError):
-                ts = st.st_mtime_ns / 1_000_000_000.0
-            archivable.append(((ts, st.st_mtime_ns, fp.name), fp))
-
-    keep_other = max(0, limit - len(protected))
-    if len(archivable) <= keep_other:
-        return 0
-
-    archivable.sort(key=lambda item: item[0], reverse=True)
-    to_archive = [fp for _, fp in archivable[keep_other:]]
-    if not to_archive:
-        return 0
-
-    arch_dir = Path(archive_dir) if archive_dir is not None else (active.parent / "archive")
-    try:
-        arch_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return 0
-
-    archived = 0
-    for fp in to_archive:
-        dst = arch_dir / fp.name
-        try:
-            os.replace(fp, dst)
-            archived += 1
-        except OSError:
-            try:
-                shutil.move(str(fp), str(dst))
-                archived += 1
-            except Exception:
-                continue
-    return archived
+    return _pc_common.prune_active_tasks(
+        active_dir if active_dir is not None else ACTIVE_DIR,
+        max_keep=max_keep,
+        archive_dir=archive_dir,
+    )
 
 
 def _write_heartbeat() -> float:
@@ -500,10 +299,11 @@ def _process_task(task_file: Path) -> bool:
         if os.name == "nt":
             popen_kwargs["creationflags"] = _CREATE_NO_WINDOW
         proc = subprocess.Popen(prepared_cmd, **popen_kwargs)
+        proc_create_time = _pc_common.get_process_create_time(proc.pid)
         try:
             stdout_raw, stderr_raw = proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
-            _kill_process_tree(proc.pid)
+            _kill_process_tree(proc.pid, expected_create_time=proc_create_time)
             try:
                 proc.communicate(timeout=5)
             except Exception:

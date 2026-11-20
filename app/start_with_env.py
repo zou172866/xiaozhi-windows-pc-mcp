@@ -11,9 +11,14 @@ import runpy
 import threading
 import time
 
-ROOT_DIR = "/opt/xiaozhi-esp32-server"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(ROOT_DIR, "data")
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
+import xz_common
+
+ROOT_DIR = xz_common.ROOT_DIR
+DATA_DIR = xz_common.DATA_DIR
 for p in (ROOT_DIR, APP_DIR, DATA_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -24,7 +29,6 @@ import patch_registry
 import runtime_events
 import runtime_settings
 import turn_context_router
-import xz_common
 
 # 0. Verify upstream SERVER_VERSION contract & migrate legacy runtime JSONs at startup (P1-8, P2-21)
 _ver_info = patch_registry.check_upstream_server_version()
@@ -41,10 +45,10 @@ import config.config_loader as config_loader
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_DEFAULTS = {
     "HOST_LAN_IP": "127.0.0.1",
-    "HOST_DATA_DIR": "/opt/xiaozhi-esp32-server/data",
-    "HOST_VOICES_DIR": "/opt/xiaozhi-esp32-server/voices",
-    "HOST_GSV_WEIGHTS_DIR": "/opt/xiaozhi-esp32-server/models/gsv_weights",
-    "HOST_PROJECT_DIR": "/opt/xiaozhi-esp32-server",
+    "HOST_DATA_DIR": xz_common.DATA_DIR,
+    "HOST_VOICES_DIR": xz_common.VOICES_DIR,
+    "HOST_GSV_WEIGHTS_DIR": os.path.join(xz_common.ROOT_DIR, "models", "gsv_weights"),
+    "HOST_PROJECT_DIR": xz_common.ROOT_DIR,
 }
 _PATH_ENV_KEYS = frozenset({"HOST_DATA_DIR", "HOST_VOICES_DIR", "HOST_GSV_WEIGHTS_DIR", "HOST_PROJECT_DIR"})
 _EPHEMERAL_ESP32_AUTH_KEY = secrets.token_hex(32)

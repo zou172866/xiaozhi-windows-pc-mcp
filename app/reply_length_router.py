@@ -38,6 +38,8 @@ DEFAULT_CFG = {
 _cfg_lock = threading.Lock()
 _cfg_mtime = -1.0
 _cfg_cache = dict(DEFAULT_CFG)
+_cfg_file_cache: Optional[xz_common.MtimeJsonCache] = None
+_cfg_file_cache_path = ""
 
 _BLOCK_RE = re.compile(r"\n*<reply_length_control>.*?</reply_length_control>", re.DOTALL)
 
@@ -80,24 +82,31 @@ def _normalize(data: dict) -> dict:
     return out
 
 
+def _get_custom_cfg_cache() -> xz_common.MtimeJsonCache:
+    global _cfg_file_cache
+    if _cfg_file_cache is None:
+        _cfg_file_cache = xz_common.MtimeJsonCache(
+            normalizer=_normalize,
+            default_factory=lambda: _normalize(_cfg_cache),
+        )
+    return _cfg_file_cache
+
+
 def read_reply_length_config() -> dict:
-    """Read reply_length settings from unified runtime_settings.json (or custom monkeypatched path)."""
-    global _cfg_mtime, _cfg_cache
+    """Read reply_length settings from unified runtime_settings.json (or custom monkeypatched path via xz_common)."""
+    global _cfg_mtime, _cfg_cache, _cfg_file_cache_path
     if REPLY_LEN_PATH == _DEFAULT_REPLY_LEN_PATH:
         return _normalize(runtime_settings.get_reply_length())
-    try:
-        if not os.path.exists(REPLY_LEN_PATH):
-            return _normalize(_cfg_cache)
-        st = os.stat(REPLY_LEN_PATH)
-        with _cfg_lock:
-            if st.st_mtime != _cfg_mtime:
-                with open(REPLY_LEN_PATH, "r", encoding="utf-8") as f:
-                    raw = json.load(f) or {}
-                _cfg_cache = _normalize(raw)
-                _cfg_mtime = st.st_mtime
-            return dict(_cfg_cache)
-    except Exception:
-        return _normalize(_cfg_cache)
+    with _cfg_lock:
+        cache = _get_custom_cfg_cache()
+        if _cfg_mtime < 0 or _cfg_file_cache_path != REPLY_LEN_PATH:
+            cache.invalidate()
+            _cfg_file_cache_path = REPLY_LEN_PATH
+        res = cache.get(REPLY_LEN_PATH)
+        _cfg_cache = dict(res)
+        sig = cache._inner._sig
+        _cfg_mtime = (sig[0] / 1_000_000_000.0) if sig else -1.0
+        return dict(res)
 
 
 def write_reply_length_config(
@@ -105,7 +114,7 @@ def write_reply_length_config(
     story_chars: Optional[int] = None,
     preset: Optional[str] = None,
 ) -> dict:
-    global _cfg_mtime, _cfg_cache
+    global _cfg_mtime, _cfg_cache, _cfg_file_cache_path
     if REPLY_LEN_PATH == _DEFAULT_REPLY_LEN_PATH:
         saved = runtime_settings.set_reply_length(
             chat_chars=chat_chars,
@@ -129,11 +138,12 @@ def write_reply_length_config(
     }
     xz_common.atomic_write_json(REPLY_LEN_PATH, disk_data)
     with _cfg_lock:
+        cache = _get_custom_cfg_cache()
+        _cfg_file_cache_path = REPLY_LEN_PATH
+        cache.set(REPLY_LEN_PATH, norm)
         _cfg_cache = dict(norm)
-        try:
-            _cfg_mtime = os.stat(REPLY_LEN_PATH).st_mtime
-        except Exception:
-            _cfg_mtime = -1.0
+        sig = cache._inner._sig
+        _cfg_mtime = (sig[0] / 1_000_000_000.0) if sig else -1.0
     return dict(norm)
 
 

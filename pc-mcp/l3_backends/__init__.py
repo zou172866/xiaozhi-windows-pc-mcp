@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import shlex
-import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -20,6 +18,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 import psutil
 
 MCP_DIR = Path(__file__).resolve().parent.parent
+if str(MCP_DIR) not in sys.path:
+    sys.path.insert(0, str(MCP_DIR))
+
+import common as _pc_common
+
 SERVER_DIR = MCP_DIR.parent
 DOTENV_FILE = SERVER_DIR / ".env"
 STATE_DIR = MCP_DIR / "state"
@@ -29,7 +32,7 @@ ACTIVE_DIR = TASKS_ROOT / "active"
 ARCHIVE_DIR = TASKS_ROOT / "archive"
 HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
 L3_CONFIG_FILE = STATE_DIR / "l3_backend_config.json"
-MAX_ACTIVE_TASK_RECORDS = 50
+MAX_ACTIVE_TASK_RECORDS = _pc_common.MAX_ACTIVE_TASK_RECORDS
 
 for _d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
@@ -37,38 +40,18 @@ for _d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR):
 VALID_BACKENDS = ("antigravity", "dsh", "workbuddy", "none")
 ALLOWED_L3_CONFIG_KEYS = frozenset({"backend", "timeout_seconds", "timeout"})
 HOST_ENV_ONLY_L3_KEYS = frozenset({"workdir", "dsh_cmd", "workbuddy_cmd", "workbuddy_auto_approve"})
-TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_WINDOWS_RESERVED_TASK_NAMES = frozenset(
-    {
-        "CON",
-        "PRN",
-        "AUX",
-        "NUL",
-        *(f"COM{i}" for i in range(1, 10)),
-        *(f"LPT{i}" for i in range(1, 10)),
-    }
-)
+TASK_ID_RE = _pc_common.TASK_ID_RE
+_WINDOWS_RESERVED_TASK_NAMES = _pc_common.WINDOWS_RESERVED_TASK_NAMES
 
 
 def validate_task_id(task_id: Any) -> str:
     """Strictly validate an L3 task ID to prevent path traversal or reserved-device writes."""
-    if not isinstance(task_id, str):
-        raise ValueError("invalid task_id: must be a string")
-    if not TASK_ID_RE.fullmatch(task_id):
-        raise ValueError(f"invalid task_id: {task_id!r}")
-    if task_id.upper() in _WINDOWS_RESERVED_TASK_NAMES:
-        raise ValueError(f"reserved task_id: {task_id!r}")
-    return task_id
+    return _pc_common.validate_task_id(task_id, task_id_re=TASK_ID_RE)
 
 
 def resolve_task_file(base_dir: Path, task_id: Any) -> Path:
     """Resolve `<base_dir>/<task_id>.json` with strict regex + `.resolve().is_relative_to()` containment."""
-    safe_id = validate_task_id(task_id)
-    root = Path(base_dir).resolve()
-    candidate = (root / f"{safe_id}.json").resolve()
-    if not candidate.is_relative_to(root) or candidate.parent != root:
-        raise ValueError(f"task path escapes base directory: {task_id!r}")
-    return candidate
+    return _pc_common.resolve_task_file(base_dir, task_id, task_id_re=TASK_ID_RE)
 
 _cfg_lock = threading.Lock()
 _dotenv_lock = threading.Lock()
@@ -145,297 +128,92 @@ def wait_for_worker_threads(
 
 
 def _strip_dotenv_value(raw_val: str) -> str:
-    val = raw_val.strip()
-    if not val:
-        return ""
-    if val[0] in ('"', "'"):
-        quote = val[0]
-        end = val.find(quote, 1)
-        if end != -1:
-            return val[1:end].strip()
-        return val[1:].strip()
-    # Strip unquoted inline comments preceded by whitespace (e.g. `L3_BACKEND=dsh # comment`)
-    for idx, ch in enumerate(val):
-        if ch == "#" and idx > 0 and val[idx - 1].isspace():
-            val = val[:idx]
-            break
-    return val.strip()
+    return _pc_common.strip_dotenv_value(raw_val)
 
 
 def _parse_dotenv_text(text: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for raw_line in text.splitlines():
-        line = raw_line.lstrip("\ufeff").strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-        eq = line.find("=")
-        if eq <= 0:
-            continue
-        key = line[:eq].strip()
-        val = _strip_dotenv_value(line[eq + 1 :])
-        if key:
-            out[key] = val
-    return out
+    return _pc_common.parse_dotenv_text(text)
 
 
 def _read_dotenv_map() -> Dict[str, str]:
     """Read project root .env with mtime+size cache (needed when WMI spawns 18900 without PowerShell env)."""
     global _dotenv_cache_key, _dotenv_cache_map
-    env_path = DOTENV_FILE
-    try:
-        if not env_path.is_file():
-            with _dotenv_lock:
+    with _dotenv_lock:
+        if _dotenv_cache_key is None:
+            _pc_common.invalidate_dotenv_cache(DOTENV_FILE)
+    data = _pc_common.read_dotenv_map(DOTENV_FILE)
+    with _dotenv_lock:
+        try:
+            if DOTENV_FILE.is_file():
+                st = DOTENV_FILE.stat()
+                _dotenv_cache_key = (str(DOTENV_FILE), st.st_mtime_ns, st.st_size)
+                _dotenv_cache_map = dict(data)
+            else:
                 _dotenv_cache_key = None
                 _dotenv_cache_map = {}
-            return {}
-        st = env_path.stat()
-        cache_key = (str(env_path), st.st_mtime_ns, st.st_size)
-        with _dotenv_lock:
-            if _dotenv_cache_key != cache_key:
-                _dotenv_cache_map = _parse_dotenv_text(
-                    env_path.read_text(encoding="utf-8", errors="replace")
-                )
-                _dotenv_cache_key = cache_key
-            return dict(_dotenv_cache_map)
-    except Exception:
-        return {}
+        except OSError:
+            _dotenv_cache_key = None
+            _dotenv_cache_map = {}
+    return data
 
 
 def read_env_key(name: str) -> str:
     """Read an environment variable from process env, Windows registry, or project .env fallback."""
-    val = os.environ.get(name, "")
-    if not val and os.name == "nt":
-        try:
-            import winreg
-
-            for root, subkey in (
-                (winreg.HKEY_CURRENT_USER, r"Environment"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
-            ):
-                try:
-                    with winreg.OpenKey(root, subkey) as k:
-                        v, _ = winreg.QueryValueEx(k, name)
-                        if v:
-                            val = str(v)
-                            break
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    if not val:
-        val = _read_dotenv_map().get(name, "")
-    return val.lstrip("\ufeff").strip()
+    return _pc_common.read_env_key(name, dotenv_path=DOTENV_FILE)
 
 
 def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     """Atomically write text via a same-directory temp file + os.replace."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_name = f".{path.name}.{os.getpid()}.{threading.get_ident()}.{os.urandom(3).hex()}.tmp"
-    tmp_path = path.with_name(tmp_name)
-    try:
-        with open(tmp_path, "w", encoding=encoding) as f:
-            f.write(text)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    _pc_common.atomic_write_text(path, text, encoding=encoding)
 
 
 def atomic_write_json(path: Path, payload: Any, indent: int = 2) -> None:
-    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=indent), encoding="utf-8")
-
-
-_CMD_NODE_SCRIPT_RE = re.compile(
-    r'"(?:%~dp0|%dp0%)[\\/]+([^"\r\n]+\.(?:js|mjs|cjs))"',
-    flags=re.IGNORECASE,
-)
-_CMD_NODE_ANY_BIN_RE = re.compile(
-    r'"(?:%~dp0|%dp0%)[\\/]+(node_modules[\\/][^"\r\n]+)"\s+%\*',
-    flags=re.IGNORECASE,
-)
-_CMD_EXE_TARGET_RE = re.compile(
-    r'"([^"\r\n]+\.exe)"([^\r\n]*)%\*',
-    flags=re.IGNORECASE,
-)
-_SAFE_CLI_FLAG_RE = re.compile(r"^--?[A-Za-z0-9][A-Za-z0-9._-]*$")
-_FLAG_KEY_VAL_RE = re.compile(r"^(--?[A-Za-z0-9][A-Za-z0-9._-]*=)(.*)$", flags=re.DOTALL)
+    _pc_common.atomic_write_json(path, payload, indent=indent)
 
 
 def _expand_batch_dp0(text: str, shim_dir: Path) -> str:
-    prefix = str(shim_dir).rstrip("\\/") + "\\"
-    out = re.sub(r"%~dp0[\\/]*", lambda _: prefix, text, flags=re.IGNORECASE)
-    out = re.sub(r"%dp0%[\\/]*", lambda _: prefix, out, flags=re.IGNORECASE)
-    return out
+    return _pc_common.expand_batch_dp0(text, shim_dir)
 
 
 def _find_node_exe(shim_dir: Path) -> Optional[str]:
-    cand = shim_dir / "node.exe"
-    if cand.is_file():
-        return str(cand)
-    return shutil.which("node.exe") or shutil.which("node")
+    return _pc_common.find_node_exe(shim_dir)
 
 
 def unwrap_windows_cmd_shim(cmd: List[str]) -> List[str]:
     """Unwrap Windows npm/batch .cmd/.bat shims into direct .exe invocations so
     CreateProcessW bypasses cmd.exe newline truncation and shell metacharacter parsing."""
-    if not cmd or os.name != "nt":
-        return list(cmd)
-
-    exe = cmd[0]
-    resolved = exe if os.path.isfile(exe) else (shutil.which(exe) or exe)
-    low = resolved.lower()
-    if not low.endswith((".cmd", ".bat")) or not os.path.isfile(resolved):
-        return list(cmd)
-
-    shim_path = Path(resolved)
-    shim_dir = shim_path.parent
-    try:
-        content = shim_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return list(cmd)
-
-    # 1. Node/npm/npx .cmd shims (e.g. npx.cmd, corepack.cmd, dsh.cmd, workbuddy.cmd, codebuddy.cmd, cbc.cmd)
-    node_exe = _find_node_exe(shim_dir)
-    if node_exe:
-        # Special case: official Node.js npx.cmd (checks node_modules\npm\bin\npx-cli.js)
-        npx_js = shim_dir / "node_modules" / "npm" / "bin" / "npx-cli.js"
-        if shim_path.stem.lower() == "npx" and npx_js.is_file():
-            return [node_exe, str(npx_js), *cmd[1:]]
-
-        # Standard npm global bin shim: pick the main entry script (skipping helper npm-prefix.js)
-        candidates = [
-            m.group(1)
-            for m in _CMD_NODE_SCRIPT_RE.finditer(content)
-            if not m.group(1).lower().endswith("npm-prefix.js")
-        ]
-        for m in _CMD_NODE_ANY_BIN_RE.finditer(content):
-            rel = m.group(1)
-            if rel not in candidates and not rel.lower().endswith("npm-prefix.js"):
-                candidates.append(rel)
-        for rel_js in reversed(candidates):
-            js_path = (shim_dir / rel_js).resolve()
-            if js_path.is_file():
-                return [node_exe, str(js_path), *cmd[1:]]
-
-    # 2. Generic .bat/.cmd delegating directly to a real .exe with %* (e.g. agentapi.bat)
-    for m in _CMD_EXE_TARGET_RE.finditer(content):
-        raw_exe = _expand_batch_dp0(m.group(1), shim_dir)
-        exe_path = Path(raw_exe)
-        if exe_path.is_file():
-            extra_raw = _expand_batch_dp0((m.group(2) or "").strip(), shim_dir)
-            # Abort unwrap if unexpanded batch variables remain (e.g. %VAR%)
-            if "%" in extra_raw:
-                continue
-            extra_args = split_command(extra_raw) if extra_raw else []
-            return [str(exe_path), *extra_args, *cmd[1:]]
-
-    return list(cmd)
+    return _pc_common.unwrap_windows_cmd_shim(cmd)
 
 
 def _sanitize_batch_text(text: str) -> str:
-    # Flatten CR/LF so cmd.exe never truncates arguments mid-prompt
-    s = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-    # Neutralize cmd.exe env-var (%VAR%), delayed-expansion (!VAR!), quote breakout ("), and command chaining (&|<>^)
-    for bad, rep in (
-        ("%", "％"),
-        ("!", "！"),
-        ('"', "”"),
-        ("&", "＆"),
-        ("|", "｜"),
-        ("<", "＜"),
-        (">", "＞"),
-        ("^", "＾"),
-    ):
-        s = s.replace(bad, rep)
-    return s
+    return _pc_common.sanitize_batch_text(text)
 
 
 def sanitize_arg_for_windows_batch(arg: str) -> str:
     """Fallback sanitizer when a command still ends in .cmd/.bat and must pass through cmd.exe."""
-    s = str(arg)
-    if not s:
-        return s
-    # Keep pure CLI flags (e.g. `-y`, `--profile`) and safe existing filesystem paths untouched
-    if _SAFE_CLI_FLAG_RE.fullmatch(s):
-        return s
-    if "\n" not in s and "\r" not in s and not any(c in s for c in '%!"&|<>^') and os.path.exists(s):
-        return s
-    # For `--key=value` options (e.g. `--title=...`), keep the flag prefix and sanitize the value
-    m_kv = _FLAG_KEY_VAL_RE.match(s)
-    if m_kv:
-        return m_kv.group(1) + _sanitize_batch_text(m_kv.group(2))
-    return _sanitize_batch_text(s)
+    return _pc_common.sanitize_arg_for_windows_batch(arg)
 
 
 def prepare_subprocess_command(cmd: List[str]) -> List[str]:
     """Unwrap .cmd/.bat shims to direct .exe where possible; otherwise sanitize args against cmd.exe truncation."""
-    unwrapped = unwrap_windows_cmd_shim(cmd)
-    if not unwrapped or os.name != "nt":
-        return unwrapped
-    first = unwrapped[0]
-    resolved_first = first if os.path.isfile(first) else (shutil.which(first) or first)
-    if resolved_first.lower().endswith((".cmd", ".bat")):
-        return [unwrapped[0], *(sanitize_arg_for_windows_batch(a) for a in unwrapped[1:])]
-    return unwrapped
+    return _pc_common.prepare_subprocess_command(cmd)
 
 
 def _safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
-    if val is None or isinstance(val, bool):
-        return default
-    try:
-        return int(val)
-    except (TypeError, ValueError, OverflowError):
-        return default
+    return _pc_common.safe_int(val, default)
 
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
-    if val is None or isinstance(val, bool):
-        return default
-    try:
-        f = float(val)
-        if f != f or f in (float("inf"), float("-inf")):
-            return default
-        return f
-    except (TypeError, ValueError, OverflowError):
-        return default
+    return _pc_common.safe_float(val, default)
 
 
 def get_process_create_time(pid: Optional[int]) -> Optional[float]:
     """Return psutil create_time() for a live PID, or None if unavailable/not running."""
-    pid_i = _safe_int(pid, None)
-    if not pid_i or pid_i <= 0:
-        return None
-    try:
-        proc = psutil.Process(pid_i)
-        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
-            return None
-        return float(proc.create_time())
-    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, OSError):
-        return None
+    return _pc_common.get_process_create_time(pid)
 
 
 def _is_pid_running(pid: Optional[int]) -> bool:
-    pid_i = _safe_int(pid, None)
-    if not pid_i or pid_i <= 0:
-        return False
-    try:
-        proc = psutil.Process(pid_i)
-        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-    except psutil.AccessDenied:
-        return True
-    except (psutil.NoSuchProcess, ValueError, OSError):
-        return False
+    return _pc_common.is_pid_running(pid)
 
 
 def is_same_process(
@@ -447,24 +225,13 @@ def is_same_process(
     max_drift: float = 2.0,
 ) -> bool:
     """Verify PID is alive AND matches expected create_time() so PID reuse never kills an unrelated process (P1-17)."""
-    pid_i = _safe_int(pid, None)
-    if not pid_i or pid_i <= 0:
-        return False
-    actual_ct = get_process_create_time(pid_i)
-    if actual_ct is None:
-        return False
-    exp_ct = _safe_float(expected_create_time, 0.0)
-    if exp_ct > 0.0:
-        return abs(actual_ct - exp_ct) <= max(0.5, float(max_drift))
-    # Legacy record without explicit create_time: bound by started_ts to protect against PID reuse
-    st_ts = _safe_float(started_ts, 0.0)
-    if st_ts <= 0.0:
-        return False
-    if role == "owner":
-        # Owner process must have existed BEFORE the task was started
-        return actual_ct <= st_ts + 5.0
-    # Child process must have been spawned close to task start time
-    return (st_ts - 5.0) <= actual_ct <= (st_ts + 30.0)
+    return _pc_common.is_same_process(
+        pid,
+        expected_create_time,
+        started_ts=started_ts,
+        role=role,
+        max_drift=max_drift,
+    )
 
 
 def kill_process_tree(
@@ -473,74 +240,12 @@ def kill_process_tree(
     *,
     expected_create_time: Optional[float] = None,
 ) -> bool:
-    """Terminate ONLY the specified task subprocess and its descendant process tree.
-
-    When `expected_create_time` is provided, verifies `psutil.Process.create_time()` before
-    terminating and before the Windows `taskkill /T` fallback to prevent killing a reused PID.
-    Returns True if a matching process was targeted, False if skipped or already gone.
-    """
-    pid_i = _safe_int(pid, None)
-    if not pid_i or pid_i <= 0:
-        return False
-    exp_ct = _safe_float(expected_create_time, 0.0)
-    try:
-        root = psutil.Process(pid_i)
-        if exp_ct > 0.0:
-            actual_ct = float(root.create_time())
-            if abs(actual_ct - exp_ct) > 2.0:
-                return False
-        children = root.children(recursive=True)
-    except psutil.NoSuchProcess:
-        return False
-    except Exception:
-        if exp_ct > 0.0:
-            # Fail closed when identity cannot be verified against expected_create_time
-            return False
-        children = []
-        root = None
-
-    targets = list(reversed(children))
-    if root is not None:
-        targets.append(root)
-
-    for p in targets:
-        try:
-            p.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-
-    if targets:
-        try:
-            _, alive = psutil.wait_procs(targets, timeout=max(0.1, grace_seconds))
-        except Exception:
-            alive = targets
-        for p in alive:
-            try:
-                p.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        if alive:
-            try:
-                psutil.wait_procs(alive, timeout=1.0)
-            except Exception:
-                pass
-
-    # Targeted Windows fallback ONLY for this specific verified task PID if still alive
-    if os.name == "nt" and _is_pid_running(pid_i):
-        if exp_ct > 0.0:
-            cur_ct = get_process_create_time(pid_i)
-            if cur_ct is None or abs(cur_ct - exp_ct) > 2.0:
-                return True
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid_i)],
-                capture_output=True,
-                timeout=5,
-                creationflags=0x08000000,
-            )
-        except Exception:
-            pass
-    return True
+    """Terminate ONLY the specified task subprocess and its descendant process tree."""
+    return _pc_common.kill_process_tree(
+        pid,
+        grace_seconds=grace_seconds,
+        expected_create_time=expected_create_time,
+    )
 
 
 def run_subprocess_with_tree_kill(
@@ -553,48 +258,21 @@ def run_subprocess_with_tree_kill(
     on_spawn: Optional[Callable[[int], None]] = None,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess with Windows .cmd shim unwrapping and guaranteed descendant tree kill on timeout."""
-    prepared = prepare_subprocess_command(cmd)
-    kwargs: Dict[str, Any] = {
-        "cwd": cwd,
-        "env": env,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-    }
-    if os.name == "nt" and creationflags:
-        kwargs["creationflags"] = creationflags
-
-    proc = subprocess.Popen(prepared, **kwargs)
-    proc_create_time = get_process_create_time(proc.pid)
-    if on_spawn is not None:
-        try:
-            on_spawn(proc.pid)
-        except Exception:
-            pass
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(prepared, proc.returncode, stdout=stdout, stderr=stderr)
-    except subprocess.TimeoutExpired:
-        kill_process_tree(proc.pid, expected_create_time=proc_create_time)
-        try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except Exception:
-            stdout, stderr = "", ""
-        raise subprocess.TimeoutExpired(prepared, timeout, output=stdout, stderr=stderr)
+    return _pc_common.run_subprocess_with_tree_kill(
+        cmd,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        creationflags=creationflags,
+        on_spawn=on_spawn,
+        prepare_fn=prepare_subprocess_command,
+        kill_fn=kill_process_tree,
+    )
 
 
 def split_command(cmd_str: str) -> List[str]:
     """Split a custom Windows command string preserving quoted paths."""
-    raw = (cmd_str or "").strip()
-    if not raw:
-        return []
-    try:
-        parts = shlex.split(raw, posix=False)
-    except Exception:
-        parts = raw.split()
-    return [p.strip('"').strip("'") for p in parts if p.strip()]
+    return _pc_common.split_command(cmd_str)
 
 
 def _parse_env_bool(raw: str, default: bool = False) -> bool:
@@ -814,66 +492,11 @@ def prune_active_tasks(
 
     Currently running or queued task records are never archived prematurely.
     """
-    active = Path(active_dir) if active_dir is not None else ACTIVE_DIR
-    limit = max(1, int(max_keep))
-    try:
-        if not active.exists():
-            return 0
-        task_files = [fp for fp in active.glob("*.json") if not fp.is_symlink()]
-    except Exception:
-        return 0
-
-    if len(task_files) <= limit:
-        return 0
-
-    protected: List[Path] = []
-    archivable: List[tuple[tuple[float, int, str], Path]] = []
-    for fp in task_files:
-        try:
-            st = fp.stat()
-        except OSError:
-            continue
-        obj: Dict[str, Any] = {}
-        try:
-            parsed = json.loads(fp.read_text(encoding="utf-8"))
-            if isinstance(parsed, dict):
-                obj = parsed
-        except Exception:
-            obj = {}
-        status = str(obj.get("status") or "").strip().lower()
-        if status in ("running", "queued"):
-            protected.append(fp)
-        else:
-            archivable.append((_task_recency_key(fp, obj, st.st_mtime_ns), fp))
-
-    keep_other = max(0, limit - len(protected))
-    if len(archivable) <= keep_other:
-        return 0
-
-    archivable.sort(key=lambda item: item[0], reverse=True)
-    to_archive = [fp for _, fp in archivable[keep_other:]]
-    if not to_archive:
-        return 0
-
-    arch_dir = Path(archive_dir) if archive_dir is not None else (active.parent / "archive")
-    try:
-        arch_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return 0
-
-    archived = 0
-    for fp in to_archive:
-        dst = arch_dir / fp.name
-        try:
-            os.replace(fp, dst)
-            archived += 1
-        except OSError:
-            try:
-                shutil.move(str(fp), str(dst))
-                archived += 1
-            except Exception:
-                continue
-    return archived
+    return _pc_common.prune_active_tasks(
+        active_dir if active_dir is not None else ACTIVE_DIR,
+        max_keep=max_keep,
+        archive_dir=archive_dir,
+    )
 
 
 def save_active_task(task_id: str, payload: Dict[str, Any]) -> Path:
@@ -885,15 +508,7 @@ def save_active_task(task_id: str, payload: Dict[str, Any]) -> Path:
 
 
 def _task_recency_key(fp: Path, obj: Dict[str, Any], st_mtime_ns: int) -> tuple[float, int, str]:
-    started_ts = obj.get("started_ts")
-    if started_ts is not None:
-        try:
-            ts = float(started_ts)
-            if ts > 0:
-                return (ts, st_mtime_ns, fp.name)
-        except (TypeError, ValueError):
-            pass
-    return (st_mtime_ns / 1_000_000_000.0, st_mtime_ns, fp.name)
+    return _pc_common.task_recency_key(fp, obj, st_mtime_ns)
 
 
 def reap_stale_running_tasks(now: Optional[float] = None) -> int:

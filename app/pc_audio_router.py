@@ -36,6 +36,11 @@ PC_AUDIO_HOST = os.environ.get("PC_AUDIO_BRIDGE_URL", "http://host.docker.intern
 _cfg_lock = threading.Lock()
 _cfg_mtime = -1.0
 _cfg_cache = {"target": "esp32", "volume": 1.0}
+_cfg_file_cache = xz_common.MtimeJsonCache(
+    normalizer=runtime_settings.normalize_audio_output,
+    default_factory=lambda: dict(_cfg_cache),
+)
+_cfg_file_cache_path = ""
 
 _health_lock = threading.Lock()
 _health_ts = 0.0
@@ -93,27 +98,23 @@ def _atomic_write_json(path: str, payload: dict) -> None:
 
 
 def read_audio_output_config() -> dict:
-    """Read audio_output settings from unified runtime_settings.json (or custom monkeypatched path)."""
-    global _cfg_mtime, _cfg_cache
+    """Read audio_output settings from unified runtime_settings.json (or custom monkeypatched path via xz_common)."""
+    global _cfg_mtime, _cfg_cache, _cfg_file_cache_path
     if AUDIO_MODE_PATH == _DEFAULT_AUDIO_MODE_PATH:
         return runtime_settings.get_audio_output()
-    try:
-        if not os.path.exists(AUDIO_MODE_PATH):
-            return dict(_cfg_cache)
-        st = os.stat(AUDIO_MODE_PATH)
-        with _cfg_lock:
-            if st.st_mtime != _cfg_mtime:
-                with open(AUDIO_MODE_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f) or {}
-                _cfg_cache = runtime_settings.normalize_audio_output(data)
-                _cfg_mtime = st.st_mtime
-            return dict(_cfg_cache)
-    except Exception:
-        return dict(_cfg_cache)
+    with _cfg_lock:
+        if _cfg_mtime < 0 or _cfg_file_cache_path != AUDIO_MODE_PATH:
+            _cfg_file_cache.invalidate()
+            _cfg_file_cache_path = AUDIO_MODE_PATH
+        res = _cfg_file_cache.get(AUDIO_MODE_PATH)
+        _cfg_cache = dict(res)
+        sig = _cfg_file_cache._inner._sig
+        _cfg_mtime = (sig[0] / 1_000_000_000.0) if sig else -1.0
+        return dict(res)
 
 
 def write_audio_output_config(target: str, volume: Optional[float] = None) -> dict:
-    global _cfg_mtime, _cfg_cache
+    global _cfg_mtime, _cfg_cache, _cfg_file_cache_path
     if AUDIO_MODE_PATH == _DEFAULT_AUDIO_MODE_PATH:
         return runtime_settings.set_audio_output(target=target, volume=volume)
     cur = read_audio_output_config()
@@ -124,11 +125,11 @@ def write_audio_output_config(target: str, volume: Optional[float] = None) -> di
     payload = {"target": t, "volume": vol}
     _atomic_write_json(AUDIO_MODE_PATH, payload)
     with _cfg_lock:
+        _cfg_file_cache_path = AUDIO_MODE_PATH
+        _cfg_file_cache.set(AUDIO_MODE_PATH, payload)
         _cfg_cache = dict(payload)
-        try:
-            _cfg_mtime = os.stat(AUDIO_MODE_PATH).st_mtime
-        except Exception:
-            _cfg_mtime = -1.0
+        sig = _cfg_file_cache._inner._sig
+        _cfg_mtime = (sig[0] / 1_000_000_000.0) if sig else -1.0
     return payload
 
 

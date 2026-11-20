@@ -1274,7 +1274,7 @@ def reset_prompt_anchor_warnings() -> None:
 
 
 def verify_prompt_base_anchors(
-    prompt_path: str = "/opt/xiaozhi-esp32-server/agent-base-prompt.txt",
+    prompt_path: str = os.path.join(xz_common.ROOT_DIR, "agent-base-prompt.txt"),
 ) -> Tuple[bool, str]:
     """Verify upstream agent-base-prompt.txt still contains every anchor we .replace()."""
     if not os.path.isfile(prompt_path):
@@ -1318,7 +1318,7 @@ def _apply_prompt_harmony_detailed(
 
 
 def dry_run_prompt_harmony(
-    prompt_path: str = "/opt/xiaozhi-esp32-server/agent-base-prompt.txt",
+    prompt_path: str = os.path.join(xz_common.ROOT_DIR, "agent-base-prompt.txt"),
 ) -> Tuple[str, str, List[str], List[str]]:
     """Run prompt harmony replacements against the real upstream template at startup (C-2)."""
     all_names = [name for name, _, _ in _PROMPT_REPLACEMENTS]

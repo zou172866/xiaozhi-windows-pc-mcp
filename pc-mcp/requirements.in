@@ -1,0 +1,16 @@
+# Direct runtime dependencies for host Windows PC Control MCP (H-9)
+# Regenerate locked requirements.txt with official PyPI SHA256 hashes via:
+#   uv pip compile pc-mcp/requirements.in --generate-hashes --python-version 3.11 --python-platform windows -o pc-mcp/requirements.txt
+# (or: pip-compile --generate-hashes --output-file=pc-mcp/requirements.txt pc-mcp/requirements.in)
+
+comtypes>=1.5.0,<2
+httpx>=0.28.1,<1
+mcp==2.3.0
+pillow>=13.0.0,<14
+psutil>=7.2.2,<8
+PyAutoGUI>=0.9.54,<1
+pycaw>=20260927
+pyperclip>=1.11.0,<2
+starlette>=1.10.0,<2
+uiautomation>=2.0.29,<3
+uvicorn>=0.54.0,<1
