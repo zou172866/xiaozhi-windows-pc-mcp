@@ -781,9 +781,105 @@
         <strong id="relRomVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">20% · 已解锁</strong>
       </div>
 
+      <div class="l3-box" style="margin-top:11px;">
+        <div class="l3-head" style="margin-bottom:6px;">
+          <strong>Anima 本地发件箱（Outbox 持久化与死信重放 · B-5）</strong>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span id="animaOutboxBadge" class="rel-stage-badge num">pending 0 · dead 0</span>
+            <button type="button" class="btn" id="animaReplayDeadBtn" style="padding:4px 11px;font-size:12px;" disabled>重放 dead</button>
+          </div>
+        </div>
+        <div class="field-foot" style="margin-top:2px;">
+          <span>队列统计：待发 <strong id="animaOutboxPendingText" class="num">0</strong> · 死信 <strong id="animaOutboxDeadText" class="num">0</strong> · 已送达 <strong id="animaOutboxSentText" class="num">0</strong><span id="animaOutboxCorruptWrap" style="display:none;"> · 损坏 <strong id="animaOutboxCorruptText" class="num">0</strong></span></span>
+          <span id="animaOutboxErrText" style="color:var(--ink-muted);">无积压异常</span>
+        </div>
+      </div>
+
       <div class="field-foot">
         <span>Anima Brain 同步状态（18787）：<strong id="relStatusText">检测中…</strong> · 最近一次备份：<strong id="animaBackupText" class="num">检测中…</strong></span>
         <span>下一句话即刻生效，无需重启或重连 ESP32</span>
+      </div>
+    </div>
+
+    <!-- Section 1f: Speculative VAD Early-Commit (F-1) -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">投机 VAD 抢答加速（句末早判 · 免重启热开关）</h2>
+        <span id="vadSpecBadge" class="rel-stage-badge num">检测中…</span>
+      </div>
+      <p class="section-desc">保留 1100ms 静音上限防止句中换气被截断；在设定早判窗口触发异步识别，若判断语义完整则提前提交省去约 0.4～0.55 秒尾延迟，遇犹豫停顿词或讲故事模式自动继续等待。</p>
+
+      <div class="switch-row">
+        <div class="switch-row-label">
+          <strong>启用投机 VAD 句末早判（F-1）</strong>
+          <span id="vadSpecToggleHint">开启后在完整句结尾提前提交；关闭即刻回退纯 1100ms 稳健判停</span>
+        </div>
+        <label class="toggle-switch" aria-label="启用投机 VAD 句末早判开关">
+          <input type="checkbox" id="vadSpecToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:0;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">早判静默阈值</span>
+        <input type="range" id="vadSpecMsRange" min="300" max="950" step="25" value="550" aria-label="投机早判静默毫秒数">
+        <strong id="vadSpecMsVal" class="num" style="font-size:12.5px;min-width:84px;text-align:right;">550 ms</strong>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:8px;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">唤醒首句静默阈值</span>
+        <input type="range" id="vadPostWakeupMsRange" min="450" max="1050" step="25" value="800" aria-label="唤醒首句静默毫秒数">
+        <strong id="vadPostWakeupMsVal" class="num" style="font-size:12.5px;min-width:84px;text-align:right;">800 ms</strong>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:8px;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">早判最小字数</span>
+        <input type="range" id="vadMinCharsRange" min="2" max="20" step="1" value="4" aria-label="早判最小字数">
+        <strong id="vadMinCharsVal" class="num" style="font-size:12.5px;min-width:84px;text-align:right;">4 字</strong>
+      </div>
+
+      <div class="l3-adv-grid" style="margin-top:10px;">
+        <div>
+          <label class="field-label" style="font-size:12.5px;margin-bottom:4px;" for="vadCompleteSuffixesInput">完整句尾词表（逗号或换行分隔）</label>
+          <textarea id="vadCompleteSuffixesInput" spellcheck="false" style="min-height:68px;font-size:12.5px;" placeholder="吗, 呢, 吧, 了, 啊, 呀, 哦, 谢谢, 好的"></textarea>
+        </div>
+        <div>
+          <label class="field-label" style="font-size:12.5px;margin-bottom:4px;" for="vadHesitationSuffixesInput">犹豫/未完词表（命中则继续等到 1100ms）</label>
+          <textarea id="vadHesitationSuffixesInput" spellcheck="false" style="min-height:68px;font-size:12.5px;" placeholder="然后, 就是, 那个, 因为, 嗯, 但是, 而且, 所以"></textarea>
+        </div>
+      </div>
+
+      <div class="field-foot" style="margin-top:8px;align-items:center;">
+        <span id="vadSpecStatsText" class="num">遥测：等待对话触发 · 1100ms 上限始终生效</span>
+        <button type="button" class="btn" id="vadSpecSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存投机 VAD 配置</button>
+      </div>
+    </div>
+
+    <!-- Section 1g: Post-ASR Homophone Corrections Hot Editor (G-4) -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">语音识别同音词热纠错（ASR 后处理 · 免重启生效）</h2>
+        <span id="asrCorrBadge" class="rel-stage-badge num">检测中…</span>
+      </div>
+      <p class="section-desc">在 SherpaASR 识别输出后自动替换高频同音错词（按词长优先匹配，避免子串错替），保存后下一句话立即生效。</p>
+
+      <div class="switch-row">
+        <div class="switch-row-label">
+          <strong>启用同音词自动纠错（G-4）</strong>
+          <span id="asrCorrToggleHint">开启后自动按下方映射表修正所有语音识别结果</span>
+        </div>
+        <label class="toggle-switch" aria-label="启用语音识别同音词热纠错开关">
+          <input type="checkbox" id="asrCorrToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <label class="field-label" for="asrCorrInput" style="margin-top:8px;">纠错映射表（每行一条，格式：错词-&gt;正词，例如 牙医-&gt;芽衣）</label>
+      <textarea id="asrCorrInput" spellcheck="false" style="min-height:84px;font-family:var(--font-mono);font-size:12.5px;" placeholder="雷电牙医->雷电芽衣&#10;牙医->芽衣"></textarea>
+
+      <div class="field-foot" style="margin-top:8px;align-items:center;">
+        <span id="asrCorrMeta" class="num">已配置 0 条规则 · 最多 500 条</span>
+        <button type="button" class="btn" id="asrCorrSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存纠错词表</button>
       </div>
     </div>
 
@@ -1039,6 +1135,33 @@
     relRomVal: document.getElementById("relRomVal"),
     relStatusText: document.getElementById("relStatusText"),
     animaBackupText: document.getElementById("animaBackupText"),
+    animaOutboxBadge: document.getElementById("animaOutboxBadge"),
+    animaReplayDeadBtn: document.getElementById("animaReplayDeadBtn"),
+    animaOutboxPendingText: document.getElementById("animaOutboxPendingText"),
+    animaOutboxDeadText: document.getElementById("animaOutboxDeadText"),
+    animaOutboxSentText: document.getElementById("animaOutboxSentText"),
+    animaOutboxCorruptWrap: document.getElementById("animaOutboxCorruptWrap"),
+    animaOutboxCorruptText: document.getElementById("animaOutboxCorruptText"),
+    animaOutboxErrText: document.getElementById("animaOutboxErrText"),
+    vadSpecBadge: document.getElementById("vadSpecBadge"),
+    vadSpecToggle: document.getElementById("vadSpecToggle"),
+    vadSpecToggleHint: document.getElementById("vadSpecToggleHint"),
+    vadSpecMsRange: document.getElementById("vadSpecMsRange"),
+    vadSpecMsVal: document.getElementById("vadSpecMsVal"),
+    vadPostWakeupMsRange: document.getElementById("vadPostWakeupMsRange"),
+    vadPostWakeupMsVal: document.getElementById("vadPostWakeupMsVal"),
+    vadMinCharsRange: document.getElementById("vadMinCharsRange"),
+    vadMinCharsVal: document.getElementById("vadMinCharsVal"),
+    vadCompleteSuffixesInput: document.getElementById("vadCompleteSuffixesInput"),
+    vadHesitationSuffixesInput: document.getElementById("vadHesitationSuffixesInput"),
+    vadSpecStatsText: document.getElementById("vadSpecStatsText"),
+    vadSpecSaveBtn: document.getElementById("vadSpecSaveBtn"),
+    asrCorrBadge: document.getElementById("asrCorrBadge"),
+    asrCorrToggle: document.getElementById("asrCorrToggle"),
+    asrCorrToggleHint: document.getElementById("asrCorrToggleHint"),
+    asrCorrInput: document.getElementById("asrCorrInput"),
+    asrCorrMeta: document.getElementById("asrCorrMeta"),
+    asrCorrSaveBtn: document.getElementById("asrCorrSaveBtn"),
     obsStatusBadge: document.getElementById("obsStatusBadge"),
     obsSyncToggle: document.getElementById("obsSyncToggle"),
     obsToggleHint: document.getElementById("obsToggleHint"),
@@ -1817,6 +1940,314 @@
     });
   });
 
+  let outboxReplaying = false;
+  function renderAnimaOutboxUI(ob) {
+    if (!ob || !els.animaOutboxBadge) return;
+    const pending = Math.max(0, Number(ob.pending) || 0);
+    const dead = Math.max(0, Number(ob.dead) || 0);
+    const corrupt = Math.max(0, Number(ob.corrupt) || 0);
+    const sent = Math.max(0, Number(ob.sent) || 0);
+    els.animaOutboxBadge.textContent = `pending ${pending} · dead ${dead}`;
+    els.animaOutboxBadge.style.color = dead > 0 ? "var(--danger)" : (pending > 0 ? "var(--warn)" : "var(--accent)");
+    if (els.animaOutboxPendingText) {
+      els.animaOutboxPendingText.textContent = String(pending);
+      els.animaOutboxPendingText.style.color = pending > 0 ? "var(--warn)" : "var(--ink)";
+    }
+    if (els.animaOutboxDeadText) {
+      els.animaOutboxDeadText.textContent = String(dead);
+      els.animaOutboxDeadText.style.color = dead > 0 ? "var(--danger)" : "var(--ink)";
+    }
+    if (els.animaOutboxSentText) els.animaOutboxSentText.textContent = String(sent);
+    if (els.animaOutboxCorruptWrap && els.animaOutboxCorruptText) {
+      els.animaOutboxCorruptWrap.style.display = corrupt > 0 ? "inline" : "none";
+      els.animaOutboxCorruptText.textContent = String(corrupt);
+      els.animaOutboxCorruptText.style.color = "var(--danger)";
+    }
+    if (els.animaOutboxErrText) {
+      if (ob.last_error) {
+        els.animaOutboxErrText.textContent = `最近异常：${ob.last_error}`;
+        els.animaOutboxErrText.style.color = "var(--danger)";
+      } else if (dead > 0) {
+        els.animaOutboxErrText.textContent = `有 ${dead} 条死信等待手动重放（TTL ${ob.dead_ttl_days || 14} 天）`;
+        els.animaOutboxErrText.style.color = "var(--warn)";
+      } else {
+        els.animaOutboxErrText.textContent = ob.worker_alive ? "后台投递正常 · 无积压异常" : "发件箱空闲待命";
+        els.animaOutboxErrText.style.color = "var(--ink-muted)";
+      }
+    }
+    if (els.animaReplayDeadBtn && !outboxReplaying) {
+      els.animaReplayDeadBtn.disabled = dead <= 0;
+    }
+  }
+
+  if (els.animaReplayDeadBtn) {
+    els.animaReplayDeadBtn.addEventListener("click", async () => {
+      if (outboxReplaying) return;
+      outboxReplaying = true;
+      const oldLabel = els.animaReplayDeadBtn.textContent;
+      els.animaReplayDeadBtn.disabled = true;
+      els.animaReplayDeadBtn.textContent = "重放中…";
+      try {
+        const resp = await consolePost("/api/anima-outbox/replay-dead", {});
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) {
+          throw new Error((res && res.error) || "重放失败");
+        }
+        if (res.outbox) renderAnimaOutboxUI(res.outbox);
+        showBanner("info", `已将 ${res.replayed || 0} 条 Anima 死信记录重新入队投递！`);
+        scheduleHideBanner(3200);
+      } catch (err) {
+        showBanner("err", `重放 Anima dead 队列失败：${err.message}`);
+      } finally {
+        outboxReplaying = false;
+        els.animaReplayDeadBtn.textContent = oldLabel;
+        pollState(true);
+      }
+    });
+  }
+
+  let vadSpecDirty = false;
+  let vadSpecDragging = false;
+  let vadSpecSaving = false;
+
+  function parseWordListText(raw) {
+    const out = [];
+    const seen = new Set();
+    for (const tok of String(raw || "").split(/[\r\n,，、;；]+/)) {
+      const s = tok.trim();
+      if (!s || seen.has(s)) continue;
+      seen.add(s);
+      out.push(s);
+    }
+    return out;
+  }
+
+  function updateVadSpecDraftMeta() {
+    const enabled = Boolean(els.vadSpecToggle && els.vadSpecToggle.checked);
+    const specMs = Number(els.vadSpecMsRange ? els.vadSpecMsRange.value : 550) || 550;
+    const wakeMs = Math.max(specMs, Number(els.vadPostWakeupMsRange ? els.vadPostWakeupMsRange.value : 800) || 800);
+    const minC = Number(els.vadMinCharsRange ? els.vadMinCharsRange.value : 4) || 4;
+    if (els.vadSpecMsVal) els.vadSpecMsVal.textContent = `${specMs} ms`;
+    if (els.vadPostWakeupMsRange && Number(els.vadPostWakeupMsRange.value) < specMs) {
+      els.vadPostWakeupMsRange.value = String(wakeMs);
+    }
+    if (els.vadPostWakeupMsVal) els.vadPostWakeupMsVal.textContent = `${wakeMs} ms`;
+    if (els.vadMinCharsVal) els.vadMinCharsVal.textContent = `${minC} 字`;
+    if (els.vadSpecBadge) {
+      els.vadSpecBadge.textContent = enabled ? `已开启 · ${specMs}ms` : "已关闭 · 1100ms";
+    }
+    if (els.vadSpecToggleHint) {
+      els.vadSpecToggleHint.textContent = enabled
+        ? `开启中：静默 ${specMs}ms 触发早判（唤醒首句 ${wakeMs}ms），未完自动续等至 1100ms`
+        : "已关闭：全部对话统一使用 1100ms 稳健判停（随时可再开启）";
+    }
+  }
+
+  function renderVadSpeculativeUI(cfg, stats) {
+    if (stats && els.vadSpecStatsText) {
+      const trig = Number(stats.speculative_triggers) || 0;
+      const commits = Number(stats.early_commits) || 0;
+      const held = (Number(stats.held_hesitation) || 0) + (Number(stats.held_incomplete) || 0);
+      const disc = Number(stats.resumed_discards) || 0;
+      const avgSaved = Number(stats.avg_saved_ms) || 0;
+      const statePrefix = vadSpecDirty ? "未保存词表修改 · " : "";
+      if (trig > 0) {
+        els.vadSpecStatsText.textContent = `${statePrefix}早判 ${commits}/${trig} 次 · 省 ${Math.round(avgSaved)}ms · 续等 ${held} · 续说丢弃 ${disc}`;
+      } else {
+        els.vadSpecStatsText.textContent = `${statePrefix}遥测：等待对话触发 · 1100ms 上限始终生效`;
+      }
+    }
+    if (!cfg || vadSpecDirty || vadSpecDragging || vadSpecSaving) return;
+    if (els.vadSpecToggle) els.vadSpecToggle.checked = cfg.enabled !== false;
+    if (els.vadSpecMsRange && typeof cfg.speculative_ms === "number") {
+      els.vadSpecMsRange.value = String(cfg.speculative_ms);
+    }
+    if (els.vadPostWakeupMsRange && typeof cfg.post_wakeup_ms === "number") {
+      els.vadPostWakeupMsRange.value = String(cfg.post_wakeup_ms);
+    }
+    if (els.vadMinCharsRange && typeof cfg.min_chars === "number") {
+      els.vadMinCharsRange.value = String(cfg.min_chars);
+    }
+    if (els.vadCompleteSuffixesInput && Array.isArray(cfg.complete_suffixes)) {
+      els.vadCompleteSuffixesInput.value = cfg.complete_suffixes.join(", ");
+    }
+    if (els.vadHesitationSuffixesInput && Array.isArray(cfg.hesitation_suffixes)) {
+      els.vadHesitationSuffixesInput.value = cfg.hesitation_suffixes.join(", ");
+    }
+    updateVadSpecDraftMeta();
+  }
+
+  async function saveVadSpeculative(overridePayload = null, toastText = "") {
+    if (vadSpecSaving) return;
+    vadSpecSaving = true;
+    if (els.vadSpecSaveBtn) els.vadSpecSaveBtn.disabled = true;
+    const specMs = Number(els.vadSpecMsRange ? els.vadSpecMsRange.value : 550) || 550;
+    const wakeMs = Math.max(specMs, Number(els.vadPostWakeupMsRange ? els.vadPostWakeupMsRange.value : 800) || 800);
+    const payload = overridePayload || {
+      enabled: Boolean(els.vadSpecToggle && els.vadSpecToggle.checked),
+      speculative_ms: specMs,
+      post_wakeup_ms: wakeMs,
+      min_chars: Number(els.vadMinCharsRange ? els.vadMinCharsRange.value : 4) || 4,
+      complete_suffixes: parseWordListText(els.vadCompleteSuffixesInput ? els.vadCompleteSuffixesInput.value : ""),
+      hesitation_suffixes: parseWordListText(els.vadHesitationSuffixesInput ? els.vadHesitationSuffixesInput.value : "")
+    };
+    try {
+      const resp = await consolePost("/api/vad-speculative", payload);
+      const res = await resp.json();
+      if (!resp.ok || !res || !res.ok || !res.vad_speculative) {
+        throw new Error((res && res.error) || "保存投机 VAD 配置失败");
+      }
+      vadSpecDirty = false;
+      vadSpecSaving = false;
+      renderVadSpeculativeUI(res.vad_speculative, res.stats);
+      const sv = res.vad_speculative;
+      showBanner(
+        "info",
+        toastText || (sv.enabled
+          ? `投机 VAD 配置已免重启生效（早判 ${sv.speculative_ms}ms · 首句 ${sv.post_wakeup_ms}ms · ≥${sv.min_chars}字）`
+          : "已关闭投机 VAD 早判，立即回退 1100ms 稳健判停。")
+      );
+      scheduleHideBanner(3000);
+    } catch (err) {
+      showBanner("err", `保存投机 VAD 配置失败：${err.message}`);
+    } finally {
+      vadSpecSaving = false;
+      if (els.vadSpecSaveBtn) els.vadSpecSaveBtn.disabled = false;
+    }
+  }
+
+  if (els.vadSpecToggle) {
+    els.vadSpecToggle.addEventListener("change", () => {
+      updateVadSpecDraftMeta();
+      saveVadSpeculative();
+    });
+  }
+  [els.vadSpecMsRange, els.vadPostWakeupMsRange, els.vadMinCharsRange].forEach(el => {
+    if (!el) return;
+    el.addEventListener("input", () => {
+      vadSpecDragging = true;
+      updateVadSpecDraftMeta();
+    });
+    el.addEventListener("change", () => {
+      vadSpecDragging = false;
+      updateVadSpecDraftMeta();
+      saveVadSpeculative();
+    });
+  });
+  [els.vadCompleteSuffixesInput, els.vadHesitationSuffixesInput].forEach(el => {
+    if (!el) return;
+    el.addEventListener("input", () => {
+      vadSpecDirty = true;
+      updateVadSpecDraftMeta();
+    });
+  });
+  if (els.vadSpecSaveBtn) {
+    els.vadSpecSaveBtn.addEventListener("click", () => saveVadSpeculative());
+  }
+
+  let asrCorrDirty = false;
+  let asrCorrSaving = false;
+
+  function formatAsrCorrectionsMap(mapObj) {
+    if (!mapObj || typeof mapObj !== "object") return "";
+    return Object.entries(mapObj).map(([k, v]) => `${k}->${v}`).join("\n");
+  }
+
+  function countAsrCorrectionLines(rawText) {
+    let n = 0;
+    for (const ln of String(rawText || "").split(/\r?\n/)) {
+      const s = ln.trim();
+      if (!s || s.startsWith("#")) continue;
+      if (s.includes("->") || s.includes("=>") || s.includes("→") || s.includes("=") || s.includes("：") || s.includes(":")) n += 1;
+    }
+    return n;
+  }
+
+  function updateAsrCorrDraftMeta() {
+    const enabled = Boolean(els.asrCorrToggle && els.asrCorrToggle.checked);
+    const n = countAsrCorrectionLines(els.asrCorrInput ? els.asrCorrInput.value : "");
+    if (els.asrCorrBadge) {
+      els.asrCorrBadge.textContent = enabled ? `已开启 · ${n} 条` : `已关闭 · ${n} 条`;
+    }
+    if (els.asrCorrToggleHint) {
+      els.asrCorrToggleHint.textContent = enabled
+        ? "开启中：SherpaASR 每次识别输出都会自动应用下方同音纠错规则"
+        : "已暂停：原样保留 SherpaASR 识别输出（规则列表仍保留）";
+    }
+    if (els.asrCorrMeta) {
+      const tag = asrCorrDirty ? "未保存更改 · " : "";
+      els.asrCorrMeta.textContent = `${tag}已填写 ${n} 条规则（最多 500 条 · 免重启生效）`;
+    }
+  }
+
+  function renderAsrCorrectionsUI(cfg) {
+    if (!cfg || asrCorrDirty || asrCorrSaving) return;
+    if (els.asrCorrToggle) els.asrCorrToggle.checked = cfg.enabled !== false;
+    if (els.asrCorrInput && cfg.corrections && typeof cfg.corrections === "object") {
+      els.asrCorrInput.value = formatAsrCorrectionsMap(cfg.corrections);
+    }
+    updateAsrCorrDraftMeta();
+  }
+
+  async function saveAsrCorrections(overridePayload = null, toastText = "") {
+    if (asrCorrSaving) return;
+    asrCorrSaving = true;
+    if (els.asrCorrSaveBtn) els.asrCorrSaveBtn.disabled = true;
+    const payload = overridePayload || {
+      enabled: Boolean(els.asrCorrToggle && els.asrCorrToggle.checked),
+      corrections: els.asrCorrInput ? els.asrCorrInput.value : ""
+    };
+    const savedCorrections = Object.prototype.hasOwnProperty.call(payload, "corrections");
+    try {
+      const resp = await consolePost("/api/asr-corrections", payload);
+      const res = await resp.json();
+      if (!resp.ok || !res || !res.ok || !res.asr_corrections) {
+        throw new Error((res && res.error) || "保存同音词纠错表失败");
+      }
+      const sv = res.asr_corrections;
+      asrCorrSaving = false;
+      if (savedCorrections) {
+        asrCorrDirty = false;
+        renderAsrCorrectionsUI(sv);
+      } else {
+        if (els.asrCorrToggle) els.asrCorrToggle.checked = sv.enabled !== false;
+        updateAsrCorrDraftMeta();
+      }
+      showBanner(
+        "info",
+        toastText || (savedCorrections
+          ? `语音识别同音纠错词表已免重启生效（${sv.enabled ? "已开启" : "已关闭"} · 共 ${sv.count || 0} 条规则）`
+          : `语音识别同音纠错开关已${sv.enabled ? "开启" : "暂停"}（未保存的词表草稿已保留）`)
+      );
+      scheduleHideBanner(3000);
+    } catch (err) {
+      if (!savedCorrections && els.asrCorrToggle && typeof payload.enabled === "boolean") {
+        els.asrCorrToggle.checked = !payload.enabled;
+        updateAsrCorrDraftMeta();
+      }
+      showBanner("err", `保存同音纠错词表失败：${err.message}`);
+    } finally {
+      asrCorrSaving = false;
+      if (els.asrCorrSaveBtn) els.asrCorrSaveBtn.disabled = false;
+    }
+  }
+
+  if (els.asrCorrToggle) {
+    els.asrCorrToggle.addEventListener("change", () => {
+      updateAsrCorrDraftMeta();
+      saveAsrCorrections({ enabled: Boolean(els.asrCorrToggle.checked) });
+    });
+  }
+  if (els.asrCorrInput) {
+    els.asrCorrInput.addEventListener("input", () => {
+      asrCorrDirty = true;
+      updateAsrCorrDraftMeta();
+    });
+  }
+  if (els.asrCorrSaveBtn) {
+    els.asrCorrSaveBtn.addEventListener("click", () => saveAsrCorrections());
+  }
+
   let obsBusy = false;
   let obsOnline = false;
   let obsPendingState = null;
@@ -2387,6 +2818,15 @@
       if (!relDragging && !relSaving && cfg.relationship) {
         renderRelationshipUI(cfg.relationship);
       }
+      if (cfg.anima_outbox) {
+        renderAnimaOutboxUI(cfg.anima_outbox);
+      }
+      if (cfg.vad_speculative || cfg.vad_speculative_stats) {
+        renderVadSpeculativeUI(cfg.vad_speculative, cfg.vad_speculative_stats);
+      }
+      if (cfg.asr_corrections) {
+        renderAsrCorrectionsUI(cfg.asr_corrections);
+      }
       if (els.animaBackupText && cfg.anima_backup) {
         const bk = cfg.anima_backup;
         if (bk.last_error) {
@@ -2532,17 +2972,26 @@
       pollInFlight = false;
       if (pollPendingAfterInFlight) {
         pollPendingAfterInFlight = false;
-        pollState();
+        if (isTabVisible()) pollState();
       }
     }
   }
 
+  function isTabVisible() {
+    if (typeof document.visibilityState === "string") {
+      return document.visibilityState === "visible" && !document.hidden;
+    }
+    return !document.hidden;
+  }
+
   function startPolling() {
-    if (pollTimer !== null) return;
-    pollState();
-    pollTimer = setInterval(() => {
-      if (!document.hidden) pollState();
-    }, 1200);
+    if (!isTabVisible()) return;
+    if (pollTimer === null) {
+      pollTimer = setInterval(() => {
+        if (isTabVisible()) pollState();
+      }, 1200);
+    }
+    pollState(true);
   }
 
   function stopPolling() {
@@ -2553,14 +3002,14 @@
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
+    if (document.visibilityState !== "visible" || document.hidden) {
       stopPolling();
     } else {
       startPolling();
     }
   });
 
-  if (!document.hidden) {
+  if (isTabVisible()) {
     startPolling();
   }
 })();

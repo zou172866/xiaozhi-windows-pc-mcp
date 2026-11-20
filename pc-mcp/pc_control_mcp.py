@@ -133,11 +133,14 @@ from pc_mcp_modules.ui_tools import (  # noqa: E402
     inspect_window_ui,
 )
 from pc_mcp_modules.vision import (  # noqa: E402
+    LocateResult,
     _POSITIONAL_HINTS,
     _call_vision_llm,
     _collect_uia_elements,
+    _compute_region_hash,
     _draw_som_overlay,
     _parse_json_obj,
+    _parse_mark_id,
     _prefer_gemini_vision,
     _smart_locate_target,
     _walk_uia_controls,
@@ -283,18 +286,18 @@ def pc_ui_action(
         )
         return err
 
-    with _gui_lock:
-        return _pc_ui_action_locked(
-            act=act,
-            raw_action=action,
-            element_name=element_name,
-            x=x,
-            y=y,
-            text=text,
-            press_enter=press_enter,
-            hotkey=hotkey,
-            scroll_clicks=scroll_clicks,
-        )
+    # E-3: _pc_ui_action_locked manages _gui_lock fine-grained so VLM inference runs outside _gui_lock.
+    return _pc_ui_action_locked(
+        act=act,
+        raw_action=action,
+        element_name=element_name,
+        x=x,
+        y=y,
+        text=text,
+        press_enter=press_enter,
+        hotkey=hotkey,
+        scroll_clicks=scroll_clicks,
+    )
 
 
 @mcp.tool()
@@ -308,6 +311,7 @@ def pc_agent_task(
     action 可选:
     - dispatch: 异步派发新任务给当前已选的本地 L3 后台 Agent 执行（follow_up_last=True 则向最近一次派发的任务追加指令）
     - check_status: 查询最近一次派发任务的执行进度与结果摘要
+    - cancel: 取消当前工作目录正在进行或排队中的后台任务
     """
     err = _check_permission("L3")
     if err:
@@ -316,6 +320,8 @@ def pc_agent_task(
     act = (action or "dispatch").strip().lower()
     if act == "check_status":
         return l3_backends.check_task_status()
+    if act == "cancel":
+        return l3_backends.cancel_active_task()
 
     instr = (task_instruction or "").strip()
     if not instr:

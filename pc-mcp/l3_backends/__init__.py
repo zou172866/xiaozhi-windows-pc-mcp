@@ -26,8 +26,10 @@ STATE_DIR = MCP_DIR / "state"
 TASKS_ROOT = STATE_DIR / "agy_tasks"
 PENDING_DIR = TASKS_ROOT / "pending"
 ACTIVE_DIR = TASKS_ROOT / "active"
+ARCHIVE_DIR = TASKS_ROOT / "archive"
 HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
 L3_CONFIG_FILE = STATE_DIR / "l3_backend_config.json"
+MAX_ACTIVE_TASK_RECORDS = 50
 
 for _d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
@@ -74,6 +76,11 @@ _dotenv_cache_key: Optional[tuple[str, int, int]] = None
 _dotenv_cache_map: Dict[str, str] = {}
 _worker_threads_lock = threading.Lock()
 _active_worker_threads: Dict[str, threading.Thread] = {}
+_workspace_guard_lock = threading.Lock()
+_workspace_active_tasks: Dict[str, Dict[str, Any]] = {}
+_workspace_queues: Dict[str, List[Dict[str, Any]]] = {}
+_cancelled_task_ids: set[str] = set()
+_MAX_WORKSPACE_QUEUE_SIZE = 10
 
 
 def start_worker_thread(
@@ -635,6 +642,9 @@ def default_l3_config() -> Dict[str, Any]:
         "workbuddy_auto_approve": _parse_env_bool(
             read_env_key("WORKBUDDY_AUTO_APPROVE"), default=False
         ),
+        "queue_mode": _parse_env_bool(
+            read_env_key("L3_WORKSPACE_QUEUE_MODE"), default=False
+        ),
         "timeout_seconds": 300,
     }
 
@@ -659,6 +669,7 @@ def _normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
     merged["dsh_cmd"] = str(base["dsh_cmd"] or "").strip()
     merged["workbuddy_cmd"] = str(base["workbuddy_cmd"] or "").strip()
     merged["workbuddy_auto_approve"] = bool(base["workbuddy_auto_approve"])
+    merged["queue_mode"] = bool(base["queue_mode"])
     return merged
 
 
@@ -793,10 +804,83 @@ def resolve_workdir(cfg: Optional[Dict[str, Any]] = None) -> Path:
     return SERVER_DIR.parent
 
 
+def prune_active_tasks(
+    active_dir: Optional[Path] = None,
+    *,
+    max_keep: int = MAX_ACTIVE_TASK_RECORDS,
+    archive_dir: Optional[Path] = None,
+) -> int:
+    """Keep at most `max_keep` recent task records in `agy_tasks/active`, archiving older ones cleanly (H-6).
+
+    Currently running or queued task records are never archived prematurely.
+    """
+    active = Path(active_dir) if active_dir is not None else ACTIVE_DIR
+    limit = max(1, int(max_keep))
+    try:
+        if not active.exists():
+            return 0
+        task_files = [fp for fp in active.glob("*.json") if not fp.is_symlink()]
+    except Exception:
+        return 0
+
+    if len(task_files) <= limit:
+        return 0
+
+    protected: List[Path] = []
+    archivable: List[tuple[tuple[float, int, str], Path]] = []
+    for fp in task_files:
+        try:
+            st = fp.stat()
+        except OSError:
+            continue
+        obj: Dict[str, Any] = {}
+        try:
+            parsed = json.loads(fp.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                obj = parsed
+        except Exception:
+            obj = {}
+        status = str(obj.get("status") or "").strip().lower()
+        if status in ("running", "queued"):
+            protected.append(fp)
+        else:
+            archivable.append((_task_recency_key(fp, obj, st.st_mtime_ns), fp))
+
+    keep_other = max(0, limit - len(protected))
+    if len(archivable) <= keep_other:
+        return 0
+
+    archivable.sort(key=lambda item: item[0], reverse=True)
+    to_archive = [fp for _, fp in archivable[keep_other:]]
+    if not to_archive:
+        return 0
+
+    arch_dir = Path(archive_dir) if archive_dir is not None else (active.parent / "archive")
+    try:
+        arch_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0
+
+    archived = 0
+    for fp in to_archive:
+        dst = arch_dir / fp.name
+        try:
+            os.replace(fp, dst)
+            archived += 1
+        except OSError:
+            try:
+                shutil.move(str(fp), str(dst))
+                archived += 1
+            except Exception:
+                continue
+    return archived
+
+
 def save_active_task(task_id: str, payload: Dict[str, Any]) -> Path:
     ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
     out = resolve_task_file(ACTIVE_DIR, task_id)
     atomic_write_json(out, payload)
+    prune_active_tasks()
     return out
 
 
@@ -890,7 +974,8 @@ def reap_stale_running_tasks(now: Optional[float] = None) -> int:
                 reason = f"后台任务超过 {timeout_sec} 秒仍未结束，已自动回收清理"
             elif owner_pid is not None and not same_owner_here and not owner_alive:
                 if child_pid and child_verified_alive:
-                    kill_process_tree(child_pid, expected_create_time=verified_child_ct)
+                    # E-1: Running L3 child processes survive MCP restarts independently until finished or timed out.
+                    continue
                 reason = "原宿主机服务已重启或退出，遗留运行中任务已自动回收"
             elif (
                 child_pid is not None
@@ -917,6 +1002,7 @@ def reap_stale_running_tasks(now: Optional[float] = None) -> int:
         except Exception:
             # Isolate corrupt/unreadable task files so one bad record never aborts startup or blocks other tasks
             continue
+    prune_active_tasks()
     return reaped
 
 
@@ -989,6 +1075,328 @@ def summarize_text_for_voice(text: str, limit: int = 280) -> str:
     return clean[:limit].rstrip() + "……"
 
 
+def normalize_workspace_key(workdir: Path | str) -> str:
+    """Canonicalize a workspace directory path for per-workspace mutual exclusion (E-2)."""
+    raw = str(workdir or "").strip()
+    if not raw:
+        raw = str(SERVER_DIR.parent)
+    try:
+        resolved = Path(raw).expanduser().resolve()
+        return os.path.normcase(os.path.normpath(str(resolved)))
+    except Exception:
+        return os.path.normcase(os.path.normpath(raw))
+
+
+def is_workspace_queue_mode(cfg: Optional[Dict[str, Any]] = None) -> bool:
+    if isinstance(cfg, dict) and "queue_mode" in cfg:
+        return bool(cfg["queue_mode"])
+    return _parse_env_bool(read_env_key("L3_WORKSPACE_QUEUE_MODE"), default=False)
+
+
+def is_task_cancelled(task_id: str) -> bool:
+    if not task_id:
+        return False
+    with _workspace_guard_lock:
+        return task_id in _cancelled_task_ids
+
+
+def _mark_task_cancelled_id(task_id: str) -> None:
+    if not task_id:
+        return
+    with _workspace_guard_lock:
+        if len(_cancelled_task_ids) >= 256:
+            _cancelled_task_ids.clear()
+        _cancelled_task_ids.add(task_id)
+
+
+def _find_active_workspace_task_locked(ws_key: str) -> Optional[Dict[str, Any]]:
+    """Locate an active running task for `ws_key` (must be called under `_workspace_guard_lock`)."""
+    entry = _workspace_active_tasks.get(ws_key)
+    if entry is not None:
+        tid = str(entry.get("task_id") or "")
+        if entry.get("starting") or is_worker_thread_alive(tid):
+            return dict(entry)
+        # Verify against disk record in current ACTIVE_DIR (protects test isolation & post-restart state)
+        still_running = False
+        try:
+            fp = resolve_task_file(ACTIVE_DIR, tid)
+            if fp.is_file():
+                obj = json.loads(fp.read_text(encoding="utf-8"))
+                if isinstance(obj, dict) and obj.get("status") == "running":
+                    child_pid = _safe_int(obj.get("pid"), None)
+                    child_ct = _safe_float(obj.get("pid_create_time"), 0.0) or None
+                    started_ts = _safe_float(obj.get("started_ts"), 0.0)
+                    if child_pid and is_same_process(child_pid, child_ct, started_ts=started_ts, role="child"):
+                        still_running = True
+        except Exception:
+            still_running = False
+        if still_running:
+            return dict(entry)
+        _workspace_active_tasks.pop(ws_key, None)
+
+    # Disk fallback: detect L3 tasks that survived an MCP restart independently (E-1 + E-2)
+    try:
+        if ACTIVE_DIR.exists():
+            for fp in sorted(ACTIVE_DIR.glob("*.json")):
+                if fp.is_symlink():
+                    continue
+                try:
+                    obj = json.loads(fp.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or obj.get("status") != "running":
+                    continue
+                rec_wd = str(obj.get("workdir") or "").strip()
+                if not rec_wd or normalize_workspace_key(rec_wd) != ws_key:
+                    continue
+                tid = str(obj.get("id") or fp.stem)
+                child_pid = _safe_int(obj.get("pid"), None)
+                child_ct = _safe_float(obj.get("pid_create_time"), 0.0) or None
+                started_ts = _safe_float(obj.get("started_ts"), 0.0)
+                if is_worker_thread_alive(tid) or (
+                    child_pid and is_same_process(child_pid, child_ct, started_ts=started_ts, role="child")
+                ):
+                    return {
+                        "task_id": tid,
+                        "backend": str(obj.get("backend") or ""),
+                        "prompt": str(obj.get("prompt") or "")[:80],
+                        "workdir": rec_wd,
+                        "pid": child_pid,
+                        "pid_create_time": child_ct,
+                    }
+    except Exception:
+        pass
+    return None
+
+
+def find_busy_workspace_task(workdir: Path | str) -> Optional[Dict[str, Any]]:
+    """Return active running task metadata if `workdir` currently has a running L3 task, else None (E-2)."""
+    reap_stale_running_tasks()
+    ws_key = normalize_workspace_key(workdir)
+    with _workspace_guard_lock:
+        return _find_active_workspace_task_locked(ws_key)
+
+
+def format_workspace_busy_message(workdir: Path | str, busy_info: Optional[Dict[str, Any]] = None) -> str:
+    ws_name = Path(workdir).name or str(workdir)
+    tid = str((busy_info or {}).get("task_id") or "")
+    prompt_snippet = str((busy_info or {}).get("prompt") or "")[:24]
+    detail = f"（当前任务 {tid}：「{prompt_snippet}」）" if tid else ""
+    return f"工作目录 {ws_name} 已有任务进行中，可追加指令或取消{detail}。"
+
+
+def claim_workspace_or_enqueue(
+    *,
+    workdir: Path | str,
+    task_id: str,
+    backend: str,
+    prompt: str,
+    cfg: Optional[Dict[str, Any]] = None,
+    start_fn: Optional[Callable[[], None]] = None,
+    queued_record: Optional[Dict[str, Any]] = None,
+    queue_if_busy: Optional[bool] = None,
+) -> tuple[str, Optional[str]]:
+    """Atomically claim single-active-task mutex for `workdir`, reject if busy, or enqueue when queue mode is on (E-2).
+
+    Returns:
+      - ("acquired", None): caller owns the workspace slot (and `start_fn` has been started if provided).
+      - ("queued", user_message): task was queued behind the active task and will run automatically next.
+      - ("busy", user_message): workspace is busy and queue mode is disabled (or queue full).
+    """
+    reap_stale_running_tasks()
+    ws_key = normalize_workspace_key(workdir)
+    use_queue = is_workspace_queue_mode(cfg) if queue_if_busy is None else bool(queue_if_busy)
+
+    with _workspace_guard_lock:
+        busy = _find_active_workspace_task_locked(ws_key)
+        if busy is None:
+            entry = {
+                "task_id": task_id,
+                "backend": backend,
+                "prompt": str(prompt or "")[:80],
+                "workdir": str(workdir),
+                "claimed_ts": time.time(),
+                "starting": True,
+            }
+            _workspace_active_tasks[ws_key] = entry
+        else:
+            if not use_queue or start_fn is None:
+                return "busy", format_workspace_busy_message(workdir, busy)
+            q = _workspace_queues.setdefault(ws_key, [])
+            if len(q) >= _MAX_WORKSPACE_QUEUE_SIZE:
+                return (
+                    "busy",
+                    f"工作目录 {Path(workdir).name} 排队队列已满（最多 {_MAX_WORKSPACE_QUEUE_SIZE} 个），已有任务进行中，可追加指令或取消。",
+                )
+            pos = len(q) + 1
+            if queued_record is not None:
+                rec = dict(queued_record)
+                rec["status"] = "queued"
+                rec["queue_position"] = pos
+                save_active_task(task_id, rec)
+            q.append(
+                {
+                    "task_id": task_id,
+                    "backend": backend,
+                    "prompt": str(prompt or "")[:80],
+                    "workdir": str(workdir),
+                    "start_fn": start_fn,
+                }
+            )
+            return (
+                "queued",
+                f"工作目录 {Path(workdir).name} 已有任务进行中，已将任务加入排队队列（第 {pos} 位，任务 {task_id}），当前任务完成后将自动顺延执行。",
+            )
+
+    if start_fn is not None:
+        try:
+            start_fn()
+        except Exception:
+            with _workspace_guard_lock:
+                if _workspace_active_tasks.get(ws_key, {}).get("task_id") == task_id:
+                    _workspace_active_tasks.pop(ws_key, None)
+            raise
+    with _workspace_guard_lock:
+        cur = _workspace_active_tasks.get(ws_key)
+        if cur is not None and cur.get("task_id") == task_id:
+            cur["starting"] = False
+    return "acquired", None
+
+
+def release_workspace_slot(workdir: Path | str, task_id: str) -> Optional[str]:
+    """Release workspace mutex for `task_id` and automatically dispatch the next queued task if any (E-2)."""
+    ws_key = normalize_workspace_key(workdir)
+    while True:
+        next_item: Optional[Dict[str, Any]] = None
+        with _workspace_guard_lock:
+            cur = _workspace_active_tasks.get(ws_key)
+            if cur is not None and cur.get("task_id") == task_id:
+                _workspace_active_tasks.pop(ws_key, None)
+            if ws_key in _workspace_active_tasks:
+                return None
+            q = _workspace_queues.get(ws_key)
+            if not q:
+                _workspace_queues.pop(ws_key, None)
+                return None
+            next_item = q.pop(0)
+            if not q:
+                _workspace_queues.pop(ws_key, None)
+            _workspace_active_tasks[ws_key] = {
+                "task_id": next_item["task_id"],
+                "backend": next_item["backend"],
+                "prompt": next_item["prompt"],
+                "workdir": next_item["workdir"],
+                "claimed_ts": time.time(),
+                "starting": True,
+            }
+
+        nxt_tid = str(next_item["task_id"])
+        try:
+            next_item["start_fn"]()
+            with _workspace_guard_lock:
+                cur_nxt = _workspace_active_tasks.get(ws_key)
+                if cur_nxt is not None and cur_nxt.get("task_id") == nxt_tid:
+                    cur_nxt["starting"] = False
+            return nxt_tid
+        except Exception as exc:
+            try:
+                fp = resolve_task_file(ACTIVE_DIR, nxt_tid)
+                if fp.is_file():
+                    rec = json.loads(fp.read_text(encoding="utf-8"))
+                    if isinstance(rec, dict):
+                        rec["status"] = "error"
+                        rec["stderr"] = f"排队任务启动失败: {exc}"
+                        rec["summary"] = rec["stderr"]
+                        rec["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        save_active_task(nxt_tid, rec)
+            except Exception:
+                pass
+            task_id = nxt_tid
+
+
+def get_workspace_queue_snapshot(workdir: Optional[Path | str] = None) -> Dict[str, Any]:
+    """Return active task and queued task IDs for a workspace (for diagnostics/tests)."""
+    ws_key = normalize_workspace_key(workdir if workdir is not None else resolve_workdir())
+    with _workspace_guard_lock:
+        active = _workspace_active_tasks.get(ws_key)
+        queued = [str(item.get("task_id") or "") for item in _workspace_queues.get(ws_key, [])]
+    return {
+        "workspace_key": ws_key,
+        "active_task_id": str(active.get("task_id")) if active else None,
+        "queued_task_ids": queued,
+    }
+
+
+def cancel_active_task(workdir: Optional[Path | str] = None) -> str:
+    """Cancel active running task(s) and queued tasks in the specified (or configured) workspace (E-2)."""
+    target_wd = Path(workdir) if workdir is not None else resolve_workdir()
+    ws_key = normalize_workspace_key(target_wd)
+    cancelled_ids: List[str] = []
+    queued_cancelled: List[str] = []
+
+    with _workspace_guard_lock:
+        active_entry = _workspace_active_tasks.pop(ws_key, None)
+        if active_entry and active_entry.get("task_id"):
+            tid = str(active_entry["task_id"])
+            cancelled_ids.append(tid)
+            if len(_cancelled_task_ids) >= 256:
+                _cancelled_task_ids.clear()
+            _cancelled_task_ids.add(tid)
+        queued_items = _workspace_queues.pop(ws_key, [])
+        for qi in queued_items:
+            qtid = str(qi.get("task_id") or "")
+            if qtid:
+                queued_cancelled.append(qtid)
+                _cancelled_task_ids.add(qtid)
+
+    # Also cancel any matching running/queued records on disk (including MCP-restart survivors)
+    if ACTIVE_DIR.exists():
+        for fp in sorted(ACTIVE_DIR.glob("*.json")):
+            if fp.is_symlink():
+                continue
+            try:
+                obj = json.loads(fp.read_text(encoding="utf-8"))
+                if not isinstance(obj, dict):
+                    continue
+                st = str(obj.get("status") or "").strip().lower()
+                if st not in ("running", "queued"):
+                    continue
+                rec_wd = str(obj.get("workdir") or "").strip()
+                tid = str(obj.get("id") or fp.stem)
+                if tid not in cancelled_ids and tid not in queued_cancelled:
+                    if not rec_wd or normalize_workspace_key(rec_wd) != ws_key:
+                        continue
+                _mark_task_cancelled_id(tid)
+                child_pid = _safe_int(obj.get("pid"), None)
+                child_ct = _safe_float(obj.get("pid_create_time"), 0.0) or None
+                started_ts = _safe_float(obj.get("started_ts"), 0.0)
+                if st == "running" and child_pid and is_same_process(
+                    child_pid, child_ct, started_ts=started_ts, role="child"
+                ):
+                    verified_ct = child_ct or get_process_create_time(child_pid)
+                    kill_process_tree(child_pid, grace_seconds=1.5, expected_create_time=verified_ct)
+                obj["status"] = "cancelled"
+                obj["stderr"] = "任务已被用户取消"
+                obj["summary"] = "任务已被用户取消"
+                obj["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                atomic_write_json(fp, obj)
+                if st == "running" and tid not in cancelled_ids:
+                    cancelled_ids.append(tid)
+                elif st == "queued" and tid not in queued_cancelled:
+                    queued_cancelled.append(tid)
+            except Exception:
+                continue
+
+    if not cancelled_ids and not queued_cancelled:
+        return f"工作目录 {target_wd.name} 当前没有进行中或排队中的 L3 任务。"
+    parts = []
+    if cancelled_ids:
+        parts.append(f"已取消进行中任务 {len(cancelled_ids)} 个（{', '.join(cancelled_ids[:3])}）")
+    if queued_cancelled:
+        parts.append(f"已清空排队任务 {len(queued_cancelled)} 个")
+    return f"工作目录 {target_wd.name}：{'，'.join(parts)}。"
+
+
 class L3Backend:
     name: str = "base"
     label_zh: str = "通用后端"
@@ -1052,8 +1460,16 @@ def get_status_overview() -> Dict[str, Any]:
     }
 
 
-def dispatch_task(instruction: str, follow_up_last: bool = False) -> str:
+def dispatch_task(
+    instruction: str,
+    follow_up_last: bool = False,
+    *,
+    queue_if_busy: Optional[bool] = None,
+) -> str:
     cfg = read_l3_config()
+    if queue_if_busy is not None:
+        cfg = dict(cfg)
+        cfg["queue_mode"] = bool(queue_if_busy)
     backend = get_backend(cfg["backend"])
     task_id = time.strftime("%Y%m%d_%H%M%S_") + os.urandom(3).hex()
     return backend.dispatch(task_id, instruction, follow_up_last, cfg)

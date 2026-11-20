@@ -54,6 +54,31 @@ DEFAULT_IDLE_FAREWELL_SUMMARY_PROMPT: str = (
     "不要以“时间过得真快”开头，不要客套寒暄，不要输出 Markdown、括号动作或表情符号。"
 )
 
+DEFAULT_VAD_SPECULATIVE_COMPLETE_SUFFIXES: tuple[str, ...] = (
+    "吗", "呢", "吧", "了", "啦", "呀", "哦", "嘛", "呗", "哈", "么",
+    "好啊", "行啊", "对啊", "是啊", "可以啊", "真好啊",
+    "好不好", "行不行", "可以吗", "对不对", "是不是", "有没有", "行吗", "好吗",
+    "怎么样", "怎么了", "怎么办", "什么意思", "多少钱", "几点了", "几号",
+    "星期几", "周几", "在哪里", "在哪儿", "在哪", "是谁", "为什么",
+    "谢谢", "谢谢你", "再见", "拜拜", "晚安", "早安", "辛苦了",
+    "算了", "不用了", "没关系", "没问题",
+)
+
+DEFAULT_VAD_SPECULATIVE_HESITATION_SUFFIXES: tuple[str, ...] = (
+    "然后", "就是", "那个", "这个", "因为", "所以", "但是", "不过", "而且",
+    "并且", "或者", "还是", "如果", "要是", "虽然", "尽管", "哪怕", "其实",
+    "比如", "比如说", "好像", "大概", "可能", "应该", "还有", "另外", "顺便",
+    "首先", "其次", "接着", "同时", "否则", "不然", "除非", "既然", "只要",
+    "只有", "无论", "不管", "甚至", "尤其", "特别是", "也就是说", "怎么说呢",
+    "就是说", "那个啥", "的时候", "以后", "之后", "之前", "的话", "方面",
+    "我想", "我要", "我想问", "我想让你", "帮我", "给我", "请你", "能不能",
+    "可不可以", "准备", "打算", "正在", "觉得", "感觉", "关于", "对于",
+    "查一下", "看一下", "看看", "搜一下", "搜索", "找一下", "发给", "定一个",
+    "嗯", "呃", "额", "诶", "唉", "哎", "啊",
+    "那", "就", "和", "跟", "与", "把", "被", "给", "让", "对", "向", "从",
+    "在", "到", "的", "地", "得", "着", "过",
+)
+
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "schema_version": SCHEMA_VERSION,
     "pc_control": {"mode": "safe"},
@@ -67,6 +92,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "messages": list(DEFAULT_IDLE_FAREWELL_MESSAGES),
     },
     "turn_context": {"mode": "split"},
+    "vad_speculative": {
+        "enabled": True,
+        "speculative_ms": 550,
+        "post_wakeup_ms": 800,
+        "min_chars": 4,
+        "complete_suffixes": list(DEFAULT_VAD_SPECULATIVE_COMPLETE_SUFFIXES),
+        "hesitation_suffixes": list(DEFAULT_VAD_SPECULATIVE_HESITATION_SUFFIXES),
+    },
 }
 
 _settings_lock = threading.RLock()
@@ -182,6 +215,74 @@ def normalize_turn_context(raw: Any) -> Dict[str, str]:
     return {"mode": mode}
 
 
+def _normalize_word_list(raw: Any, default_items: tuple[str, ...], *, max_items: int, max_len: int = 24) -> list[str]:
+    if raw is None:
+        return list(default_items)
+    if isinstance(raw, str):
+        parts = [p for ln in raw.splitlines() for p in ln.replace("，", ",").replace("、", ",").split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        parts = list(raw)
+    else:
+        return list(default_items)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in parts:
+        s = str(item or "").strip()
+        if not s:
+            continue
+        if len(s) > max_len:
+            s = s[:max_len].rstrip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def normalize_vad_speculative(raw: Any) -> Dict[str, Any]:
+    d = raw if isinstance(raw, dict) else {}
+    raw_enabled = d.get("enabled", True)
+    enabled = (
+        raw_enabled
+        if isinstance(raw_enabled, bool)
+        else str(raw_enabled).strip().lower() not in ("0", "false", "no", "off")
+    )
+    spec_ms = _clamp_int(d.get("speculative_ms", 550), 300, 950, 550)
+    post_wakeup_ms = _clamp_int(d.get("post_wakeup_ms", 800), 450, 1050, 800)
+    if post_wakeup_ms < spec_ms:
+        post_wakeup_ms = spec_ms
+    min_chars = _clamp_int(d.get("min_chars", 4), 2, 20, 4)
+
+    if "complete_suffixes" not in d:
+        complete_suffixes = list(DEFAULT_VAD_SPECULATIVE_COMPLETE_SUFFIXES)
+    else:
+        complete_suffixes = _normalize_word_list(
+            d.get("complete_suffixes"),
+            DEFAULT_VAD_SPECULATIVE_COMPLETE_SUFFIXES,
+            max_items=120,
+        )
+
+    if "hesitation_suffixes" not in d:
+        hesitation_suffixes = list(DEFAULT_VAD_SPECULATIVE_HESITATION_SUFFIXES)
+    else:
+        hesitation_suffixes = _normalize_word_list(
+            d.get("hesitation_suffixes"),
+            DEFAULT_VAD_SPECULATIVE_HESITATION_SUFFIXES,
+            max_items=160,
+        )
+
+    return {
+        "enabled": bool(enabled),
+        "speculative_ms": int(spec_ms),
+        "post_wakeup_ms": int(post_wakeup_ms),
+        "min_chars": int(min_chars),
+        "complete_suffixes": complete_suffixes,
+        "hesitation_suffixes": hesitation_suffixes,
+    }
+
+
 def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
     d = raw if isinstance(raw, dict) else {}
     return {
@@ -191,6 +292,7 @@ def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
         "reply_length": normalize_reply_length(d.get("reply_length")),
         "idle_farewell": normalize_idle_farewell(d.get("idle_farewell")),
         "turn_context": normalize_turn_context(d.get("turn_context")),
+        "vad_speculative": normalize_vad_speculative(d.get("vad_speculative")),
     }
 
 
@@ -448,3 +550,71 @@ def set_turn_context_mode(mode: str, settings_path: Optional[str] = None) -> str
         raise ValueError(f"Unsupported turn_context mode: {mode}")
     saved = update_runtime_section("turn_context", lambda _: {"mode": m}, settings_path=settings_path)
     return saved["turn_context"]["mode"]
+
+
+def get_vad_speculative(settings_path: Optional[str] = None) -> Dict[str, Any]:
+    sec = read_runtime_settings(settings_path)["vad_speculative"]
+    return {
+        "enabled": bool(sec["enabled"]),
+        "speculative_ms": int(sec["speculative_ms"]),
+        "post_wakeup_ms": int(sec["post_wakeup_ms"]),
+        "min_chars": int(sec["min_chars"]),
+        "complete_suffixes": list(sec["complete_suffixes"]),
+        "hesitation_suffixes": list(sec["hesitation_suffixes"]),
+    }
+
+
+def _require_int_param(name: str, val: Any) -> int:
+    if isinstance(val, bool):
+        raise ValueError(f"{name} must be an integer, not bool")
+    try:
+        return int(round(float(val)))
+    except Exception as exc:
+        raise ValueError(f"{name} must be an integer: {val!r}") from exc
+
+
+def set_vad_speculative(
+    enabled: Optional[bool] = None,
+    speculative_ms: Optional[int] = None,
+    post_wakeup_ms: Optional[int] = None,
+    min_chars: Optional[int] = None,
+    complete_suffixes: Any = None,
+    hesitation_suffixes: Any = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be a boolean, got {type(enabled).__name__}")
+    spec_val = _require_int_param("speculative_ms", speculative_ms) if speculative_ms is not None else None
+    post_val = _require_int_param("post_wakeup_ms", post_wakeup_ms) if post_wakeup_ms is not None else None
+    min_c_val = _require_int_param("min_chars", min_chars) if min_chars is not None else None
+    if complete_suffixes is not None and not isinstance(complete_suffixes, (list, tuple, set, str)):
+        raise ValueError("complete_suffixes must be a list of strings or delimited string")
+    if hesitation_suffixes is not None and not isinstance(hesitation_suffixes, (list, tuple, set, str)):
+        raise ValueError("hesitation_suffixes must be a list of strings or delimited string")
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if enabled is not None:
+            next_cfg["enabled"] = bool(enabled)
+        if spec_val is not None:
+            next_cfg["speculative_ms"] = spec_val
+        if post_val is not None:
+            next_cfg["post_wakeup_ms"] = post_val
+        if min_c_val is not None:
+            next_cfg["min_chars"] = min_c_val
+        if complete_suffixes is not None:
+            next_cfg["complete_suffixes"] = complete_suffixes
+        if hesitation_suffixes is not None:
+            next_cfg["hesitation_suffixes"] = hesitation_suffixes
+        return normalize_vad_speculative(next_cfg)
+
+    saved = update_runtime_section("vad_speculative", _upd, settings_path=settings_path)
+    sec = saved["vad_speculative"]
+    return {
+        "enabled": bool(sec["enabled"]),
+        "speculative_ms": int(sec["speculative_ms"]),
+        "post_wakeup_ms": int(sec["post_wakeup_ms"]),
+        "min_chars": int(sec["min_chars"]),
+        "complete_suffixes": list(sec["complete_suffixes"]),
+        "hesitation_suffixes": list(sec["hesitation_suffixes"]),
+    }

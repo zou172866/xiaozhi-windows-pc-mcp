@@ -77,14 +77,14 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
         plan.append(
             (
                 "unit",
-                "Host pc-mcp (L1/L2/L3 security, guardrails, modular split, watchdog)",
+                "Host pc-mcp (L1/L2/L3 security, guardrails, watchdog, vision, sidecar, launcher)",
                 [py_host, "-m", "unittest", "discover", "-s", str(PC_MCP_DIR), "-p", "test_*.py", "-v"],
             )
         )
         plan.append(
             (
                 "unit",
-                "Anima Brain & Obsidian Exporter (Docker isolated)",
+                "Anima Brain & Obsidian Exporter (Docker isolated, incl. B-1 inbox & rollback)",
                 [
                     "docker",
                     "run",
@@ -93,6 +93,8 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
                     "python",
                     "-v",
                     f"{ANIMA_DIR / 'tests'}:/app/tests:ro",
+                    "-v",
+                    f"{ANIMA_DIR / 'scripts'}:/app/scripts:ro",
                     "-v",
                     f"{ANIMA_DIR / 'obsidian_exporter.py'}:/app/obsidian_exporter.py:ro",
                     "-v",
@@ -123,12 +125,51 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
                 ],
             )
         )
+        plan.append(
+            (
+                "unit",
+                "Batch 3 Anima outbox dead-lettering/replay & per-device recall (B-5, C-6)",
+                [
+                    "docker",
+                    "exec",
+                    "xiaozhi-esp32-server",
+                    "python3",
+                    "/opt/xiaozhi-esp32-server/app/test_batch3_anima_outbox.py",
+                ],
+            )
+        )
+        plan.append(
+            (
+                "unit",
+                "Batch 3 voice pipeline, speculative VAD 34-case suite, idle trim & ASR corrections (C-4..8, F-1, G-1/2/4)",
+                [
+                    "docker",
+                    "exec",
+                    "xiaozhi-esp32-server",
+                    "python3",
+                    "/opt/xiaozhi-esp32-server/app/test_batch3_pipeline_vad.py",
+                ],
+            )
+        )
+        plan.append(
+            (
+                "unit",
+                "Batch 3 18080 console hardening, allowlists, redaction & B-5/F-1/G-4 API/UI (D-1..7, H-6)",
+                [
+                    "docker",
+                    "exec",
+                    "xiaozhi-esp32-server",
+                    "python3",
+                    "/opt/xiaozhi-esp32-server/app/test_batch3_console.py",
+                ],
+            )
+        )
 
     if layer in ("contract", "all"):
         plan.append(
             (
                 "contract",
-                "Upstream image contracts (SERVER_VERSION, 19 patches, anchors, rebind)",
+                "Upstream image contracts (SERVER_VERSION, 19+1 patches, anchors, rebind)",
                 [
                     "docker",
                     "exec",

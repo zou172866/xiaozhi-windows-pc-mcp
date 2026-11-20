@@ -1,4 +1,6 @@
 import asyncio
+import atexit
+import copy
 import io
 import json
 import math
@@ -72,6 +74,7 @@ GSV_PROFILES = {
         "sovits_weights": f"{HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/芽衣/芽衣_e10_s430_l32.pth",
         "block": {
             "type": "gpt_sovits_v2",
+            "voice_id": "__gsv_raiden_mei__",
             "url": f"{GSV_Host}/tts",
             "output_dir": "tmp/",
             "text_lang": "zh",
@@ -99,6 +102,7 @@ GSV_PROFILES = {
         "sovits_weights": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
         "block": {
             "type": "gpt_sovits_v2",
+            "voice_id": "__gsv_xiaozhi_tw__",
             "url": f"{GSV_Host}/tts",
             "output_dir": "tmp/",
             "text_lang": "zh",
@@ -120,6 +124,23 @@ GSV_PROFILES = {
         },
     },
 }
+
+ALLOWED_GSV_VOICES = frozenset(GSV_PROFILES.keys())
+ALLOWED_EDGE_VOICES = frozenset(
+    {
+        "zh-TW-HsiaoChenNeural",
+        "zh-TW-YunJheNeural",
+        "zh-CN-XiaoxiaoNeural",
+        "zh-CN-XiaoyiNeural",
+        "zh-CN-YunxiNeural",
+        "zh-CN-YunjianNeural",
+        "zh-CN-YunxiaNeural",
+        "zh-HK-HiuGaaiNeural",
+        "zh-CN-liaoning-XiaobeiNeural",
+        "zh-CN-shaanxi-XiaoniNeural",
+    }
+)
+ALLOWED_VOICES = ALLOWED_GSV_VOICES | ALLOWED_EDGE_VOICES
 # Share the exact same RLock with live ESP32 GPT-SoVITS synthesis (P1-14)
 _gsv_weights_lock = mei_emotion_router.GSV_GPU_LOCK
 _active_gsv_loaded = None
@@ -162,28 +183,71 @@ def _detect_boot_gsv_voice() -> str | None:
             for vid, prof in GSV_PROFILES.items():
                 if prof["gpt_weights"] == t2s:
                     return vid
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_rate_limited("detect_boot_gsv_voice", exc)
     return None
+
+
+def _resolve_gsv_voice_id(tts_cfg: dict | None) -> str:
+    """Resolve GSV voice ID from explicit persistent `voice_id` first, falling back to legacy ref_audio_path (D-7)."""
+    cfg_d = tts_cfg if isinstance(tts_cfg, dict) else {}
+    explicit = str(cfg_d.get("voice_id") or "").strip()
+    if explicit in GSV_PROFILES:
+        return explicit
+    # Legacy fallback ONLY for older configs lacking explicit voice_id
+    ref_p = str(cfg_d.get("ref_audio_path") or "")
+    return "__gsv_raiden_mei__" if "raiden_mei" in ref_p else "__gsv_xiaozhi_tw__"
 
 
 def _get_configured_gsv_voice() -> str | None:
     try:
         cfg = _read_raw_yaml()
-        selected = cfg.get("selected_module", {})
+        selected = cfg.get("selected_module") or {}
         if selected.get("TTS") != "GPT_SOVITS_V2":
             return None
-        ref_p = str((cfg.get("TTS", {}).get("GPT_SOVITS_V2") or {}).get("ref_audio_path") or "")
-        return "__gsv_raiden_mei__" if "raiden_mei" in ref_p else "__gsv_xiaozhi_tw__"
-    except Exception:
+        return _get_current_voice_id(cfg)
+    except Exception as exc:
+        _log_rate_limited("get_configured_gsv_voice", exc)
         return None
 
 
 _SECRET_PATTERNS = (
-    (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-~+/=]{8,}", re.IGNORECASE), r"\1***"),
-    (re.compile(r"(#token=|api_key=|authorization\s*[:=]\s*)[^\s&\"',;]+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-~+/=]{6,}", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(Basic\s+)[A-Za-z0-9+/=]{8,}", re.IGNORECASE), r"\1***"),
+    (
+        re.compile(
+            r"([?#&](?:access_token|refresh_token|auth_token|token|api_key|apikey|key)=)[^\s&#\"',;)}\]]+",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
+    (
+        re.compile(
+            r"((?:x-goog-api-key|x-api-key|x-console-token|api_key|apikey|access_token|refresh_token|auth_token)\s*[\"']?\s*[:=]\s*[\"']?)[^\s&\"',;)}\]]+",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
+    (
+        re.compile(
+            r"(authorization\s*[\"']?\s*[:=]\s*[\"']?(?:(?:Bearer|Basic)\s+)?)[^\s&\"',;)}\]]+",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
     (re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"), "sk-***"),
-    (re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}\b"), "AIza***"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{16,}\b"), "AIza***"),
+)
+
+_ERROR_PAYLOAD_KEYS = frozenset(
+    {
+        "error",
+        "detail",
+        "message",
+        "rollback_warning",
+        "voice_dirty_error",
+        "last_error",
+    }
 )
 
 
@@ -192,6 +256,61 @@ def _redact_secrets(text: str) -> str:
     for pat, repl in _SECRET_PATTERNS:
         s = pat.sub(repl, s)
     return s
+
+
+def _redact_json_payload(obj, *, redact_all_strings: bool = False):
+    """Recursively redact secrets in error responses and error-bearing fields (D-5)."""
+    if isinstance(obj, str):
+        return _redact_secrets(obj) if redact_all_strings else obj
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            force_child = redact_all_strings or (str(k).lower() in _ERROR_PAYLOAD_KEYS)
+            out[k] = _redact_json_payload(v, redact_all_strings=force_child)
+        return out
+    if isinstance(obj, list):
+        return [_redact_json_payload(item, redact_all_strings=redact_all_strings) for item in obj]
+    if isinstance(obj, tuple):
+        return [_redact_json_payload(item, redact_all_strings=redact_all_strings) for item in obj]
+    return obj
+
+
+_RATE_LOG_INTERVAL_SECONDS = 60.0
+_rate_log_lock = threading.Lock()
+_rate_log_last_ts: dict[str, float] = {}
+_rate_log_suppressed: dict[str, int] = {}
+
+
+def _reset_rate_limited_logs() -> None:
+    with _rate_log_lock:
+        _rate_log_last_ts.clear()
+        _rate_log_suppressed.clear()
+
+
+def _log_rate_limited(
+    site: str,
+    exc: BaseException | str,
+    *,
+    interval: float | None = None,
+    context: str = "",
+) -> bool:
+    """Emit a redacted warning at most once per `interval` seconds (default 60s) per `site` key (D-6)."""
+    window = _RATE_LOG_INTERVAL_SECONDS if interval is None else max(0.0, float(interval))
+    now = time.monotonic()
+    key = str(site or "unknown")
+    with _rate_log_lock:
+        last_ts = _rate_log_last_ts.get(key)
+        if last_ts is not None and (now - last_ts) < window:
+            _rate_log_suppressed[key] = _rate_log_suppressed.get(key, 0) + 1
+            return False
+        suppressed = _rate_log_suppressed.pop(key, 0)
+        _rate_log_last_ts[key] = now
+
+    detail = _redact_secrets(f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else str(exc))
+    ctx_part = f" ({_redact_secrets(context)})" if context else ""
+    sup_part = f" [suppressed {suppressed} similar in last {int(window)}s]" if suppressed else ""
+    print(f"[WebConsole] WARN [{key}]{ctx_part}: {detail}{sup_part}", flush=True)
+    return True
 
 
 def _atomic_write_text(path: str, content: str) -> None:
@@ -323,7 +442,8 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
                 try:
                     with open(GSV_INFER_YAML, "r", encoding="utf-8") as rf:
                         boot_cfg = yaml.safe_load(rf) or {}
-                except Exception:
+                except Exception as exc:
+                    _log_rate_limited("read_gsv_infer_yaml", exc)
                     boot_cfg = {}
             boot_cfg["custom"] = {
                 "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
@@ -497,6 +617,7 @@ def _apply_runtime_event(evt: dict) -> None:
                         _current_ai_turn_open = True
                     _turn_has_tts = True
                     _trim_chat_messages()
+                    _save_history()
             return
 
         if etype == "assistant_message":
@@ -546,6 +667,16 @@ def _dedup_chat_items(items: list) -> list:
     return deduped
 
 
+_HISTORY_FLUSH_INTERVAL = 2.0
+_history_dirty_lock = threading.Lock()
+_history_flush_lock = threading.Lock()
+_history_dirty = False
+_history_dirty_gen = 0
+_history_flushed_gen = 0
+_history_stop_event = threading.Event()
+_history_flusher_thread: threading.Thread | None = None
+
+
 def _load_history():
     global _chat_messages
     loaded = None
@@ -555,7 +686,8 @@ def _load_history():
                 items = json.load(f)
                 if isinstance(items, list):
                     loaded = _dedup_chat_items(items)[-100:]
-        except Exception:
+        except Exception as exc:
+            _log_rate_limited("load_history", exc)
             loaded = []
     if loaded is not None:
         with _state_lock:
@@ -565,14 +697,89 @@ def _load_history():
                 _chat_messages = _dedup_chat_items(loaded + _chat_messages)[-100:]
 
 
-def _save_history():
+def _save_history() -> None:
+    """D-1: Mark chat history dirty for coalesced background disk flush (~2s); ZERO synchronous disk I/O."""
+    global _history_dirty, _history_dirty_gen
+    with _history_dirty_lock:
+        _history_dirty = True
+        _history_dirty_gen += 1
+
+
+def is_history_dirty() -> bool:
+    with _history_dirty_lock:
+        return bool(_history_dirty)
+
+
+def flush_history_if_dirty(*, force: bool = False) -> bool:
+    """Coalesce and atomically persist chat history outside _state_lock (D-1). Returns True if written.
+
+    Lock order: _history_flush_lock -> _state_lock -> _history_dirty_lock.
+    Acquiring _history_flush_lock before snapshotting guarantees concurrent flushers
+    (e.g. background 2s timer vs shutdown flush) can never overwrite a newer generation with an older snapshot.
+    """
+    global _history_dirty, _history_flushed_gen
+    with _history_dirty_lock:
+        if not force and not _history_dirty:
+            return False
+
+    with _history_flush_lock:
+        with _state_lock:
+            with _history_dirty_lock:
+                if not force and not _history_dirty:
+                    return False
+                snap_gen = _history_dirty_gen
+            snapshot = [dict(m) if isinstance(m, dict) else m for m in _chat_messages[-100:]]
+
+        serialized = json.dumps(snapshot, ensure_ascii=False, indent=2)
+        try:
+            _atomic_write_text(HISTORY_PATH, serialized)
+        except Exception as exc:
+            _log_rate_limited("flush_history", exc)
+            return False
+
+        with _history_dirty_lock:
+            if _history_dirty_gen == snap_gen:
+                _history_dirty = False
+            _history_flushed_gen = max(_history_flushed_gen, snap_gen)
+        return True
+
+
+def _history_flusher_loop() -> None:
+    while not _history_stop_event.wait(timeout=_HISTORY_FLUSH_INTERVAL):
+        try:
+            flush_history_if_dirty()
+        except Exception as exc:
+            _log_rate_limited("history_flusher_loop", exc)
     try:
-        _atomic_write_text(
-            HISTORY_PATH,
-            json.dumps(_chat_messages[-100:], ensure_ascii=False, indent=2),
-        )
-    except Exception:
-        pass
+        flush_history_if_dirty()
+    except Exception as exc:
+        _log_rate_limited("history_flusher_shutdown", exc)
+
+
+def start_history_flusher() -> threading.Thread:
+    """Idempotently start the background coalesced history flusher thread (~2s interval)."""
+    global _history_flusher_thread
+    with _history_dirty_lock:
+        if _history_flusher_thread is not None and _history_flusher_thread.is_alive():
+            return _history_flusher_thread
+        _history_stop_event.clear()
+        t = threading.Thread(target=_history_flusher_loop, name="console-history-flusher", daemon=True)
+        t.start()
+        _history_flusher_thread = t
+        return t
+
+
+def stop_history_flusher(timeout: float = 2.0) -> None:
+    """Stop background history flusher cleanly and flush any pending dirty history."""
+    global _history_flusher_thread
+    _history_stop_event.set()
+    t = _history_flusher_thread
+    if t is not None and t.is_alive() and t is not threading.current_thread():
+        t.join(timeout=timeout)
+    flush_history_if_dirty()
+    with _history_dirty_lock:
+        if _history_flusher_thread is t:
+            _history_flusher_thread = None
 
 
 _pc_mode_lock = threading.Lock()
@@ -606,8 +813,8 @@ def _read_pc_mode() -> str:
                 m = json.load(f).get("mode", "safe")
                 if m in ("off", "safe", "full"):
                     return m
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_rate_limited("read_pc_mode", exc)
     return "safe"
 
 
@@ -711,8 +918,8 @@ def _update_idle_farewell_config(payload: dict) -> tuple[bool, dict | str]:
                 conn.timeout_seconds = eff_hard
             if isinstance(getattr(conn, "config", None), dict):
                 conn.config["close_connection_no_voice_time"] = eff_timeout
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_rate_limited("idle_farewell_live_sync", exc)
     return True, saved
 
 
@@ -797,8 +1004,8 @@ def _fetch_l3_backend_status(force: bool = False) -> dict:
                 _l3_cache = dict(data)
                 _l3_cache_ts = time.monotonic()
             return data
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_rate_limited("fetch_l3_backend_status", exc)
     fb = _read_local_l3_fallback()
     with _l3_cache_lock:
         _l3_cache = dict(fb)
@@ -922,6 +1129,12 @@ def _trim_chat_messages() -> None:
         del _chat_messages[:-100]
 
 
+_LOG_MAX_READ_BYTES = 256 * 1024
+_LOG_CURSOR_WRITE_INTERVAL = 5.0
+_active_watcher_state_lock = threading.Lock()
+_active_watcher_state: dict | None = None
+
+
 def _load_log_cursor() -> tuple[int | None, int]:
     try:
         if os.path.isfile(LOG_CURSOR_PATH):
@@ -932,8 +1145,8 @@ def _load_log_cursor() -> tuple[int | None, int]:
                 off = int(data.get("offset", 0))
                 if ino is not None and off >= 0:
                     return int(ino), off
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_rate_limited("load_log_cursor", exc)
     return None, 0
 
 
@@ -943,8 +1156,25 @@ def _save_log_cursor(inode: int, offset: int) -> None:
             LOG_CURSOR_PATH,
             json.dumps({"inode": int(inode), "offset": int(offset)}),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_rate_limited("save_log_cursor", exc)
+
+
+def flush_log_cursor_if_dirty(watcher_state: dict | None = None) -> bool:
+    """Persist pending throttled log cursor if dirty (used on clean shutdown or explicit flush)."""
+    st = watcher_state
+    if st is None:
+        with _active_watcher_state_lock:
+            st = _active_watcher_state
+    if not isinstance(st, dict) or not st.get("cursor_dirty"):
+        return False
+    ino = st.get("cursor_inode") or st.get("last_inode")
+    if ino is None:
+        return False
+    _save_log_cursor(int(ino), int(_log_offset))
+    st["last_cursor_save_ts"] = time.monotonic()
+    st["cursor_dirty"] = False
+    return True
 
 
 def _process_log_line(line: str, *, status_only: bool = False):
@@ -1138,8 +1368,8 @@ def _poll_log_once(watcher_state: dict, *, raw_logs_only: bool = False) -> None:
                     _nl = _first_chunk.find(b"\n")
                     if _nl >= 0:
                         _log_offset += _nl + 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log_rate_limited("poll_log_tail_align", exc)
             watcher_state["last_inode"] = st.st_ino
         elif saved_ino == st.st_ino and 0 < saved_off <= st.st_size:
             _stream_status_prefix(LOG_PATH, saved_off)
@@ -1153,14 +1383,24 @@ def _poll_log_once(watcher_state: dict, *, raw_logs_only: bool = False) -> None:
         _log_offset = 0
         watcher_state["last_inode"] = st.st_ino
 
+    consumed_any = False
     if st.st_size > _log_offset:
         with open(LOG_PATH, "rb") as f:
             f.seek(_log_offset)
-            raw = f.read()
+            # D-4: Cap log read to at most 256 KB per tick to bound memory/CPU spikes
+            raw = f.read(_LOG_MAX_READ_BYTES)
         last_nl = raw.rfind(b"\n")
         if last_nl >= 0:
             to_consume = raw[: last_nl + 1]
+        elif len(raw) >= _LOG_MAX_READ_BYTES:
+            # Giant >256 KB single line without newline: consume chunk so watcher never stalls
+            to_consume = raw
+        else:
+            to_consume = b""
+
+        if to_consume:
             _log_offset += len(to_consume)
+            consumed_any = True
             lines = to_consume.decode("utf-8", errors="replace").splitlines()
             if raw_logs_only:
                 with _state_lock:
@@ -1175,10 +1415,26 @@ def _poll_log_once(watcher_state: dict, *, raw_logs_only: bool = False) -> None:
                     _process_log_line(ln, status_only=False)
                 with _state_lock:
                     _trim_chat_messages()
-            _save_log_cursor(st.st_ino, _log_offset)
+            watcher_state["cursor_dirty"] = True
+            watcher_state["cursor_inode"] = st.st_ino
+
+    # D-4: Write log cursor to disk at most once every 5s (first write on a fresh watcher flushes immediately)
+    if watcher_state.get("cursor_dirty"):
+        now_mono = time.monotonic()
+        last_save = float(watcher_state.get("last_cursor_save_ts") or 0.0)
+        if last_save <= 0.0 or (now_mono - last_save) >= _LOG_CURSOR_WRITE_INTERVAL:
+            _save_log_cursor(int(watcher_state.get("cursor_inode") or st.st_ino), _log_offset)
+            watcher_state["last_cursor_save_ts"] = now_mono
+            watcher_state["cursor_dirty"] = False
+
+    # Legacy non-hooks log-replay path (runs in background watcher thread, never in sentence_start):
+    # coalesce the full batch into at most one disk flush after processing lines.
+    if consumed_any and not raw_logs_only:
+        flush_history_if_dirty()
 
 
 def _log_watcher_loop():
+    global _active_watcher_state
     _load_history()
     _sync_runtime_events()
     saved_ino, saved_off = _load_log_cursor()
@@ -1187,21 +1443,58 @@ def _log_watcher_loop():
         "last_inode": None,
         "saved_inode": saved_ino,
         "saved_offset": saved_off,
+        "cursor_dirty": False,
+        "cursor_inode": saved_ino,
+        "last_cursor_save_ts": 0.0,
     }
+    with _active_watcher_state_lock:
+        _active_watcher_state = watcher_state
     while True:
         try:
             _sync_runtime_events()
             _poll_log_once(watcher_state, raw_logs_only=runtime_events.is_hooks_active())
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_rate_limited("log_watcher_loop", exc)
         time.sleep(0.4)
 
 
+_config_yaml_caches_lock = threading.Lock()
+_config_yaml_caches: dict[str, xz_common.MtimeFileCache[dict]] = {}
+
+
+def _parse_yaml_dict(raw: str) -> dict:
+    parsed = yaml.safe_load(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _get_config_yaml_cache(path: str) -> xz_common.MtimeFileCache[dict]:
+    norm = os.path.abspath(str(path))
+    with _config_yaml_caches_lock:
+        cache = _config_yaml_caches.get(norm)
+        if cache is None:
+            cache = xz_common.MtimeFileCache(
+                parser=_parse_yaml_dict,
+                default_factory=dict,
+                retries=2,
+            )
+            _config_yaml_caches[norm] = cache
+        return cache
+
+
+def invalidate_config_yaml_cache(path: str | None = None) -> None:
+    with _config_yaml_caches_lock:
+        if path is None:
+            for c in _config_yaml_caches.values():
+                c.invalidate()
+        else:
+            c = _config_yaml_caches.get(os.path.abspath(str(path)))
+            if c is not None:
+                c.invalidate()
+
+
 def _read_raw_yaml() -> dict:
-    if not os.path.exists(CONFIG_PATH):
-        return {}
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+    """Read .config.yaml via xz_common.MtimeFileCache so /api/state avoids reparsing unchanged YAML (D-4)."""
+    return _get_config_yaml_cache(CONFIG_PATH).get(CONFIG_PATH, clone=copy.deepcopy)
 
 
 ANIMA_HOST = "http://anima-brain:18787"
@@ -1222,8 +1515,8 @@ def _get_anima_character_id(cfg: dict | None = None) -> str:
         cid = str(((c.get("Memory") or {}).get("AnimaBrain") or {}).get("character_id") or "").strip()
         if cid:
             return cid
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_rate_limited("get_anima_character_id", exc)
     return "xiaozhi"
 
 
@@ -1275,8 +1568,8 @@ def _fetch_anima_relationship(force: bool = False, cfg: dict | None = None) -> d
                 _anima_rel_cache = dict(data)
                 _anima_rel_ts = time.monotonic()
             return data
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_rate_limited("fetch_anima_relationship", exc)
     with _anima_rel_lock:
         if _anima_rel_cache is not None:
             stale = dict(_anima_rel_cache)
@@ -1393,8 +1686,8 @@ def _fetch_obsidian_status(force: bool = False) -> dict:
                 _obsidian_cache = dict(data)
                 _obsidian_ts = time.monotonic()
             return data
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_rate_limited("fetch_obsidian_status", exc)
     return _mark_obsidian_cache_offline()
 
 
@@ -1448,7 +1741,8 @@ def _trigger_obsidian_rebuild() -> tuple[bool, dict | str]:
         raw = {}
         try:
             raw = resp.json()
-        except Exception:
+        except Exception as exc:
+            _log_rate_limited("obsidian_rebuild_json", exc)
             raw = {}
         if resp.status_code == 200 and raw.get("ok"):
             status_data = dict(raw.get("obsidian") or {})
@@ -1545,7 +1839,8 @@ def _probe_gsv_tcp_once() -> bool:
         port = int(u.port or 19880)
         with socket.create_connection((host, port), timeout=0.4):
             return True
-    except Exception:
+    except Exception as exc:
+        _log_rate_limited("probe_gsv_tcp", exc)
         return False
 
 
@@ -1558,7 +1853,8 @@ def _probe_background_services_once() -> dict[str, bool]:
     audio_ok = False
     try:
         audio_ok = bool(pc_audio_router.is_pc_audio_bridge_online(force=True))
-    except Exception:
+    except Exception as exc:
+        _log_rate_limited("probe_pc_audio", exc)
         audio_ok = False
     with _probe_lock:
         if audio_ok:
@@ -1588,7 +1884,8 @@ def _probe_background_services_once() -> dict[str, bool]:
                 _l3_cache = dict(data)
                 _l3_cache_ts = time.monotonic()
             l3_ok = True
-    except Exception:
+    except Exception as exc:
+        _log_rate_limited("probe_l3_status", exc)
         l3_ok = False
     with _probe_lock:
         if l3_ok:
@@ -1611,7 +1908,8 @@ def _probe_background_services_once() -> dict[str, bool]:
     cfg = None
     try:
         cfg = _read_raw_yaml()
-    except Exception:
+    except Exception as exc:
+        _log_rate_limited("probe_read_yaml", exc)
         cfg = None
     char_id = _get_anima_character_id(cfg)
     anima_tok = _read_anima_token()
@@ -1631,7 +1929,8 @@ def _probe_background_services_once() -> dict[str, bool]:
                     _anima_rel_cache = dict(data)
                     _anima_rel_ts = time.monotonic()
                 rel_ok = True
-        except Exception:
+        except Exception as exc:
+            _log_rate_limited("probe_anima_rel", exc)
             rel_ok = False
     with _probe_lock:
         if rel_ok:
@@ -1667,7 +1966,8 @@ def _probe_background_services_once() -> dict[str, bool]:
                     _obsidian_cache = dict(data)
                     _obsidian_ts = time.monotonic()
                 obs_ok = True
-        except Exception:
+        except Exception as exc:
+            _log_rate_limited("probe_obsidian", exc)
             obs_ok = False
     with _probe_lock:
         if obs_ok:
@@ -1693,18 +1993,24 @@ def _probe_background_services_once() -> dict[str, bool]:
             if _probe_fail_counts["gsv"] >= _PROBE_OFFLINE_THRESHOLD:
                 _gsv_online_cache = False
 
-    # 6. 18787 Anima Health & Online Backup Status (B-2)
+    # 6. 18787 Anima Health & Online Backup Status (B-2 / B-1 inbox counters)
     try:
         client = _get_console_http_client()
         resp = client.get(f"{ANIMA_HOST}/xiaozhi/health", timeout=1.5)
         if resp.status_code in (200, 503):
             h_data = resp.json()
-            if isinstance(h_data, dict) and isinstance(h_data.get("backup"), dict):
-                with _anima_backup_lock:
-                    global _anima_backup_cache
-                    _anima_backup_cache = dict(h_data["backup"])
-    except Exception:
-        pass
+            if isinstance(h_data, dict):
+                if isinstance(h_data.get("backup"), dict):
+                    snap_bk = dict(h_data["backup"])
+                    if "inbox_pending" in h_data:
+                        snap_bk["inbox_pending"] = int(h_data.get("inbox_pending") or 0)
+                    if "inbox_dead" in h_data:
+                        snap_bk["inbox_dead"] = int(h_data.get("inbox_dead") or 0)
+                    with _anima_backup_lock:
+                        global _anima_backup_cache
+                        _anima_backup_cache = snap_bk
+    except Exception as exc:
+        _log_rate_limited("probe_anima_health", exc)
 
     # 7. Auto-retry dirty GSV voice weight rollback when GSV is online and ESP32 is idle (D-3)
     dirty_target, _dirty_err = _get_voice_dirty_state()
@@ -1768,8 +2074,8 @@ def _service_probe_loop() -> None:
     while True:
         try:
             _probe_background_services_once()
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_rate_limited("service_probe_loop", exc)
         time.sleep(_PROBE_INTERVAL_SECONDS)
 
 
@@ -1837,12 +2143,12 @@ def _get_current_voice_id(cfg: dict) -> str:
     tts_key = selected.get("TTS", "GPT_SOVITS_V2")
     tts_cfg = ((cfg or {}).get("TTS") or {}).get(tts_key) or {}
     if tts_key == "GPT_SOVITS_V2":
-        ref_p = str(tts_cfg.get("ref_audio_path") or "")
-        return "__gsv_raiden_mei__" if "raiden_mei" in ref_p else "__gsv_xiaozhi_tw__"
-    return str(tts_cfg.get("voice") or "zh-CN-XiaoxiaoNeural")
+        return _resolve_gsv_voice_id(tts_cfg)
+    return str(tts_cfg.get("voice_id") or tts_cfg.get("voice") or "zh-CN-XiaoxiaoNeural")
 
 
 _GSV_VOICE_IDENTITY_KEYS = (
+    "voice_id",
     "ref_audio_path",
     "aux_ref_audio_paths",
     "prompt_text",
@@ -1869,6 +2175,71 @@ _LLM_PROVIDER_DEFAULTS = {
     },
 }
 
+ALLOWED_LLM_PROVIDERS = frozenset(_LLM_PROVIDER_DEFAULTS.keys())
+ALLOWED_LLM_MODELS: dict[str, frozenset[str]] = {
+    "DeepSeekLLM": frozenset(
+        {
+            "deepseek-flash",
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-v4-pro",
+            "deepseek-v3",
+        }
+    ),
+    "GeminiOpenAI": frozenset(
+        {
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+        }
+    ),
+}
+
+# D-2: Module-level lock serializing all .config.yaml read-modify-write operations
+_config_write_lock = threading.RLock()
+
+
+def _validate_config_fields(
+    *,
+    llm_provider: str | None,
+    model_name: str | None,
+    voice: str | None,
+    cur_llm_provider: str,
+) -> tuple[str, str | None, str | None]:
+    """D-2: Strictly validate llm_provider, model_name, and voice against explicit allowlists (raise ValueError -> HTTP 400)."""
+    target_provider = cur_llm_provider
+    if llm_provider is not None:
+        cand_prov = str(llm_provider).strip()
+        if not cand_prov or cand_prov not in ALLOWED_LLM_PROVIDERS:
+            raise ValueError(
+                f"无效的 LLM 服务商: {cand_prov or '(空)'}（仅允许: {', '.join(sorted(ALLOWED_LLM_PROVIDERS))}）"
+            )
+        target_provider = cand_prov
+
+    validated_model: str | None = None
+    if model_name is not None:
+        cand_model = str(model_name).strip()
+        allowed_for_prov = ALLOWED_LLM_MODELS.get(target_provider, frozenset())
+        if not cand_model or cand_model not in allowed_for_prov:
+            raise ValueError(
+                f"服务商 {target_provider} 不支持模型 {cand_model or '(空)'}（允许列表: {', '.join(sorted(allowed_for_prov))}）"
+            )
+        validated_model = cand_model
+
+    validated_voice: str | None = None
+    if voice is not None:
+        cand_voice = str(voice).strip()
+        if not cand_voice or cand_voice not in ALLOWED_VOICES:
+            raise ValueError(f"无效的音色 ID: {cand_voice or '(空)'}（不在允许的本地 GSV / EdgeTTS 音色列表中）")
+        validated_voice = cand_voice
+
+    return target_provider, validated_model, validated_voice
+
 
 def _write_updated_yaml(
     prompt: str | None = None,
@@ -1876,133 +2247,136 @@ def _write_updated_yaml(
     model_name: str | None = None,
     voice: str | None = None,
 ) -> dict:
-    """Deep-merge ONLY user-modified keys into data/.config.yaml without clobbering LLM/TTS blocks (P1-13)."""
+    """Deep-merge ONLY user-modified keys into data/.config.yaml under _config_write_lock with strict allowlists (P1-13 / D-2 / D-7)."""
     global _active_gsv_loaded
-    cfg = _read_raw_yaml()
-    selected = cfg.get("selected_module") or {}
-    cur_prompt = str(cfg.get("prompt") or "").strip()
-    cur_llm_provider = str(selected.get("LLM") or "DeepSeekLLM").strip()
-    cur_llm_cfg = ((cfg.get("LLM") or {}).get(cur_llm_provider)) or {}
-    cur_model = str(cur_llm_cfg.get("model_name") or "").strip()
-    cur_voice = _get_current_voice_id(cfg)
+    with _config_write_lock:
+        cfg = _read_raw_yaml()
+        selected = cfg.get("selected_module") or {}
+        cur_prompt = str(cfg.get("prompt") or "").strip()
+        cur_llm_provider = str(selected.get("LLM") or "DeepSeekLLM").strip()
+        cur_llm_cfg = ((cfg.get("LLM") or {}).get(cur_llm_provider)) or {}
+        cur_model = str(cur_llm_cfg.get("model_name") or "").strip()
+        cur_voice = _get_current_voice_id(cfg)
 
-    patch: dict = {}
-    changed_fields: list[str] = []
+        # D-2: Validate all supplied fields strictly before any GPU weight swap or file write
+        target_provider, validated_model, validated_voice = _validate_config_fields(
+            llm_provider=llm_provider,
+            model_name=model_name,
+            voice=voice,
+            cur_llm_provider=cur_llm_provider,
+        )
 
-    if prompt is not None:
-        new_prompt = prompt.strip()
-        if new_prompt and new_prompt != cur_prompt:
-            patch["prompt"] = new_prompt + "\n"
-            changed_fields.append("prompt")
+        patch: dict = {}
+        changed_fields: list[str] = []
 
-    target_provider = cur_llm_provider
-    if llm_provider is not None and llm_provider.strip():
-        cand_prov = llm_provider.strip()
-        if cand_prov in _LLM_PROVIDER_DEFAULTS or cand_prov in (cfg.get("LLM") or {}):
-            target_provider = cand_prov
-        else:
-            target_provider = "DeepSeekLLM"
+        if prompt is not None:
+            new_prompt = prompt.strip()
+            if new_prompt and new_prompt != cur_prompt:
+                patch["prompt"] = new_prompt + "\n"
+                changed_fields.append("prompt")
 
-    provider_changed = target_provider != cur_llm_provider
-    target_model = (model_name or "").strip()
-    if provider_changed:
-        changed_fields.append("llm_provider")
-        patch.setdefault("selected_module", {})["LLM"] = target_provider
-        existing_prov_blk = ((cfg.get("LLM") or {}).get(target_provider)) or {}
-        if not existing_prov_blk and target_provider in _LLM_PROVIDER_DEFAULTS:
-            patch.setdefault("LLM", {})[target_provider] = dict(_LLM_PROVIDER_DEFAULTS[target_provider])
+        provider_changed = target_provider != cur_llm_provider
+        if provider_changed:
+            changed_fields.append("llm_provider")
+            patch.setdefault("selected_module", {})["LLM"] = target_provider
+            existing_prov_blk = ((cfg.get("LLM") or {}).get(target_provider)) or {}
+            if not existing_prov_blk and target_provider in _LLM_PROVIDER_DEFAULTS:
+                patch.setdefault("LLM", {})[target_provider] = dict(_LLM_PROVIDER_DEFAULTS[target_provider])
 
-    existing_target_model = str(
-        (((cfg.get("LLM") or {}).get(target_provider)) or {}).get("model_name") or ""
-    ).strip()
-    if target_model and target_model != (cur_model if not provider_changed else existing_target_model):
-        changed_fields.append("model_name")
-        prov_patch = patch.setdefault("LLM", {}).setdefault(target_provider, {})
-        if not ((cfg.get("LLM") or {}).get(target_provider)) and target_provider in _LLM_PROVIDER_DEFAULTS:
-            for dk, dv in _LLM_PROVIDER_DEFAULTS[target_provider].items():
-                prov_patch.setdefault(dk, dv)
-        prov_patch["model_name"] = target_model
+        existing_target_model = str(
+            (((cfg.get("LLM") or {}).get(target_provider)) or {}).get("model_name") or ""
+        ).strip()
+        if validated_model and validated_model != (cur_model if not provider_changed else existing_target_model):
+            changed_fields.append("model_name")
+            prov_patch = patch.setdefault("LLM", {}).setdefault(target_provider, {})
+            if not ((cfg.get("LLM") or {}).get(target_provider)) and target_provider in _LLM_PROVIDER_DEFAULTS:
+                for dk, dv in _LLM_PROVIDER_DEFAULTS[target_provider].items():
+                    prov_patch.setdefault(dk, dv)
+            prov_patch["model_name"] = validated_model
 
-    voice_recovered = False
-    if voice is not None and voice.strip():
-        v_id = voice.strip()
-        if v_id != cur_voice:
-            changed_fields.append("voice")
-            if v_id in GSV_PROFILES:
-                with _gsv_weights_lock:
-                    dirty_before, _ = _get_voice_dirty_state()
-                    if dirty_before is not None:
-                        _active_gsv_loaded = "__dirty__"
-                    try:
-                        _ensure_gsv_weights(v_id, persist_boot_yaml=True)
-                    except Exception as exc:
-                        if (
-                            _active_gsv_loaded == "__dirty__" or dirty_before is not None
-                        ) and cur_voice in GSV_PROFILES:
-                            _set_voice_dirty(cur_voice, str(exc))
-                        raise
-                    if _active_gsv_loaded == "__dirty__":
-                        _active_gsv_loaded = v_id
-                    _set_voice_dirty(None, "")
-                patch.setdefault("selected_module", {})["TTS"] = "GPT_SOVITS_V2"
-                existing_gsv = ((cfg.get("TTS") or {}).get("GPT_SOVITS_V2")) or {}
-                prof_blk = GSV_PROFILES[v_id]["block"]
-                gsv_patch: dict = {}
-                # Populate missing defaults only once, never overwriting user-customized tuning keys
-                for dk, dv in prof_blk.items():
-                    if dk not in existing_gsv:
-                        gsv_patch[dk] = dv
-                # Update only voice-identity fields for the newly selected GSV speaker profile
-                for ik in _GSV_VOICE_IDENTITY_KEYS:
-                    if ik in prof_blk:
-                        gsv_patch[ik] = prof_blk[ik]
-                if "sample_steps" in prof_blk and "sample_steps" not in existing_gsv:
-                    gsv_patch["sample_steps"] = prof_blk["sample_steps"]
-                patch.setdefault("TTS", {})["GPT_SOVITS_V2"] = gsv_patch
-            else:
-                with _gsv_weights_lock:
-                    _set_voice_dirty(None, "")
-                patch.setdefault("selected_module", {})["TTS"] = "EdgeTTS"
-                existing_edge = ((cfg.get("TTS") or {}).get("EdgeTTS")) or {}
-                edge_patch = {"voice": v_id}
-                if "type" not in existing_edge:
-                    edge_patch["type"] = "edge"
-                if "output_dir" not in existing_edge:
-                    edge_patch["output_dir"] = "tmp/"
-                patch.setdefault("TTS", {})["EdgeTTS"] = edge_patch
-        else:
-            if v_id in GSV_PROFILES:
-                with _gsv_weights_lock:
-                    dirty_target, _ = _get_voice_dirty_state()
-                    is_dirty = (dirty_target is not None) or (_active_gsv_loaded == "__dirty__")
-                    if is_dirty:
-                        _active_gsv_loaded = "__dirty__"
+        voice_recovered = False
+        if validated_voice is not None:
+            v_id = validated_voice
+            if v_id != cur_voice:
+                changed_fields.append("voice")
+                if v_id in GSV_PROFILES:
+                    with _gsv_weights_lock:
+                        dirty_before, _ = _get_voice_dirty_state()
+                        if dirty_before is not None:
+                            _active_gsv_loaded = "__dirty__"
                         try:
                             _ensure_gsv_weights(v_id, persist_boot_yaml=True)
                         except Exception as exc:
-                            _set_voice_dirty(v_id, str(exc))
+                            if (
+                                _active_gsv_loaded == "__dirty__" or dirty_before is not None
+                            ) and cur_voice in GSV_PROFILES:
+                                _set_voice_dirty(cur_voice, str(exc))
                             raise
                         if _active_gsv_loaded == "__dirty__":
                             _active_gsv_loaded = v_id
                         _set_voice_dirty(None, "")
-                        voice_recovered = True
+                    patch.setdefault("selected_module", {})["TTS"] = "GPT_SOVITS_V2"
+                    existing_gsv = ((cfg.get("TTS") or {}).get("GPT_SOVITS_V2")) or {}
+                    prof_blk = GSV_PROFILES[v_id]["block"]
+                    gsv_patch: dict = {}
+                    # Populate missing defaults only once, never overwriting user-customized tuning keys
+                    for dk, dv in prof_blk.items():
+                        if dk not in existing_gsv:
+                            gsv_patch[dk] = dv
+                    # Update only voice-identity fields (incl. explicit voice_id) for the newly selected GSV profile
+                    for ik in _GSV_VOICE_IDENTITY_KEYS:
+                        if ik in prof_blk:
+                            gsv_patch[ik] = prof_blk[ik]
+                    gsv_patch["voice_id"] = v_id
+                    if "sample_steps" in prof_blk and "sample_steps" not in existing_gsv:
+                        gsv_patch["sample_steps"] = prof_blk["sample_steps"]
+                    patch.setdefault("TTS", {})["GPT_SOVITS_V2"] = gsv_patch
+                else:
+                    with _gsv_weights_lock:
+                        _set_voice_dirty(None, "")
+                    patch.setdefault("selected_module", {})["TTS"] = "EdgeTTS"
+                    existing_edge = ((cfg.get("TTS") or {}).get("EdgeTTS")) or {}
+                    edge_patch = {"voice": v_id, "voice_id": v_id}
+                    if "type" not in existing_edge:
+                        edge_patch["type"] = "edge"
+                    if "output_dir" not in existing_edge:
+                        edge_patch["output_dir"] = "tmp/"
+                    patch.setdefault("TTS", {})["EdgeTTS"] = edge_patch
             else:
-                dirty_target, _ = _get_voice_dirty_state()
-                if dirty_target is not None:
-                    _set_voice_dirty(None, "")
+                if v_id in GSV_PROFILES:
+                    with _gsv_weights_lock:
+                        dirty_target, _ = _get_voice_dirty_state()
+                        is_dirty = (dirty_target is not None) or (_active_gsv_loaded == "__dirty__")
+                        if is_dirty:
+                            _active_gsv_loaded = "__dirty__"
+                            try:
+                                _ensure_gsv_weights(v_id, persist_boot_yaml=True)
+                            except Exception as exc:
+                                _set_voice_dirty(v_id, str(exc))
+                                raise
+                            if _active_gsv_loaded == "__dirty__":
+                                _active_gsv_loaded = v_id
+                            _set_voice_dirty(None, "")
+                            voice_recovered = True
+                else:
+                    dirty_target, _ = _get_voice_dirty_state()
+                    if dirty_target is not None:
+                        _set_voice_dirty(None, "")
 
-    if not changed_fields:
-        return {"changed_fields": [], "written": False, "voice_recovered": voice_recovered}
+        if not changed_fields:
+            return {"changed_fields": [], "written": False, "voice_recovered": voice_recovered}
 
-    merged_cfg = _deep_merge_dict(cfg, patch)
-    header = (
-        "# =====================================================================\n"
-        "# 小智 ESP32 本地服务端精简配置（由本地 Web 控制台管理）\n"
-        "# 自动读取 DEEPSEEK_API_KEY 与 GEMINI_API_KEY 环境变量，不落盘明文密钥\n"
-        "# =====================================================================\n\n"
-    )
-    body = yaml.safe_dump(merged_cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
-    _atomic_write_text(CONFIG_PATH, header + body)
+        merged_cfg = _deep_merge_dict(cfg, patch)
+        header = (
+            "# =====================================================================\n"
+            "# 小智 ESP32 本地服务端精简配置（由本地 Web 控制台管理）\n"
+            "# 自动读取 DEEPSEEK_API_KEY 与 GEMINI_API_KEY 环境变量，不落盘明文密钥\n"
+            "# =====================================================================\n\n"
+        )
+        body = yaml.safe_dump(merged_cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        _atomic_write_text(CONFIG_PATH, header + body)
+        _get_config_yaml_cache(CONFIG_PATH).set(CONFIG_PATH, copy.deepcopy(merged_cfg))
+
     if "prompt" in changed_fields and prompt is not None:
         threading.Thread(target=_sync_persona_to_anima, args=(prompt,), daemon=True).start()
     return {"changed_fields": changed_fields, "written": True, "voice_recovered": voice_recovered}
@@ -2024,14 +2398,14 @@ def _apply_tts_attrs_in_place(tts_obj, tts_module_name: str, tts_cfg: dict) -> b
             if f_attr in tts_cfg and tts_cfg[f_attr] is not None:
                 try:
                     setattr(tts_obj, f_attr, float(tts_cfg[f_attr]))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log_rate_limited(f"tts_attr_{f_attr}", exc)
         for i_attr in ("top_k", "sample_steps"):
             if i_attr in tts_cfg and tts_cfg[i_attr] is not None:
                 try:
                     setattr(tts_obj, i_attr, int(tts_cfg[i_attr]))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log_rate_limited(f"tts_attr_{i_attr}", exc)
         if isinstance(getattr(tts_obj, "config", None), dict):
             tts_obj.config.update(tts_cfg)
         return True
@@ -2069,8 +2443,8 @@ def _hot_reload_runtime_config(changed_fields: list[str]) -> tuple[bool, str]:
 
         try:
             cache_manager.set(CacheType.CONFIG, "main_config", new_cfg)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_rate_limited("hot_reload_cache_set", exc)
 
         llm_changed = "llm_provider" in changed_fields or "model_name" in changed_fields
         prompt_changed = "prompt" in changed_fields
@@ -2133,14 +2507,14 @@ def _hot_reload_runtime_config(changed_fields: list[str]) -> tuple[bool, str]:
                         if not intent_llm_override:
                             try:
                                 intent_obj.set_llm(new_llm)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                _log_rate_limited("hot_reload_intent_set_llm", exc)
                     mem_obj = getattr(conn, "memory", None)
                     if mem_obj is not None and hasattr(mem_obj, "set_llm"):
                         try:
                             mem_obj.set_llm(new_llm)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _log_rate_limited("hot_reload_memory_set_llm", exc)
                 if voice_changed and getattr(conn, "tts", None) is not None:
                     if not _apply_tts_attrs_in_place(conn.tts, tts_mod_name, tts_cfg):
                         tts_class_mismatch = True
@@ -2206,6 +2580,228 @@ async def _synthesize_mp3_with_timeout(
     return await asyncio.wait_for(_synthesize_mp3(text=text, voice=voice), timeout=float(timeout))
 
 
+# --- B-5 / F-1 / G-4 Console Integration Helpers ---
+_DEFAULT_VAD_SPECULATIVE = {
+    "enabled": True,
+    "speculative_ms": 550,
+    "post_wakeup_ms": 800,
+    "min_chars": 4,
+    "complete_suffixes": [],
+    "hesitation_suffixes": [],
+}
+_ALLOWED_VAD_SPEC_KEYS = frozenset(
+    {"enabled", "speculative_ms", "post_wakeup_ms", "min_chars", "complete_suffixes", "hesitation_suffixes"}
+)
+_ALLOWED_ASR_CORR_KEYS = frozenset({"enabled", "corrections"})
+
+
+def _sanitize_outbox_stats(raw: dict | None) -> dict:
+    d = raw if isinstance(raw, dict) else {}
+    return {
+        "pending": int(d.get("pending") or 0),
+        "dead": int(d.get("dead") or 0),
+        "corrupt": int(d.get("corrupt") or 0),
+        "sent": int(d.get("sent") or 0),
+        "max_retries": int(d.get("max_retries") or 8),
+        "dead_ttl_days": float(d.get("dead_ttl_days") or 14.0),
+        "last_error": _redact_secrets(str(d.get("last_error") or "")),
+        "worker_alive": bool(d.get("worker_alive", False)),
+    }
+
+
+def _get_anima_outbox_snapshot() -> dict:
+    try:
+        import anima_memory_provider
+
+        return _sanitize_outbox_stats(anima_memory_provider.get_outbox_stats())
+    except Exception as exc:
+        _log_rate_limited("get_anima_outbox_stats", exc)
+        return _sanitize_outbox_stats(None)
+
+
+def _replay_anima_outbox_dead(payload: dict) -> tuple[bool, dict | str, int]:
+    if not isinstance(payload, dict):
+        return False, "请求体必须为 JSON 对象", int(HTTPStatus.BAD_REQUEST)
+    unknown = sorted(str(k) for k in payload.keys() if k not in ("limit", "request_ids"))
+    if unknown:
+        return False, f"包含不支持的字段: {', '.join(unknown)}", int(HTTPStatus.BAD_REQUEST)
+
+    limit_arg: int | None = None
+    if "limit" in payload and payload.get("limit") is not None:
+        raw_lim = payload.get("limit")
+        if isinstance(raw_lim, bool):
+            return False, "字段 limit 必须为正整数", int(HTTPStatus.BAD_REQUEST)
+        try:
+            limit_arg = int(raw_lim)
+        except (TypeError, ValueError):
+            return False, "字段 limit 必须为正整数", int(HTTPStatus.BAD_REQUEST)
+        if limit_arg <= 0 or limit_arg > 1000:
+            return False, "字段 limit 必须在 1～1000 之间", int(HTTPStatus.BAD_REQUEST)
+
+    req_ids_arg: list[str] | None = None
+    if "request_ids" in payload and payload.get("request_ids") is not None:
+        raw_ids = payload.get("request_ids")
+        if not isinstance(raw_ids, list) or not all(isinstance(x, str) and x.strip() for x in raw_ids):
+            return False, "字段 request_ids 必须为非空字符串数组", int(HTTPStatus.BAD_REQUEST)
+        req_ids_arg = [x.strip() for x in raw_ids]
+
+    try:
+        import anima_memory_provider
+
+        fn = getattr(anima_memory_provider, "replay_dead_outbox_turns", None)
+        if not callable(fn):
+            return False, "当前 anima_memory_provider 版本不支持重放 dead 队列", int(HTTPStatus.NOT_IMPLEMENTED)
+        res = fn(limit=limit_arg, request_ids=req_ids_arg)
+        if not isinstance(res, dict) or not res.get("ok"):
+            err = (res.get("error") if isinstance(res, dict) else None) or "重放 dead 队列失败"
+            return False, str(err), int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        return (
+            True,
+            {
+                "ok": True,
+                "replayed": int(res.get("replayed") or 0),
+                "outbox": _sanitize_outbox_stats(res.get("stats")),
+            },
+            int(HTTPStatus.OK),
+        )
+    except Exception as exc:
+        _log_rate_limited("replay_anima_outbox_dead", exc)
+        return False, f"重放 Anima dead 队列失败: {exc}", int(HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+def _get_vad_speculative_snapshot() -> dict:
+    try:
+        fn = getattr(runtime_settings, "get_vad_speculative", None)
+        if callable(fn):
+            return dict(fn())
+    except Exception as exc:
+        _log_rate_limited("get_vad_speculative", exc)
+    return copy.deepcopy(_DEFAULT_VAD_SPECULATIVE)
+
+
+def _get_vad_speculative_stats_snapshot() -> dict:
+    try:
+        import vad_speculative_router
+
+        fn = getattr(vad_speculative_router, "get_vad_speculative_stats", None)
+        if callable(fn):
+            return dict(fn())
+    except ImportError:
+        pass
+    except Exception as exc:
+        _log_rate_limited("get_vad_speculative_stats", exc)
+    return {
+        "speculative_triggers": 0,
+        "early_commits": 0,
+        "resumed_discards": 0,
+        "held_hesitation": 0,
+        "held_incomplete": 0,
+        "story_mode_skips": 0,
+        "avg_saved_ms": 0.0,
+    }
+
+
+def _update_vad_speculative_config(payload: dict) -> tuple[bool, dict | str]:
+    if not isinstance(payload, dict):
+        return False, "请求体必须为 JSON 对象"
+    unknown = sorted(str(k) for k in payload.keys() if k not in _ALLOWED_VAD_SPEC_KEYS)
+    if unknown:
+        return False, f"包含不支持的字段: {', '.join(unknown)}"
+
+    kwargs: dict = {}
+    if "enabled" in payload:
+        if not isinstance(payload["enabled"], bool):
+            return False, "字段 enabled 必须为布尔值"
+        kwargs["enabled"] = payload["enabled"]
+
+    for int_key, lo, hi, label in (
+        ("speculative_ms", 300, 950, "早判静默阈值 speculative_ms"),
+        ("post_wakeup_ms", 450, 1050, "唤醒首句静默阈值 post_wakeup_ms"),
+        ("min_chars", 2, 20, "最小字数 min_chars"),
+    ):
+        if int_key in payload:
+            raw_v = payload[int_key]
+            if isinstance(raw_v, bool):
+                return False, f"{label} 必须为整数（{lo}～{hi}）"
+            try:
+                iv = int(raw_v)
+            except (TypeError, ValueError):
+                return False, f"{label} 必须为整数（{lo}～{hi}）"
+            if iv < lo or iv > hi:
+                return False, f"{label} 必须在 {lo}～{hi} 之间"
+            kwargs[int_key] = iv
+
+    for list_key in ("complete_suffixes", "hesitation_suffixes"):
+        if list_key in payload:
+            raw_l = payload[list_key]
+            if isinstance(raw_l, str):
+                kwargs[list_key] = raw_l
+            elif isinstance(raw_l, list) and all(isinstance(x, str) for x in raw_l):
+                kwargs[list_key] = raw_l
+            else:
+                return False, f"字段 {list_key} 必须为字符串数组或逗号/换行分隔文本"
+
+    if not kwargs:
+        return False, "请至少提供一个要更新的投机 VAD 字段"
+
+    fn = getattr(runtime_settings, "set_vad_speculative", None)
+    if not callable(fn):
+        return False, "当前 runtime_settings 版本不支持 set_vad_speculative"
+    try:
+        saved = fn(**kwargs)
+        return True, dict(saved)
+    except ValueError as exc:
+        return False, str(exc)
+
+
+def _get_asr_corrections_snapshot() -> dict:
+    try:
+        import asr_corrections
+
+        return dict(asr_corrections.get_asr_corrections())
+    except ImportError:
+        pass
+    except Exception as exc:
+        _log_rate_limited("get_asr_corrections", exc)
+    return {"schema_version": 1, "enabled": True, "corrections": {}, "count": 0}
+
+
+def _update_asr_corrections_config(payload: dict) -> tuple[bool, dict | str]:
+    if not isinstance(payload, dict):
+        return False, "请求体必须为 JSON 对象"
+    unknown = sorted(str(k) for k in payload.keys() if k not in _ALLOWED_ASR_CORR_KEYS)
+    if unknown:
+        return False, f"包含不支持的字段: {', '.join(unknown)}"
+
+    has_en = "enabled" in payload
+    has_corr = "corrections" in payload
+    if not has_en and not has_corr:
+        return False, "请至少提供 enabled 或 corrections"
+
+    en_arg: bool | None = None
+    if has_en:
+        if not isinstance(payload["enabled"], bool):
+            return False, "字段 enabled 必须为布尔值"
+        en_arg = payload["enabled"]
+
+    corr_arg = None
+    if has_corr:
+        raw_c = payload["corrections"]
+        if not isinstance(raw_c, (dict, list, str)):
+            return False, "字段 corrections 必须为映射对象、规则数组或 '错词->正词' 多行文本"
+        corr_arg = raw_c
+
+    try:
+        import asr_corrections
+
+        saved = asr_corrections.save_asr_corrections(corrections=corr_arg, enabled=en_arg)
+        return True, dict(saved)
+    except ValueError as exc:
+        return False, str(exc)
+    except ImportError:
+        return False, "当前环境未加载 asr_corrections 模块"
+
+
 class ConsoleHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -2225,7 +2821,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def _send_json(self, payload: dict, status=HTTPStatus.OK):
-        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # D-5: Automatically redact secrets in all error responses and error-bearing fields
+        is_err = int(status) >= 400 or (isinstance(payload, dict) and payload.get("ok") is False)
+        safe_payload = _redact_json_payload(payload, redact_all_strings=is_err)
+        raw = json.dumps(safe_payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -2329,11 +2928,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             ds_ok = bool(ds_env and len(ds_env) > 10 and "请在这里" not in ds_env)
             gem_ok = bool(gem_env and len(gem_env) > 10 and "请在这里" not in gem_env)
 
-            if tts_key == "GPT_SOVITS_V2":
-                ref_p = str(tts_cfg.get("ref_audio_path", ""))
-                active_voice = "__gsv_raiden_mei__" if "raiden_mei" in ref_p else "__gsv_xiaozhi_tw__"
-            else:
-                active_voice = tts_cfg.get("voice", "zh-CN-XiaoxiaoNeural")
+            active_voice = _get_current_voice_id(cfg)
 
             qs = parse_qs(parsed.query)
             req_cursor: int | None = None
@@ -2359,6 +2954,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             l3_cfg = _get_cached_l3_backend_snapshot()
             obs_cfg = _get_cached_obsidian_snapshot()
             backup_cfg = _get_cached_anima_backup_snapshot()
+            outbox_cfg = _get_anima_outbox_snapshot()
+            vad_spec_cfg = _get_vad_speculative_snapshot()
+            vad_spec_stats = _get_vad_speculative_stats_snapshot()
+            asr_corr_cfg = _get_asr_corrections_snapshot()
             dirty_voice, dirty_voice_err = _get_voice_dirty_state()
 
             self._send_json(
@@ -2389,6 +2988,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "idle_farewell": idle_farewell_cfg,
                         "relationship": rel_cfg,
                         "anima_backup": backup_cfg,
+                        "anima_outbox": outbox_cfg,
+                        "vad_speculative": vad_spec_cfg,
+                        "vad_speculative_stats": vad_spec_stats,
+                        "asr_corrections": asr_corr_cfg,
                         "obsidian": obs_cfg,
                         "l3_backend": l3_cfg,
                         "agy_bridge_online": _check_agy_bridge_online(l3_cfg),
@@ -2435,6 +3038,24 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/idle-farewell":
             self._send_json({"ok": True, "idle_farewell": runtime_settings.get_idle_farewell()})
+            return
+
+        if parsed.path == "/api/anima-outbox":
+            self._send_json({"ok": True, "outbox": _get_anima_outbox_snapshot()})
+            return
+
+        if parsed.path == "/api/vad-speculative":
+            self._send_json(
+                {
+                    "ok": True,
+                    "vad_speculative": _get_vad_speculative_snapshot(),
+                    "stats": _get_vad_speculative_stats_snapshot(),
+                }
+            )
+            return
+
+        if parsed.path == "/api/asr-corrections":
+            self._send_json({"ok": True, "asr_corrections": _get_asr_corrections_snapshot()})
             return
 
         self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
@@ -2518,6 +3139,54 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 ok_if, res_or_err = _update_idle_farewell_config(body)
                 if ok_if:
                     self._send_json({"ok": True, "idle_farewell": res_or_err})
+                else:
+                    self._send_json({"ok": False, "error": str(res_or_err)}, HTTPStatus.BAD_REQUEST)
+            except _BadRequestError:
+                raise
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/anima-outbox/replay-dead":
+            try:
+                body = self._read_body_json()
+                ok_rep, res_or_err, status_code = _replay_anima_outbox_dead(body)
+                if ok_rep and isinstance(res_or_err, dict):
+                    self._send_json(res_or_err, HTTPStatus(status_code))
+                else:
+                    self._send_json({"ok": False, "error": str(res_or_err)}, HTTPStatus(status_code))
+            except _BadRequestError:
+                raise
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/vad-speculative":
+            try:
+                body = self._read_body_json()
+                ok_vs, res_or_err = _update_vad_speculative_config(body)
+                if ok_vs:
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "vad_speculative": res_or_err,
+                            "stats": _get_vad_speculative_stats_snapshot(),
+                        }
+                    )
+                else:
+                    self._send_json({"ok": False, "error": str(res_or_err)}, HTTPStatus.BAD_REQUEST)
+            except _BadRequestError:
+                raise
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/asr-corrections":
+            try:
+                body = self._read_body_json()
+                ok_ac, res_or_err = _update_asr_corrections_config(body)
+                if ok_ac:
+                    self._send_json({"ok": True, "asr_corrections": res_or_err})
                 else:
                     self._send_json({"ok": False, "error": str(res_or_err)}, HTTPStatus.BAD_REQUEST)
             except _BadRequestError:
@@ -2624,10 +3293,36 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_body_json()
                 has_prompt = "prompt" in body
-                prompt = str(body.get("prompt") or "").strip() if has_prompt else None
-                llm_provider = str(body.get("llm_provider")).strip() if "llm_provider" in body and body.get("llm_provider") is not None else None
-                model_name = str(body.get("model_name")).strip() if "model_name" in body and body.get("model_name") is not None else None
-                voice = str(body.get("voice")).strip() if "voice" in body and body.get("voice") is not None else None
+                raw_prompt = body.get("prompt")
+                if has_prompt and not isinstance(raw_prompt, str):
+                    self._send_json({"ok": False, "error": "字段 prompt 必须为字符串"}, HTTPStatus.BAD_REQUEST)
+                    return
+                prompt = raw_prompt.strip() if has_prompt else None
+
+                llm_provider: str | None = None
+                if "llm_provider" in body and body.get("llm_provider") is not None:
+                    raw_prov = body.get("llm_provider")
+                    if not isinstance(raw_prov, str):
+                        self._send_json({"ok": False, "error": "字段 llm_provider 必须为字符串"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    llm_provider = raw_prov.strip()
+
+                model_name: str | None = None
+                if "model_name" in body and body.get("model_name") is not None:
+                    raw_model = body.get("model_name")
+                    if not isinstance(raw_model, str):
+                        self._send_json({"ok": False, "error": "字段 model_name 必须为字符串"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    model_name = raw_model.strip()
+
+                voice: str | None = None
+                if "voice" in body and body.get("voice") is not None:
+                    raw_voice = body.get("voice")
+                    if not isinstance(raw_voice, str):
+                        self._send_json({"ok": False, "error": "字段 voice 必须为字符串"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    voice = raw_voice.strip()
+
                 force_restart = bool(body.get("force_restart", False))
                 allow_restart = bool(body.get("restart", True))
 
@@ -2664,17 +3359,23 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 if will_restart:
                     def _delayed_restart():
                         try:
+                            _flush_console_state_on_shutdown()
+                        except Exception as exc:
+                            _log_rate_limited("delayed_restart_flush_console", exc)
+                        try:
                             import anima_memory_provider
 
                             anima_memory_provider.flush_outbox(timeout=3.5)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _log_rate_limited("delayed_restart_flush_outbox", exc)
                         time.sleep(0.5)
                         os._exit(0)
 
                     threading.Thread(target=_delayed_restart, daemon=True).start()
             except _BadRequestError:
                 raise
+            except ValueError as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -2690,7 +3391,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tts-preview":
             try:
                 body = self._read_body_json()
-                voice = str(body.get("voice") or "__gsv_raiden_mei__").strip()
+                raw_voice = body.get("voice", "__gsv_raiden_mei__")
+                if raw_voice is not None and not isinstance(raw_voice, str):
+                    self._send_json({"ok": False, "error": "字段 voice 必须为字符串"}, HTTPStatus.BAD_REQUEST)
+                    return
+                voice = (raw_voice or "__gsv_raiden_mei__").strip()
+                if voice not in ALLOWED_VOICES:
+                    self._send_json(
+                        {"ok": False, "error": f"无效的试听音色 ID: {voice or '(空)'}"},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 raw_text = str(body.get("text") or "嗯，哥哥欢迎回来，今天的工作辛苦了，我已经为你泡好了热茶。").strip()
                 req_emotion = str(body.get("emotion") or "auto").strip().lower()
                 tag_emo, stripped_text = mei_emotion_router.extract_and_strip_emotion(
@@ -2778,7 +3489,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                                 req_payload["temperature"] = emo_prof["temperature"]
                                 req_payload["top_k"] = emo_prof["top_k"]
                                 req_payload["top_p"] = emo_prof["top_p"]
-                            for drop_k in ("type", "url", "output_dir"):
+                            for drop_k in ("type", "url", "output_dir", "voice_id"):
                                 req_payload.pop(drop_k, None)
                             tts_timeout = _gsv_timeout_within_budget(25.0)
                             client = _get_console_http_client()
@@ -2871,10 +3582,26 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
 
+def _flush_console_state_on_shutdown() -> None:
+    """Flush coalesced dirty history and throttled log cursor on clean process shutdown (D-1 / D-4)."""
+    try:
+        flush_history_if_dirty()
+    except Exception as exc:
+        _log_rate_limited("shutdown_flush_history", exc)
+    try:
+        flush_log_cursor_if_dirty()
+    except Exception as exc:
+        _log_rate_limited("shutdown_flush_cursor", exc)
+
+
+atexit.register(_flush_console_state_on_shutdown)
+
+
 def start_console_background():
     _load_history()
     runtime_events.subscribe(_apply_runtime_event)
     _sync_runtime_events()
+    start_history_flusher()
     watcher = threading.Thread(target=_log_watcher_loop, name="console-log-watcher", daemon=True)
     watcher.start()
     prober = threading.Thread(target=_service_probe_loop, name="console-service-prober", daemon=True)

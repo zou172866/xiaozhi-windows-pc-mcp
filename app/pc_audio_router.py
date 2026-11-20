@@ -44,6 +44,11 @@ _health_ok = False
 _silent_opus_cache: Dict[int, bytes] = {}
 _silent_opus_lock = threading.Lock()
 
+# C-5 / §8 #2: Bound wait on AudioRateController.queue_empty_event (upstream _send_loop exits
+# without setting queue_empty_event if send_audio_callback raises or pending_send_task cancels).
+QUEUE_EMPTY_WAIT_TIMEOUT = 10.0
+QUEUE_EMPTY_POLL_SLICE = 1.0
+
 _sync_client_lock = threading.Lock()
 _sync_client: Optional[httpx.Client] = None
 _async_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = (
@@ -293,6 +298,79 @@ async def _post_stop_to_pc() -> None:
         )
     except Exception:
         pass
+
+
+def _load_wav_for_pc_sync(wav_path: str) -> Tuple[bytes, int]:
+    with open(wav_path, "rb") as f:
+        raw_bytes = f.read()
+    ext = os.path.splitext(wav_path)[1].lstrip(".").lower() or "wav"
+    return ensure_pcm_wav(raw_bytes, ext)
+
+
+async def _wait_rate_controller_empty(
+    conn,
+    rc,
+    cur_sid: Optional[str],
+    *,
+    stall_timeout: Optional[float] = None,
+) -> bool:
+    """Bounded wait for AudioRateController.queue_empty_event (C-5 / §8 #2).
+
+    Upstream `AudioRateController._send_loop()` exits on send_audio_callback exception or
+    cancellation WITHOUT calling `queue_empty_event.set()`. At the same time, long stories
+    legitimately drain 60ms pacing frames over 30-120s. Therefore:
+    - Return immediately if `queue_empty_event` is already set.
+    - Abort immediately if `conn.client_abort`, turn changed, or `pending_send_task` died.
+    - Await `asyncio.wait_for(rc.queue_empty_event.wait(), timeout=step)` in bounded slices,
+      tracking `len(rc.queue)` progress and failing soft after `stall_timeout` (default 10.0s)
+      without progress or overall turn ceiling.
+    """
+    ev = getattr(rc, "queue_empty_event", None)
+    if ev is None or ev.is_set():
+        return True
+
+    eff_stall = max(0.05, float(QUEUE_EMPTY_WAIT_TIMEOUT if stall_timeout is None else stall_timeout))
+    queued_ms = max(0, int(getattr(conn, "_pc_audio_queued_ms", 0) or 0))
+    hard_cap = max(eff_stall, min(600.0, (queued_ms / 1000.0) + max(15.0, eff_stall)))
+
+    now = time.monotonic()
+    hard_deadline = now + hard_cap
+    last_progress = now
+    q_obj = getattr(rc, "queue", None)
+    prev_qlen = len(q_obj) if q_obj is not None else -1
+
+    while not ev.is_set():
+        if getattr(conn, "client_abort", False) or getattr(conn, "sentence_id", None) != cur_sid:
+            return False
+        sender_task = getattr(rc, "pending_send_task", None)
+        if sender_task is not None and callable(getattr(sender_task, "done", None)) and sender_task.done():
+            print(
+                "[PCAudioRouter] AudioRateController 发送任务已退出但 queue_empty_event 未置位，提前结束等待 (C-5)",
+                flush=True,
+            )
+            return False
+
+        now = time.monotonic()
+        rem_stall = eff_stall - (now - last_progress)
+        rem_hard = hard_deadline - now
+        if rem_stall <= 0 or rem_hard <= 0:
+            print(
+                f"[PCAudioRouter] 等待 AudioRateController.queue_empty_event 超时 ({eff_stall:.1f}s 无进展)，强制继续收尾 (C-5)",
+                flush=True,
+            )
+            return False
+
+        step = min(max(0.02, float(QUEUE_EMPTY_POLL_SLICE)), rem_stall, rem_hard)
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=step)
+            return True
+        except asyncio.TimeoutError:
+            if q_obj is not None:
+                cur_qlen = len(q_obj)
+                if cur_qlen < prev_qlen:
+                    prev_qlen = cur_qlen
+                    last_progress = time.monotonic()
+    return True
 
 
 async def _wait_pc_audio_done(
@@ -550,7 +628,7 @@ def apply_pc_audio_playback_patches() -> None:
                 # /audio/wait until Windows speakers finish the exact last millisecond of audio.
                 rc = getattr(conn, "audio_rate_controller", None)
                 if rc is not None and hasattr(rc, "queue_empty_event"):
-                    await rc.queue_empty_event.wait()
+                    await _wait_rate_controller_empty(conn, rc, cur_sid)
                 if not getattr(conn, "client_abort", False) and getattr(conn, "sentence_id", None) == cur_sid:
                     async with conn._pc_audio_send_lock:
                         pass
@@ -596,10 +674,7 @@ def apply_pc_audio_playback_patches() -> None:
                 resp = hello_mod.wakeup_words_config.get_wakeup_response(voice)
                 wav_path = (resp or {}).get("file_path") or "config/assets/wakeup_words_short.wav"
                 if os.path.isfile(wav_path):
-                    with open(wav_path, "rb") as f:
-                        raw_bytes = f.read()
-                    ext = os.path.splitext(wav_path)[1].lstrip(".").lower() or "wav"
-                    wav_bytes, dur_ms = ensure_pcm_wav(raw_bytes, ext)
+                    wav_bytes, dur_ms = await asyncio.to_thread(_load_wav_for_pc_sync, wav_path)
                     cur_sid = getattr(conn, "sentence_id", None)
                     _enqueue_pc_clip(conn, cur_sid, text or "", wav_bytes, dur_ms, cfg["volume"])
                     silent_pkt = _get_silent_opus_frame(getattr(conn, "sample_rate", 16000))

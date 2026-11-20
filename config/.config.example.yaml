@@ -81,6 +81,7 @@ TTS:
     output_dir: tmp/
   GPT_SOVITS_V2:
     type: gpt_sovits_v2
+    voice_id: __gsv_raiden_mei__
     url: http://host.docker.internal:19880/tts
     output_dir: tmp/
     text_lang: zh

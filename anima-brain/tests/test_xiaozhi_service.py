@@ -981,6 +981,496 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
             _aio.run(_send_direct_na())
             self.assertEqual(sent_direct_na[0]["status"], 401)
 
+    def test_batch3_b1_inbox_persists_before_http_200_and_b4_conflict_semantics(self):
+        import threading
+
+        token = "b1-persist-token-" + ("h" * 24)
+        # Verify exact xiaozhi_inbox schema columns
+        svc.ensure_xiaozhi_inbox_table(self.brain.engine)
+        cols = [
+            r["name"]
+            for r in self.brain.engine.db.execute("PRAGMA table_info(xiaozhi_inbox)").fetchall()
+        ]
+        self.assertEqual(
+            cols,
+            [
+                "request_id",
+                "character_id",
+                "payload",
+                "status",
+                "attempts",
+                "last_error",
+                "created_at",
+                "updated_at",
+            ],
+        )
+
+        gate = threading.Event()
+        started_t1 = threading.Event()
+        real_extract = svc.extract_and_commit_turn
+        seen_t1_calls = []
+
+        def _gated_extract(brain, char_id, req_id, user_msg, reply_msg, **kwargs):
+            if req_id == "b1-req-1":
+                seen_t1_calls.append(reply_msg)
+                if len(seen_t1_calls) == 1:
+                    started_t1.set()
+                    gate.wait(timeout=3.0)
+            return real_extract(brain, char_id, req_id, user_msg, reply_msg, **kwargs)
+
+        frontend_override = svc.FRONTEND_DIR if (svc.FRONTEND_DIR / "index.html").is_file() else None
+        with (
+            patch.object(svc, "FRONTEND_DIR", frontend_override),
+            patch.object(svc, "extract_and_commit_turn", side_effect=_gated_extract),
+        ):
+            app = svc.create_combined_asgi_app(self.brain, token)
+            with TestClient(app, base_url="http://127.0.0.1:18787") as client:
+                headers = {"Authorization": f"Bearer {token}"}
+                # 1. Send b1-req-1 -> worker claims it ('processing') and blocks on gate
+                r1 = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={
+                        "request_id": "b1-req-1",
+                        "user_message": "查一下明天天气",
+                        "assistant_reply": "我帮你查一下",
+                    },
+                )
+                self.assertEqual(r1.status_code, 200)
+                self.assertTrue(started_t1.wait(timeout=2.0))
+
+                # 2. Send b1-req-2 while worker is blocked -> MUST already be committed in xiaozhi_inbox BEFORE HTTP 200!
+                r2 = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={
+                        "request_id": "b1-req-2",
+                        "user_message": "我喜欢拿铁",
+                        "assistant_reply": "记住你喜欢拿铁啦。",
+                    },
+                )
+                self.assertEqual(r2.status_code, 200)
+                self.assertEqual(r2.json()["accepted_ids"], ["b1-req-2"])
+                row2 = self.brain.engine.db.execute(
+                    "SELECT status, payload FROM xiaozhi_inbox WHERE request_id='b1-req-2'"
+                ).fetchone()
+                self.assertIsNotNone(row2)
+                self.assertEqual(row2["status"], "pending")
+
+                # 3. B-4 duplicate idempotency & conflict guard at inbox layer
+                r2_dup = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={
+                        "request_id": "b1-req-2",
+                        "user_message": "我喜欢拿铁",
+                        "assistant_reply": "记住你喜欢拿铁啦。",
+                    },
+                )
+                self.assertEqual(r2_dup.status_code, 200)
+                with self.assertLogs("anima-bridge", level="WARNING") as cm_conf:
+                    r2_conflict_u = client.post(
+                        "/xiaozhi/ingest",
+                        headers=headers,
+                        json={
+                            "request_id": "b1-req-2",
+                            "user_message": "完全不同的另一句话",
+                            "assistant_reply": "完全不同的更长回复不能覆盖原始记录！",
+                        },
+                    )
+                    r2_conflict_a = client.post(
+                        "/xiaozhi/ingest",
+                        headers=headers,
+                        json={
+                            "request_id": "b1-req-2",
+                            "user_message": "我喜欢拿铁",
+                            "assistant_reply": "另一条完全不相关且更长的回复也不能覆盖！",
+                        },
+                    )
+                self.assertEqual(r2_conflict_u.status_code, 200)
+                self.assertEqual(r2_conflict_a.status_code, 200)
+                self.assertTrue(any("conflict" in m for m in cm_conf.output))
+                row2_after = self.brain.engine.db.execute(
+                    "SELECT payload FROM xiaozhi_inbox WHERE request_id='b1-req-2'"
+                ).fetchone()
+                p2 = json.loads(row2_after["payload"])
+                self.assertEqual(p2["user_message"], "我喜欢拿铁")
+                self.assertEqual(p2["assistant_reply"], "记住你喜欢拿铁啦。")
+
+                # 4. Mid-processing continuation upgrade for b1-req-1 -> worker MUST re-run and commit fuller reply!
+                r1_full = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={
+                        "request_id": "b1-req-1",
+                        "user_message": "查一下明天天气",
+                        "assistant_reply": "我帮你查一下 明天长沙晴，18到26度。",
+                        "used_tools": True,
+                    },
+                )
+                self.assertEqual(r1_full.status_code, 200)
+                gate.set()
+
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    st = svc.get_inbox_stats(self.brain)
+                    if st["done"] == 2 and st["pending"] == 0 and st["processing"] == 0:
+                        break
+                    time.sleep(0.03)
+
+                st_done = svc.get_inbox_stats(self.brain)
+                self.assertEqual(st_done["done"], 2)
+                self.assertEqual(st_done["pending"], 0)
+                self.assertEqual(st_done["processing"], 0)
+                t1 = self.brain.engine.db.execute(
+                    "SELECT assistant_reply FROM turns WHERE request_id='b1-req-1'"
+                ).fetchone()
+                self.assertIsNotNone(t1)
+                self.assertEqual(t1["assistant_reply"], "我帮你查一下 明天长沙晴，18到26度。")
+
+    def test_batch3_b1_simulated_crash_and_restart_reconciliation_zero_lost_turns(self):
+        token = "b1-crash-token-" + ("i" * 24)
+        frontend_override = svc.FRONTEND_DIR if (svc.FRONTEND_DIR / "index.html").is_file() else None
+        client_sent: list[tuple[str, str, str]] = [
+            (f"b1-crash-{idx:02d}", f"用户消息 {idx}", f"助手回复 {idx}")
+            for idx in range(1, 13)
+        ]
+
+        # Phase 1: Process turns 1-2 to completion, leave turn 3 stuck in 'processing',
+        # and persist turns 4-8 as 'pending' — then simulate abrupt process kill (no shutdown drain!).
+        svc.ensure_xiaozhi_inbox_table(self.brain.engine)
+        for req_id, u_msg, a_msg in client_sent[:2]:
+            enq = svc.enqueue_inbox_turn(self.brain, svc.DEFAULT_CHARACTER_ID, req_id, u_msg, a_msg)
+            self.assertTrue(enq["accepted"])
+            row, _ = svc._claim_next_inbox_row(self.brain)
+            self.assertIsNotNone(row)
+            res = svc.extract_and_commit_turn(
+                self.brain, svc.DEFAULT_CHARACTER_ID, req_id, u_msg, a_msg
+            )
+            self.assertTrue(res["committed"])
+            self.assertTrue(svc._complete_inbox_row(self.brain, req_id, row["payload"]))
+
+        # Turn 3 claimed as 'processing' when process is SIGKILLed mid-flight
+        r3_id, r3_u, r3_a = client_sent[2]
+        svc.enqueue_inbox_turn(self.brain, svc.DEFAULT_CHARACTER_ID, r3_id, r3_u, r3_a)
+        row3, _ = svc._claim_next_inbox_row(self.brain)
+        self.assertIsNotNone(row3)
+        self.assertEqual(row3["request_id"], r3_id)
+
+        # Turns 4-8 durably persisted via transactional INSERT OR IGNORE as 'pending' before crash
+        for req_id, u_msg, a_msg in client_sent[3:8]:
+            enq = svc.enqueue_inbox_turn(self.brain, svc.DEFAULT_CHARACTER_ID, req_id, u_msg, a_msg)
+            self.assertTrue(enq["accepted"])
+
+        pre_crash_stats = svc.get_inbox_stats(self.brain)
+        self.assertEqual(pre_crash_stats["done"], 2)
+        self.assertEqual(pre_crash_stats["processing"], 1)
+        self.assertEqual(pre_crash_stats["pending"], 5)
+
+        # Close old brain handle without draining (simulating hard kill & fresh container boot)
+        self.brain.close()
+
+        # Phase 2: Fresh CompanionBrain + ASGI app restart on same brain.sqlite3
+        self.brain = CompanionBrain(
+            self.db_path,
+            user_id="local",
+            settings=self.settings,
+            config=BrainConfig(start_worker=False),
+        )
+        with patch.object(svc, "FRONTEND_DIR", frontend_override):
+            app2 = svc.create_combined_asgi_app(self.brain, token)
+            with TestClient(app2, base_url="http://127.0.0.1:18787") as client:
+                headers = {"Authorization": f"Bearer {token}"}
+                # Send remaining turns 9-12 after restart
+                for req_id, u_msg, a_msg in client_sent[8:]:
+                    resp = client.post(
+                        "/xiaozhi/ingest",
+                        headers=headers,
+                        json={"request_id": req_id, "user_message": u_msg, "assistant_reply": a_msg},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    self.assertEqual(resp.json()["accepted_ids"], [req_id])
+
+                # Wait for startup recovery + live ingest to finish reconciling all 12 turns
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    h = client.get("/xiaozhi/health").json()
+                    if h["inbox_pending"] == 0 and h["ingest"]["inbox_processing"] == 0 and h["ingest"]["inbox_done"] == 12:
+                        break
+                    time.sleep(0.04)
+
+                h_final = client.get("/xiaozhi/health").json()
+                self.assertEqual(h_final["status"], "ok")
+                self.assertEqual(h_final["inbox_pending"], 0)
+                self.assertEqual(h_final["inbox_dead"], 0)
+                self.assertEqual(h_final["ingest"]["inbox_done"], 12)
+
+        # Reconciliation proof: every single client-sent turn is committed in turns & done in xiaozhi_inbox (0 lost!)
+        committed_rows = {
+            r["request_id"]: (r["status"], r["user_message"], r["assistant_reply"])
+            for r in self.brain.engine.db.execute(
+                "SELECT request_id, status, user_message, assistant_reply FROM turns WHERE request_id LIKE 'b1-crash-%'"
+            ).fetchall()
+        }
+        inbox_rows = {
+            r["request_id"]: r["status"]
+            for r in self.brain.engine.db.execute(
+                "SELECT request_id, status FROM xiaozhi_inbox WHERE request_id LIKE 'b1-crash-%'"
+            ).fetchall()
+        }
+        self.assertEqual(len(committed_rows), 12)
+        for req_id, u_msg, a_msg in client_sent:
+            self.assertIn(req_id, committed_rows, f"Lost turn {req_id} across crash/restart!")
+            self.assertEqual(committed_rows[req_id], ("committed", u_msg, a_msg))
+            self.assertEqual(inbox_rows.get(req_id), "done")
+
+    def test_batch3_b1_retries_dead_letter_timeout_recovery_and_health_backlog(self):
+        token = "b1-dead-token-" + ("j" * 24)
+        frontend_override = svc.FRONTEND_DIR if (svc.FRONTEND_DIR / "index.html").is_file() else None
+
+        # 1. Runtime recovery of timed-out 'processing' rows (and dead-lettering when attempts > max)
+        svc.ensure_xiaozhi_inbox_table(self.brain.engine)
+        old_ts = time.time() - 600.0
+        with self.brain.engine._transaction():
+            self.brain.engine.db.execute(
+                "INSERT INTO xiaozhi_inbox VALUES(?,?,?,?,?,?,?,?)",
+                ("b1-stuck-ok", svc.DEFAULT_CHARACTER_ID, '{"user_message":"u","assistant_reply":"a"}', "processing", 0, "", old_ts, old_ts),
+            )
+            self.brain.engine.db.execute(
+                "INSERT INTO xiaozhi_inbox VALUES(?,?,?,?,?,?,?,?)",
+                ("b1-stuck-max", svc.DEFAULT_CHARACTER_ID, '{"user_message":"u","assistant_reply":"a"}', "processing", 2, "", old_ts, old_ts),
+            )
+        with patch.object(svc, "INGEST_PENDING_MAX_RETRIES", 2):
+            rec = svc.recover_inbox_rows(self.brain, processing_timeout_seconds=30.0, is_startup=False)
+        self.assertEqual(rec["recovered_processing"], 1)
+        self.assertEqual(rec["marked_dead"], 1)
+        r_ok = self.brain.engine.db.execute(
+            "SELECT status, attempts, last_error FROM xiaozhi_inbox WHERE request_id='b1-stuck-ok'"
+        ).fetchone()
+        r_max = self.brain.engine.db.execute(
+            "SELECT status, attempts, last_error FROM xiaozhi_inbox WHERE request_id='b1-stuck-max'"
+        ).fetchone()
+        self.assertEqual((r_ok["status"], r_ok["attempts"]), ("pending", 1))
+        self.assertEqual((r_max["status"], r_max["attempts"]), ("dead", 3))
+        # Clean synthetic rows before testing worker dead-lettering
+        with self.brain.engine._transaction():
+            self.brain.engine.db.execute("DELETE FROM xiaozhi_inbox")
+
+        # 2. Worker increments attempts on repeated failure, redacts secrets in last_error, moves to 'dead'
+        def _always_boom(*args, **kwargs):
+            raise RuntimeError("upstream failed with Bearer sk-topsecret1234567890abcdef")
+
+        with (
+            patch.object(svc, "FRONTEND_DIR", frontend_override),
+            patch.object(svc, "extract_and_commit_turn", side_effect=_always_boom),
+            patch.object(svc, "INGEST_PENDING_MAX_RETRIES", 2),
+            patch.object(svc, "INGEST_PENDING_BACKOFF_BASE", 0.03),
+            patch.object(svc, "HEALTH_BACKLOG_THRESHOLD", 2),
+        ):
+            app = svc.create_combined_asgi_app(self.brain, token)
+            with TestClient(app, base_url="http://127.0.0.1:18787") as client:
+                headers = {"Authorization": f"Bearer {token}"}
+                r_ing = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={"request_id": "b1-always-fail", "user_message": "u", "assistant_reply": "a"},
+                )
+                self.assertEqual(r_ing.status_code, 200)
+
+                deadline = time.monotonic() + 3.0
+                row_dead = None
+                while time.monotonic() < deadline:
+                    row_dead = self.brain.engine.db.execute(
+                        "SELECT status, attempts, last_error FROM xiaozhi_inbox WHERE request_id='b1-always-fail'"
+                    ).fetchone()
+                    if row_dead and row_dead["status"] == "dead":
+                        break
+                    time.sleep(0.03)
+
+                self.assertIsNotNone(row_dead)
+                self.assertEqual(row_dead["status"], "dead")
+                self.assertEqual(row_dead["attempts"], 3)  # > max_retries(2)
+                self.assertNotIn("sk-topsecret1234567890abcdef", row_dead["last_error"])
+
+                h_dead = client.get("/xiaozhi/health")
+                self.assertEqual(h_dead.status_code, 200)
+                hb = h_dead.json()
+                self.assertEqual(hb["inbox_dead"], 1)
+                self.assertEqual(hb["inbox_pending"], 0)
+                self.assertEqual(hb["ingest"]["inbox_dead"], 1)
+
+                # 3. Seed 2 pending rows with future backoff to hit HEALTH_BACKLOG_THRESHOLD=2 -> 503 backlog_ok=False
+                fut_ts = time.time() + 120.0
+                with self.brain.engine._transaction():
+                    for k in range(2):
+                        self.brain.engine.db.execute(
+                            "INSERT INTO xiaozhi_inbox VALUES(?,?,?,?,?,?,?,?)",
+                            (f"b1-backlog-{k}", svc.DEFAULT_CHARACTER_ID, '{"user_message":"u","assistant_reply":"a"}', "pending", 1, "wait", fut_ts, fut_ts),
+                        )
+                h_high = client.get("/xiaozhi/health")
+                self.assertEqual(h_high.status_code, 503)
+                hh = h_high.json()
+                self.assertFalse(hh["backlog_ok"])
+                self.assertEqual(hh["inbox_pending"], 2)
+                self.assertEqual(hh["status"], "unhealthy")
+                # Clean synthetic pending rows so shutdown drain completes immediately
+                with self.brain.engine._transaction():
+                    self.brain.engine.db.execute("DELETE FROM xiaozhi_inbox WHERE request_id LIKE 'b1-backlog-%'")
+
+    def test_batch3_b1_rollback_inbox_script(self):
+        import importlib.util
+        import sqlite3
+
+        script_path = ANIMA_ROOT / "scripts" / "rollback_inbox.py"
+        self.assertTrue(
+            script_path.is_file(),
+            f"Missing rollback script at {script_path} (ensure anima-brain/scripts is mounted to /app/scripts:ro)",
+        )
+        spec = importlib.util.spec_from_file_location("rollback_inbox", str(script_path))
+        rb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rb)
+
+        # Seed a committed turn plus inbox rows across all 4 statuses
+        svc.extract_and_commit_turn(
+            self.brain, svc.DEFAULT_CHARACTER_ID, "rb-existing-turn", "已有问题", "已有回复"
+        )
+        svc.ensure_xiaozhi_inbox_table(self.brain.engine)
+        now = time.time()
+        with self.brain.engine._transaction():
+            self.brain.engine.db.execute(
+                "INSERT INTO xiaozhi_inbox VALUES(?,?,?,?,?,?,?,?)",
+                ("rb-pending-1", svc.DEFAULT_CHARACTER_ID, json.dumps({"user_message": "待处理1", "assistant_reply": "回复1"}, ensure_ascii=False), "pending", 0, "", now - 30, now - 30),
+            )
+            self.brain.engine.db.execute(
+                "INSERT INTO xiaozhi_inbox VALUES(?,?,?,?,?,?,?,?)",
+                ("rb-proc-1", svc.DEFAULT_CHARACTER_ID, json.dumps({"user_message": "处理中1", "assistant_reply": "回复2"}, ensure_ascii=False), "processing", 1, "", now - 20, now - 20),
+            )
+            self.brain.engine.db.execute(
+                "INSERT INTO xiaozhi_inbox VALUES(?,?,?,?,?,?,?,?)",
+                ("rb-dead-1", svc.DEFAULT_CHARACTER_ID, json.dumps({"user_message": "死信1", "assistant_reply": "回复3"}, ensure_ascii=False), "dead", 13, "boom", now - 10, now - 10),
+            )
+            self.brain.engine.db.execute(
+                "INSERT INTO xiaozhi_inbox VALUES(?,?,?,?,?,?,?,?)",
+                ("rb-done-1", svc.DEFAULT_CHARACTER_ID, json.dumps({"user_message": "已完成1", "assistant_reply": "回复4"}, ensure_ascii=False), "done", 0, "", now - 5, now - 5),
+            )
+
+        # 1. Dry-run leaves table untouched and reports counts accurately
+        dry = rb.rollback_inbox(self.db_path, dry_run=True)
+        self.assertTrue(dry["ok"])
+        self.assertTrue(dry["dry_run"])
+        self.assertFalse(dry["dropped"])
+        self.assertEqual(dry["counts"], {"pending": 1, "processing": 1, "dead": 1, "done": 1})
+        self.assertEqual(dry["exported"], 3)
+
+        # 2. Drain callback failing on one row refuses to drop table and still exports uncompleted rows safely
+        exp_partial = Path(self._tmp.name) / "partial_export.json"
+
+        def _partial_drain(row):
+            return row["request_id"] == "rb-pending-1"
+
+        res_partial = rb.rollback_inbox(
+            self.db_path, export_path=exp_partial, drain_fn=_partial_drain, drop_table=True
+        )
+        self.assertFalse(res_partial["ok"])
+        self.assertEqual(res_partial["drained"], 1)
+        self.assertEqual(res_partial["drain_failed"], 1)
+        self.assertFalse(res_partial["dropped"])
+        self.assertTrue(exp_partial.is_file())
+        exported_partial = json.loads(exp_partial.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {r["request_id"] for r in exported_partial["rows"]},
+            {"rb-proc-1", "rb-dead-1"},
+        )
+
+        # 3. Full rollback export + drop via CLI main()
+        exp_final = Path(self._tmp.name) / "final_rollback_export.json"
+        rc = rb.main(["--db", str(self.db_path), "--export", str(exp_final)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(exp_final.is_file())
+        doc = json.loads(exp_final.read_text(encoding="utf-8"))
+        self.assertEqual(doc["exported_count"], 2)
+        self.assertEqual({r["request_id"] for r in doc["rows"]}, {"rb-proc-1", "rb-dead-1"})
+
+        # Verify xiaozhi_inbox is gone, turns table intact, and DB passes integrity_check
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            self.assertIsNone(
+                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='xiaozhi_inbox'").fetchone()
+            )
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM turns WHERE request_id='rb-existing-turn'").fetchone()[0],
+                1,
+            )
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+        finally:
+            conn.close()
+
+        # 4. Idempotent re-run after table is already dropped succeeds cleanly
+        again = rb.rollback_inbox(self.db_path)
+        self.assertTrue(again["ok"])
+        self.assertFalse(again["table_existed"])
+        self.assertFalse(again["dropped"])
+
+        # 5. CLI --drain mode commits pending row into turns, exports dead row, and drops xiaozhi_inbox
+        drain_db = Path(self._tmp.name) / "drain_cli.sqlite3"
+        drain_brain = CompanionBrain(
+            drain_db,
+            user_id="local",
+            settings=self.settings,
+            config=BrainConfig(start_worker=False),
+        )
+        try:
+            svc.ensure_default_character(drain_brain)
+            svc.ensure_xiaozhi_inbox_table(drain_brain.engine)
+            with drain_brain.engine._transaction():
+                drain_brain.engine.db.execute(
+                    "INSERT INTO xiaozhi_inbox VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        "rb-cli-drain-ok",
+                        svc.DEFAULT_CHARACTER_ID,
+                        json.dumps({"user_message": "CLI排空问题", "assistant_reply": "CLI排空回复"}, ensure_ascii=False),
+                        "pending",
+                        0,
+                        "",
+                        now - 10,
+                        now - 10,
+                    ),
+                )
+                drain_brain.engine.db.execute(
+                    "INSERT INTO xiaozhi_inbox VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        "rb-cli-drain-dead",
+                        svc.DEFAULT_CHARACTER_ID,
+                        json.dumps({"user_message": "死信保留", "assistant_reply": "死信回复"}, ensure_ascii=False),
+                        "dead",
+                        13,
+                        "err",
+                        now - 5,
+                        now - 5,
+                    ),
+                )
+        finally:
+            drain_brain.close()
+
+        exp_drain = Path(self._tmp.name) / "drain_cli_export.json"
+        rc_drain = rb.main(["--db", str(drain_db), "--drain", "--export", str(exp_drain)])
+        self.assertEqual(rc_drain, 0)
+        doc_drain = json.loads(exp_drain.read_text(encoding="utf-8"))
+        self.assertEqual([r["request_id"] for r in doc_drain["rows"]], ["rb-cli-drain-dead"])
+        dconn = sqlite3.connect(str(drain_db))
+        try:
+            self.assertIsNone(
+                dconn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='xiaozhi_inbox'").fetchone()
+            )
+            t_dr = dconn.execute(
+                "SELECT status, assistant_reply FROM turns WHERE request_id='rb-cli-drain-ok'"
+            ).fetchone()
+            self.assertIsNotNone(t_dr)
+            self.assertEqual(t_dr[0], "committed")
+            self.assertEqual(t_dr[1], "CLI排空回复")
+        finally:
+            dconn.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -14,11 +14,50 @@ from . import (
     L3Backend,
     PENDING_DIR,
     atomic_write_json,
+    find_busy_workspace_task,
+    format_workspace_busy_message,
+    is_workspace_queue_mode,
     load_last_active_task,
+    normalize_workspace_key,
     read_env_key,
     resolve_task_file,
+    resolve_workdir,
     validate_task_id,
 )
+
+TRANSCRIPT_TAIL_BYTES = 64 * 1024  # H-6: Read at most the last 64 KB of transcript.jsonl
+
+
+def _guard_leading_dash_prompt(prompt: str, prefix_tag: str = "[指令]") -> str:
+    """Prevent leading '-' prompt from being parsed as a CLI flag by agentapi without passing '--' (E-4)."""
+    s = str(prompt or "").strip()
+    if s.startswith("-"):
+        return f"{prefix_tag} {s}"
+    return s
+
+
+def _read_tail_lines(path: Path, max_bytes: int = TRANSCRIPT_TAIL_BYTES) -> tuple[list[str], bool]:
+    """Read at most the last `max_bytes` bytes of a JSONL file, discarding any partial leading line (H-6)."""
+    limit = max(1, int(max_bytes))
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        truncated = file_size > limit
+        if truncated:
+            # Read 1 extra byte before the window to check whether the window starts right after '\n'
+            f.seek(file_size - limit - 1, os.SEEK_SET)
+            raw_plus_one = f.read(limit + 1)
+            starts_on_line_boundary = raw_plus_one[:1] in (b"\n", b"\r")
+            raw = raw_plus_one[1:]
+        else:
+            f.seek(0, os.SEEK_SET)
+            raw = f.read(limit)
+            starts_on_line_boundary = True
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if truncated and not starts_on_line_boundary and len(lines) > 1:
+        lines = lines[1:]
+    return lines, truncated
 
 
 def _get_brain_dir() -> Path:
@@ -28,7 +67,7 @@ def _get_brain_dir() -> Path:
     return Path.home() / ".gemini" / "antigravity" / "brain"
 
 
-def _summarize_transcript(conv_id: str) -> str:
+def _summarize_transcript(conv_id: str, *, max_bytes: int = TRANSCRIPT_TAIL_BYTES) -> str:
     try:
         safe_conv = validate_task_id(conv_id)
     except ValueError:
@@ -40,7 +79,7 @@ def _summarize_transcript(conv_id: str) -> str:
     if not t_path.exists():
         return f"会话 ({safe_conv[:8]}) 已创建，正在初始化或等待执行中。"
 
-    lines = t_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines, truncated = _read_tail_lines(t_path, max_bytes=max_bytes)
     last_model_reply = ""
     last_step_type = ""
     last_status = ""
@@ -61,7 +100,8 @@ def _summarize_transcript(conv_id: str) -> str:
     if last_model_reply:
         short = last_model_reply[:280].replace("\n", " ")
         return f"反重力最新进展（状态 {last_status}）：{short}"
-    return f"反重力正在后台执行工具步骤中（当前步骤类型: {last_step_type}，共 {len(lines)} 步），请稍后再查询。"
+    step_desc = f"最近 {len(lines)} 步" if truncated else f"共 {len(lines)} 步"
+    return f"反重力正在后台执行工具步骤中（当前步骤类型: {last_step_type}，{step_desc}），请稍后再查询。"
 
 
 def _is_worker_alive() -> bool:
@@ -96,6 +136,31 @@ class AntigravityBackend(L3Backend):
         if not instr:
             return "任务内容不能为空。"
 
+        workdir = resolve_workdir(cfg)
+        ws_key = normalize_workspace_key(workdir)
+        busy = find_busy_workspace_task(workdir)
+        if busy is not None:
+            return format_workspace_busy_message(workdir, busy)
+        if not follow_up_last and not is_workspace_queue_mode(cfg) and PENDING_DIR.exists():
+            for pfp in sorted(PENDING_DIR.glob("*.json")):
+                if pfp.is_symlink():
+                    continue
+                try:
+                    pobj = json.loads(pfp.read_text(encoding="utf-8"))
+                    if not isinstance(pobj, dict):
+                        continue
+                    pwd = str(pobj.get("workdir") or "").strip()
+                    if not pwd or normalize_workspace_key(pwd) == ws_key:
+                        return format_workspace_busy_message(
+                            workdir,
+                            {
+                                "task_id": str(pobj.get("id") or pfp.stem),
+                                "prompt": str(pobj.get("prompt") or "")[:80],
+                            },
+                        )
+                except Exception:
+                    continue
+
         conv_id = ""
         if follow_up_last:
             last = load_last_active_task(backend="antigravity")
@@ -107,11 +172,13 @@ class AntigravityBackend(L3Backend):
                 except ValueError:
                     conv_id = ""
 
+        safe_prompt = _guard_leading_dash_prompt(instr, prefix_tag="[追问]" if conv_id else "[指令]")
         task_obj = {
             "id": safe_task_id,
             "backend": "antigravity",
+            "workdir": str(workdir),
             "title": f"[小智派单] {instr[:24]}",
-            "prompt": instr,
+            "prompt": safe_prompt,
             "conversation_id": conv_id,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }

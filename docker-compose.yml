@@ -83,6 +83,8 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - MALLOC_ARENA_MAX=2
+      - MALLOC_TRIM_THRESHOLD_=131072
+      - MALLOC_MMAP_THRESHOLD_=131072
       - OMP_NUM_THREADS=2
       - HOST_LAN_IP=${HOST_LAN_IP:-127.0.0.1}
       - HOST_PROJECT_DIR=${HOST_PROJECT_DIR:-}

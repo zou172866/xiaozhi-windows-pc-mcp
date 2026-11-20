@@ -848,6 +848,46 @@ def _summarize_typed_text_for_audit(text: str) -> tuple[int, str]:
     return len(s), f"[REDACTED len={len(s)}]"
 
 
+L2_AUDIT_MAX_BYTES = 5 * 1024 * 1024  # H-6: 5 MB per audit log file
+L2_AUDIT_BACKUP_COUNT = 3  # H-6: Keep 3 rotated backups (.1 .. .3)
+
+
+def _rotate_file_if_needed(
+    path: Path,
+    *,
+    max_bytes: int = L2_AUDIT_MAX_BYTES,
+    backup_count: int = L2_AUDIT_BACKUP_COUNT,
+    pending_bytes: int = 0,
+) -> bool:
+    """Rotate `path` to `.1`..`.<backup_count>` when size + pending write exceeds `max_bytes` (H-6).
+
+    Caller must hold `_audit_log_lock`.
+    """
+    if max_bytes <= 0 or backup_count <= 0:
+        return False
+    try:
+        if not path.is_file():
+            return False
+        cur_size = path.stat().st_size
+        if cur_size <= 0 or (cur_size + max(0, int(pending_bytes))) <= max_bytes:
+            return False
+        keep = int(backup_count)
+        oldest = path.with_name(f"{path.name}.{keep}")
+        try:
+            oldest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        for idx in range(keep - 1, 0, -1):
+            src = path.with_name(f"{path.name}.{idx}")
+            dst = path.with_name(f"{path.name}.{idx + 1}")
+            if src.exists():
+                os.replace(src, dst)
+        os.replace(path, path.with_name(f"{path.name}.1"))
+        return True
+    except OSError:
+        return False
+
+
 def _write_l2_audit_log(
     *,
     tool: str,
@@ -862,7 +902,7 @@ def _write_l2_audit_log(
     press_enter: bool = False,
     detail: str = "",
 ) -> None:
-    """Append a sanitized JSONL audit record to host-private pc-mcp/state/l2_audit.jsonl."""
+    """Append a sanitized JSONL audit record to host-private pc-mcp/state/l2_audit.jsonl (with 5MBx3 rotation)."""
     get_fg_fn = facade_attr("_get_foreground_window_info", _get_foreground_window_info)
     get_mode_fn = facade_attr("_get_mode", _get_mode)
     audit_path = Path(facade_attr("L2_AUDIT_LOG_FILE", _DEFAULT_L2_AUDIT_LOG_FILE))
@@ -889,9 +929,16 @@ def _write_l2_audit_log(
         "detail": _sanitize_audit_text(detail, max_len=160),
     }
     line = json.dumps(record, ensure_ascii=False) + "\n"
+    line_bytes_len = len(line.encode("utf-8"))
     try:
         with _audit_log_lock:
             audit_path.parent.mkdir(parents=True, exist_ok=True)
+            _rotate_file_if_needed(
+                audit_path,
+                max_bytes=L2_AUDIT_MAX_BYTES,
+                backup_count=L2_AUDIT_BACKUP_COUNT,
+                pending_bytes=line_bytes_len,
+            )
             with open(audit_path, "a", encoding="utf-8") as f:
                 f.write(line)
     except Exception as exc:

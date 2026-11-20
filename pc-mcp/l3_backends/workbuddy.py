@@ -11,8 +11,11 @@ from typing import Any, Dict, List, Tuple
 
 from . import (
     L3Backend,
+    claim_workspace_or_enqueue,
     get_process_create_time,
+    is_task_cancelled,
     load_last_active_task,
+    release_workspace_slot,
     resolve_workdir,
     run_subprocess_with_tree_kill,
     save_active_task,
@@ -126,45 +129,67 @@ class WorkBuddyBackend(L3Backend):
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_ts": time.time(),
         }
-        save_active_task(task_id, task_record)
 
-        def _on_spawn(child_pid: int) -> None:
-            task_record["pid"] = child_pid
-            task_record["pid_create_time"] = get_process_create_time(child_pid)
+        def _start_now() -> None:
+            task_record["status"] = "running"
+            task_record["started_ts"] = time.time()
+            task_record.pop("queue_position", None)
             save_active_task(task_id, task_record)
 
-        def _worker():
-            env = os.environ.copy()
-            env["PYTHONUTF8"] = "1"
-            try:
-                proc = run_subprocess_with_tree_kill(
-                    cmd,
-                    cwd=str(workdir),
-                    env=env,
-                    timeout=timeout_sec,
-                    creationflags=_CREATE_NO_WINDOW,
-                    on_spawn=_on_spawn,
-                )
-                stdout = (proc.stdout or "").strip()
-                stderr = (proc.stderr or "").strip()
-                task_record["returncode"] = proc.returncode
-                task_record["stdout"] = stdout[-4000:]
-                task_record["stderr"] = stderr[-2000:]
-                task_record["summary"] = summarize_text_for_voice(stdout or stderr, 300)
-                task_record["status"] = "completed" if proc.returncode == 0 else "error"
-            except subprocess.TimeoutExpired:
-                task_record["status"] = "error"
-                task_record["stderr"] = f"执行超过 {timeout_sec} 秒已自动中止并清理子进程树"
-                task_record["summary"] = task_record["stderr"]
-            except Exception as exc:
-                task_record["status"] = "error"
-                task_record["stderr"] = str(exc)
-                task_record["summary"] = str(exc)
-            finally:
-                task_record["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            def _on_spawn(child_pid: int) -> None:
+                task_record["pid"] = child_pid
+                task_record["pid_create_time"] = get_process_create_time(child_pid)
                 save_active_task(task_id, task_record)
 
-        start_worker_thread(task_id, f"l3-wb-{task_id}", _worker)
+            def _worker():
+                env = os.environ.copy()
+                env["PYTHONUTF8"] = "1"
+                try:
+                    proc = run_subprocess_with_tree_kill(
+                        cmd,
+                        cwd=str(workdir),
+                        env=env,
+                        timeout=timeout_sec,
+                        creationflags=_CREATE_NO_WINDOW,
+                        on_spawn=_on_spawn,
+                    )
+                    stdout = (proc.stdout or "").strip()
+                    stderr = (proc.stderr or "").strip()
+                    task_record["returncode"] = proc.returncode
+                    task_record["stdout"] = stdout[-4000:]
+                    task_record["stderr"] = stderr[-2000:]
+                    task_record["summary"] = summarize_text_for_voice(stdout or stderr, 300)
+                    task_record["status"] = "completed" if proc.returncode == 0 else "error"
+                except subprocess.TimeoutExpired:
+                    task_record["status"] = "error"
+                    task_record["stderr"] = f"执行超过 {timeout_sec} 秒已自动中止并清理子进程树"
+                    task_record["summary"] = task_record["stderr"]
+                except Exception as exc:
+                    task_record["status"] = "error"
+                    task_record["stderr"] = str(exc)
+                    task_record["summary"] = str(exc)
+                finally:
+                    if is_task_cancelled(task_id):
+                        task_record["status"] = "cancelled"
+                        task_record["stderr"] = "任务已被用户取消"
+                        task_record["summary"] = "任务已被用户取消"
+                    task_record["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    save_active_task(task_id, task_record)
+                    release_workspace_slot(workdir, task_id)
+
+            start_worker_thread(task_id, f"l3-wb-{task_id}", _worker)
+
+        outcome, guard_msg = claim_workspace_or_enqueue(
+            workdir=workdir,
+            task_id=task_id,
+            backend="workbuddy",
+            prompt=instr,
+            cfg=cfg,
+            start_fn=_start_now,
+            queued_record=task_record,
+        )
+        if outcome in ("busy", "queued") and guard_msg:
+            return guard_msg
         return f"已成功派单给本机腾讯 WorkBuddy 后台执行（工作目录 {workdir.name}），稍后可随时问我进展！"
 
     def check_status(self, cfg: Dict[str, Any]) -> str:
@@ -175,6 +200,10 @@ class WorkBuddyBackend(L3Backend):
         if st == "running":
             elapsed = max(1, int(time.time() - float(last.get("started_ts") or time.time())))
             return f"腾讯 WorkBuddy 正在后台处理「{str(last.get('prompt') or '')[:24]}」，已运行约 {elapsed} 秒，请稍后再问我。"
+        if st == "queued":
+            return f"腾讯 WorkBuddy 任务「{str(last.get('prompt') or '')[:24]}」正在队列中等待前序任务完成。"
+        if st == "cancelled":
+            return "腾讯 WorkBuddy 上一次任务已被取消。"
         if st == "completed":
             summary = str(last.get("summary") or "").strip() or "任务已完成，未返回额外文字输出。"
             return f"腾讯 WorkBuddy 已完成任务：{summary}"

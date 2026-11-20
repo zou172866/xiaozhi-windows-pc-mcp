@@ -15,13 +15,14 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import os
 import re
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import patch_registry
 import runtime_events
@@ -443,7 +444,9 @@ _LEXICAL_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ),
 )
 
+_DEFAULT_MOOD_DEVICE_KEY = "__default__"
 _anima_lock = threading.Lock()
+_last_anima_emotion_by_device: Dict[str, str] = {}
 _last_anima_emotion: str = "calm"
 _cached_manifest: Optional[Dict[str, Dict[str, Any]]] = None
 
@@ -464,6 +467,146 @@ def is_live_gsv_busy() -> bool:
     """Return True while a live ESP32 GPT-SoVITS synthesis request is in flight."""
     with _gsv_inflight_lock:
         return _gsv_live_inflight > 0
+
+
+@contextlib.contextmanager
+def _try_acquire_gsv_gpu_lock():
+    """Non-blocking context manager around GSV_GPU_LOCK so background jobs never stall live TTS."""
+    acquired = GSV_GPU_LOCK.acquire(blocking=False)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            GSV_GPU_LOCK.release()
+
+
+def _post_gsv_sync(url: str, request_json: Dict[str, Any], timeout: float):
+    """Run blocking GPT-SoVITS HTTP POST + GSV_GPU_LOCK on a worker thread (C-5)."""
+    sess = _get_gsv_http_session()
+    with GSV_GPU_LOCK:
+        return sess.post(url, json=request_json, timeout=timeout)
+
+
+def _synthesize_gsv_wakeup_snapshot_sync(
+    url: str,
+    request_json: Dict[str, Any],
+    timeout: float,
+) -> Optional[bytes]:
+    """Synthesize a wakeup cache WAV ONLY when GSV is idle and GPU lock is uncontended (C-4)."""
+    if is_live_gsv_busy():
+        return None
+    with _try_acquire_gsv_gpu_lock() as acquired:
+        if not acquired or is_live_gsv_busy():
+            return None
+        sess = _get_gsv_http_session()
+        resp = sess.post(url, json=request_json, timeout=timeout)
+        if getattr(resp, "status_code", 0) == 200 and getattr(resp, "content", None):
+            return bytes(resp.content)
+        return None
+
+
+def _write_bytes_atomic(file_path: str, data: bytes) -> None:
+    parent = os.path.dirname(os.path.abspath(file_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{file_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+            f.flush()
+        os.replace(tmp_path, file_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _write_file_bytes(file_path: str, data: bytes) -> None:
+    with open(file_path, "wb") as f:
+        f.write(data)
+
+
+def build_gsv_request_snapshot(
+    provider,
+    clean_text: str,
+    *,
+    explicit_segment_emotion: Optional[str] = None,
+    turn_explicit_emotion: Optional[str] = None,
+    device_id: Optional[str] = None,
+    is_first_segment: bool = False,
+    suppress_first_seg_fast_steps: bool = False,
+) -> Tuple[str, Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
+    """Build an immutable GPT-SoVITS /tts request dict from `provider` without mutating `provider` (C-4)."""
+    ref_audio_path = getattr(provider, "ref_audio_path", "")
+    aux_ref_audio_paths = list(getattr(provider, "aux_ref_audio_paths", None) or [])
+    prompt_text = getattr(provider, "prompt_text", "")
+    prompt_lang = getattr(provider, "prompt_lang", "zh")
+    top_k = getattr(provider, "top_k", 12)
+    top_p = getattr(provider, "top_p", 1.0)
+    temperature = getattr(provider, "temperature", 0.98)
+    speed_factor = getattr(provider, "speed_factor", 1.0)
+    raw_split = getattr(provider, "text_split_method", "cut0")
+    # Avoid double-splitting inside GPT-SoVITS when clauses are already segmented
+    split_method = "cut0" if raw_split in ("cut5", "cut0", "", None) else raw_split
+
+    chosen_prof: Optional[Dict[str, Any]] = None
+    emo_key: Optional[str] = None
+    is_mei = is_raiden_mei_voice(ref_audio_path)
+    if is_mei:
+        emo_key = resolve_mei_emotion(
+            clean_text,
+            explicit_segment_emotion=explicit_segment_emotion,
+            turn_explicit_emotion=turn_explicit_emotion,
+            device_id=device_id,
+        )
+        prof = get_mei_emotion_profile(emo_key)
+        chosen_prof = prof
+        ref_audio_path = prof["ref_audio_path"]
+        aux_ref_audio_paths = []
+        prompt_text = prof["prompt_text"]
+        prompt_lang = prof.get("prompt_lang", "zh")
+        speed_factor = float(prof.get("speed_factor", speed_factor))
+        temperature = float(prof.get("temperature", temperature))
+        top_k = int(prof.get("top_k", top_k))
+        top_p = float(prof.get("top_p", top_p))
+        split_method = "cut0"
+
+    request_json: Dict[str, Any] = {
+        "text": clean_text,
+        "text_lang": getattr(provider, "text_lang", "zh"),
+        "ref_audio_path": ref_audio_path,
+        "aux_ref_audio_paths": aux_ref_audio_paths,
+        "prompt_text": prompt_text,
+        "prompt_lang": prompt_lang,
+        "top_k": top_k,
+        "top_p": top_p,
+        "temperature": temperature,
+        "text_split_method": split_method,
+        "batch_size": getattr(provider, "batch_size", 1),
+        "batch_threshold": getattr(provider, "batch_threshold", 0.75),
+        "split_bucket": getattr(provider, "split_bucket", True),
+        "return_fragment": getattr(provider, "return_fragment", False),
+        "speed_factor": speed_factor,
+        "streaming_mode": getattr(provider, "streaming_mode", False),
+        "seed": getattr(provider, "seed", -1),
+        "parallel_infer": getattr(provider, "parallel_infer", True),
+        "repetition_penalty": getattr(provider, "repetition_penalty", 1.35),
+    }
+    effective_first = False if suppress_first_seg_fast_steps else bool(is_first_segment)
+    sample_steps = _resolve_gsv_sample_steps(
+        provider,
+        chosen_prof,
+        is_mei,
+        is_first_segment=effective_first,
+    )
+    if sample_steps is not None:
+        request_json["sample_steps"] = sample_steps
+
+    url = str(getattr(provider, "url", "") or "").strip()
+    return url, request_json, chosen_prof, emo_key
 
 
 def _get_gsv_http_session():
@@ -891,8 +1034,13 @@ def infer_emotion_from_text(text: str, allow_soft_wave_cue: bool = True) -> Opti
     return None
 
 
-def set_anima_mood(mood_summary: str) -> None:
-    """Update cached Anima Brain emotion from `/xiaozhi/recall` mood summary string."""
+def _normalize_mood_device_key(device_id: Optional[str] = None) -> str:
+    dev = str(device_id or "").strip().lower()
+    return dev if dev else _DEFAULT_MOOD_DEVICE_KEY
+
+
+def set_anima_mood(mood_summary: str, device_id: Optional[str] = None) -> None:
+    """Update cached Anima Brain emotion from `/xiaozhi/recall` mood summary string, isolated per device_id (C-6)."""
     global _last_anima_emotion
     if not mood_summary:
         return
@@ -900,25 +1048,51 @@ def set_anima_mood(mood_summary: str) -> None:
     raw = m.group(1).strip().lower() if m else mood_summary.strip().lower()
     emo, _ = normalize_emotion_name(raw)
     if emo:
+        dev_key = _normalize_mood_device_key(device_id)
         with _anima_lock:
-            _last_anima_emotion = emo
+            _last_anima_emotion_by_device[dev_key] = emo
+            if dev_key == _DEFAULT_MOOD_DEVICE_KEY:
+                _last_anima_emotion = emo
+            if len(_last_anima_emotion_by_device) > 256:
+                for k in list(_last_anima_emotion_by_device.keys()):
+                    if k != _DEFAULT_MOOD_DEVICE_KEY:
+                        _last_anima_emotion_by_device.pop(k, None)
+                        break
 
 
-def get_anima_mood() -> str:
+def get_anima_mood(device_id: Optional[str] = None) -> str:
+    dev_key = _normalize_mood_device_key(device_id)
     with _anima_lock:
-        return _last_anima_emotion
+        if dev_key in _last_anima_emotion_by_device:
+            return _last_anima_emotion_by_device[dev_key]
+        return _last_anima_emotion_by_device.get(_DEFAULT_MOOD_DEVICE_KEY, _last_anima_emotion)
+
+
+def clear_anima_mood(device_id: Optional[str] = None) -> None:
+    """Reset cached Anima mood for one device_id or all devices (for cleanup/tests)."""
+    global _last_anima_emotion
+    with _anima_lock:
+        if device_id is None:
+            _last_anima_emotion_by_device.clear()
+            _last_anima_emotion = "calm"
+        else:
+            dev_key = _normalize_mood_device_key(device_id)
+            _last_anima_emotion_by_device.pop(dev_key, None)
+            if dev_key == _DEFAULT_MOOD_DEVICE_KEY:
+                _last_anima_emotion = "calm"
 
 
 def resolve_mei_emotion(
     clean_text: str,
     explicit_segment_emotion: Optional[str] = None,
     turn_explicit_emotion: Optional[str] = None,
+    device_id: Optional[str] = None,
 ) -> str:
     """3-layer emotion resolution:
     1. Explicit tag on current segment
     2. Turn-level explicit tag (unless a subsequent clause has a clear lexical mood shift;
        soft `~` punctuation never hijacks an explicit turn tag) or clause lexical cue
-    3. Anima Brain PAD / turn_appraisals `last_emotion` continuity
+    3. Anima Brain PAD / turn_appraisals `last_emotion` continuity (isolated per device_id)
     4. Default 'calm'
     """
     emotions = load_mei_emotions()
@@ -939,7 +1113,7 @@ def resolve_mei_emotion(
             if lexical and lexical in emotions:
                 chosen = lexical
             else:
-                anima_emo = get_anima_mood()
+                anima_emo = get_anima_mood(device_id=device_id)
                 chosen = anima_emo if anima_emo in emotions else "calm"
 
     prof = emotions.get(chosen) or emotions["calm"]
@@ -1499,75 +1673,27 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         pending_emo = getattr(self, "_pending_segment_emotion", None)
         explicit_seg = seg_emo or pending_emo
         turn_emo = getattr(self, "_turn_explicit_emotion", None)
+        dev_id = str(getattr(conn, "device_id", "") or "").strip() or None
 
-        ref_audio_path = self.ref_audio_path
-        aux_ref_audio_paths = self.aux_ref_audio_paths
-        prompt_text = self.prompt_text
-        prompt_lang = self.prompt_lang
-        top_k = self.top_k
-        top_p = self.top_p
-        temperature = self.temperature
-        speed_factor = self.speed_factor
-        # Avoid double-splitting inside GPT-SoVITS when clauses are already segmented
-        split_method = "cut0" if self.text_split_method in ("cut5", "cut0", "", None) else self.text_split_method
-
-        chosen_prof = None
-        is_mei = is_raiden_mei_voice(self.ref_audio_path)
-        if is_mei:
-            emo_key = resolve_mei_emotion(
-                clean_text,
-                explicit_segment_emotion=explicit_seg,
-                turn_explicit_emotion=turn_emo,
-            )
-            prof = get_mei_emotion_profile(emo_key)
-            chosen_prof = prof
-            ref_audio_path = prof["ref_audio_path"]
-            aux_ref_audio_paths = []
-            prompt_text = prof["prompt_text"]
-            prompt_lang = prof.get("prompt_lang", "zh")
-            speed_factor = float(prof.get("speed_factor", self.speed_factor))
-            temperature = float(prof.get("temperature", self.temperature))
-            top_k = int(prof.get("top_k", self.top_k))
-            top_p = float(prof.get("top_p", self.top_p))
-            split_method = "cut0"
-
-            base_logger.bind(tag=gsv_mod.TAG).info(
-                f"[芽衣多情绪路由] 情绪={emo_key}({prof['label_zh']}) | speed={speed_factor} | 文本={clean_text}"
-            )
-
-        request_json = {
-            "text": clean_text,
-            "text_lang": self.text_lang,
-            "ref_audio_path": ref_audio_path,
-            "aux_ref_audio_paths": aux_ref_audio_paths,
-            "prompt_text": prompt_text,
-            "prompt_lang": prompt_lang,
-            "top_k": top_k,
-            "top_p": top_p,
-            "temperature": temperature,
-            "text_split_method": split_method,
-            "batch_size": self.batch_size,
-            "batch_threshold": self.batch_threshold,
-            "split_bucket": self.split_bucket,
-            "return_fragment": self.return_fragment,
-            "speed_factor": speed_factor,
-            "streaming_mode": self.streaming_mode,
-            "seed": self.seed,
-            "parallel_infer": self.parallel_infer,
-            "repetition_penalty": self.repetition_penalty,
-        }
-        sample_steps = _resolve_gsv_sample_steps(
-            self, chosen_prof, is_mei, is_first_segment=is_first_segment
+        req_url, request_json, chosen_prof, emo_key = build_gsv_request_snapshot(
+            self,
+            clean_text,
+            explicit_segment_emotion=explicit_seg,
+            turn_explicit_emotion=turn_emo,
+            device_id=dev_id,
+            is_first_segment=is_first_segment,
+            suppress_first_seg_fast_steps=bool(getattr(self, "_suppress_first_seg_fast_steps", False)),
         )
-        if sample_steps is not None:
-            request_json["sample_steps"] = sample_steps
+        if chosen_prof is not None and emo_key:
+            base_logger.bind(tag=gsv_mod.TAG).info(
+                f"[芽衣多情绪路由] 情绪={emo_key}({chosen_prof['label_zh']}) | speed={request_json['speed_factor']} | 文本={clean_text}"
+            )
 
-        sess = _get_gsv_http_session()
+        timeout_sec = float(getattr(self, "tts_timeout", None) or 30.0)
         with _gsv_inflight_lock:
             _gsv_live_inflight += 1
         try:
-            with GSV_GPU_LOCK:
-                resp = sess.post(self.url, json=request_json, timeout=self.tts_timeout)
+            resp = await asyncio.to_thread(_post_gsv_sync, req_url or self.url, request_json, timeout_sec)
         finally:
             with _gsv_inflight_lock:
                 _gsv_live_inflight = max(0, _gsv_live_inflight - 1)
@@ -1603,8 +1729,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
                         chosen_prof["esp32_emotion"],
                     )
             if output_file:
-                with open(output_file, "wb") as file:
-                    file.write(resp.content)
+                await asyncio.to_thread(_write_file_bytes, output_file, resp.content)
             else:
                 return resp.content
         else:
@@ -1800,44 +1925,46 @@ def apply_mei_wakeup_responses_patch() -> None:
         if tts is None or not is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
             return await _orig_wakeup_response(conn, *args, **kwargs)
 
-        prev_suppress = getattr(tts, "_suppress_first_seg_fast_steps", False)
-        try:
-            if not await hello_mod._wakeup_response_lock.acquire():
+        # C-4: Run wakeup cache refresh ONLY when GSV is idle and lock is uncontended,
+        # using `async with` + an immutable request snapshot (ZERO mutation of shared `tts`).
+        if is_live_gsv_busy() or hello_mod._wakeup_response_lock.locked():
+            return
+
+        async with hello_mod._wakeup_response_lock:
+            if is_live_gsv_busy():
                 return
 
             pool = [r for r in MEI_WAKEUP_RESPONSES if r != _last_mei_reply["text"]] or list(MEI_WAKEUP_RESPONSES)
             result = random.choice(pool)
             _last_mei_reply["text"] = result
 
-            # Guide GPT-SoVITS into Mei's warm 'gentle' reference clip (full sample_steps in background cache)
-            tts._pending_segment_emotion = "gentle"
-            tts._turn_explicit_emotion = "gentle"
-            tts._suppress_first_seg_fast_steps = True
-            tts_result = await asyncio.to_thread(tts.to_tts, result)
-            if not tts_result:
+            url, req_json, _, _ = build_gsv_request_snapshot(
+                tts,
+                result,
+                explicit_segment_emotion="gentle",
+                turn_explicit_emotion="gentle",
+                is_first_segment=False,
+                suppress_first_seg_fast_steps=True,
+            )
+            if not url:
+                return
+
+            timeout_sec = float(getattr(tts, "tts_timeout", None) or 30.0)
+            raw_wav = await asyncio.to_thread(
+                _synthesize_gsv_wakeup_snapshot_sync,
+                url,
+                req_json,
+                timeout_sec,
+            )
+            if not raw_wav:
                 return
 
             voice = getattr(tts, "voice", "raiden_mei") or "raiden_mei"
-            if isinstance(tts_result, str):
-                wav_bytes = await asyncio.to_thread(
-                    hello_mod.audio_file_to_wav_bytes, tts_result, conn.sample_rate
-                )
-            else:
-                wav_bytes = hello_mod.opus_datas_to_wav_bytes(tts_result, sample_rate=conn.sample_rate)
-
-            wav_bytes = _trim_wav_leading_breath(wav_bytes)
+            wav_bytes = await asyncio.to_thread(_trim_wav_leading_breath, raw_wav)
             file_path = hello_mod.wakeup_words_config.generate_file_path(voice)
-            with open(file_path, "wb") as f:
-                f.write(wav_bytes)
+            await asyncio.to_thread(_write_bytes_atomic, file_path, wav_bytes)
             hello_mod.wakeup_words_config.update_wakeup_response(voice, file_path, result)
             await hello_mod.audio_to_data(file_path, use_cache=True)
-        finally:
-            try:
-                tts._suppress_first_seg_fast_steps = prev_suppress
-            except Exception:
-                pass
-            if hello_mod._wakeup_response_lock.locked():
-                hello_mod._wakeup_response_lock.release()
 
     @functools.wraps(_orig_check_wakeup)
     async def _mei_aware_check_wakeup_words(conn, text, *args, **kwargs):
@@ -1907,7 +2034,7 @@ def apply_mei_wakeup_responses_patch() -> None:
         asyncio.create_task(hello_mod._finish_wakeup_reply(conn))
 
         if time.time() - response.get("time", 0) > hello_mod.WAKEUP_CONFIG["refresh_time"]:
-            if not hello_mod._wakeup_response_lock.locked():
+            if not hello_mod._wakeup_response_lock.locked() and not is_live_gsv_busy():
                 asyncio.create_task(_mei_aware_wakeup_words_response(conn))
         return True
 

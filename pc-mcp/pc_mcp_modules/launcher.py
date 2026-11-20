@@ -1,12 +1,14 @@
-"""Application & website launcher with foreground window restoration (P2-20)."""
+"""Application & website launcher with foreground window restoration & Start Menu hardening (P2-20, H-7)."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from typing import Optional
 import webbrowser
@@ -156,23 +158,239 @@ def _shell_open(target_str: str, params: Optional[str] = None) -> None:
         subprocess.Popen([resolved, *extra_args], **popen_kw)
 
 
-def _find_start_menu_shortcut(keyword: str) -> Optional[Path]:
-    kw = keyword.lower().strip()
-    start_dirs = [
+# H-7: Start Menu shortcut blacklist blocking sensitive/system tools & uninstallers from fuzzy launch
+_BLOCKED_SHORTCUT_DIR_NAMES = frozenset({
+    "administrative tools",
+    "windows administrative tools",
+    "windows 管理工具",
+    "管理工具",
+    "windows powershell",
+    "powershell",
+})
+
+_BLOCKED_SHORTCUT_EXACT_STEMS = frozenset({
+    "run",
+    "运行",
+    "cmd",
+    "wt",
+    "wsl",
+    "powershell",
+    "pwsh",
+    "regedit",
+    "regedt32",
+    "terminal",
+    "终端",
+    "shell",
+    "console",
+    "控制台",
+    "services",
+    "服务",
+    "taskmgr",
+    "msconfig",
+    "gpedit",
+    "secpol",
+    "mmc",
+})
+
+_BLOCKED_SHORTCUT_SUBSTRINGS = (
+    # Uninstallers / removers
+    "uninstall",
+    "卸载",
+    "移除",
+    "解除安装",
+    "反安装",
+    # Shells & terminals
+    "powershell",
+    "pwsh",
+    "command prompt",
+    "命令提示符",
+    "windows terminal",
+    "git bash",
+    "git cmd",
+    "wezterm",
+    "mintty",
+    "cygwin",
+    "alacritty",
+    "conemu",
+    "cmder",
+    "putty",
+    "tabby",
+    "mysql shell",
+    "command line client",
+    "developer command prompt",
+    "native tools command prompt",
+    "cross tools command prompt",
+    "anaconda prompt",
+    "conda prompt",
+    "node.js command prompt",
+    # Registry & system admin tools
+    "regedit",
+    "registry editor",
+    "注册表",
+    "msconfig",
+    "system configuration",
+    "系统配置",
+    "gpedit",
+    "组策略",
+    "secpol",
+    "security configuration",
+    "安全策略",
+    "computer management",
+    "计算机管理",
+    "disk management",
+    "磁盘管理",
+    "device manager",
+    "设备管理器",
+    "event viewer",
+    "事件查看器",
+    "task scheduler",
+    "任务计划程序",
+    "component services",
+    "组件服务",
+    "recovery drive",
+    "recoverydrive",
+    "恢复驱动器",
+    "reset this pc",
+    "重置此电脑",
+    "remote desktop",
+    "远程桌面",
+    "mstsc",
+    "task manager",
+    "任务管理器",
+    "administrative tools",
+    "管理工具",
+    "defender firewall",
+    "防火墙",
+    "dfrgui",
+    "iscsi",
+    "odbc",
+    "memory diagnostics",
+    "performance monitor",
+    "resource monitor",
+    "print management",
+)
+
+_BLOCKED_SHORTCUT_WORD_RE = re.compile(
+    r"\b(?:cmd|wt|wsl|bash|sh|pwsh|powershell|regedit|regedt32|msconfig|gpedit|secpol|taskmgr|mstsc|mmc|diskpart|bcdedit|netsh|schtasks|wmic|cscript|wscript|mshta|rundll32|certutil|bitsadmin)\b",
+    re.IGNORECASE,
+)
+
+_shortcut_cache_lock = threading.Lock()
+_shortcut_cache: dict[tuple[str, ...], dict] = {}
+
+
+def _clear_start_menu_cache() -> None:
+    """Clear cached Start Menu shortcut index (useful in unit tests)."""
+    with _shortcut_cache_lock:
+        _shortcut_cache.clear()
+
+
+def _is_blocked_shortcut(lnk: Path, *, root_dir: Optional[Path] = None) -> bool:
+    """Return True if a Start Menu shortcut targets a sensitive/system tool or uninstaller (H-7)."""
+    stem = lnk.stem.strip().lower()
+    if not stem:
+        return True
+    if stem in _BLOCKED_SHORTCUT_EXACT_STEMS:
+        return True
+    if any(tok in stem for tok in _BLOCKED_SHORTCUT_SUBSTRINGS):
+        return True
+    if _BLOCKED_SHORTCUT_WORD_RE.search(stem):
+        return True
+
+    # Check relative parent directory names inside Start Menu (e.g. Administrative Tools, Windows PowerShell)
+    try:
+        if root_dir is not None:
+            rel_parts = lnk.relative_to(root_dir).parent.parts
+        else:
+            rel_parts = lnk.parent.parts[-3:]
+    except Exception:
+        rel_parts = lnk.parent.parts[-3:]
+    for part in rel_parts:
+        p_low = part.strip().lower()
+        if p_low in _BLOCKED_SHORTCUT_DIR_NAMES:
+            return True
+    return False
+
+
+def _default_start_menu_dirs() -> list[Path]:
+    return [
         Path(os.environ.get("ProgramData", r"C:\ProgramData")) / r"Microsoft\Windows\Start Menu\Programs",
         Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs",
     ]
-    best = None
-    for sd in start_dirs:
+
+
+def _stat_dir_mtime_ns(dir_str: str) -> int:
+    try:
+        return os.stat(dir_str).st_mtime_ns
+    except OSError:
+        return -1
+
+
+def _get_start_menu_shortcuts(start_dirs: Optional[list[Path]] = None) -> list[tuple[str, Path]]:
+    """Return cached non-blocked `(stem_lower, Path)` Start Menu shortcut list, invalidated by directory mtime (H-7)."""
+    dirs = list(start_dirs) if start_dirs is not None else _default_start_menu_dirs()
+    cache_key = tuple(os.path.normcase(os.path.normpath(str(d))) for d in dirs)
+
+    with _shortcut_cache_lock:
+        cached = _shortcut_cache.get(cache_key)
+        if cached is not None:
+            dir_mtimes: list[tuple[str, int]] = cached["dir_mtimes"]
+            if all(_stat_dir_mtime_ns(d_str) == prev_mt for d_str, prev_mt in dir_mtimes):
+                return list(cached["shortcuts"])
+
+    # Cache miss or directory mtime changed: walk start menu directories and rebuild filtered index
+    new_dir_mtimes: list[tuple[str, int]] = []
+    shortcuts: list[tuple[str, Path]] = []
+    seen_dirs: set[str] = set()
+
+    for sd in dirs:
+        sd_str = str(sd)
         if not sd.exists():
+            if sd_str not in seen_dirs:
+                seen_dirs.add(sd_str)
+                new_dir_mtimes.append((sd_str, -1))
             continue
-        for lnk in sd.rglob("*.lnk"):
-            stem = lnk.stem.lower()
-            if stem == kw:
-                return lnk
-            if kw in stem and best is None:
-                best = lnk
-    return best
+        for dirpath, dirnames, filenames in os.walk(sd_str):
+            dirnames.sort()
+            if dirpath not in seen_dirs:
+                seen_dirs.add(dirpath)
+                new_dir_mtimes.append((dirpath, _stat_dir_mtime_ns(dirpath)))
+            for fn in sorted(filenames):
+                if not fn.lower().endswith(".lnk"):
+                    continue
+                lnk_path = Path(dirpath) / fn
+                if _is_blocked_shortcut(lnk_path, root_dir=sd):
+                    continue
+                shortcuts.append((lnk_path.stem.lower(), lnk_path))
+
+    with _shortcut_cache_lock:
+        if len(_shortcut_cache) >= 8 and cache_key not in _shortcut_cache:
+            _shortcut_cache.pop(next(iter(_shortcut_cache)))
+        _shortcut_cache[cache_key] = {
+            "dir_mtimes": new_dir_mtimes,
+            "shortcuts": shortcuts,
+        }
+    return list(shortcuts)
+
+
+def _find_start_menu_shortcut(
+    keyword: str,
+    *,
+    start_dirs: Optional[list[Path]] = None,
+) -> Optional[Path]:
+    kw = (keyword or "").lower().strip()
+    if not kw:
+        return None
+    shortcuts = _get_start_menu_shortcuts(start_dirs=start_dirs)
+    best: Optional[tuple[int, Path]] = None
+    for stem, lnk in shortcuts:
+        if stem == kw:
+            return lnk
+        if kw in stem:
+            cand = (len(stem), lnk)
+            if best is None or cand[0] < best[0]:
+                best = cand
+    return best[1] if best is not None else None
 
 
 def _pc_open_app_or_web_locked(t: str) -> str:

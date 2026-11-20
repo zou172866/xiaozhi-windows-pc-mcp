@@ -132,7 +132,7 @@ def _payload_hash(payload: dict[str, Any]) -> str:
 
 
 class AnimaOutbox:
-    """Durable SQLite outbox + single background delivery worker with exponential backoff."""
+    """Durable SQLite outbox + single background delivery worker with exponential backoff & dead-lettering (B-5)."""
 
     def __init__(
         self,
@@ -144,6 +144,8 @@ class AnimaOutbox:
         client_factory: Callable[[], httpx.Client] | None = None,
         base_backoff: float = 2.0,
         max_backoff: float = 300.0,
+        max_retries: int | None = None,
+        dead_ttl_days: float | None = None,
         keep_sent_rows: int = 500,
         wal_journal_size_limit: int = 8 * 1024 * 1024,
         wal_checkpoint_interval: float = 180.0,
@@ -162,6 +164,20 @@ class AnimaOutbox:
         )
         self.base_backoff = max(0.05, float(base_backoff))
         self.max_backoff = max(self.base_backoff, float(max_backoff))
+        if max_retries is None:
+            raw_mr = (os.environ.get("ANIMA_OUTBOX_MAX_RETRIES") or "").strip()
+            try:
+                max_retries = int(raw_mr) if raw_mr else 8
+            except ValueError:
+                max_retries = 8
+        self.max_retries = max(1, int(max_retries))
+        if dead_ttl_days is None:
+            raw_ttl = (os.environ.get("ANIMA_OUTBOX_DEAD_TTL_DAYS") or "").strip()
+            try:
+                dead_ttl_days = float(raw_ttl) if raw_ttl else 14.0
+            except ValueError:
+                dead_ttl_days = 14.0
+        self.dead_ttl_days = max(0.0, float(dead_ttl_days))
         self.keep_sent_rows = max(20, int(keep_sent_rows))
         self.wal_journal_size_limit = max(65536, int(wal_journal_size_limit))
         self.wal_checkpoint_interval = max(1.0, float(wal_checkpoint_interval))
@@ -176,6 +192,7 @@ class AnimaOutbox:
         self._last_error: str = ""
         self._prune_counter: int = 0
         self._last_wal_checkpoint_ts: float | None = None
+        self._last_cleanup_ts: float | None = None
 
     def _ensure_db(self) -> sqlite3.Connection:
         with self._lock:
@@ -270,15 +287,29 @@ class AnimaOutbox:
                         )
                         continue
                     new_hash = _payload_hash(merged)
-                    if existing["payload_hash"] == new_hash and existing["status"] in ("sent", "pending"):
+                    if existing["payload_hash"] == new_hash and existing["status"] in (
+                        "sent",
+                        "pending",
+                        "dead",
+                        "corrupt",
+                    ):
                         continue
-                    db.execute(
-                        "UPDATE outbox_turns "
-                        "SET character_id=?, payload_json=?, payload_hash=?, status='pending', "
-                        "next_retry_at=0, updated_at=? "
-                        "WHERE request_id=?",
-                        (cid, json.dumps(merged, ensure_ascii=False), new_hash, now, req_id),
-                    )
+                    if existing["status"] == "pending":
+                        db.execute(
+                            "UPDATE outbox_turns "
+                            "SET character_id=?, payload_json=?, payload_hash=?, status='pending', "
+                            "next_retry_at=0, updated_at=? "
+                            "WHERE request_id=?",
+                            (cid, json.dumps(merged, ensure_ascii=False), new_hash, now, req_id),
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE outbox_turns "
+                            "SET character_id=?, payload_json=?, payload_hash=?, status='pending', "
+                            "attempts=0, next_retry_at=0, last_error='', updated_at=? "
+                            "WHERE request_id=?",
+                            (cid, json.dumps(merged, ensure_ascii=False), new_hash, now, req_id),
+                        )
                     queued += 1
                 else:
                     h = _payload_hash(item)
@@ -298,21 +329,79 @@ class AnimaOutbox:
             self._wake.set()
         return queued
 
-    def _schedule_backoff(self, rows: list[sqlite3.Row], err_msg: str) -> None:
+    def _mark_dead(self, rows: list[sqlite3.Row], err_msg: str) -> int:
+        if not rows:
+            return 0
         now = time.time()
         sanitized = _sanitize_err(err_msg)
         self._last_error = sanitized
+        marked = 0
         with self._lock:
             db = self._ensure_db()
             for r in rows:
                 attempts = int(r["attempts"] or 0) + 1
-                delay = min(self.max_backoff, self.base_backoff * (2 ** min(attempts - 1, 8)))
-                db.execute(
-                    "UPDATE outbox_turns SET attempts=?, next_retry_at=?, last_error=?, updated_at=? "
+                cur = db.execute(
+                    "UPDATE outbox_turns "
+                    "SET status='dead', attempts=?, next_retry_at=0, last_error=?, updated_at=? "
                     "WHERE request_id=? AND status='pending'",
-                    (attempts, now + delay, sanitized, now, r["request_id"]),
+                    (attempts, sanitized, now, r["request_id"]),
                 )
+                marked += max(0, cur.rowcount or 0)
             db.commit()
+        return marked
+
+    def _schedule_backoff(self, rows: list[sqlite3.Row], err_msg: str) -> int:
+        now = time.time()
+        sanitized = _sanitize_err(err_msg)
+        self._last_error = sanitized
+        dead_count = 0
+        with self._lock:
+            db = self._ensure_db()
+            for r in rows:
+                attempts = int(r["attempts"] or 0) + 1
+                if attempts > self.max_retries:
+                    cur = db.execute(
+                        "UPDATE outbox_turns "
+                        "SET status='dead', attempts=?, next_retry_at=0, last_error=?, updated_at=? "
+                        "WHERE request_id=? AND status='pending'",
+                        (attempts, sanitized, now, r["request_id"]),
+                    )
+                    dead_count += max(0, cur.rowcount or 0)
+                else:
+                    delay = min(self.max_backoff, self.base_backoff * (2 ** min(attempts - 1, 8)))
+                    db.execute(
+                        "UPDATE outbox_turns SET attempts=?, next_retry_at=?, last_error=?, updated_at=? "
+                        "WHERE request_id=? AND status='pending'",
+                        (attempts, now + delay, sanitized, now, r["request_id"]),
+                    )
+            db.commit()
+        if dead_count > 0:
+            logger.bind(tag=TAG).warning(
+                f"Anima 本地发件箱 {dead_count} 轮重试超过上限 ({self.max_retries})，已转入 dead 死信队列: {sanitized}"
+            )
+        return dead_count
+
+    def cleanup_expired_rows(
+        self,
+        *,
+        ttl_days: float | None = None,
+        now: float | None = None,
+    ) -> int:
+        """Delete aged 'dead' and 'corrupt' rows past TTL (default 14 days, B-5)."""
+        days = self.dead_ttl_days if ttl_days is None else max(0.0, float(ttl_days))
+        ts = time.time() if now is None else float(now)
+        cutoff = ts - (days * 86400.0)
+        with self._lock:
+            db = self._ensure_db()
+            cur = db.execute(
+                "DELETE FROM outbox_turns "
+                "WHERE status IN ('dead', 'corrupt') "
+                "AND coalesce(updated_at, created_at) < ?",
+                (cutoff,),
+            )
+            db.commit()
+            self._last_cleanup_ts = time.monotonic()
+            return max(0, cur.rowcount or 0)
 
     def _mark_sent(self, req_ids: list[str], snapshot_hashes: dict[str, str]) -> int:
         if not req_ids:
@@ -339,6 +428,14 @@ class AnimaOutbox:
                     ")",
                     (self.keep_sent_rows,),
                 )
+                cutoff = now - (self.dead_ttl_days * 86400.0)
+                db.execute(
+                    "DELETE FROM outbox_turns "
+                    "WHERE status IN ('dead', 'corrupt') "
+                    "AND coalesce(updated_at, created_at) < ?",
+                    (cutoff,),
+                )
+                self._last_cleanup_ts = time.monotonic()
             db.commit()
         return marked
 
@@ -378,7 +475,7 @@ class AnimaOutbox:
                 ).fetchall()
 
         if not rows:
-            return {"sent": 0, "failed": 0, "remaining": self.pending_count()}
+            return {"sent": 0, "failed": 0, "dead": 0, "remaining": self.pending_count()}
 
         # Group due rows by character_id while preserving order
         by_char: dict[str, list[sqlite3.Row]] = {}
@@ -387,12 +484,13 @@ class AnimaOutbox:
 
         token = (self._token_getter() or "").strip()
         if not token:
-            self._schedule_backoff(rows, "missing_anima_token")
-            return {"sent": 0, "failed": len(rows), "remaining": self.pending_count()}
+            dead_n = self._schedule_backoff(rows, "missing_anima_token")
+            return {"sent": 0, "failed": len(rows), "dead": dead_n, "remaining": self.pending_count()}
 
         url = self._service_url_getter().rstrip("/") + "/xiaozhi/ingest"
         total_sent = 0
         total_failed = 0
+        total_dead = 0
 
         for cid, group_rows in by_char.items():
             turns_batch = []
@@ -465,25 +563,38 @@ class AnimaOutbox:
                         )
                     if fail_rows:
                         total_failed += len(fail_rows)
-                        self._schedule_backoff(fail_rows, "ingest_partial_or_queue_full")
+                        total_dead += self._schedule_backoff(fail_rows, "ingest_partial_or_queue_full")
                         logger.bind(tag=TAG).warning(
                             f"Anima Brain ingest 队列繁忙，{len(fail_rows)} 轮已保留在本地发件箱稍后重试"
                         )
+                elif 400 <= resp.status_code < 500:
+                    total_failed += len(valid_rows)
+                    err = f"HTTP {resp.status_code}: {resp.text[:160]}"
+                    dead_n = self._mark_dead(valid_rows, err)
+                    total_dead += dead_n
+                    logger.bind(tag=TAG).warning(
+                        f"Anima Brain ingest 返回 HTTP {resp.status_code} (4xx)，{dead_n} 轮已转入 dead 死信队列停止重试"
+                    )
                 else:
                     total_failed += len(valid_rows)
                     err = f"HTTP {resp.status_code}: {resp.text[:160]}"
-                    self._schedule_backoff(valid_rows, err)
+                    total_dead += self._schedule_backoff(valid_rows, err)
                     logger.bind(tag=TAG).warning(
                         f"Anima Brain ingest 返回 HTTP {resp.status_code}，已保留在本地发件箱指数退避重试"
                     )
             except Exception as e:
                 total_failed += len(valid_rows)
-                self._schedule_backoff(valid_rows, str(e))
+                total_dead += self._schedule_backoff(valid_rows, str(e))
                 logger.bind(tag=TAG).warning(
                     f"连接 Anima Brain ingest 失败，已保留在本地发件箱等待重试: {e}"
                 )
 
-        return {"sent": total_sent, "failed": total_failed, "remaining": self.pending_count()}
+        return {
+            "sent": total_sent,
+            "failed": total_failed,
+            "dead": total_dead,
+            "remaining": self.pending_count(),
+        }
 
     def pending_count(self) -> int:
         with self._lock:
@@ -526,6 +637,11 @@ class AnimaOutbox:
                 if res["remaining"] == 0:
                     now_mono = time.monotonic()
                     if (
+                        self._last_cleanup_ts is None
+                        or (now_mono - self._last_cleanup_ts) >= 3600.0
+                    ):
+                        self.cleanup_expired_rows()
+                    if (
                         self._last_wal_checkpoint_ts is None
                         or (now_mono - self._last_wal_checkpoint_ts) >= self.wal_checkpoint_interval
                     ):
@@ -541,12 +657,14 @@ class AnimaOutbox:
         deadline = time.monotonic() + max(0.2, float(timeout))
         sent_total = 0
         failed_total = 0
+        dead_total = 0
         while time.monotonic() < deadline:
             if self.pending_count() == 0:
                 break
             res = self.drain_once(batch_size=16, force_due=True)
             sent_total += res["sent"]
             failed_total += res["failed"]
+            dead_total += res.get("dead", 0)
             if res["remaining"] == 0 or res["failed"] > 0:
                 # If server is unreachable right now, stop spinning so restart isn't stalled;
                 # rows stay durably persisted in SQLite for automatic delivery after restart.
@@ -554,25 +672,85 @@ class AnimaOutbox:
         return {
             "sent": sent_total,
             "failed": failed_total,
+            "dead": dead_total,
             "remaining": self.pending_count(),
         }
 
     def stats(self) -> dict[str, Any]:
+        counts = {"pending": 0, "dead": 0, "corrupt": 0, "sent": 0}
         with self._lock:
             db = self._ensure_db()
-            pending = int(
-                db.execute("SELECT count(*) FROM outbox_turns WHERE status='pending'").fetchone()[0]
-            )
-            sent = int(
-                db.execute("SELECT count(*) FROM outbox_turns WHERE status='sent'").fetchone()[0]
-            )
+            for r in db.execute("SELECT status, count(*) AS cnt FROM outbox_turns GROUP BY status").fetchall():
+                st = str(r["status"] or "")
+                if st in counts:
+                    counts[st] = int(r["cnt"] or 0)
             return {
                 "db_path": self.db_path,
-                "pending": pending,
-                "sent": sent,
+                "pending": counts["pending"],
+                "dead": counts["dead"],
+                "corrupt": counts["corrupt"],
+                "sent": counts["sent"],
+                "max_retries": self.max_retries,
+                "dead_ttl_days": self.dead_ttl_days,
                 "last_error": self._last_error,
                 "worker_alive": bool(self._worker and self._worker.is_alive()),
             }
+
+    def replay_dead_turns(
+        self,
+        *,
+        limit: int | None = None,
+        request_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Move dead-lettered outbox turns back to 'pending' with reset attempts and wake worker (B-5)."""
+        now = time.time()
+        replayed = 0
+        with self._lock:
+            db = self._ensure_db()
+            if request_ids is not None:
+                clean_ids = [str(rid).strip() for rid in request_ids if str(rid or "").strip()]
+                if clean_ids:
+                    placeholders = ",".join("?" for _ in clean_ids)
+                    cur = db.execute(
+                        f"UPDATE outbox_turns "
+                        f"SET status='pending', attempts=0, next_retry_at=0, last_error='', updated_at=? "
+                        f"WHERE status='dead' AND request_id IN ({placeholders})",
+                        (now, *clean_ids),
+                    )
+                    replayed = max(0, cur.rowcount or 0)
+            elif limit is not None:
+                lim = max(0, int(limit))
+                if lim > 0:
+                    cur = db.execute(
+                        "UPDATE outbox_turns "
+                        "SET status='pending', attempts=0, next_retry_at=0, last_error='', updated_at=? "
+                        "WHERE request_id IN ("
+                        "  SELECT request_id FROM outbox_turns WHERE status='dead' "
+                        "  ORDER BY created_at ASC LIMIT ?"
+                        ")",
+                        (now, lim),
+                    )
+                    replayed = max(0, cur.rowcount or 0)
+            else:
+                cur = db.execute(
+                    "UPDATE outbox_turns "
+                    "SET status='pending', attempts=0, next_retry_at=0, last_error='', updated_at=? "
+                    "WHERE status='dead'",
+                    (now,),
+                )
+                replayed = max(0, cur.rowcount or 0)
+            db.commit()
+
+        if replayed > 0:
+            if self._auto_start:
+                self.start()
+            self._wake.set()
+            logger.bind(tag=TAG).info(f"Anima 本地发件箱已重放 {replayed} 条 dead 死信记录")
+        return {
+            "ok": True,
+            "replayed": replayed,
+            "stats": self.stats(),
+        }
 
 
 _outbox_lock = threading.Lock()
@@ -626,14 +804,44 @@ def flush_outbox(timeout: float = 4.0) -> dict[str, Any]:
         return outbox.flush(timeout=timeout)
     except Exception as exc:
         logger.bind(tag=TAG).warning(f"刷新 Anima 本地发件箱失败: {exc}")
-        return {"sent": 0, "failed": 0, "remaining": -1}
+        return {"sent": 0, "failed": 0, "dead": 0, "remaining": -1}
 
 
 def get_outbox_stats() -> dict[str, Any]:
     try:
         return get_default_outbox(auto_start=False).stats()
     except Exception:
-        return {"pending": 0, "sent": 0, "last_error": "", "worker_alive": False}
+        return {
+            "db_path": str(_GLOBAL_CONFIG.get("outbox_db") or ""),
+            "pending": 0,
+            "dead": 0,
+            "corrupt": 0,
+            "sent": 0,
+            "max_retries": 8,
+            "dead_ttl_days": 14.0,
+            "last_error": "",
+            "worker_alive": False,
+        }
+
+
+def replay_dead_outbox_turns(
+    *,
+    limit: int | None = None,
+    request_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Module-level helper for 18080 console to replay dead-lettered Anima outbox turns (B-5)."""
+    try:
+        outbox = get_default_outbox(auto_start=True)
+        return outbox.replay_dead_turns(limit=limit, request_ids=request_ids)
+    except Exception as exc:
+        err = _sanitize_err(exc)
+        logger.bind(tag=TAG).warning(f"重放 Anima 本地发件箱 dead 记录失败: {err}")
+        return {
+            "ok": False,
+            "replayed": 0,
+            "error": err,
+            "stats": get_outbox_stats(),
+        }
 
 
 def _has_real_tool_calls(msg: Any) -> bool:
@@ -732,14 +940,29 @@ class MemoryProvider(MemoryProviderBase):
         if cfg.get("outbox_db"):
             _GLOBAL_CONFIG["outbox_db"] = str(cfg["outbox_db"])
 
-        # P1-9: Hard per-phase HTTP timeout + outer asyncio.wait_for total budget + circuit breaker + SWR cache
+        # P1-9 + C-6: Per-phase HTTP timeout + outer asyncio.wait_for budget + circuit breaker +
+        # per-device recall cache with short-budget (300ms) synchronous attempt on cache hit.
         http_timeout = max(0.2, float(cfg.get("recall_http_timeout", 0.8)))
         connect_timeout = max(0.05, min(http_timeout, float(cfg.get("recall_connect_timeout", 0.2))))
         self._http_timeout = httpx.Timeout(http_timeout, connect=connect_timeout)
         self._recall_budget_seconds = max(0.05, float(cfg.get("recall_budget_seconds", 0.6)))
         self._bg_budget_seconds = max(self._recall_budget_seconds, float(cfg.get("recall_bg_budget_seconds", 0.8)))
-        self._stale_while_revalidate = bool(cfg.get("stale_while_revalidate", True))
+
+        has_explicit_swr = "stale_while_revalidate" in cfg
+        has_explicit_warm_budget = "recall_warm_budget_seconds" in cfg
+        self._stale_while_revalidate = bool(cfg.get("stale_while_revalidate", False))
+        if has_explicit_warm_budget:
+            self._warm_recall_budget_seconds = max(0.0, float(cfg["recall_warm_budget_seconds"]))
+        elif has_explicit_swr and self._stale_while_revalidate:
+            # Explicit legacy SWR=True without warm budget preserves zero-wait SWR compatibility
+            self._warm_recall_budget_seconds = 0.0
+        else:
+            # C-6 default: attempt synchronous recall within 300ms even when cache hits,
+            # falling back to the cached value on timeout (avoids "always 1 turn late")
+            self._warm_recall_budget_seconds = min(self._recall_budget_seconds, 0.3)
+
         self._cache_ttl_seconds = max(1.0, float(cfg.get("recall_cache_ttl_seconds", 600.0)))
+        self._max_cached_devices = max(8, int(cfg.get("recall_max_cached_devices", 64)))
 
         # Circuit breaker parameters
         self._cb_failure_threshold = max(1, int(cfg.get("recall_cb_threshold", 3)))
@@ -747,14 +970,16 @@ class MemoryProvider(MemoryProviderBase):
         self._cb_consecutive_failures = 0
         self._cb_open_until = 0.0
 
-        # Stale-while-revalidate state (previous turn recall returns immediately with 0ms blocking)
-        self._cached_context: str | None = None
-        self._cache_ts: float = 0.0
-        self._bg_refresh_task: asyncio.Task | None = None
-        self._pending_refresh_query: str | None = None
+        # C-6: Per-device isolated recall cache & background refresh tasks (keyed by normalized device_id)
+        self._recall_cache: dict[str, tuple[str, float]] = {}
+        self._recall_gen: dict[str, int] = {}
+        self._bg_refresh_tasks: dict[str, asyncio.Task] = {}
+        self._pending_refresh_queries: dict[str, tuple[str, int] | None] = {}
 
         self._recall_stats: dict[str, Any] = {
             "sync_calls": 0,
+            "warm_sync_hits": 0,
+            "warm_fallback_hits": 0,
             "cache_hits": 0,
             "bg_refreshes": 0,
             "timeouts": 0,
@@ -772,9 +997,24 @@ class MemoryProvider(MemoryProviderBase):
             logger.bind(tag=TAG).warning(f"初始化 Anima 本地发件箱失败: {exc}")
         logger.bind(tag=TAG).info(
             f"Anima Brain 记忆引擎桥接已就绪 -> {_GLOBAL_CONFIG['service_url']} "
-            f"(角色: {_GLOBAL_CONFIG['character_id']}, 预算: {self._recall_budget_seconds:.2f}s, "
+            f"(角色: {_GLOBAL_CONFIG['character_id']}, 冷预算: {self._recall_budget_seconds:.2f}s, "
+            f"温预算: {self._warm_recall_budget_seconds:.2f}s, "
             f"SWR={'on' if self._stale_while_revalidate else 'off'})"
         )
+
+    def _resolve_device_key(self, device_id: str | None = None) -> str:
+        raw = device_id if device_id is not None else getattr(self, "role_id", None)
+        cleaned = str(raw or "").strip().lower()[:64]
+        return cleaned or "__default__"
+
+    @property
+    def _cached_context(self) -> str | None:
+        entry = self._recall_cache.get(self._resolve_device_key())
+        return entry[0] if entry is not None else None
+
+    @property
+    def _bg_refresh_task(self) -> asyncio.Task | None:
+        return self._bg_refresh_tasks.get(self._resolve_device_key())
 
     def _get_async_client(self):
         cur_loop = asyncio.get_running_loop()
@@ -791,12 +1031,23 @@ class MemoryProvider(MemoryProviderBase):
     def _is_circuit_open(self) -> bool:
         return self._cb_open_until > 0.0 and time.monotonic() < self._cb_open_until
 
-    def _record_recall_success(self, ctx: str, elapsed_ms: float) -> None:
+    def _record_recall_success(
+        self,
+        dev_key: str,
+        ctx: str,
+        elapsed_ms: float,
+        *,
+        gen: int | None = None,
+    ) -> None:
         self._cb_consecutive_failures = 0
         self._cb_open_until = 0.0
-        self._cached_context = ctx
-        self._cache_ts = time.monotonic()
         self._recall_stats["last_latency_ms"] = round(elapsed_ms, 2)
+        if gen is None or gen >= self._recall_gen.get(dev_key, 0):
+            self._recall_cache[dev_key] = (ctx, time.monotonic())
+            if len(self._recall_cache) > self._max_cached_devices:
+                oldest_dev = min(self._recall_cache.items(), key=lambda kv: kv[1][1])[0]
+                if oldest_dev != dev_key:
+                    self._recall_cache.pop(oldest_dev, None)
 
     def _record_recall_failure(self, *, is_timeout: bool = False) -> None:
         if is_timeout:
@@ -810,17 +1061,34 @@ class MemoryProvider(MemoryProviderBase):
                 f"Anima Brain recall 连续失败 {self._cb_consecutive_failures} 次，熔断开启 {self._cb_cooldown_seconds:.0f}s"
             )
 
-    def get_recall_stats(self) -> dict[str, Any]:
+    def get_recall_stats(self, device_id: str | None = None) -> dict[str, Any]:
+        dev_key = self._resolve_device_key(device_id)
         return {
             **self._recall_stats,
             "circuit_open": self._is_circuit_open(),
             "consecutive_failures": self._cb_consecutive_failures,
-            "cache_warm": self._cached_context is not None,
+            "cache_warm": dev_key in self._recall_cache,
+            "cached_devices": len(self._recall_cache),
             "budget_seconds": self._recall_budget_seconds,
+            "warm_budget_seconds": self._warm_recall_budget_seconds,
             "stale_while_revalidate": self._stale_while_revalidate,
         }
 
-    async def _fetch_recall_once(self, query: str, token: str) -> str:
+    def _set_device_anima_mood(self, mood_str: str, dev_key: str) -> None:
+        eff_dev = None if dev_key == "__default__" else dev_key
+        try:
+            mei_emotion_router.set_anima_mood(mood_str, device_id=eff_dev)
+        except TypeError:
+            mei_emotion_router.set_anima_mood(mood_str)
+
+    async def _fetch_recall_once(
+        self,
+        query: str,
+        token: str,
+        dev_key: str,
+        *,
+        gen: int | None = None,
+    ) -> str:
         url = _GLOBAL_CONFIG["service_url"] + "/xiaozhi/recall"
         client = self._get_async_client()
         t0 = time.monotonic()
@@ -837,7 +1105,7 @@ class MemoryProvider(MemoryProviderBase):
             raise RuntimeError(f"HTTP {resp.status_code}")
         data = resp.json()
         mood_str = str(data.get("mood") or "")
-        mei_emotion_router.set_anima_mood(mood_str)
+        self._set_device_anima_mood(mood_str, dev_key)
         ctx = (data.get("context_text") or "").strip()
         # 剥离重复的【角色身份设定】段落，以小智主配置 prompt 为唯一人设权威，避免双倍 Token 与人设冲突
         ctx = re.sub(
@@ -846,31 +1114,31 @@ class MemoryProvider(MemoryProviderBase):
             ctx,
             flags=re.DOTALL,
         ).strip()
-        self._record_recall_success(ctx, elapsed_ms)
+        self._record_recall_success(dev_key, ctx, elapsed_ms, gen=gen)
         logger.bind(tag=TAG).info(
             f"Anima Brain 极速召回成功 ({elapsed_ms:.0f}ms): 事实={data.get('facts_count', 0)}, "
             f"待跟进={data.get('open_loops_count', 0)}, 状态={data.get('mood', '')}"
         )
         return ctx
 
-    async def _bg_refresh_loop(self, initial_query: str) -> None:
-        next_query: str | None = initial_query
+    async def _bg_refresh_loop(self, dev_key: str, initial_query: str, initial_gen: int) -> None:
+        next_item: tuple[str, int] | None = (initial_query, initial_gen)
         try:
-            while next_query is not None:
-                q = next_query
-                next_query = None
+            while next_item is not None:
+                q, req_gen = next_item
+                next_item = None
                 if self._is_circuit_open():
-                    self._pending_refresh_query = None
+                    self._pending_refresh_queries.pop(dev_key, None)
                     self._recall_stats["cb_short_circuits"] += 1
                     return
                 token = _read_token()
                 if not token:
-                    self._pending_refresh_query = None
+                    self._pending_refresh_queries.pop(dev_key, None)
                     return
                 self._recall_stats["bg_refreshes"] += 1
                 try:
                     await asyncio.wait_for(
-                        self._fetch_recall_once(q, token),
+                        self._fetch_recall_once(q, token, dev_key, gen=req_gen),
                         timeout=self._bg_budget_seconds,
                     )
                 except asyncio.TimeoutError:
@@ -884,24 +1152,26 @@ class MemoryProvider(MemoryProviderBase):
                     self._record_recall_failure(is_timeout=False)
                     logger.bind(tag=TAG).warning(f"Anima Brain 后台召回刷新失败: {e}")
 
-                if self._pending_refresh_query is not None:
-                    next_query = self._pending_refresh_query
-                    self._pending_refresh_query = None
+                queued_next = self._pending_refresh_queries.pop(dev_key, None)
+                if queued_next is not None:
+                    next_item = queued_next
         finally:
             cur_task = asyncio.current_task()
-            if self._bg_refresh_task is cur_task:
-                self._bg_refresh_task = None
+            if self._bg_refresh_tasks.get(dev_key) is cur_task:
+                self._bg_refresh_tasks.pop(dev_key, None)
 
-    def _schedule_bg_refresh(self, query: str) -> None:
+    def _schedule_bg_refresh(self, query: str, dev_key: str, *, gen: int | None = None) -> None:
         if self._is_circuit_open():
             self._recall_stats["cb_short_circuits"] += 1
             return
-        if self._bg_refresh_task is not None and not self._bg_refresh_task.done():
-            self._pending_refresh_query = query
+        req_gen = self._recall_gen.get(dev_key, 0) if gen is None else gen
+        existing = self._bg_refresh_tasks.get(dev_key)
+        if existing is not None and not existing.done():
+            self._pending_refresh_queries[dev_key] = (query, req_gen)
             return
         try:
-            task = asyncio.create_task(self._bg_refresh_loop(query))
-            self._bg_refresh_task = task
+            task = asyncio.create_task(self._bg_refresh_loop(dev_key, query, req_gen))
+            self._bg_refresh_tasks[dev_key] = task
 
             def _consume_exc(t: asyncio.Task) -> None:
                 try:
@@ -913,31 +1183,75 @@ class MemoryProvider(MemoryProviderBase):
         except RuntimeError:
             pass
 
-    async def query_memory(self, query: str) -> str:
+    async def query_memory(self, query: str, *, device_id: str | None = None) -> str:
         token = _read_token()
         if not token:
             return ""
 
         now = time.monotonic()
-        # Stale-while-revalidate: serve previous turn's recall immediately (0ms blocking) and refresh in background
+        dev_key = self._resolve_device_key(device_id)
+        cache_entry = self._recall_cache.get(dev_key)
+        has_valid_cache = (
+            cache_entry is not None and (now - cache_entry[1]) <= self._cache_ttl_seconds
+        )
+        cached_ctx = cache_entry[0] if has_valid_cache else None
+
+        # Legacy explicit zero-wait SWR mode (only when stale_while_revalidate=True and warm_budget == 0)
         if (
             self._stale_while_revalidate
-            and self._cached_context is not None
-            and (now - self._cache_ts) <= self._cache_ttl_seconds
+            and self._warm_recall_budget_seconds <= 0.0
+            and cached_ctx is not None
         ):
             self._recall_stats["cache_hits"] += 1
-            self._schedule_bg_refresh(query or "")
-            return self._cached_context
+            gen = self._recall_gen.get(dev_key, 0) + 1
+            self._recall_gen[dev_key] = gen
+            self._schedule_bg_refresh(query or "", dev_key, gen=gen)
+            return cached_ctx
 
-        # Circuit breaker open: degrade immediately without waiting on network
+        # Circuit breaker open: degrade immediately to this device's cached context (never cross-device)
         if self._is_circuit_open():
             self._recall_stats["cb_short_circuits"] += 1
-            return self._cached_context or ""
+            if cached_ctx is not None:
+                self._recall_stats["cache_hits"] += 1
+            return cached_ctx or ""
 
+        gen = self._recall_gen.get(dev_key, 0) + 1
+        self._recall_gen[dev_key] = gen
+
+        # C-6: Even when cache hits, attempt a short-budget synchronous recall (default 300ms)
+        # and fall back to this device's cached value on timeout/error, avoiding "always 1 turn late".
+        if cached_ctx is not None:
+            warm_budget = min(self._recall_budget_seconds, self._warm_recall_budget_seconds)
+            self._recall_stats["sync_calls"] += 1
+            try:
+                fresh = await asyncio.wait_for(
+                    self._fetch_recall_once(query or "", token, dev_key, gen=gen),
+                    timeout=warm_budget,
+                )
+                self._recall_stats["warm_sync_hits"] += 1
+                return fresh
+            except asyncio.TimeoutError:
+                self._record_recall_failure(is_timeout=True)
+                self._recall_stats["cache_hits"] += 1
+                self._recall_stats["warm_fallback_hits"] += 1
+                logger.bind(tag=TAG).warning(
+                    f"Anima Brain 温缓存短预算召回超时 (>{warm_budget:.2f}s)，回退缓存并后台刷新"
+                )
+                if not self._is_circuit_open():
+                    self._schedule_bg_refresh(query or "", dev_key, gen=gen)
+                return cached_ctx
+            except Exception as e:
+                self._record_recall_failure(is_timeout=False)
+                self._recall_stats["cache_hits"] += 1
+                self._recall_stats["warm_fallback_hits"] += 1
+                logger.bind(tag=TAG).warning(f"Anima Brain 温缓存召回异常，回退缓存: {e}")
+                return cached_ctx
+
+        # Cold cache miss for this device: wait up to full recall budget
         self._recall_stats["sync_calls"] += 1
         try:
             return await asyncio.wait_for(
-                self._fetch_recall_once(query or "", token),
+                self._fetch_recall_once(query or "", token, dev_key, gen=gen),
                 timeout=self._recall_budget_seconds,
             )
         except asyncio.TimeoutError:
@@ -948,7 +1262,7 @@ class MemoryProvider(MemoryProviderBase):
         except Exception as e:
             self._record_recall_failure(is_timeout=False)
             logger.bind(tag=TAG).warning(f"Anima Brain recall 超时或暂不可用，降级直接回复: {e}")
-        return self._cached_context or ""
+        return ""
 
     async def save_memory(self, msgs, session_id=None):
         dev_id = str(getattr(self, "role_id", "") or "")

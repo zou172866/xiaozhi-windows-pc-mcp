@@ -30,7 +30,7 @@ from starlette.responses import JSONResponse
 
 from companion_engine import BrainConfig, CompanionBrain, Settings
 from companion_engine import emotion
-from companion_engine.automation import MemoryAutomation
+from companion_engine.automation import MemoryAutomation, _sanitize_error_for_log
 from companion_engine.http_server import create_app
 from companion_engine.knowledge import eligible
 from companion_engine.models import (
@@ -95,13 +95,17 @@ SHUTDOWN_DRAIN_SECONDS = _env_float("ANIMA_SHUTDOWN_DRAIN_SECONDS", 15.0, 1.0)
 DEFAULT_TIMEOUT_SECONDS = _env_float("COMPANION_TIMEOUT_SECONDS", 150.0, 10.0, 600.0)
 TERMINAL_REVIEW_ERROR = "auto_retry_exhausted"
 
-# Ingest queue / retry hardening (P0-7)
+# Ingest queue / persistent inbox hardening (P0-7, B-1)
 INGEST_QUEUE_MAXSIZE = _env_int("ANIMA_INGEST_QUEUE_MAXSIZE", 256, 1)
 INGEST_PENDING_INLINE_WAIT_SECONDS = _env_float("ANIMA_PENDING_INLINE_WAIT_SECONDS", 5.0, 0.0, 30.0)
 INGEST_PENDING_MAX_RETRIES = _env_int("ANIMA_INGEST_PENDING_MAX_RETRIES", 12, 1, 100)
 INGEST_PENDING_BACKOFF_BASE = _env_float("ANIMA_INGEST_PENDING_BACKOFF_BASE", 1.5, 0.02, 60.0)
 INGEST_OVERFLOW_MAX_TASKS = _env_int("ANIMA_INGEST_OVERFLOW_MAX_TASKS", 128, 0, 1024)
 INGEST_ENQUEUE_WAIT_SECONDS = _env_float("ANIMA_INGEST_ENQUEUE_WAIT_SECONDS", 0.25, 0.01, 10.0)
+INBOX_PROCESSING_TIMEOUT_SECONDS = _env_float("ANIMA_INBOX_PROCESSING_TIMEOUT_SECONDS", 300.0, 5.0, 3600.0)
+INBOX_POLL_IDLE_SECONDS = _env_float("ANIMA_INBOX_POLL_IDLE_SECONDS", 2.0, 0.05, 30.0)
+INBOX_DONE_KEEP_ROWS = _env_int("ANIMA_INBOX_DONE_KEEP_ROWS", 500, 20, 50000)
+INBOX_DONE_TTL_DAYS = _env_int("ANIMA_INBOX_DONE_TTL_DAYS", 14, 1, 365)
 
 # Obsidian one-way export settings
 OBSIDIAN_SYNC_ENABLED = _env_bool("OBSIDIAN_SYNC_ENABLED", False)
@@ -833,6 +837,20 @@ def prune_database_bloat(
                 )
                 stats["jobs_deleted"] = max(0, cur.rowcount or 0)
 
+                # 5. Trim aged completed xiaozhi_inbox rows (never touches pending/processing/dead)
+                inbox_exists = engine.db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='xiaozhi_inbox'"
+                ).fetchone()
+                if inbox_exists:
+                    engine.db.execute(
+                        "DELETE FROM xiaozhi_inbox WHERE request_id IN ("
+                        "  SELECT request_id FROM xiaozhi_inbox "
+                        "  WHERE status='done' AND updated_at < ? "
+                        "  ORDER BY updated_at DESC LIMIT -1 OFFSET ?"
+                        ")",
+                        (now - INBOX_DONE_TTL_DAYS * 86400, INBOX_DONE_KEEP_ROWS),
+                    )
+
             if allow_vacuum and not engine.db.in_transaction:
                 freelist = engine.db.execute("PRAGMA freelist_count").fetchone()[0]
                 page_size = engine.db.execute("PRAGMA page_size").fetchone()[0]
@@ -1362,6 +1380,480 @@ def ensure_xiaozhi_turn_meta_table(engine) -> None:
             )
 
 
+def _sanitize_inbox_error(err: Any, limit: int = 240) -> str:
+    try:
+        cleaned = _sanitize_error_for_log(err if isinstance(err, BaseException) else RuntimeError(str(err or "")))
+    except Exception:
+        cleaned = str(err or "")
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:limit]
+
+
+def ensure_xiaozhi_inbox_table(engine) -> None:
+    """Create durable xiaozhi_inbox table in brain.sqlite3 for crash-safe ingest (B-1)."""
+    with engine._lock:
+        with engine._transaction():
+            engine.db.execute(
+                "CREATE TABLE IF NOT EXISTS xiaozhi_inbox ("
+                "request_id TEXT PRIMARY KEY, "
+                "character_id TEXT NOT NULL, "
+                "payload TEXT NOT NULL, "
+                "status TEXT NOT NULL DEFAULT 'pending', "
+                "attempts INTEGER NOT NULL DEFAULT 0, "
+                "last_error TEXT NOT NULL DEFAULT '', "
+                "created_at REAL NOT NULL, "
+                "updated_at REAL NOT NULL"
+                ")"
+            )
+            engine.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_xiaozhi_inbox_status "
+                "ON xiaozhi_inbox(status, updated_at, created_at)"
+            )
+
+
+def _merge_inbox_payload(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> tuple[dict[str, Any], bool, bool]:
+    """Merge duplicate request_id updates in xiaozhi_inbox with strict B-4 conflict protection.
+
+    Returns (merged_payload, changed, conflict).
+    """
+    old_user = str(existing.get("user_message") or "").strip()
+    new_user = str(incoming.get("user_message") or "").strip()
+    old_reply = str(existing.get("assistant_reply") or "").strip()
+    new_reply = str(incoming.get("assistant_reply") or "").strip()
+
+    if old_user and new_user and new_user != old_user:
+        return dict(existing), False, True
+
+    if old_reply and new_reply and new_reply != old_reply:
+        is_continuation = len(new_reply) > len(old_reply) and new_reply.startswith(old_reply)
+        is_shorter_prefix = old_reply.startswith(new_reply)
+        if not is_continuation and not is_shorter_prefix:
+            return dict(existing), False, True
+
+    old_meta = dict(existing.get("turn_meta") or {}) if isinstance(existing.get("turn_meta"), dict) else {}
+    new_meta = dict(incoming.get("turn_meta") or {}) if isinstance(incoming.get("turn_meta"), dict) else {}
+    merged_meta = dict(old_meta)
+
+    valid_occ = [
+        float(v)
+        for v in (old_meta.get("occurred_at"), new_meta.get("occurred_at"))
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+    ]
+    if valid_occ:
+        merged_meta["occurred_at"] = min(valid_occ)
+
+    if new_meta.get("source"):
+        merged_meta["source"] = str(new_meta["source"])
+    elif old_meta.get("source"):
+        merged_meta["source"] = str(old_meta["source"])
+
+    if new_meta.get("device_id"):
+        merged_meta["device_id"] = str(new_meta["device_id"])
+    elif old_meta.get("device_id"):
+        merged_meta["device_id"] = str(old_meta["device_id"])
+
+    if "used_tools" in old_meta or "used_tools" in new_meta:
+        merged_meta["used_tools"] = bool(old_meta.get("used_tools", False)) or bool(
+            new_meta.get("used_tools", False)
+        )
+
+    eff_reply = (
+        new_reply
+        if (len(new_reply) > len(old_reply) and (not old_reply or new_reply.startswith(old_reply)))
+        else (old_reply or new_reply)
+    )
+    merged = {
+        "request_id": str(incoming.get("request_id") or existing.get("request_id") or ""),
+        "user_message": old_user or new_user,
+        "assistant_reply": eff_reply,
+        "turn_meta": merged_meta,
+    }
+    changed = (
+        merged["user_message"] != old_user
+        or merged["assistant_reply"] != old_reply
+        or merged_meta != old_meta
+    )
+    return merged, changed, False
+
+
+def enqueue_inbox_turn(
+    brain: CompanionBrain,
+    character_id: str,
+    request_id: str,
+    user_message: str,
+    assistant_reply: str,
+    *,
+    turn_meta: dict[str, Any] | None = None,
+    max_pending: int | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Durably persist a voice turn into xiaozhi_inbox via transactional INSERT OR IGNORE + commit (B-1)."""
+    engine = brain.engine
+    ensure_xiaozhi_inbox_table(engine)
+    raw_id = (request_id or "").strip()[:110]
+    req_id = re.sub(r"[^a-zA-Z0-9_\-:.]", "_", raw_id)[:110] or _new_request_id()
+    u_msg = (user_message or "").strip()
+    a_msg = (assistant_reply or "").strip()
+    cid = (character_id or DEFAULT_CHARACTER_ID).strip() or DEFAULT_CHARACTER_ID
+    ts = float(now) if now is not None else time.time()
+    incoming_payload = {
+        "request_id": req_id,
+        "user_message": u_msg,
+        "assistant_reply": a_msg,
+        "turn_meta": dict(turn_meta or {}),
+    }
+    payload_json = json.dumps(incoming_payload, ensure_ascii=False)
+
+    with engine._lock:
+        with engine._transaction():
+            existing = engine.db.execute(
+                "SELECT character_id, payload, status, attempts FROM xiaozhi_inbox WHERE request_id=?",
+                (req_id,),
+            ).fetchone()
+            if existing is None:
+                if max_pending is not None:
+                    pending_cnt = int(
+                        engine.db.execute(
+                            "SELECT count(*) FROM xiaozhi_inbox WHERE status='pending'"
+                        ).fetchone()[0]
+                    )
+                    if pending_cnt >= max_pending:
+                        return {
+                            "accepted": False,
+                            "reason": "queue_full",
+                            "request_id": req_id,
+                        }
+                cur = engine.db.execute(
+                    "INSERT OR IGNORE INTO xiaozhi_inbox("
+                    "request_id, character_id, payload, status, attempts, last_error, created_at, updated_at"
+                    ") VALUES(?, ?, ?, 'pending', 0, '', ?, ?)",
+                    (req_id, cid, payload_json, ts, ts),
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    return {
+                        "accepted": True,
+                        "inserted": True,
+                        "updated": False,
+                        "conflict": False,
+                        "replayed": False,
+                        "request_id": req_id,
+                    }
+                existing = engine.db.execute(
+                    "SELECT character_id, payload, status, attempts FROM xiaozhi_inbox WHERE request_id=?",
+                    (req_id,),
+                ).fetchone()
+
+            if existing is None:
+                return {"accepted": False, "reason": "insert_failed", "request_id": req_id}
+
+            try:
+                prev_payload = json.loads(existing["payload"])
+                if not isinstance(prev_payload, dict):
+                    prev_payload = {}
+            except Exception:
+                prev_payload = {}
+
+            merged, changed, conflict = _merge_inbox_payload(prev_payload, incoming_payload)
+            if conflict:
+                log.warning(
+                    "Inbox request_id collision/conflict for %s; refusing to overwrite existing row",
+                    req_id,
+                )
+                return {
+                    "accepted": True,
+                    "inserted": False,
+                    "updated": False,
+                    "conflict": True,
+                    "replayed": True,
+                    "request_id": req_id,
+                }
+
+            merged_json = json.dumps(merged, ensure_ascii=False)
+            prev_status = str(existing["status"] or "")
+            if prev_status == "dead":
+                engine.db.execute(
+                    "UPDATE xiaozhi_inbox "
+                    "SET character_id=?, payload=?, status='pending', attempts=0, last_error='', updated_at=? "
+                    "WHERE request_id=?",
+                    (cid, merged_json, ts, req_id),
+                )
+                return {
+                    "accepted": True,
+                    "inserted": False,
+                    "updated": True,
+                    "conflict": False,
+                    "replayed": False,
+                    "request_id": req_id,
+                }
+
+            if changed:
+                if prev_status == "done":
+                    engine.db.execute(
+                        "UPDATE xiaozhi_inbox "
+                        "SET character_id=?, payload=?, status='pending', attempts=0, last_error='', updated_at=? "
+                        "WHERE request_id=?",
+                        (cid, merged_json, ts, req_id),
+                    )
+                else:
+                    # pending or processing: update payload in-place; worker verifies payload before marking done
+                    engine.db.execute(
+                        "UPDATE xiaozhi_inbox "
+                        "SET character_id=?, payload=?, updated_at=? "
+                        "WHERE request_id=?",
+                        (cid, merged_json, ts, req_id),
+                    )
+                return {
+                    "accepted": True,
+                    "inserted": False,
+                    "updated": True,
+                    "conflict": False,
+                    "replayed": False,
+                    "request_id": req_id,
+                }
+
+            return {
+                "accepted": True,
+                "inserted": False,
+                "updated": False,
+                "conflict": False,
+                "replayed": True,
+                "request_id": req_id,
+            }
+
+
+def get_inbox_stats(brain: CompanionBrain) -> dict[str, int]:
+    """Return row counts by status for xiaozhi_inbox."""
+    counts = {
+        "pending": 0,
+        "pending_retries": 0,
+        "processing": 0,
+        "done": 0,
+        "dead": 0,
+    }
+    engine = brain.engine
+    with engine._lock:
+        exists = engine.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='xiaozhi_inbox'"
+        ).fetchone()
+        if not exists:
+            return counts
+        rows = engine.db.execute(
+            "SELECT status, count(*) AS cnt, "
+            "SUM(CASE WHEN status='pending' AND attempts > 0 THEN 1 ELSE 0 END) AS retry_cnt "
+            "FROM xiaozhi_inbox GROUP BY status"
+        ).fetchall()
+        for r in rows:
+            st = str(r["status"] or "")
+            cnt = int(r["cnt"] or 0)
+            if st in counts:
+                counts[st] = cnt
+            if st == "pending":
+                counts["pending_retries"] = int(r["retry_cnt"] or 0)
+    return counts
+
+
+def recover_inbox_rows(
+    brain: CompanionBrain,
+    *,
+    processing_timeout_seconds: float | None = None,
+    is_startup: bool = False,
+    now: float | None = None,
+) -> dict[str, int]:
+    """Recover timed-out (or orphaned on startup) 'processing' rows back to 'pending' (B-1)."""
+    engine = brain.engine
+    ensure_xiaozhi_inbox_table(engine)
+    ts = float(now) if now is not None else time.time()
+    timeout = (
+        INBOX_PROCESSING_TIMEOUT_SECONDS
+        if processing_timeout_seconds is None
+        else max(0.1, float(processing_timeout_seconds))
+    )
+    recovered_processing = 0
+    marked_dead = 0
+
+    with engine._lock:
+        with engine._transaction():
+            if is_startup:
+                cur = engine.db.execute(
+                    "UPDATE xiaozhi_inbox "
+                    "SET status='pending', last_error='recovered_on_startup', updated_at=0.0 "
+                    "WHERE status='processing'"
+                )
+                recovered_processing = max(0, cur.rowcount or 0)
+            else:
+                cutoff = ts - timeout
+                stuck_rows = engine.db.execute(
+                    "SELECT request_id, attempts FROM xiaozhi_inbox "
+                    "WHERE status='processing' AND updated_at <= ?",
+                    (cutoff,),
+                ).fetchall()
+                for r in stuck_rows:
+                    new_attempts = int(r["attempts"] or 0) + 1
+                    if new_attempts > INGEST_PENDING_MAX_RETRIES:
+                        engine.db.execute(
+                            "UPDATE xiaozhi_inbox "
+                            "SET status='dead', attempts=?, last_error='processing_timeout_exhausted', updated_at=? "
+                            "WHERE request_id=? AND status='processing'",
+                            (new_attempts, ts, r["request_id"]),
+                        )
+                        marked_dead += 1
+                    else:
+                        engine.db.execute(
+                            "UPDATE xiaozhi_inbox "
+                            "SET status='pending', attempts=?, last_error='processing_timeout', updated_at=? "
+                            "WHERE request_id=? AND status='processing'",
+                            (new_attempts, ts, r["request_id"]),
+                        )
+                        recovered_processing += 1
+            pending_total = int(
+                engine.db.execute(
+                    "SELECT count(*) FROM xiaozhi_inbox WHERE status='pending'"
+                ).fetchone()[0]
+            )
+
+    if is_startup and (recovered_processing > 0 or pending_total > 0):
+        log.info(
+            "Recovered Anima inbox on startup: processing->pending=%d, total_pending=%d",
+            recovered_processing,
+            pending_total,
+        )
+    elif recovered_processing > 0 or marked_dead > 0:
+        log.warning(
+            "Recovered timed-out inbox processing rows: requeued=%d, dead=%d",
+            recovered_processing,
+            marked_dead,
+        )
+    return {
+        "recovered_processing": recovered_processing,
+        "marked_dead": marked_dead,
+        "pending": pending_total,
+    }
+
+
+def _inbox_retry_delay(attempts: int) -> float:
+    if attempts <= 0:
+        return 0.0
+    return min(30.0, INGEST_PENDING_BACKOFF_BASE * (2 ** min(attempts - 1, 4)))
+
+
+def _claim_next_inbox_row(
+    brain: CompanionBrain,
+    *,
+    force_due: bool = False,
+    now: float | None = None,
+) -> tuple[dict[str, Any] | None, float]:
+    """Claim the oldest due 'pending' row from xiaozhi_inbox -> 'processing'."""
+    engine = brain.engine
+    ts = float(now) if now is not None else time.time()
+    recover_inbox_rows(brain, is_startup=False, now=ts)
+
+    with engine._lock:
+        rows = engine.db.execute(
+            "SELECT request_id, character_id, payload, attempts, created_at, updated_at "
+            "FROM xiaozhi_inbox WHERE status='pending' "
+            "ORDER BY created_at ASC, rowid ASC LIMIT 64"
+        ).fetchall()
+        if not rows:
+            return None, INBOX_POLL_IDLE_SECONDS
+
+        chosen = None
+        min_due_at: float | None = None
+        for r in rows:
+            attempts = int(r["attempts"] or 0)
+            upd = float(r["updated_at"] or 0.0)
+            if force_due or attempts == 0 or upd <= 0.0:
+                due_at = 0.0
+            else:
+                due_at = upd + _inbox_retry_delay(attempts)
+            if due_at <= ts:
+                chosen = r
+                break
+            if min_due_at is None or due_at < min_due_at:
+                min_due_at = due_at
+
+        if chosen is None:
+            wait_sec = max(0.02, min(INBOX_POLL_IDLE_SECONDS, (min_due_at or ts) - ts))
+            return None, wait_sec
+
+        with engine._transaction():
+            cur = engine.db.execute(
+                "UPDATE xiaozhi_inbox SET status='processing', updated_at=? "
+                "WHERE request_id=? AND status='pending'",
+                (ts, chosen["request_id"]),
+            )
+            if not cur.rowcount:
+                return None, 0.02
+
+        return (
+            {
+                "request_id": str(chosen["request_id"]),
+                "character_id": str(chosen["character_id"] or DEFAULT_CHARACTER_ID),
+                "payload": str(chosen["payload"] or ""),
+                "attempts": int(chosen["attempts"] or 0),
+                "created_at": float(chosen["created_at"] or ts),
+                "updated_at": ts,
+            },
+            0.0,
+        )
+
+
+def _complete_inbox_row(
+    brain: CompanionBrain,
+    request_id: str,
+    claimed_payload: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Mark a 'processing' row 'done' if payload hasn't changed; else requeue for upgraded payload."""
+    engine = brain.engine
+    ts = float(now) if now is not None else time.time()
+    with engine._lock:
+        with engine._transaction():
+            cur = engine.db.execute(
+                "UPDATE xiaozhi_inbox SET status='done', last_error='', updated_at=? "
+                "WHERE request_id=? AND status='processing' AND payload=?",
+                (ts, request_id, claimed_payload),
+            )
+            if cur.rowcount and cur.rowcount > 0:
+                return True
+            # Payload was upgraded while processing; re-queue immediately to commit fuller continuation
+            engine.db.execute(
+                "UPDATE xiaozhi_inbox "
+                "SET status='pending', attempts=0, last_error='', updated_at=0.0 "
+                "WHERE request_id=? AND status='processing'",
+                (request_id,),
+            )
+            return False
+
+
+def _fail_inbox_row(
+    brain: CompanionBrain,
+    request_id: str,
+    attempts_before: int,
+    err_msg: Any,
+    *,
+    now: float | None = None,
+    force_dead: bool = False,
+) -> tuple[str, int]:
+    """Increment attempts on a failed 'processing' row; move to 'dead' once attempts exceed max retries."""
+    engine = brain.engine
+    ts = float(now) if now is not None else time.time()
+    new_attempts = int(attempts_before) + 1
+    sanitized = _sanitize_inbox_error(err_msg)
+    new_status = "dead" if (force_dead or new_attempts > INGEST_PENDING_MAX_RETRIES) else "pending"
+    with engine._lock:
+        with engine._transaction():
+            engine.db.execute(
+                "UPDATE xiaozhi_inbox "
+                "SET status=?, attempts=?, last_error=?, updated_at=? "
+                "WHERE request_id=? AND status='processing'",
+                (new_status, new_attempts, sanitized, ts, request_id),
+            )
+    return new_status, new_attempts
+
+
 def _normalize_turn_meta(meta: dict[str, Any] | None, fallback_ts: float) -> dict[str, Any]:
     raw = meta if isinstance(meta, dict) else {}
     raw_occ = raw.get("occurred_at")
@@ -1824,6 +2316,7 @@ def create_combined_asgi_app(
     from obsidian_exporter import ObsidianExporter, ObsidianSyncRunner
 
     ensure_xiaozhi_turn_meta_table(brain.engine)
+    ensure_xiaozhi_inbox_table(brain.engine)
     configure_sqlite_wal(brain.engine)
     backup_dir = _resolve_backup_dir(brain)
 
@@ -1860,11 +2353,8 @@ def create_combined_asgi_app(
     if LAN_IP:
         allowed_hosts.add(f"{LAN_IP}:{PORT}")
 
-    ingest_queue: asyncio.Queue[tuple[str, str, str, str, dict[str, Any], int]] = asyncio.Queue(
-        maxsize=INGEST_QUEUE_MAXSIZE
-    )
-    retry_tasks: set[asyncio.Task] = set()
-    retry_items: dict[asyncio.Task, tuple[str, str, str, str, dict[str, Any], int]] = {}
+    inbox_wake: asyncio.Event | None = None
+    inbox_slot_freed: asyncio.Event | None = None
     shutting_down = False
     ingest_stats: dict[str, int] = {
         "enqueued_total": 0,
@@ -1875,66 +2365,57 @@ def create_combined_asgi_app(
         "dropped_pending_exhausted": 0,
     }
 
-    def _schedule_delayed_reenqueue(
-        item: tuple[str, str, str, str, dict[str, Any], int],
-        delay_sec: float,
-        reason: str,
-    ) -> bool:
-        if shutting_down or len(retry_tasks) >= INGEST_OVERFLOW_MAX_TASKS:
-            return False
-
-        async def _retry_put():
-            cur_task = asyncio.current_task()
-            try:
-                await asyncio.sleep(delay_sec)
-                if shutting_down:
-                    return
-                await asyncio.wait_for(ingest_queue.put(item), timeout=1.5)
-                if cur_task is not None:
-                    retry_items.pop(cur_task, None)
-            except asyncio.CancelledError:
-                return
-            except asyncio.TimeoutError:
-                if cur_task is not None:
-                    retry_items.pop(cur_task, None)
-                req_id = item[1]
-                attempt = item[5]
-                if attempt < INGEST_PENDING_MAX_RETRIES and not shutting_down:
-                    ingest_stats["retried_total"] += 1
-                    next_item = (item[0], item[1], item[2], item[3], item[4], attempt + 1)
-                    next_delay = min(30.0, INGEST_PENDING_BACKOFF_BASE * (2 ** min(attempt, 4)))
-                    if not _schedule_delayed_reenqueue(next_item, next_delay, reason):
-                        ingest_stats["dropped_total"] += 1
-                        if reason == "queue_full":
-                            ingest_stats["dropped_queue_full"] += 1
-                        else:
-                            ingest_stats["dropped_pending_exhausted"] += 1
-                        log.warning(
-                            "Dropped turn %s after %s retry saturation",
-                            req_id,
-                            reason,
-                        )
-                else:
-                    ingest_stats["dropped_total"] += 1
-                    if reason == "queue_full":
-                        ingest_stats["dropped_queue_full"] += 1
-                    else:
-                        ingest_stats["dropped_pending_exhausted"] += 1
-                    log.warning("Dropped turn %s after exhausting %s retries", req_id, reason)
-
-        def _on_retry_done(t: asyncio.Task) -> None:
-            retry_tasks.discard(t)
-            retry_items.pop(t, None)
-
-        task = asyncio.create_task(_retry_put())
-        retry_tasks.add(task)
-        retry_items[task] = item
-        task.add_done_callback(_on_retry_done)
-        return True
-
     async def ingest_worker():
         while True:
-            character_id, req_id, user_msg, reply_msg, turn_meta, attempt = await ingest_queue.get()
+            if inbox_wake is not None:
+                inbox_wake.clear()
+            row, wait_sec = await asyncio.to_thread(
+                _claim_next_inbox_row, brain, force_due=shutting_down
+            )
+            if row is None:
+                if shutting_down:
+                    ib_st = await asyncio.to_thread(get_inbox_stats, brain)
+                    if ib_st["pending"] == 0 and ib_st["processing"] == 0:
+                        return
+                    await asyncio.sleep(0.05)
+                    continue
+                if inbox_wake is not None:
+                    try:
+                        await asyncio.wait_for(inbox_wake.wait(), timeout=wait_sec)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(wait_sec)
+                continue
+
+            if inbox_slot_freed is not None:
+                inbox_slot_freed.set()
+
+            req_id = row["request_id"]
+            character_id = row["character_id"]
+            claimed_payload = row["payload"]
+            attempts_before = row["attempts"]
+
+            try:
+                parsed = json.loads(claimed_payload)
+                if not isinstance(parsed, dict):
+                    raise ValueError("inbox payload is not a JSON object")
+                user_msg = str(parsed.get("user_message") or "").strip()
+                reply_msg = str(parsed.get("assistant_reply") or "").strip()
+                turn_meta = parsed.get("turn_meta") if isinstance(parsed.get("turn_meta"), dict) else {}
+            except Exception as exc:
+                await asyncio.to_thread(
+                    _fail_inbox_row,
+                    brain,
+                    req_id,
+                    attempts_before,
+                    f"corrupt_inbox_payload: {exc}",
+                    force_dead=True,
+                )
+                ingest_stats["dropped_total"] += 1
+                log.error("Marked corrupt inbox row %s as dead: %s", req_id, exc)
+                continue
+
             try:
                 if turn_meta:
                     result = await asyncio.to_thread(
@@ -1956,45 +2437,90 @@ def create_combined_asgi_app(
                         reply_msg,
                     )
                 if isinstance(result, dict) and result.get("skipped") == "another_turn_pending":
-                    if attempt < INGEST_PENDING_MAX_RETRIES and not shutting_down:
-                        delay = min(30.0, INGEST_PENDING_BACKOFF_BASE * (2 ** min(attempt, 4)))
-                        scheduled = _schedule_delayed_reenqueue(
-                            (character_id, req_id, user_msg, reply_msg, turn_meta, attempt + 1),
-                            delay,
-                            "another_turn_pending",
-                        )
-                        if scheduled:
-                            ingest_stats["retried_total"] += 1
-                            log.info(
-                                "Turn %s deferred (another_turn_pending); scheduled retry %d/%d in %.2fs",
-                                req_id,
-                                attempt + 1,
-                                INGEST_PENDING_MAX_RETRIES,
-                                delay,
-                            )
-                        else:
-                            ingest_stats["dropped_total"] += 1
-                            ingest_stats["dropped_pending_exhausted"] += 1
-                            log.warning("Turn %s dropped (retry buffer saturated during pending turn)", req_id)
-                    else:
+                    new_status, new_attempts = await asyncio.to_thread(
+                        _fail_inbox_row,
+                        brain,
+                        req_id,
+                        attempts_before,
+                        "another_turn_pending",
+                    )
+                    if new_status == "dead":
                         ingest_stats["dropped_total"] += 1
                         ingest_stats["dropped_pending_exhausted"] += 1
                         log.warning(
-                            "Turn %s dropped after %d pending-turn retries",
+                            "Inbox turn %s moved to dead after %d pending-turn attempts",
                             req_id,
-                            attempt,
+                            new_attempts,
                         )
-                elif isinstance(result, dict) and result.get("committed"):
-                    ingest_stats["committed_total"] += 1
-                    if not result.get("replayed") or result.get("updated"):
-                        obsidian_runner.notify_turn(
-                            result.get("occurred_at") or (turn_meta or {}).get("occurred_at"),
-                            extra_occurred_at=result.get("prev_occurred_at"),
+                    else:
+                        ingest_stats["retried_total"] += 1
+                        delay = _inbox_retry_delay(new_attempts)
+                        log.info(
+                            "Inbox turn %s deferred (another_turn_pending); retry %d/%d in %.2fs",
+                            req_id,
+                            new_attempts,
+                            INGEST_PENDING_MAX_RETRIES,
+                            delay,
                         )
+                        if shutting_down:
+                            await asyncio.sleep(0.05)
+                elif isinstance(result, dict) and (
+                    result.get("committed") or result.get("skipped") == "empty_message"
+                ):
+                    marked_done = await asyncio.to_thread(
+                        _complete_inbox_row, brain, req_id, claimed_payload
+                    )
+                    if not marked_done:
+                        if inbox_wake is not None:
+                            inbox_wake.set()
+                    elif result.get("committed"):
+                        ingest_stats["committed_total"] += 1
+                        if not result.get("replayed") or result.get("updated"):
+                            obsidian_runner.notify_turn(
+                                result.get("occurred_at") or (turn_meta or {}).get("occurred_at"),
+                                extra_occurred_at=result.get("prev_occurred_at"),
+                            )
+                else:
+                    new_status, new_attempts = await asyncio.to_thread(
+                        _fail_inbox_row,
+                        brain,
+                        req_id,
+                        attempts_before,
+                        f"unexpected_result: {result}",
+                    )
+                    if new_status == "dead":
+                        ingest_stats["dropped_total"] += 1
+                    else:
+                        ingest_stats["retried_total"] += 1
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                log.error("Background ingest error for %s: %s", req_id, exc)
-            finally:
-                ingest_queue.task_done()
+                new_status, new_attempts = await asyncio.to_thread(
+                    _fail_inbox_row,
+                    brain,
+                    req_id,
+                    attempts_before,
+                    exc,
+                )
+                if new_status == "dead":
+                    ingest_stats["dropped_total"] += 1
+                    log.error(
+                        "Inbox turn %s moved to dead after %d attempts: %s",
+                        req_id,
+                        new_attempts,
+                        _sanitize_inbox_error(exc),
+                    )
+                else:
+                    ingest_stats["retried_total"] += 1
+                    log.warning(
+                        "Background inbox error for %s (attempt %d/%d): %s",
+                        req_id,
+                        new_attempts,
+                        INGEST_PENDING_MAX_RETRIES,
+                        _sanitize_inbox_error(exc),
+                    )
+                    if shutting_down:
+                        await asyncio.sleep(0.05)
 
     worker_task: asyncio.Task | None = None
     heal_task: asyncio.Task | None = None
@@ -2006,13 +2532,13 @@ def create_combined_asgi_app(
             tick += 1
             try:
                 await asyncio.to_thread(clear_stale_review_jobs, brain)
+                rec = await asyncio.to_thread(recover_inbox_rows, brain, is_startup=False)
+                if rec.get("recovered_processing", 0) > 0 and inbox_wake is not None:
+                    inbox_wake.set()
                 if tick % 5 == 0:
                     await asyncio.to_thread(prune_database_bloat, brain, allow_vacuum=False)
-                is_idle = (
-                    ingest_queue.empty()
-                    and int(getattr(ingest_queue, "_unfinished_tasks", 0) or 0) == 0
-                    and not retry_tasks
-                )
+                ib_st = await asyncio.to_thread(get_inbox_stats, brain)
+                is_idle = ib_st["pending"] == 0 and ib_st["processing"] == 0
                 if is_idle:
                     await asyncio.to_thread(checkpoint_wal_if_idle, brain, is_idle=True)
                 await asyncio.to_thread(run_online_backup, brain, backup_dir)
@@ -2021,32 +2547,47 @@ def create_combined_asgi_app(
             except Exception as exc:
                 log.warning("review_healer iteration failed: %s", exc)
 
-    def _check_db_and_backup_blocking() -> tuple[bool, str, dict[str, Any], dict[str, Any]]:
+    def _check_db_and_backup_blocking() -> tuple[bool, str, dict[str, int], dict[str, Any], dict[str, Any]]:
+        inbox_snap = {
+            "pending": 0,
+            "pending_retries": 0,
+            "processing": 0,
+            "done": 0,
+            "dead": 0,
+        }
         try:
             with brain.engine._lock:
                 row = brain.engine.db.execute("SELECT 1").fetchone()
             db_ok, db_err = bool(row and row[0] == 1), ""
+            if db_ok:
+                inbox_snap = get_inbox_stats(brain)
         except Exception as exc:
             db_ok, db_err = False, str(exc)
         obs_public = dict(obsidian_exporter.status())
         obs_public.pop("host_export_dir", None)
         backup_snap = get_backup_status(brain, backup_dir)
-        return db_ok, db_err, backup_snap, obs_public
+        return db_ok, db_err, inbox_snap, backup_snap, obs_public
 
     async def _build_health_response() -> tuple[dict[str, Any], int]:
         # Snapshot event-loop-owned asyncio state on the loop thread before offloading blocking DB/FS checks
         worker_alive = (worker_task is not None) and (not worker_task.done()) and (not shutting_down)
-        qsize = ingest_queue.qsize()
-        pending_r = len(retry_tasks)
         stats_snap = dict(ingest_stats)
-        db_ok, db_err, backup_snap, obs_public = await asyncio.to_thread(_check_db_and_backup_blocking)
+        db_ok, db_err, inbox_snap, backup_snap, obs_public = await asyncio.to_thread(
+            _check_db_and_backup_blocking
+        )
+
+        inbox_pending = int(inbox_snap.get("pending", 0))
+        inbox_pending_retries = int(inbox_snap.get("pending_retries", 0))
+        inbox_processing = int(inbox_snap.get("processing", 0))
+        inbox_dead = int(inbox_snap.get("dead", 0))
+        inbox_done = int(inbox_snap.get("done", 0))
 
         backlog_limit = (
             HEALTH_BACKLOG_THRESHOLD
             if HEALTH_BACKLOG_THRESHOLD > 0
             else max(1, int(INGEST_QUEUE_MAXSIZE * 0.8))
         )
-        backlog_ok = (qsize + pending_r) < backlog_limit
+        backlog_ok = inbox_pending < backlog_limit
 
         reasons: list[str] = []
         if not db_ok:
@@ -2054,7 +2595,7 @@ def create_combined_asgi_app(
         if not worker_alive:
             reasons.append("ingest_worker_not_running")
         if not backlog_ok:
-            reasons.append(f"ingest_backlog_high: {qsize + pending_r} >= {backlog_limit}")
+            reasons.append(f"ingest_backlog_high: {inbox_pending} >= {backlog_limit}")
 
         healthy = len(reasons) == 0
         payload = {
@@ -2062,12 +2603,18 @@ def create_combined_asgi_app(
             "db_ok": db_ok,
             "worker_alive": worker_alive,
             "backlog_ok": backlog_ok,
+            "inbox_pending": inbox_pending,
+            "inbox_dead": inbox_dead,
             "unhealthy_reasons": reasons,
             "character": DEFAULT_CHARACTER_ID,
             "ingest": {
-                "queue_size": qsize,
+                "queue_size": inbox_pending,
                 "queue_maxsize": INGEST_QUEUE_MAXSIZE,
-                "pending_retries": pending_r,
+                "pending_retries": inbox_pending_retries,
+                "inbox_pending": inbox_pending,
+                "inbox_processing": inbox_processing,
+                "inbox_dead": inbox_dead,
+                "inbox_done": inbox_done,
                 **stats_snap,
             },
             "backup": backup_snap,
@@ -2076,13 +2623,17 @@ def create_combined_asgi_app(
         return payload, (200 if healthy else 503)
 
     async def combined_app(scope, receive, send):
-        nonlocal worker_task, heal_task, shutting_down
+        nonlocal worker_task, heal_task, shutting_down, inbox_wake, inbox_slot_freed
         if scope["type"] == "lifespan":
             async def wrapped_receive():
                 msg = await receive()
-                nonlocal worker_task, heal_task, shutting_down
+                nonlocal worker_task, heal_task, shutting_down, inbox_wake, inbox_slot_freed
                 if msg["type"] == "lifespan.startup":
                     shutting_down = False
+                    inbox_wake = asyncio.Event()
+                    inbox_slot_freed = asyncio.Event()
+                    await asyncio.to_thread(recover_inbox_rows, brain, is_startup=True)
+                    inbox_wake.set()
                     worker_task = asyncio.create_task(ingest_worker())
                     heal_task = asyncio.create_task(review_healer())
                     obsidian_runner.start()
@@ -2094,54 +2645,32 @@ def create_combined_asgi_app(
                             await heal_task
                         except asyncio.CancelledError:
                             pass
-                    harvested_retries: list[tuple[str, str, str, str, dict[str, Any], int]] = []
-                    if retry_tasks:
-                        pending_rt = list(retry_tasks)
-                        for rt in pending_rt:
-                            saved = retry_items.pop(rt, None)
-                            if saved is not None:
-                                harvested_retries.append(saved)
-                            rt.cancel()
-                        await asyncio.gather(*pending_rt, return_exceptions=True)
-                    if harvested_retries:
-                        log.info(
-                            "Re-enqueuing %d deferred retry turn(s) for graceful shutdown drain...",
-                            len(harvested_retries),
-                        )
-                        for h_item in harvested_retries:
-                            try:
-                                ingest_queue.put_nowait(h_item)
-                            except asyncio.QueueFull:
-                                try:
-                                    await asyncio.wait_for(ingest_queue.put(h_item), timeout=1.5)
-                                except asyncio.TimeoutError:
-                                    ingest_stats["dropped_total"] += 1
-                                    ingest_stats["dropped_queue_full"] += 1
-                                    log.warning("Shutdown drain dropped overflow turn %s", h_item[1])
+                    if inbox_wake is not None:
+                        inbox_wake.set()
                     if worker_task and not worker_task.done():
-                        pending_cnt = max(
-                            ingest_queue.qsize(),
-                            int(getattr(ingest_queue, "_unfinished_tasks", 0) or 0),
-                        )
+                        ib_st = await asyncio.to_thread(get_inbox_stats, brain)
+                        pending_cnt = ib_st["pending"] + ib_st["processing"]
                         if pending_cnt:
                             log.info(
-                                "Draining %d pending ingest turn(s) before shutdown (timeout=%.1fs)...",
+                                "Draining %d persistent inbox turn(s) before shutdown (timeout=%.1fs)...",
                                 pending_cnt,
                                 SHUTDOWN_DRAIN_SECONDS,
                             )
                         try:
-                            await asyncio.wait_for(
-                                ingest_queue.join(), timeout=SHUTDOWN_DRAIN_SECONDS
-                            )
+                            await asyncio.wait_for(worker_task, timeout=SHUTDOWN_DRAIN_SECONDS)
                         except asyncio.TimeoutError:
+                            ib_rem = await asyncio.to_thread(get_inbox_stats, brain)
                             log.warning(
-                                "Shutdown ingest drain timed out after %.1fs (%d turn(s) remaining)",
+                                "Shutdown inbox drain timed out after %.1fs (pending=%d processing=%d retained safely in SQLite)",
                                 SHUTDOWN_DRAIN_SECONDS,
-                                ingest_queue.qsize(),
+                                ib_rem["pending"],
+                                ib_rem["processing"],
                             )
-                        worker_task.cancel()
-                        try:
-                            await worker_task
+                            worker_task.cancel()
+                            try:
+                                await worker_task
+                            except asyncio.CancelledError:
+                                pass
                         except asyncio.CancelledError:
                             pass
                     await obsidian_runner.stop()
@@ -2297,6 +2826,7 @@ def create_combined_asgi_app(
                     enqueued = 0
                     accepted_ids: list[str] = []
                     rejected_ids: list[str] = []
+                    max_pending_cap = max(1, int(INGEST_QUEUE_MAXSIZE) + max(0, int(INGEST_OVERFLOW_MAX_TASKS)))
                     for item in turns:
                         if not isinstance(item, dict):
                             continue
@@ -2315,48 +2845,57 @@ def create_combined_asgi_app(
                         if "used_tools" in item and item["used_tools"] is not None:
                             item_meta["used_tools"] = bool(item["used_tools"])
 
-                        q_item = (char_id, r_id, u_msg, a_msg, item_meta, 0)
-                        try:
-                            ingest_queue.put_nowait(q_item)
-                            enqueued += 1
-                            ingest_stats["enqueued_total"] += 1
-                            accepted_ids.append(r_id)
-                        except asyncio.QueueFull:
-                            placed = False
-                            try:
-                                await asyncio.wait_for(
-                                    ingest_queue.put(q_item),
-                                    timeout=INGEST_ENQUEUE_WAIT_SECONDS,
-                                )
-                                placed = True
-                                enqueued += 1
-                                ingest_stats["enqueued_total"] += 1
-                                accepted_ids.append(r_id)
-                            except asyncio.TimeoutError:
-                                pass
-                            if not placed:
-                                scheduled = _schedule_delayed_reenqueue(
-                                    (char_id, r_id, u_msg, a_msg, item_meta, 1),
-                                    INGEST_PENDING_BACKOFF_BASE,
-                                    "queue_full",
-                                )
-                                if scheduled:
-                                    enqueued += 1
-                                    ingest_stats["enqueued_total"] += 1
-                                    ingest_stats["retried_total"] += 1
-                                    accepted_ids.append(r_id)
-                                    log.warning(
-                                        "Ingest queue full; scheduled delayed retry for turn %s",
-                                        r_id,
-                                    )
+                        enq_res = await asyncio.to_thread(
+                            enqueue_inbox_turn,
+                            brain,
+                            char_id,
+                            r_id,
+                            u_msg,
+                            a_msg,
+                            turn_meta=item_meta,
+                            max_pending=max_pending_cap,
+                        )
+                        if not enq_res.get("accepted") and enq_res.get("reason") == "queue_full":
+                            deadline = time.monotonic() + INGEST_ENQUEUE_WAIT_SECONDS
+                            while time.monotonic() < deadline and not shutting_down:
+                                rem = max(0.005, deadline - time.monotonic())
+                                if inbox_slot_freed is not None:
+                                    inbox_slot_freed.clear()
+                                    try:
+                                        await asyncio.wait_for(inbox_slot_freed.wait(), timeout=rem)
+                                    except asyncio.TimeoutError:
+                                        break
                                 else:
-                                    ingest_stats["dropped_total"] += 1
-                                    ingest_stats["dropped_queue_full"] += 1
-                                    rejected_ids.append(r_id)
-                                    log.warning(
-                                        "Ingest queue & retry buffer full; rejecting turn %s",
-                                        r_id,
-                                    )
+                                    await asyncio.sleep(min(0.02, rem))
+                                enq_res = await asyncio.to_thread(
+                                    enqueue_inbox_turn,
+                                    brain,
+                                    char_id,
+                                    r_id,
+                                    u_msg,
+                                    a_msg,
+                                    turn_meta=item_meta,
+                                    max_pending=max_pending_cap,
+                                )
+                                if enq_res.get("accepted"):
+                                    break
+
+                        if enq_res.get("accepted"):
+                            enqueued += 1
+                            accepted_ids.append(r_id)
+                            if enq_res.get("inserted") or enq_res.get("updated"):
+                                ingest_stats["enqueued_total"] += 1
+                                if inbox_wake is not None:
+                                    inbox_wake.set()
+                        else:
+                            ingest_stats["dropped_total"] += 1
+                            ingest_stats["dropped_queue_full"] += 1
+                            rejected_ids.append(r_id)
+                            log.warning(
+                                "Persistent inbox backlog full (limit=%d); rejecting turn %s",
+                                max_pending_cap,
+                                r_id,
+                            )
 
                     status_code = 503 if (rejected_ids and enqueued == 0) else 200
                     payload: dict[str, Any] = {
@@ -2451,10 +2990,12 @@ def main():
     ) as brain:
         ensure_default_character(brain)
         ensure_xiaozhi_turn_meta_table(brain.engine)
+        ensure_xiaozhi_inbox_table(brain.engine)
         configure_sqlite_wal(brain.engine)
         tighten_legacy_summary_batch_size(brain)
         prune_database_bloat(brain, allow_vacuum=True)
         clear_stale_review_jobs(brain, is_startup=True)
+        recover_inbox_rows(brain, is_startup=True)
         run_online_backup(brain)
         app = create_combined_asgi_app(brain, token)
         log.info("==========================================================")

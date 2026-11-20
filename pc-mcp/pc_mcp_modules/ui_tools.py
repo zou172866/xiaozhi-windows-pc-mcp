@@ -1,9 +1,11 @@
-"""L2 UI inspection & guarded click / type_text / hotkey / scroll execution (P2-20)."""
+"""L2 UI inspection & guarded click / type_text / hotkey / scroll execution (P2-20, E-3)."""
 
 from __future__ import annotations
 
+import logging
 import time
 
+from PIL import ImageGrab
 import pyautogui
 import pyperclip
 
@@ -21,8 +23,10 @@ from .security import (
     redact_secrets,
     trigger_emergency_stop,
 )
-from .vision import _smart_locate_target, _walk_uia_controls
+from .vision import _compute_region_hash, _smart_locate_target, _walk_uia_controls
 from .winapi import _get_foreground_window_info, _get_window_info_at_point, _user32
+
+MAX_STALE_RELOCATE_RETRIES = 2
 
 
 def _clear_clipboard(u32, clip, tmod=time) -> None:
@@ -120,9 +124,11 @@ def _pc_ui_action_locked(
 ) -> str:
     pg = facade_attr("pyautogui", pyautogui)
     clip = facade_attr("pyperclip", pyperclip)
+    ig = facade_attr("ImageGrab", ImageGrab)
     tmod = facade_attr("time", time)
     u32 = facade_attr("_user32", _user32)
     locate_fn = facade_attr("_smart_locate_target", _smart_locate_target)
+    region_hash_fn = facade_attr("_compute_region_hash", _compute_region_hash)
     fg_info_fn = facade_attr("_get_foreground_window_info", _get_foreground_window_info)
     pt_info_fn = facade_attr("_get_window_info_at_point", _get_window_info_at_point)
     fg_guard_fn = facade_attr("_check_foreground_input_guard", _check_foreground_input_guard)
@@ -164,72 +170,181 @@ def _pc_ui_action_locked(
         else:
             pg.click(cx, cy)
 
+    def _is_target_region_fresh_locked(loc_obj, cx: int, cy: int) -> bool:
+        """Re-capture screenshot under _gui_lock and compare target-region hash before clicking (E-3)."""
+        expected_hash = str(getattr(loc_obj, "region_hash", "") or "")
+        if not expected_hash:
+            return True
+        expected_box = getattr(loc_obj, "region_box", None)
+        expected_size = getattr(loc_obj, "screen_size", None)
+        fresh_img = ig.grab().convert("RGB")
+        if expected_size is not None and fresh_img.size != expected_size:
+            return False
+        fresh_hash, _ = region_hash_fn(fresh_img, cx, cy, box=expected_box)
+        return bool(fresh_hash and fresh_hash == expected_hash)
+
+    def _type_clipboard_locked(target_label: str) -> str:
+        if estop_fn():
+            raise InterruptedError("emergency_stop")
+
+        fg_info = fg_info_fn()
+        fg_err = fg_guard_fn(fg_info)
+        if fg_err:
+            audit_fn(
+                tool="pc_ui_action",
+                action=act,
+                outcome="blocked",
+                reason="foreground_blocked",
+                fg_info=fg_info,
+                target=target_label,
+                text=text,
+                press_enter=press_enter,
+                detail=fg_err,
+            )
+            return fg_err
+
+        with _clipboard_lock:
+            had_text_clip = False
+            old_clip = ""
+            clip_written = False
+            try:
+                had_text_clip = bool(u32.IsClipboardFormatAvailable(_CF_UNICODETEXT))
+                if had_text_clip:
+                    old_clip = clip.paste()
+            except Exception:
+                had_text_clip = False
+            try:
+                if estop_fn():
+                    raise InterruptedError("emergency_stop")
+                clip_written = True
+                clip.copy(text)
+                tmod.sleep(0.04)
+                if estop_fn():
+                    raise InterruptedError("emergency_stop")
+                pg.hotkey("ctrl", "v")
+                tmod.sleep(0.25)
+                if press_enter:
+                    if estop_fn():
+                        raise InterruptedError("emergency_stop")
+                    pg.press("enter")
+            finally:
+                # A-3: ONLY touch clipboard if we actually wrote to it; ALWAYS restore previous text
+                # or fall back to emptying so typed text NEVER remains in the clipboard.
+                if clip_written:
+                    if had_text_clip:
+                        try:
+                            clip.copy(old_clip)
+                        except Exception:
+                            clear_clip_fn(u32, clip, tmod)
+                    else:
+                        clear_clip_fn(u32, clip, tmod)
+        audit_fn(
+            tool="pc_ui_action",
+            action=act,
+            outcome="allowed",
+            reason="ok",
+            fg_info=fg_info,
+            target=target_label,
+            text=text,
+            press_enter=press_enter,
+        )
+        return f"已输入文本：「{redact_secrets(text[:30], _get_audit_extra_secrets())}」" + (
+            " 并按下回车。" if press_enter else "。"
+        )
+
     try:
         if act in ("click", "double_click", "right_click"):
             if element_name.strip():
-                loc = locate_fn(element_name)
-                if not loc:
-                    audit_fn(
-                        tool="pc_ui_action",
-                        action=act,
-                        outcome="blocked",
-                        reason="target_not_found",
-                        target=element_name,
-                    )
-                    return f"未能在当前画面上定位到「{element_name}」，请确认目标是否在屏幕可见区域或尝试向下滚动页面。"
-                cx, cy, src_desc = loc
-                fg_info = fg_info_fn()
-                tgt_info = pt_info_fn(cx, cy)
-                clk_err = click_guard_fn(act, fg_info, tgt_info)
-                if clk_err:
-                    audit_fn(
-                        tool="pc_ui_action",
-                        action=act,
-                        outcome="blocked",
-                        reason="foreground_blocked",
-                        fg_info=fg_info,
-                        target=f"{element_name.strip()} @({cx},{cy})",
-                        detail=clk_err,
-                    )
-                    return clk_err
-                _move_and_click(cx, cy, act)
-                audit_fn(
-                    tool="pc_ui_action",
-                    action=act,
-                    outcome="allowed",
-                    reason="ok",
-                    fg_info=fg_info,
-                    target=f"{element_name.strip()} @({cx},{cy})",
-                    detail=src_desc,
-                )
-                verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
-                return f"已精准{verb} {src_desc}，物理像素坐标 ({cx}, {cy})。"
+                max_attempts = 1 + MAX_STALE_RELOCATE_RETRIES
+                for attempt in range(max_attempts):
+                    # E-3: VLM grounding runs OUTSIDE _gui_lock (vision.py holds _gui_lock only for screenshot/UIA)
+                    loc = locate_fn(element_name)
+                    if not loc:
+                        audit_fn(
+                            tool="pc_ui_action",
+                            action=act,
+                            outcome="blocked",
+                            reason="target_not_found",
+                            target=element_name,
+                        )
+                        return f"未能在当前画面上定位到「{element_name}」，请确认目标是否在屏幕可见区域或尝试向下滚动页面。"
+                    cx, cy, src_desc = int(loc[0]), int(loc[1]), str(loc[2])
+
+                    with _gui_lock:
+                        if not _is_target_region_fresh_locked(loc, cx, cy):
+                            logging.getLogger("xiaozhi.pc_mcp").warning(
+                                "[Vision] Target region changed before %s on '%s' (attempt %d/%d); %s",
+                                act,
+                                element_name.strip(),
+                                attempt + 1,
+                                max_attempts,
+                                "re-locating" if attempt + 1 < max_attempts else "aborting",
+                            )
+                            if attempt + 1 < max_attempts:
+                                continue
+                            audit_fn(
+                                tool="pc_ui_action",
+                                action=act,
+                                outcome="blocked",
+                                reason="target_region_changed",
+                                target=f"{element_name.strip()} @({cx},{cy})",
+                                detail="target screen region changed before click even after re-location",
+                            )
+                            return f"检测到「{element_name.strip()}」所在画面区域在点击前发生变化，重新定位后仍不一致，已中止点击以防误点。"
+
+                        fg_info = fg_info_fn()
+                        tgt_info = pt_info_fn(cx, cy)
+                        clk_err = click_guard_fn(act, fg_info, tgt_info)
+                        if clk_err:
+                            audit_fn(
+                                tool="pc_ui_action",
+                                action=act,
+                                outcome="blocked",
+                                reason="foreground_blocked",
+                                fg_info=fg_info,
+                                target=f"{element_name.strip()} @({cx},{cy})",
+                                detail=clk_err,
+                            )
+                            return clk_err
+                        _move_and_click(cx, cy, act)
+                        audit_fn(
+                            tool="pc_ui_action",
+                            action=act,
+                            outcome="allowed",
+                            reason="ok",
+                            fg_info=fg_info,
+                            target=f"{element_name.strip()} @({cx},{cy})",
+                            detail=src_desc,
+                        )
+                        verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
+                        return f"已精准{verb} {src_desc}，物理像素坐标 ({cx}, {cy})。"
             elif x >= 0 and y >= 0:
-                fg_info = fg_info_fn()
-                tgt_info = pt_info_fn(x, y)
-                clk_err = click_guard_fn(act, fg_info, tgt_info)
-                if clk_err:
+                with _gui_lock:
+                    fg_info = fg_info_fn()
+                    tgt_info = pt_info_fn(x, y)
+                    clk_err = click_guard_fn(act, fg_info, tgt_info)
+                    if clk_err:
+                        audit_fn(
+                            tool="pc_ui_action",
+                            action=act,
+                            outcome="blocked",
+                            reason="foreground_blocked",
+                            fg_info=fg_info,
+                            target=f"({x},{y})",
+                            detail=clk_err,
+                        )
+                        return clk_err
+                    _move_and_click(x, y, act)
                     audit_fn(
                         tool="pc_ui_action",
                         action=act,
-                        outcome="blocked",
-                        reason="foreground_blocked",
+                        outcome="allowed",
+                        reason="ok",
                         fg_info=fg_info,
                         target=f"({x},{y})",
-                        detail=clk_err,
                     )
-                    return clk_err
-                _move_and_click(x, y, act)
-                audit_fn(
-                    tool="pc_ui_action",
-                    action=act,
-                    outcome="allowed",
-                    reason="ok",
-                    fg_info=fg_info,
-                    target=f"({x},{y})",
-                )
-                verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
-                return f"已{verb}屏幕物理坐标 ({x}, {y})。"
+                    verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
+                    return f"已{verb}屏幕物理坐标 ({x}, {y})。"
             audit_fn(
                 tool="pc_ui_action",
                 action=act,
@@ -241,106 +356,69 @@ def _pc_ui_action_locked(
         if act == "type_text":
             target_desc = element_name.strip()
             if target_desc:
-                loc = locate_fn(target_desc)
-                if not loc:
-                    audit_fn(
-                        tool="pc_ui_action",
-                        action=act,
-                        outcome="blocked",
-                        reason="target_not_found",
-                        target=target_desc,
-                        text=text,
-                        press_enter=press_enter,
-                        detail="target element not located; fail-closed without typing",
-                    )
-                    return f"未能在当前画面上定位到「{target_desc}」，已中止输入，未向当前焦点窗口输入任何内容。"
-                fg_before_click = fg_info_fn()
-                tgt_info = pt_info_fn(loc[0], loc[1])
-                tgt_err = click_guard_fn("click", fg_before_click, tgt_info)
-                if tgt_err:
-                    audit_fn(
-                        tool="pc_ui_action",
-                        action=act,
-                        outcome="blocked",
-                        reason="foreground_blocked",
-                        fg_info=tgt_info or fg_before_click,
-                        target=f"{target_desc} @({loc[0]},{loc[1]})",
-                        text=text,
-                        press_enter=press_enter,
-                        detail=tgt_err,
-                    )
-                    return tgt_err
-                _move_and_click(loc[0], loc[1], "click")
-                tmod.sleep(0.15)
-                target_desc = f"{target_desc} @({loc[0]},{loc[1]})"
+                max_attempts = 1 + MAX_STALE_RELOCATE_RETRIES
+                for attempt in range(max_attempts):
+                    # E-3: VLM grounding runs OUTSIDE _gui_lock
+                    loc = locate_fn(target_desc)
+                    if not loc:
+                        audit_fn(
+                            tool="pc_ui_action",
+                            action=act,
+                            outcome="blocked",
+                            reason="target_not_found",
+                            target=target_desc,
+                            text=text,
+                            press_enter=press_enter,
+                            detail="target element not located; fail-closed without typing",
+                        )
+                        return f"未能在当前画面上定位到「{target_desc}」，已中止输入，未向当前焦点窗口输入任何内容。"
+                    cx, cy = int(loc[0]), int(loc[1])
 
-            if estop_fn():
-                raise InterruptedError("emergency_stop")
+                    with _gui_lock:
+                        if not _is_target_region_fresh_locked(loc, cx, cy):
+                            logging.getLogger("xiaozhi.pc_mcp").warning(
+                                "[Vision] Target region changed before type_text click on '%s' (attempt %d/%d); %s",
+                                target_desc,
+                                attempt + 1,
+                                max_attempts,
+                                "re-locating" if attempt + 1 < max_attempts else "aborting",
+                            )
+                            if attempt + 1 < max_attempts:
+                                continue
+                            audit_fn(
+                                tool="pc_ui_action",
+                                action=act,
+                                outcome="blocked",
+                                reason="target_region_changed",
+                                target=f"{target_desc} @({cx},{cy})",
+                                text=text,
+                                press_enter=press_enter,
+                                detail="target input region changed before click even after re-location",
+                            )
+                            return f"检测到输入框「{target_desc}」所在画面区域持续变化，已中止输入以防误写。"
 
-            fg_info = fg_info_fn()
-            fg_err = fg_guard_fn(fg_info)
-            if fg_err:
-                audit_fn(
-                    tool="pc_ui_action",
-                    action=act,
-                    outcome="blocked",
-                    reason="foreground_blocked",
-                    fg_info=fg_info,
-                    target=target_desc,
-                    text=text,
-                    press_enter=press_enter,
-                    detail=fg_err,
-                )
-                return fg_err
+                        fg_before_click = fg_info_fn()
+                        tgt_info = pt_info_fn(cx, cy)
+                        tgt_err = click_guard_fn("click", fg_before_click, tgt_info)
+                        if tgt_err:
+                            audit_fn(
+                                tool="pc_ui_action",
+                                action=act,
+                                outcome="blocked",
+                                reason="foreground_blocked",
+                                fg_info=tgt_info or fg_before_click,
+                                target=f"{target_desc} @({cx},{cy})",
+                                text=text,
+                                press_enter=press_enter,
+                                detail=tgt_err,
+                            )
+                            return tgt_err
+                        _move_and_click(cx, cy, "click")
+                        tmod.sleep(0.15)
+                        return _type_clipboard_locked(f"{target_desc} @({cx},{cy})")
 
-            with _clipboard_lock:
-                had_text_clip = False
-                old_clip = ""
-                clip_written = False
-                try:
-                    had_text_clip = bool(u32.IsClipboardFormatAvailable(_CF_UNICODETEXT))
-                    if had_text_clip:
-                        old_clip = clip.paste()
-                except Exception:
-                    had_text_clip = False
-                try:
-                    if estop_fn():
-                        raise InterruptedError("emergency_stop")
-                    clip_written = True
-                    clip.copy(text)
-                    tmod.sleep(0.04)
-                    if estop_fn():
-                        raise InterruptedError("emergency_stop")
-                    pg.hotkey("ctrl", "v")
-                    tmod.sleep(0.25)
-                    if press_enter:
-                        if estop_fn():
-                            raise InterruptedError("emergency_stop")
-                        pg.press("enter")
-                finally:
-                    # A-3: ONLY touch clipboard if we actually wrote to it; ALWAYS restore previous text
-                    # or fall back to emptying so typed text NEVER remains in the clipboard.
-                    if clip_written:
-                        if had_text_clip:
-                            try:
-                                clip.copy(old_clip)
-                            except Exception:
-                                clear_clip_fn(u32, clip, tmod)
-                        else:
-                            clear_clip_fn(u32, clip, tmod)
-            audit_fn(
-                tool="pc_ui_action",
-                action=act,
-                outcome="allowed",
-                reason="ok",
-                fg_info=fg_info,
-                target=target_desc,
-                text=text,
-                press_enter=press_enter,
-            )
-            return f"已输入文本：「{redact_secrets(text[:30], _get_audit_extra_secrets())}」" + (
-                " 并按下回车。" if press_enter else "。"
-            )
+            with _gui_lock:
+                return _type_clipboard_locked(target_desc)
 
         if act == "hotkey":
             exec_keys, canon_keys = _parse_and_normalize_hotkey(hotkey)
@@ -380,45 +458,47 @@ def _pc_ui_action_locked(
                 )
                 return inv_msg
 
-            fg_info = fg_info_fn()
-            fg_err = fg_guard_fn(fg_info) or hk_fg_guard_fn(canon_keys, fg_info)
-            if fg_err:
+            with _gui_lock:
+                fg_info = fg_info_fn()
+                fg_err = fg_guard_fn(fg_info) or hk_fg_guard_fn(canon_keys, fg_info)
+                if fg_err:
+                    audit_fn(
+                        tool="pc_ui_action",
+                        action=act,
+                        outcome="blocked",
+                        reason="foreground_blocked",
+                        fg_info=fg_info,
+                        hotkey=canon_str,
+                        detail=fg_err,
+                    )
+                    return fg_err
+
+                if estop_fn():
+                    raise InterruptedError("emergency_stop")
+                pg.hotkey(*exec_keys)
                 audit_fn(
                     tool="pc_ui_action",
                     action=act,
-                    outcome="blocked",
-                    reason="foreground_blocked",
+                    outcome="allowed",
+                    reason="ok",
                     fg_info=fg_info,
                     hotkey=canon_str,
-                    detail=fg_err,
                 )
-                return fg_err
-
-            if estop_fn():
-                raise InterruptedError("emergency_stop")
-            pg.hotkey(*exec_keys)
-            audit_fn(
-                tool="pc_ui_action",
-                action=act,
-                outcome="allowed",
-                reason="ok",
-                fg_info=fg_info,
-                hotkey=canon_str,
-            )
-            return f"已按下快捷键: {'+'.join(exec_keys)}"
+                return f"已按下快捷键: {'+'.join(exec_keys)}"
 
         if act == "scroll":
-            if estop_fn():
-                raise InterruptedError("emergency_stop")
-            pg.scroll(int(scroll_clicks) * 120)
-            audit_fn(
-                tool="pc_ui_action",
-                action=act,
-                outcome="allowed",
-                reason="ok",
-                target=f"scroll:{int(scroll_clicks)}",
-            )
-            return f"已{'向下' if scroll_clicks < 0 else '向上'}滚动页面。"
+            with _gui_lock:
+                if estop_fn():
+                    raise InterruptedError("emergency_stop")
+                pg.scroll(int(scroll_clicks) * 120)
+                audit_fn(
+                    tool="pc_ui_action",
+                    action=act,
+                    outcome="allowed",
+                    reason="ok",
+                    target=f"scroll:{int(scroll_clicks)}",
+                )
+                return f"已{'向下' if scroll_clicks < 0 else '向上'}滚动页面。"
 
         audit_fn(
             tool="pc_ui_action",

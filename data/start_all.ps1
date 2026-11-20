@@ -303,8 +303,23 @@ if ($hasLocalGsv) {
         Write-Host "[3/4] 正在后台启动本机 GPU GPT-SoVITS 语音引擎 (127.0.0.1:19880)..." -ForegroundColor Cyan
         $cfgPath = Join-Path $serverDir "config\runtime\tts_infer_xiaozhi.yaml"
         $logOut = Join-Path $serverDir "logs\gsv_19880.log"
-        # F-3: 空闲回收放宽至 300s 且按系统内存压力 (>=75%) 触发，避免聊天停顿缺页劣化
-        $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set PYTHONUTF8=1&& set GSV_IDLE_TRIM_SECONDS=300&& set GSV_IDLE_TRIM_MEM_THRESHOLD=75&& `"$gsvPy`" -X utf8 api_v2.py -a 127.0.0.1 -p 19880 -c `"$cfgPath`" > `"$logOut`" 2>&1`""
+        $gsvBootLog = Join-Path $serverDir "logs\gsv_19880_boot.log"
+        # H-6: 启动前按 5 MB x 3 份轮转旧日志，进程内由 api_v2.py RotatingFileHandler 持续控体积（避免 cmd > 锁句柄阻塞轮转）
+        try {
+            $gsvMaxBytes = 5 * 1024 * 1024
+            $gsvBackups = 3
+            if ((Test-Path $logOut) -and ((Get-Item $logOut).Length -ge $gsvMaxBytes)) {
+                for ($bi = $gsvBackups; $bi -ge 1; $bi--) {
+                    $srcB = if ($bi -eq 1) { $logOut } else { "$logOut.$($bi - 1)" }
+                    $dstB = "$logOut.$bi"
+                    if (Test-Path $srcB) {
+                        Move-Item -Path $srcB -Destination $dstB -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        } catch {}
+        # F-3 / H-6: 空闲回收放宽至 300s 且按系统内存压力 (>=75%) 触发；日志通过 --log_file 走进程内 5 MB x 3 轮转
+        $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set PYTHONUTF8=1&& set GSV_IDLE_TRIM_SECONDS=300&& set GSV_IDLE_TRIM_MEM_THRESHOLD=75&& `"$gsvPy`" -X utf8 api_v2.py -a 127.0.0.1 -p 19880 -c `"$cfgPath`" --log_file `"$logOut`" --log_max_bytes 5242880 --log_backup_count 3 > `"$gsvBootLog`" 2>&1`""
         $hideGsv = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
         Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine; ProcessStartupInformation = $hideGsv } | Out-Null
     } else {

@@ -1,14 +1,18 @@
-"""Multimodal screen vision (DeepSeek/Gemini), 18-level UIA control walk, SoM overlay & 3-stage grounding (P2-20)."""
+"""Multimodal screen vision (DeepSeek/Gemini), 18-level UIA control walk, SoM overlay & 3-stage grounding (P2-20, E-3)."""
 
 from __future__ import annotations
 
+import atexit
 import base64
+import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
-from typing import Optional
+import threading
+from typing import Any, Optional
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageGrab
@@ -28,6 +32,145 @@ _POSITIONAL_HINTS = (
     "第", "首个", "最后", "左上", "右上", "左下", "右下", "中间", "正中",
     "左边", "右边", "上方", "下方", "封面", "缩略图", "图标", "头像", "卡片", "视频",
 )
+
+_vision_http_lock = threading.Lock()
+_vision_http_client: Optional[httpx.Client] = None
+
+
+def _get_vision_http_client() -> httpx.Client:
+    """Lazily initialize and reuse a persistent thread-safe httpx.Client for VLM requests (E-3)."""
+    global _vision_http_client
+    with _vision_http_lock:
+        if _vision_http_client is None or _vision_http_client.is_closed:
+            _vision_http_client = httpx.Client(
+                timeout=16.0,
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=4,
+                    keepalive_expiry=60.0,
+                ),
+            )
+        return _vision_http_client
+
+
+def close_vision_http_client() -> None:
+    """Close the shared persistent vision httpx.Client cleanly on shutdown."""
+    global _vision_http_client
+    with _vision_http_lock:
+        if _vision_http_client is not None:
+            try:
+                _vision_http_client.close()
+            except Exception:
+                pass
+            _vision_http_client = None
+
+
+atexit.register(close_vision_http_client)
+
+
+class LocateResult(tuple):
+    """Backward-compatible 3-tuple `(x, y, src_tag)` carrying target-region staleness metadata (E-3)."""
+
+    def __new__(
+        cls,
+        x: int,
+        y: int,
+        src_tag: str,
+        *,
+        region_hash: str = "",
+        region_box: Optional[tuple[int, int, int, int]] = None,
+        screen_size: Optional[tuple[int, int]] = None,
+    ):
+        obj = super().__new__(cls, (int(x), int(y), str(src_tag)))
+        obj.region_hash = str(region_hash or "")
+        obj.region_box = region_box
+        obj.screen_size = screen_size
+        return obj
+
+
+_MARK_ID_EXACT_RE = re.compile(r"^[\s\[\(\{【<#]*([+-]?\d+)(?:\.0+)?[\s\]\)\}】>]*$")
+_MARK_ID_LABELED_RE = re.compile(
+    r"(?:^|[\s,(（\[【])(?:som|mark(?:_id)?|id|编号|#)\s*[:=#_-]?\s*([+-]?\d+)(?:\.0+)?(?=$|[\s,)）\]】])",
+    re.IGNORECASE,
+)
+
+
+def _parse_mark_id(raw: Any, max_id: int = 0) -> int:
+    """Fault-tolerant parser for VLM `mark_id` (handles strings, whitespace, brackets, prefixes, out-of-range) (E-3)."""
+    if raw is None or isinstance(raw, bool):
+        return 0
+    val: Optional[int] = None
+    if isinstance(raw, int):
+        val = raw
+    elif isinstance(raw, float):
+        if math.isfinite(raw) and raw.is_integer():
+            val = int(raw)
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if s:
+            m = _MARK_ID_EXACT_RE.fullmatch(s)
+            if m:
+                try:
+                    val = int(m.group(1))
+                except ValueError:
+                    val = None
+            else:
+                m2 = _MARK_ID_LABELED_RE.search(s)
+                if m2:
+                    try:
+                        val = int(m2.group(1))
+                    except ValueError:
+                        val = None
+    if val is None or val < 1:
+        return 0
+    if max_id > 0 and val > max_id:
+        return 0
+    return val
+
+
+def _parse_coord_float(raw: Any, default: float = -1.0) -> float:
+    """Fault-tolerant parser for normalized coordinate numbers from VLM JSON."""
+    if raw is None or isinstance(raw, bool):
+        return default
+    try:
+        v = float(raw)
+        if not math.isfinite(v):
+            return default
+        return v
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _compute_region_hash(
+    img: Image.Image,
+    cx: int,
+    cy: int,
+    *,
+    box: Optional[tuple[int, int, int, int]] = None,
+    half_w: int = 48,
+    half_h: int = 32,
+) -> tuple[str, tuple[int, int, int, int]]:
+    """Compute a jitter-tolerant target-region perceptual hash around `(cx, cy)` for click staleness check (E-3)."""
+    sw, sh = img.size
+    if sw <= 0 or sh <= 0:
+        return "", (0, 0, 0, 0)
+    if box is not None:
+        x1, y1, x2, y2 = box
+    else:
+        x1 = cx - half_w
+        y1 = cy - half_h
+        x2 = cx + half_w
+        y2 = cy + half_h
+    x1 = max(0, min(sw - 1, int(x1)))
+    y1 = max(0, min(sh - 1, int(y1)))
+    x2 = max(x1 + 1, min(sw, int(x2)))
+    y2 = max(y1 + 1, min(sh, int(y2)))
+    crop = img.crop((x1, y1, x2, y2)).convert("RGB")
+    resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR", 2)
+    thumb = crop.resize((16, 16), resample=resample)
+    quantized = bytes(b >> 3 for b in thumb.tobytes())
+    digest = hashlib.sha256(quantized).hexdigest()[:24]
+    return digest, (x1, y1, x2, y2)
 
 
 def _prefer_gemini_vision() -> bool:
@@ -92,7 +235,8 @@ def _call_vision_llm(prompt_text: str, pil_img: Image.Image, json_mode: bool = F
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         try:
-            r = httpx.post(
+            client = _get_vision_http_client()
+            r = client.post(
                 url,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json=payload,
@@ -226,8 +370,13 @@ def _draw_som_overlay(base_img: Image.Image, elements: list[dict]) -> Image.Imag
     return annotated
 
 
-def _smart_locate_target(target_desc: str) -> Optional[tuple[int, int, str]]:
-    """三阶高精度鼠标定位引擎（UIA 直点 -> Set-of-Mark 视觉定位 -> 1:1 局部高清裁剪二次精修）。"""
+def _smart_locate_target(target_desc: str) -> Optional[LocateResult]:
+    """三阶高精度鼠标定位引擎（UIA 直点 -> Set-of-Mark 视觉定位 -> 1:1 局部高清裁剪二次精修）。
+
+    E-3: Acquires `_gui_lock` ONLY for UIA collection + screenshot capture, releasing it
+    immediately before any VLM inference so `_gui_lock` is never held across network I/O.
+    Returns `LocateResult` (backward-compatible 3-tuple with `region_hash` / `region_box`).
+    """
     kw = target_desc.strip()
     kw_low = kw.lower()
     needs_visual_layout = any(h in kw for h in _POSITIONAL_HINTS)
@@ -237,27 +386,31 @@ def _smart_locate_target(target_desc: str) -> Optional[tuple[int, int, str]]:
     ig = facade_attr("ImageGrab", ImageGrab)
     grounding_img = Path(facade_attr("LAST_GROUNDING_IMG", _DEFAULT_LAST_GROUNDING_IMG))
 
-    uia_elems = collect_fn(max_items=65)
+    # Critical section: collect UIA tree and grab screenshot atomically, then release _gui_lock IMMEDIATELY!
+    with _gui_lock:
+        uia_elems = collect_fn(max_items=65)
 
-    # 第一阶：非方位词描述时，尝试 UIA 精确或强子串匹配
-    if not needs_visual_layout and uia_elems:
-        exact_hit = None
-        partial_hit = None
-        for el in uia_elems:
-            nm = el["name"].strip().lower()
-            if not nm:
-                continue
-            if nm == kw_low:
-                exact_hit = el
-                break
-            if len(kw_low) >= 2 and kw_low in nm and partial_hit is None:
-                partial_hit = el
-        hit = exact_hit or partial_hit
-        if hit:
-            return hit["cx"], hit["cy"], f"UIA控件「{hit['name'][:30]}」"
+        # 第一阶：非方位词描述时，尝试 UIA 精确或强子串匹配
+        if not needs_visual_layout and uia_elems:
+            exact_hit = None
+            partial_hit = None
+            for el in uia_elems:
+                nm = el["name"].strip().lower()
+                if not nm:
+                    continue
+                if nm == kw_low:
+                    exact_hit = el
+                    break
+                if len(kw_low) >= 2 and kw_low in nm and partial_hit is None:
+                    partial_hit = el
+            hit = exact_hit or partial_hit
+            if hit:
+                return LocateResult(hit["cx"], hit["cy"], f"UIA控件「{hit['name'][:30]}」")
 
-    # 第二阶：1:1 物理全屏截图 + Set-of-Mark 角标 + 0~1000 归一化坐标定位
-    raw_img = ig.grab().convert("RGB")
+        # 第二阶截图采样在锁内完成，随后立刻释放 _gui_lock，避免 VLM 推理占锁长达 64s
+        raw_img = ig.grab().convert("RGB")
+
+    # _gui_lock 已释放：以下 SoM 绘制、VLM 粗定位与高清裁剪二次精修均在锁外执行
     sw, sh = raw_img.size
     marked_subset = uia_elems[:55]
     som_img = _draw_som_overlay(raw_img, marked_subset) if marked_subset else raw_img
@@ -297,12 +450,12 @@ def _smart_locate_target(target_desc: str) -> Optional[tuple[int, int, str]]:
     if not resp_obj or not resp_obj.get("found"):
         return None
 
-    mark_id = int(resp_obj.get("mark_id") or 0)
+    mark_id = _parse_mark_id(resp_obj.get("mark_id"), max_id=len(marked_subset))
     label = str(resp_obj.get("label") or kw)[:32]
-    x_min = float(resp_obj.get("x_min", -1))
-    y_min = float(resp_obj.get("y_min", -1))
-    x_max = float(resp_obj.get("x_max", -1))
-    y_max = float(resp_obj.get("y_max", -1))
+    x_min = _parse_coord_float(resp_obj.get("x_min"), -1.0)
+    y_min = _parse_coord_float(resp_obj.get("y_min"), -1.0)
+    x_max = _parse_coord_float(resp_obj.get("x_max"), -1.0)
+    y_max = _parse_coord_float(resp_obj.get("y_max"), -1.0)
 
     has_box = (0 <= x_min < x_max <= 1000) and (0 <= y_min < y_max <= 1000)
     vx = int(((x_min + x_max) / 2000.0) * sw) if has_box else -1
@@ -333,10 +486,10 @@ def _smart_locate_target(target_desc: str) -> Optional[tuple[int, int, str]]:
             )
             fine_obj = _parse_json_obj(call_vlm(prompt_fine, crop_img, json_mode=True))
             if fine_obj and fine_obj.get("found"):
-                fx1 = float(fine_obj.get("x_min", -1))
-                fy1 = float(fine_obj.get("y_min", -1))
-                fx2 = float(fine_obj.get("x_max", -1))
-                fy2 = float(fine_obj.get("y_max", -1))
+                fx1 = _parse_coord_float(fine_obj.get("x_min"), -1.0)
+                fy1 = _parse_coord_float(fine_obj.get("y_min"), -1.0)
+                fx2 = _parse_coord_float(fine_obj.get("x_max"), -1.0)
+                fy2 = _parse_coord_float(fine_obj.get("y_max"), -1.0)
                 if 0 <= fx1 < fx2 <= 1000 and 0 <= fy1 < fy2 <= 1000:
                     final_x = cx1 + int(((fx1 + fx2) / 2000.0) * crop_w)
                     final_y = cy1 + int(((fy1 + fy2) / 2000.0) * crop_h)
@@ -347,6 +500,7 @@ def _smart_locate_target(target_desc: str) -> Optional[tuple[int, int, str]]:
 
     final_x = max(2, min(sw - 2, final_x))
     final_y = max(2, min(sh - 2, final_y))
+    region_hash, region_box = _compute_region_hash(raw_img, final_x, final_y)
 
     try:
         dbg = som_img.copy()
@@ -354,13 +508,20 @@ def _smart_locate_target(target_desc: str) -> Optional[tuple[int, int, str]]:
         d.ellipse([final_x - 16, final_y - 16, final_x + 16, final_y + 16], outline=(16, 185, 129), width=4)
         d.line([final_x - 26, final_y, final_x + 26, final_y], fill=(16, 185, 129), width=3)
         d.line([final_x, final_y - 26, final_x, final_y + 26], fill=(16, 185, 129), width=3)
-        tmp_img = grounding_img.with_name(f".{grounding_img.name}.{os.getpid()}.tmp")
-        dbg.resize((1280, int(sh * (1280 / sw)))).save(tmp_img, format="JPEG", quality=82)
+        tmp_img = grounding_img.with_name(f".{grounding_img.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        dbg.resize((1280, max(1, int(sh * (1280 / sw))))).save(tmp_img, format="JPEG", quality=82)
         os.replace(tmp_img, grounding_img)
     except Exception:
         pass
 
-    return final_x, final_y, src_tag
+    return LocateResult(
+        final_x,
+        final_y,
+        src_tag,
+        region_hash=region_hash,
+        region_box=region_box,
+        screen_size=(sw, sh),
+    )
 
 
 def look_at_screen(question: str = "请简明描述当前电脑屏幕上正在显示的主要内容。") -> str:

@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import time
+import weakref
 import httpx
 import patch_registry
 import xz_common
@@ -68,10 +70,96 @@ NMC_WEATHER_FUNCTION_DESC = {
 }
 
 _stations_list: list[dict] = []
-_stations_lock = asyncio.Lock()
+_stations_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
+_async_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = weakref.WeakKeyDictionary()
 _MIN_COMPLETE_STATIONS = 500
 _MIN_PROVINCE_SUCCESS_RATIO = 0.90
 _MIN_EXPECTED_PROVINCES = 25
+
+# C-7: Exponential backoff on station-table fetch failure (5 min -> 10m -> 20m -> 40m -> 1h max)
+_BACKOFF_BASE_SECONDS = 300.0
+_BACKOFF_MAX_SECONDS = 3600.0
+_fetch_fail_count: int = 0
+_next_fetch_retry_at: float = 0.0
+
+
+def _get_stations_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lk = _stations_locks.get(loop)
+    if lk is None:
+        lk = asyncio.Lock()
+        _stations_locks[loop] = lk
+    return lk
+
+
+def _get_async_client() -> httpx.AsyncClient:
+    """Reuse a module-level httpx.AsyncClient per running event loop (C-7)."""
+    loop = asyncio.get_running_loop()
+    client = _async_clients.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0, connect=4.0),
+            headers=HEADERS,
+            limits=httpx.Limits(max_connections=12, max_keepalive_connections=6),
+        )
+        _async_clients[loop] = client
+    return client
+
+
+async def close_async_client() -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    client = _async_clients.pop(loop, None)
+    if client is not None and not client.is_closed:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+def reset_station_fetch_state() -> None:
+    """Reset in-memory station list and failure backoff (primarily for isolated unit tests)."""
+    global _stations_list, _fetch_fail_count, _next_fetch_retry_at
+    _stations_list = []
+    _fetch_fail_count = 0
+    _next_fetch_retry_at = 0.0
+
+
+def get_station_fetch_backoff_state() -> dict:
+    now = time.monotonic()
+    remaining = max(0.0, _next_fetch_retry_at - now)
+    return {
+        "fail_count": _fetch_fail_count,
+        "next_retry_at": _next_fetch_retry_at,
+        "backoff_remaining_seconds": round(remaining, 2),
+        "cached_stations": len(_stations_list),
+    }
+
+
+def _record_fetch_failure() -> float:
+    global _fetch_fail_count, _next_fetch_retry_at
+    _fetch_fail_count += 1
+    delay = min(_BACKOFF_MAX_SECONDS, _BACKOFF_BASE_SECONDS * (2 ** min(_fetch_fail_count - 1, 6)))
+    _next_fetch_retry_at = time.monotonic() + delay
+    return delay
+
+
+def _reset_fetch_backoff() -> None:
+    global _fetch_fail_count, _next_fetch_retry_at
+    _fetch_fail_count = 0
+    _next_fetch_retry_at = 0.0
+
+
+def _filter_valid_stations(raw: object) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for item in raw:
+        if isinstance(item, dict) and item.get("code") and item.get("city"):
+            out.append(item)
+    return out
 
 
 def _atomic_write_stations_cache(path: str, stations: list[dict]) -> None:
@@ -92,7 +180,7 @@ async def _ensure_stations_loaded() -> list[dict]:
     if _stations_list:
         return _stations_list
 
-    async with _stations_lock:
+    async with _get_stations_lock():
         if _stations_list:
             return _stations_list
         existing_disk: list[dict] = []
@@ -103,15 +191,22 @@ async def _ensure_stations_loaded() -> list[dict]:
             if os.path.exists(cand_path):
                 try:
                     with open(cand_path, "r", encoding="utf-8") as f:
-                        cached = json.load(f)
-                        if isinstance(cached, list):
-                            if not existing_disk:
+                        cached = _filter_valid_stations(json.load(f))
+                        if cached:
+                            if len(cached) > len(existing_disk):
                                 existing_disk = cached
+                            # C-7: Once nmc_stations_cache.json has valid complete data, ALWAYS prefer local cache
                             if len(cached) > _MIN_COMPLETE_STATIONS:
                                 _stations_list = cached
+                                _reset_fetch_backoff()
                                 return _stations_list
                 except Exception:
                     pass
+
+        # C-7: Respect exponential backoff (5 min .. 1 hour) before hitting nmc.cn again
+        now = time.monotonic()
+        if _next_fetch_retry_at > 0.0 and now < _next_fetch_retry_at:
+            return existing_disk
 
         # 从中央气象台一次性拉取全国 34 省级行政区全部站点并本地持久化
         sem = asyncio.Semaphore(8)
@@ -119,43 +214,52 @@ async def _ensure_stations_loaded() -> list[dict]:
         total_provinces = 0
         ok_provinces = 0
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0), headers=HEADERS) as client:
-                prov_resp = await client.get("https://www.nmc.cn/rest/province/all")
-                if prov_resp.status_code != 200:
-                    raise RuntimeError(f"province/all HTTP {prov_resp.status_code}")
-                provinces = prov_resp.json()
-                if not isinstance(provinces, list):
-                    provinces = []
-                prov_codes = [p["code"] for p in provinces if isinstance(p, dict) and p.get("code")]
-                total_provinces = len(prov_codes)
+            client = _get_async_client()
+            prov_resp = await client.get(
+                "https://www.nmc.cn/rest/province/all",
+                timeout=httpx.Timeout(8.0, connect=4.0),
+            )
+            if prov_resp.status_code != 200:
+                raise RuntimeError(f"province/all HTTP {prov_resp.status_code}")
+            provinces = prov_resp.json()
+            if not isinstance(provinces, list):
+                provinces = []
+            prov_codes = [p["code"] for p in provinces if isinstance(p, dict) and p.get("code")]
+            total_provinces = len(prov_codes)
 
-                async def _fetch_prov(pcode: str) -> tuple[bool, list]:
-                    async with sem:
-                        try:
-                            r = await client.get(f"https://www.nmc.cn/rest/province/{pcode}")
-                            if r.status_code == 200:
-                                data = r.json()
-                                if isinstance(data, list):
-                                    return True, data
-                        except Exception:
-                            pass
-                    return False, []
+            async def _fetch_prov(pcode: str) -> tuple[bool, list]:
+                async with sem:
+                    try:
+                        r = await client.get(
+                            f"https://www.nmc.cn/rest/province/{pcode}",
+                            timeout=httpx.Timeout(8.0, connect=4.0),
+                        )
+                        if r.status_code == 200:
+                            data = r.json()
+                            if isinstance(data, list):
+                                return True, data
+                    except Exception:
+                        pass
+                return False, []
 
-                results = await asyncio.gather(*[_fetch_prov(code) for code in prov_codes])
-                for ok_flag, arr in results:
-                    if ok_flag:
-                        ok_provinces += 1
-                    for item in arr:
-                        if isinstance(item, dict) and item.get("code") and item.get("city"):
-                            collected.append(
-                                {
-                                    "code": item["code"],
-                                    "province": item.get("province", ""),
-                                    "city": item["city"],
-                                }
-                            )
+            results = await asyncio.gather(*[_fetch_prov(code) for code in prov_codes])
+            for ok_flag, arr in results:
+                if ok_flag:
+                    ok_provinces += 1
+                for item in arr:
+                    if isinstance(item, dict) and item.get("code") and item.get("city"):
+                        collected.append(
+                            {
+                                "code": item["code"],
+                                "province": item.get("province", ""),
+                                "city": item["city"],
+                            }
+                        )
         except Exception as exc:
-            logger.bind(tag=TAG).warning(f"拉取中央气象台站点列表失败: {exc}")
+            delay = _record_fetch_failure()
+            logger.bind(tag=TAG).warning(
+                f"拉取中央气象台站点列表失败: {exc}，将在 {delay:.0f}s 后重试 (第 {_fetch_fail_count} 次失败)"
+            )
             return existing_disk
 
         is_complete = (
@@ -165,6 +269,7 @@ async def _ensure_stations_loaded() -> list[dict]:
         )
         if is_complete:
             _stations_list = collected
+            _reset_fetch_backoff()
             if len(collected) >= len(existing_disk):
                 try:
                     _atomic_write_stations_cache(STATIONS_CACHE_PATH, collected)
@@ -172,10 +277,11 @@ async def _ensure_stations_loaded() -> list[dict]:
                     logger.bind(tag=TAG).warning(f"写入气象站点缓存失败: {exc}")
             return _stations_list
 
-        # 部分省份抓取失败时绝不将残缺站点表写盘覆盖完整缓存，也不永久锁死内存表，下次查询继续重试
+        # 部分省份抓取失败时绝不将残缺站点表写盘覆盖完整缓存，也不永久锁死内存表，按指数退避稍后重试
+        delay = _record_fetch_failure()
         logger.bind(tag=TAG).warning(
             f"中央气象台站点表拉取不完整 ({ok_provinces}/{total_provinces} 省, {len(collected)} 站点)，"
-            "跳过落盘以免覆盖完整缓存"
+            f"跳过落盘以免覆盖完整缓存，{delay:.0f}s 后重试"
         )
         return collected if len(collected) >= len(existing_disk) else existing_disk
 
@@ -218,29 +324,33 @@ def _match_station(query: str, stations: list[dict]) -> dict | None:
 
 async def _fetch_overseas_wttr(location: str) -> str | None:
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0), headers=HEADERS) as client:
-            r = await client.get(f"https://wttr.in/{location}", params={"format": "j1", "lang": "zh"})
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            cur = (data.get("current_condition") or [{}])[0]
-            desc_list = cur.get("lang_zh") or cur.get("weatherDesc") or [{}]
-            desc = desc_list[0].get("value", "未知") if desc_list else "未知"
-            temp = cur.get("temp_C", "?")
-            feels = cur.get("FeelsLikeC", "?")
-            hum = cur.get("humidity", "?")
-            lines = [f"查询位置：{location}", f"当前天气：{desc}，气温 {temp}℃（体感 {feels}℃），湿度 {hum}%"]
-            for d in (data.get("weather") or [])[:5]:
-                dt = d.get("date", "")
-                tmax = d.get("maxtempC", "?")
-                tmin = d.get("mintempC", "?")
-                hourly = d.get("hourly") or []
-                d_desc = ""
-                if len(hourly) >= 4:
-                    dl = hourly[4].get("lang_zh") or hourly[4].get("weatherDesc") or [{}]
-                    d_desc = dl[0].get("value", "") if dl else ""
-                lines.append(f"{dt}：{d_desc}，{tmin}~{tmax}℃")
-            return "\n".join(lines)
+        client = _get_async_client()
+        r = await client.get(
+            f"https://wttr.in/{location}",
+            params={"format": "j1", "lang": "zh"},
+            timeout=httpx.Timeout(6.0, connect=3.0),
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        cur = (data.get("current_condition") or [{}])[0]
+        desc_list = cur.get("lang_zh") or cur.get("weatherDesc") or [{}]
+        desc = desc_list[0].get("value", "未知") if desc_list else "未知"
+        temp = cur.get("temp_C", "?")
+        feels = cur.get("FeelsLikeC", "?")
+        hum = cur.get("humidity", "?")
+        lines = [f"查询位置：{location}", f"当前天气：{desc}，气温 {temp}℃（体感 {feels}℃），湿度 {hum}%"]
+        for d in (data.get("weather") or [])[:5]:
+            dt = d.get("date", "")
+            tmax = d.get("maxtempC", "?")
+            tmin = d.get("mintempC", "?")
+            hourly = d.get("hourly") or []
+            d_desc = ""
+            if len(hourly) >= 4:
+                dl = hourly[4].get("lang_zh") or hourly[4].get("weatherDesc") or [{}]
+                d_desc = dl[0].get("value", "") if dl else ""
+            lines.append(f"{dt}：{d_desc}，{tmin}~{tmax}℃")
+        return "\n".join(lines)
     except Exception:
         return None
 
@@ -267,9 +377,13 @@ async def nmc_get_weather(conn, location: str = None, lang: str = "zh_CN", *args
                 return ActionResponse(Action.REQLLM, overseas, None)
             return ActionResponse(Action.REQLLM, f"未找到「{target_loc}」对应的气象站点，请确认城市名称。", None)
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(7.0, connect=3.5), headers=HEADERS) as client:
-            resp = await client.get("https://www.nmc.cn/rest/weather", params={"stationid": st["code"]})
-            payload = resp.json()
+        client = _get_async_client()
+        resp = await client.get(
+            "https://www.nmc.cn/rest/weather",
+            params={"stationid": st["code"]},
+            timeout=httpx.Timeout(7.0, connect=3.5),
+        )
+        payload = resp.json()
 
         if resp.status_code != 200 or payload.get("code") != 0:
             return ActionResponse(Action.REQLLM, f"气象台服务暂时繁忙，未能获取 {target_loc} 天气。", None)

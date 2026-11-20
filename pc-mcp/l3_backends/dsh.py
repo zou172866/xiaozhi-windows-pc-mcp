@@ -10,9 +10,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import (
     L3Backend,
+    claim_workspace_or_enqueue,
     get_process_create_time,
+    is_task_cancelled,
     load_last_active_task,
     read_env_key,
+    release_workspace_slot,
     resolve_workdir,
     run_subprocess_with_tree_kill,
     save_active_task,
@@ -84,17 +87,6 @@ class DshBackend(L3Backend):
             )
 
         workdir = resolve_workdir(cfg)
-        full_prompt = instr
-        if follow_up_last:
-            prev = load_last_active_task(backend="dsh")
-            if prev:
-                prev_prompt = str(prev.get("prompt") or "")[:300]
-                prev_out = str(prev.get("summary") or prev.get("stdout") or "")[:500]
-                full_prompt = (
-                    f"[接续上一轮任务]\n上一轮任务：{prev_prompt}\n"
-                    f"上一轮结果摘要：{prev_out}\n\n本次追加指令：{instr}"
-                )
-
         timeout_sec = int(cfg.get("timeout_seconds", 300))
         task_record: Dict[str, Any] = {
             "id": task_id,
@@ -112,50 +104,83 @@ class DshBackend(L3Backend):
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_ts": time.time(),
         }
-        save_active_task(task_id, task_record)
 
-        cmd = self._build_command(prefix, full_prompt)
+        def _start_now() -> None:
+            full_prompt = instr
+            if follow_up_last:
+                prev = load_last_active_task(backend="dsh")
+                if prev:
+                    prev_prompt = str(prev.get("prompt") or "")[:300]
+                    prev_out = str(prev.get("summary") or prev.get("stdout") or "")[:500]
+                    full_prompt = (
+                        f"[接续上一轮任务]\n上一轮任务：{prev_prompt}\n"
+                        f"上一轮结果摘要：{prev_out}\n\n本次追加指令：{instr}"
+                    )
 
-        def _on_spawn(child_pid: int) -> None:
-            task_record["pid"] = child_pid
-            task_record["pid_create_time"] = get_process_create_time(child_pid)
+            task_record["status"] = "running"
+            task_record["started_ts"] = time.time()
+            task_record.pop("queue_position", None)
             save_active_task(task_id, task_record)
 
-        def _worker():
-            env = os.environ.copy()
-            env["PYTHONUTF8"] = "1"
-            ds_key = read_env_key("DEEPSEEK_API_KEY")
-            if ds_key:
-                env["DEEPSEEK_API_KEY"] = ds_key
-            try:
-                proc = run_subprocess_with_tree_kill(
-                    cmd,
-                    cwd=str(workdir),
-                    env=env,
-                    timeout=timeout_sec,
-                    creationflags=_CREATE_NO_WINDOW,
-                    on_spawn=_on_spawn,
-                )
-                stdout = (proc.stdout or "").strip()
-                stderr = (proc.stderr or "").strip()
-                task_record["returncode"] = proc.returncode
-                task_record["stdout"] = stdout[-4000:]
-                task_record["stderr"] = stderr[-2000:]
-                task_record["summary"] = summarize_text_for_voice(stdout or stderr, 300)
-                task_record["status"] = "completed" if proc.returncode == 0 else "error"
-            except subprocess.TimeoutExpired:
-                task_record["status"] = "error"
-                task_record["stderr"] = f"执行超过 {timeout_sec} 秒已自动中止并清理子进程树"
-                task_record["summary"] = task_record["stderr"]
-            except Exception as exc:
-                task_record["status"] = "error"
-                task_record["stderr"] = str(exc)
-                task_record["summary"] = str(exc)
-            finally:
-                task_record["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            cmd = self._build_command(prefix, full_prompt)
+
+            def _on_spawn(child_pid: int) -> None:
+                task_record["pid"] = child_pid
+                task_record["pid_create_time"] = get_process_create_time(child_pid)
                 save_active_task(task_id, task_record)
 
-        start_worker_thread(task_id, f"l3-dsh-{task_id}", _worker)
+            def _worker():
+                env = os.environ.copy()
+                env["PYTHONUTF8"] = "1"
+                ds_key = read_env_key("DEEPSEEK_API_KEY")
+                if ds_key:
+                    env["DEEPSEEK_API_KEY"] = ds_key
+                try:
+                    proc = run_subprocess_with_tree_kill(
+                        cmd,
+                        cwd=str(workdir),
+                        env=env,
+                        timeout=timeout_sec,
+                        creationflags=_CREATE_NO_WINDOW,
+                        on_spawn=_on_spawn,
+                    )
+                    stdout = (proc.stdout or "").strip()
+                    stderr = (proc.stderr or "").strip()
+                    task_record["returncode"] = proc.returncode
+                    task_record["stdout"] = stdout[-4000:]
+                    task_record["stderr"] = stderr[-2000:]
+                    task_record["summary"] = summarize_text_for_voice(stdout or stderr, 300)
+                    task_record["status"] = "completed" if proc.returncode == 0 else "error"
+                except subprocess.TimeoutExpired:
+                    task_record["status"] = "error"
+                    task_record["stderr"] = f"执行超过 {timeout_sec} 秒已自动中止并清理子进程树"
+                    task_record["summary"] = task_record["stderr"]
+                except Exception as exc:
+                    task_record["status"] = "error"
+                    task_record["stderr"] = str(exc)
+                    task_record["summary"] = str(exc)
+                finally:
+                    if is_task_cancelled(task_id):
+                        task_record["status"] = "cancelled"
+                        task_record["stderr"] = "任务已被用户取消"
+                        task_record["summary"] = "任务已被用户取消"
+                    task_record["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    save_active_task(task_id, task_record)
+                    release_workspace_slot(workdir, task_id)
+
+            start_worker_thread(task_id, f"l3-dsh-{task_id}", _worker)
+
+        outcome, guard_msg = claim_workspace_or_enqueue(
+            workdir=workdir,
+            task_id=task_id,
+            backend="dsh",
+            prompt=instr,
+            cfg=cfg,
+            start_fn=_start_now,
+            queued_record=task_record,
+        )
+        if outcome in ("busy", "queued") and guard_msg:
+            return guard_msg
         return f"已成功派单给本机 DeepSeek DSH 后台执行（工作目录 {workdir.name}），不占用语音等待时间，稍后可随时问我进展！"
 
     def check_status(self, cfg: Dict[str, Any]) -> str:
@@ -166,6 +191,10 @@ class DshBackend(L3Backend):
         if st == "running":
             elapsed = max(1, int(time.time() - float(last.get("started_ts") or time.time())))
             return f"DeepSeek DSH 正在后台处理「{str(last.get('prompt') or '')[:24]}」，已运行约 {elapsed} 秒，请稍后再问我。"
+        if st == "queued":
+            return f"DeepSeek DSH 任务「{str(last.get('prompt') or '')[:24]}」正在队列中等待前序任务完成。"
+        if st == "cancelled":
+            return "DeepSeek DSH 上一次任务已被取消。"
         if st == "completed":
             summary = str(last.get("summary") or "").strip() or "任务已完成，未返回额外文字输出。"
             return f"DeepSeek DSH 已完成任务：{summary}"

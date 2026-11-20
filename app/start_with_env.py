@@ -1,3 +1,6 @@
+import asyncio
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 import functools
 import json
 import os
@@ -16,6 +19,7 @@ for p in (ROOT_DIR, APP_DIR, DATA_DIR):
         sys.path.insert(0, p)
 os.chdir(ROOT_DIR)
 
+import asr_corrections
 import patch_registry
 import runtime_events
 import runtime_settings
@@ -679,25 +683,205 @@ patch_registry.install_patch(
 )
 _patched_create_memory = memory_factory.create_instance
 
-# 3. Real-time per-turn async sync to Anima Brain + guaranteed <memory> injection
+# 3. Real-time per-turn async sync to Anima Brain + guaranteed <memory> injection (C-8: no per-turn threading.Timer)
 import core.utils.dialogue as dialogue_mod
 
 _orig_put = dialogue_mod.Dialogue.put
 _orig_get_llm_dialogue_with_memory = dialogue_mod.Dialogue.get_llm_dialogue_with_memory
-_debounce_timers = {}  # key: id(dialogue) -> (threading.Timer, dialogue, str_req_id)
+# key: id(dialogue) -> {"gen": int, "kind": "loop"|"cond", "handle": TimerHandle|None,
+#                        "loop": AbstractEventLoop|None, "deadline": float,
+#                        "dialogue": Dialogue, "pair": dict, "user_msg": Any, "req_id": str}
+_debounce_timers: dict[int, dict] = {}
 _timers_lock = threading.Lock()
+_timers_cond = threading.Condition(_timers_lock)
+_sync_flush_thread: threading.Thread | None = None
+_debounce_gen: int = 0
 _FALLBACK_DEBOUNCE_SECONDS = 1.5
+
+
+def _cancel_loop_handle_safe(loop, handle) -> None:
+    if handle is None:
+        return
+    try:
+        if loop is not None and not loop.is_closed():
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                handle.cancel()
+            else:
+                loop.call_soon_threadsafe(handle.cancel)
+        else:
+            handle.cancel()
+    except Exception:
+        try:
+            handle.cancel()
+        except Exception:
+            pass
 
 
 def _cancel_dialogue_timer(dialogue) -> None:
     did = id(dialogue)
     with _timers_lock:
         entry = _debounce_timers.pop(did, None)
-    if entry is not None:
+        if entry is not None:
+            _timers_cond.notify_all()
+    if entry is not None and entry.get("kind") == "loop":
+        _cancel_loop_handle_safe(entry.get("loop"), entry.get("handle"))
+
+
+def _commit_pair_snapshot(dialogue, pair_snapshot: dict, user_msg=None, *, mark_closed: bool = True) -> bool:
+    if mark_closed and user_msg is not None:
         try:
-            entry[0].cancel()
+            user_msg._turn_closed = True
         except Exception:
             pass
+    return _push_pair_if_changed(dialogue, dict(pair_snapshot))
+
+
+def _ensure_sync_flush_worker_locked() -> None:
+    """Lazy single daemon worker for non-asyncio fallback flushes (zero per-turn threading.Timer)."""
+    global _sync_flush_thread
+    if _sync_flush_thread is not None and _sync_flush_thread.is_alive():
+        return
+
+    def _worker() -> None:
+        while True:
+            due_entries: list[dict] = []
+            with _timers_cond:
+                while True:
+                    now = time.monotonic()
+                    cond_items = [
+                        (did, ent)
+                        for did, ent in _debounce_timers.items()
+                        if ent.get("kind") == "cond"
+                    ]
+                    if not cond_items:
+                        _timers_cond.wait(timeout=30.0)
+                        continue
+                    next_deadline = min(ent["deadline"] for _, ent in cond_items)
+                    if next_deadline <= now:
+                        for did, ent in cond_items:
+                            if ent["deadline"] <= now:
+                                _debounce_timers.pop(did, None)
+                                due_entries.append(ent)
+                        break
+                    _timers_cond.wait(timeout=max(0.005, next_deadline - now))
+            for ent in due_entries:
+                try:
+                    _commit_pair_snapshot(
+                        ent["dialogue"],
+                        ent["pair"],
+                        user_msg=ent.get("user_msg"),
+                        mark_closed=True,
+                    )
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=_worker, name="dialogue-debounce-flush", daemon=True)
+    t.start()
+    _sync_flush_thread = t
+
+
+def _resolve_dialogue_event_loop(dialogue):
+    try:
+        loop = asyncio.get_running_loop()
+        if loop is not None and not loop.is_closed():
+            return loop
+    except RuntimeError:
+        pass
+    attached = getattr(dialogue, "_loop", None)
+    if attached is not None and not attached.is_closed() and attached.is_running():
+        return attached
+    return None
+
+
+def _schedule_dialogue_fallback_flush(dialogue, pair_snapshot: dict, user_msg=None) -> None:
+    """Schedule a snapshot-isolated fallback flush using event-loop call_later (no per-turn threading.Timer)."""
+    global _debounce_gen
+    did = id(dialogue)
+    req_id = str(pair_snapshot.get("request_id") or "")
+    delay = max(0.005, float(_FALLBACK_DEBOUNCE_SECONDS))
+    loop = _resolve_dialogue_event_loop(dialogue)
+
+    with _timers_lock:
+        old_entry = _debounce_timers.pop(did, None)
+        _debounce_gen += 1
+        gen = _debounce_gen
+
+        if loop is not None:
+            entry = {
+                "gen": gen,
+                "kind": "loop",
+                "handle": None,
+                "loop": loop,
+                "deadline": time.monotonic() + delay,
+                "dialogue": dialogue,
+                "pair": dict(pair_snapshot),
+                "user_msg": user_msg,
+                "req_id": req_id,
+            }
+            _debounce_timers[did] = entry
+
+            def _fire_from_loop(key=did, expected_gen=gen):
+                with _timers_lock:
+                    cur = _debounce_timers.get(key)
+                    if cur is None or cur.get("gen") != expected_gen:
+                        return
+                    _debounce_timers.pop(key, None)
+                try:
+                    _commit_pair_snapshot(
+                        cur["dialogue"],
+                        cur["pair"],
+                        user_msg=cur.get("user_msg"),
+                        mark_closed=True,
+                    )
+                except Exception:
+                    pass
+
+            def _arm_on_loop(ent=entry, d=delay, cb=_fire_from_loop):
+                with _timers_lock:
+                    if _debounce_timers.get(did) is not ent:
+                        return
+                    try:
+                        ent["handle"] = loop.call_later(d, cb)
+                    except Exception:
+                        pass
+
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            try:
+                if running is loop:
+                    entry["handle"] = loop.call_later(delay, _fire_from_loop)
+                else:
+                    loop.call_soon_threadsafe(_arm_on_loop)
+            except Exception:
+                # Event loop closed concurrently: fall back to single condition scheduler
+                entry["kind"] = "cond"
+                entry["loop"] = None
+                entry["handle"] = None
+                _ensure_sync_flush_worker_locked()
+                _timers_cond.notify_all()
+        else:
+            _debounce_timers[did] = {
+                "gen": gen,
+                "kind": "cond",
+                "handle": None,
+                "loop": None,
+                "deadline": time.monotonic() + delay,
+                "dialogue": dialogue,
+                "pair": dict(pair_snapshot),
+                "user_msg": user_msg,
+                "req_id": req_id,
+            }
+            _ensure_sync_flush_worker_locked()
+            _timers_cond.notify_all()
+
+    if old_entry is not None and old_entry.get("kind") == "loop":
+        _cancel_loop_handle_safe(old_entry.get("loop"), old_entry.get("handle"))
 
 
 def _push_pair_if_changed(dialogue, pair: dict) -> bool:
@@ -730,7 +914,7 @@ def _push_pair_if_changed(dialogue, pair: dict) -> bool:
 
 
 def _find_latest_real_user(messages):
-    for m in reversed(messages or []):
+    for m in reversed(list(messages or ())):
         if getattr(m, "is_temporary", False):
             continue
         if getattr(m, "role", "") == "user":
@@ -750,7 +934,8 @@ def _mark_latest_user_attr(dialogue, attr: str, value) -> None:
 
 
 def _flush_dialogue_latest_pair(dialogue, *, messages_slice=None, mark_closed: bool = False) -> bool:
-    msgs = dialogue.dialogue if messages_slice is None else messages_slice
+    # C-8: Snapshot list copy so concurrent Dialogue.put mutations never race with iteration
+    msgs = list(dialogue.dialogue if messages_slice is None else messages_slice)
     dev_id = str(getattr(dialogue, "_device_id", "") or "")
     pairs = anima_memory_provider.extract_clean_pairs(msgs, device_id=dev_id)
     if mark_closed:
@@ -766,17 +951,25 @@ def _flush_dialogue_latest_pair(dialogue, *, messages_slice=None, mark_closed: b
 
 
 def _flush_all_pending_dialogues() -> None:
-    """Pre-exit hook: cancel all pending fallback timers and flush their latest turns into outbox."""
+    """Pre-exit hook: cancel all pending fallback handles and flush their snapshots into outbox."""
     with _timers_lock:
         entries = list(_debounce_timers.values())
         _debounce_timers.clear()
-    for timer, dlg, _req_id in entries:
+        _timers_cond.notify_all()
+    for ent in entries:
+        if ent.get("kind") == "loop":
+            _cancel_loop_handle_safe(ent.get("loop"), ent.get("handle"))
         try:
-            timer.cancel()
-        except Exception:
-            pass
-        try:
-            _flush_dialogue_latest_pair(dlg)
+            pair = ent.get("pair")
+            if pair:
+                _commit_pair_snapshot(
+                    ent["dialogue"],
+                    pair,
+                    user_msg=ent.get("user_msg"),
+                    mark_closed=False,
+                )
+            else:
+                _flush_dialogue_latest_pair(ent["dialogue"])
         except Exception:
             pass
 
@@ -895,26 +1088,13 @@ def _patched_put(self, message, *args, **kwargs):
                 )
             except Exception:
                 pass
-        pairs = anima_memory_provider.extract_clean_pairs(self.dialogue, device_id=dev_id)
+        msgs_snapshot = list(self.dialogue)
+        pairs = anima_memory_provider.extract_clean_pairs(msgs_snapshot, device_id=dev_id)
         if not pairs:
             return
-        latest_pair = pairs[-1]
-        req_id = latest_pair["request_id"]
-        did = id(self)
-
-        def _flush(dlg=self, key=did):
-            with _timers_lock:
-                _debounce_timers.pop(key, None)
-            _flush_dialogue_latest_pair(dlg, mark_closed=True)
-
-        with _timers_lock:
-            old_entry = _debounce_timers.pop(did, None)
-            if old_entry is not None:
-                old_entry[0].cancel()
-            t = threading.Timer(_FALLBACK_DEBOUNCE_SECONDS, _flush)
-            t.daemon = True
-            _debounce_timers[did] = (t, self, req_id)
-            t.start()
+        latest_pair = dict(pairs[-1])
+        latest_user_ref = _find_latest_real_user(msgs_snapshot)
+        _schedule_dialogue_fallback_flush(self, latest_pair, user_msg=latest_user_ref)
     except Exception:
         pass
 
@@ -1040,6 +1220,12 @@ def install_chat_turn_flush_patch() -> None:
                         dlg._device_id = dev_id
                     except Exception:
                         pass
+                conn_loop = getattr(self, "loop", None)
+                if conn_loop is not None:
+                    try:
+                        dlg._loop = conn_loop
+                    except Exception:
+                        pass
                 try:
                     dlg._in_chat_depth = int(getattr(dlg, "_in_chat_depth", 0) or 0) + 1
                 except Exception:
@@ -1163,6 +1349,12 @@ def _install_llm_prefix_cache():
     turn_context_router.apply_llm_prefix_cache_patch()
 
 
+def _install_vad_speculative():
+    import vad_speculative_router
+
+    vad_speculative_router.apply_vad_speculative_patch()
+
+
 for _pname, _pfn, _ptarget, _pprefix in (
     ("nmc_weather", _install_nmc_weather, "get_weather", "[NMCWeather]"),
     ("pc_audio_tts", _install_pc_audio_tts, "TTSProviderBase.to_tts_stream", "[PCAudioRouter]"),
@@ -1173,6 +1365,7 @@ for _pname, _pfn, _ptarget, _pprefix in (
     ("idle_farewell", _install_idle_farewell, "receiveAudioHandle.no_voice_close_connect", "[MeiEmotionRouter]"),
     ("reply_length_llm", _install_reply_length, "OpenAI.LLMProvider", "[ReplyLengthRouter]"),
     ("llm_prefix_cache", _install_llm_prefix_cache, "OpenAI.LLMProvider.__init__", "[LLMCache]"),
+    ("vad_speculative", _install_vad_speculative, "ASRProviderBase/ConnectionHandler/receiveAudioHandle", "[SpeculativeVAD]"),
 ):
     patch_registry.run_patch_installer(
         _pname, _pfn, target=_ptarget, category="experience", log_prefix=_pprefix
@@ -1181,13 +1374,209 @@ for _pname, _pfn, _ptarget, _pprefix in (
 # Enable structured runtime event ring buffer for Console (replaces Chinese log regex parsing, P1-11)
 runtime_events.mark_hooks_active(True)
 
+# G-2: Dedicated single-thread Sherpa ASR executor (isolates CPU decode from default asyncio.to_thread pool)
+_asr_executor_lock = threading.Lock()
+_asr_executor: ThreadPoolExecutor | None = None
 
-# 6. Memory optimization for Sherpa-ONNX local ASR + periodic glibc heap trim
+
+def get_asr_executor() -> ThreadPoolExecutor:
+    global _asr_executor
+    with _asr_executor_lock:
+        if _asr_executor is None or getattr(_asr_executor, "_shutdown", False):
+            _asr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr")
+        return _asr_executor
+
+
+def _shutdown_asr_executor() -> None:
+    global _asr_executor
+    with _asr_executor_lock:
+        ex = _asr_executor
+        _asr_executor = None
+    if ex is not None:
+        try:
+            ex.shutdown(wait=False)
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_asr_executor)
+
+# G-1: Idle-triggered gc.collect() + glibc malloc_trim(0) after 25s of post-turn idle
+IDLE_TRIM_DELAY_SECONDS = 25.0
+
+
+def _load_libc_malloc_trim():
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        fn = libc.malloc_trim
+        fn.argtypes = [ctypes.c_size_t]
+        fn.restype = ctypes.c_int
+        return fn
+    except Exception:
+        return None
+
+
+def _is_pipeline_busy_for_trim() -> bool:
+    try:
+        if runtime_events.is_any_device_speaking():
+            return True
+        snap = runtime_events.get_latest_runtime_snapshot()
+        if snap.get("activity") in ("speaking", "listening"):
+            return True
+        for conn in runtime_events.get_active_connections():
+            if getattr(conn, "client_have_voice", False) or getattr(conn, "client_is_speaking", False):
+                return True
+    except Exception:
+        pass
+    try:
+        import mei_emotion_router as _mer
+
+        if _mer.is_live_gsv_busy():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+class IdleMemoryTrimmer:
+    """Runs gc.collect() + malloc_trim(0) ONLY after `delay_seconds` (20-30s) of idle following a completed turn."""
+
+    def __init__(
+        self,
+        *,
+        delay_seconds: float = IDLE_TRIM_DELAY_SECONDS,
+        busy_checker=None,
+        trim_fn=None,
+        gc_fn=None,
+    ) -> None:
+        import gc
+
+        self.delay_seconds = max(0.02, float(delay_seconds))
+        self._busy_checker = busy_checker or _is_pipeline_busy_for_trim
+        self._trim_fn = trim_fn
+        self._gc_fn = gc_fn or gc.collect
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._stop = threading.Event()
+        self._needs_trim = False
+        self._idle_since: float = 0.0
+        self._trim_count: int = 0
+        self._suppressed_busy_count: int = 0
+        self._last_trim_ts: float = 0.0
+        self._thread: threading.Thread | None = None
+
+    def on_activity_start(self) -> None:
+        with self._cond:
+            self._idle_since = 0.0
+            self._cond.notify_all()
+
+    def on_turn_completed(self) -> None:
+        with self._cond:
+            self._needs_trim = True
+            self._idle_since = time.monotonic()
+            self._cond.notify_all()
+
+    def on_runtime_event(self, evt: dict) -> None:
+        etype = str(evt.get("type") or "")
+        if etype in ("listen_start", "user_message"):
+            self.on_activity_start()
+        elif etype == "tts_state":
+            st = str(evt.get("state") or "")
+            if st in ("start", "sentence_start"):
+                self.on_activity_start()
+            elif st == "stop":
+                self.on_turn_completed()
+        elif etype == "connection_closed":
+            if not self._busy_checker():
+                self.on_turn_completed()
+
+    def _run_trim_once(self) -> bool:
+        if self._busy_checker():
+            with self._cond:
+                self._suppressed_busy_count += 1
+                self._idle_since = 0.0
+            return False
+        try:
+            self._gc_fn()
+        except Exception:
+            pass
+        if callable(self._trim_fn):
+            try:
+                self._trim_fn(0)
+            except Exception:
+                pass
+        with self._cond:
+            self._trim_count += 1
+            self._last_trim_ts = time.monotonic()
+            self._needs_trim = False
+            self._idle_since = 0.0
+        return True
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            should_run = False
+            with self._cond:
+                while not self._stop.is_set():
+                    if not self._needs_trim or self._idle_since <= 0.0:
+                        self._cond.wait(timeout=30.0)
+                        continue
+                    rem = (self._idle_since + self.delay_seconds) - time.monotonic()
+                    if rem <= 0.0:
+                        should_run = True
+                        break
+                    self._cond.wait(timeout=min(5.0, max(0.01, rem)))
+            if self._stop.is_set():
+                break
+            if should_run:
+                self._run_trim_once()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            t = threading.Thread(target=self._loop, name="glibc-idle-malloc-trim", daemon=True)
+            t.start()
+            self._thread = t
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
+        t = self._thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=timeout)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "delay_seconds": self.delay_seconds,
+                "needs_trim": self._needs_trim,
+                "trim_count": self._trim_count,
+                "suppressed_busy_count": self._suppressed_busy_count,
+                "last_trim_ts": self._last_trim_ts,
+                "alive": bool(self._thread and self._thread.is_alive()),
+            }
+
+
+_idle_memory_trimmer: IdleMemoryTrimmer | None = None
+
+
+def get_idle_memory_trimmer() -> IdleMemoryTrimmer | None:
+    return _idle_memory_trimmer
+
+
+def get_idle_trim_stats() -> dict:
+    if _idle_memory_trimmer is None:
+        return {"delay_seconds": IDLE_TRIM_DELAY_SECONDS, "trim_count": 0, "alive": False}
+    return _idle_memory_trimmer.stats()
+
+
+# 6. Memory optimization for Sherpa-ONNX local ASR + dedicated ASR executor (G-2) + ASR corrections (G-4) + idle trim (G-1)
 def _install_memory_optimizations():
-    import asyncio
-    import ctypes
-    import gc
-    import time
+    global _idle_memory_trimmer
     import types
 
     # 6a. Lazy-stub modelscope.hub.file_download when Sherpa-ONNX model files already exist locally.
@@ -1217,8 +1606,14 @@ def _install_memory_optimizations():
         sys.modules["modelscope.hub"] = _ms_hub
         sys.modules["modelscope.hub.file_download"] = _ms_dl
 
-    # 6b. Offload Sherpa-ONNX CPU decode_stream to worker thread so asyncio loop stays responsive
-    #     Always installed (including first-boot auto-download when local files don't exist yet).
+    # Seed default config/runtime/asr_corrections.json on startup if writable (fail-soft)
+    try:
+        asr_corrections.ensure_asr_corrections_file()
+    except Exception:
+        pass
+
+    # 6b. Offload Sherpa-ONNX CPU decode_stream to dedicated 1-worker 'asr' executor (G-2)
+    #     and apply hot-reloaded post-ASR homophone corrections (G-4) to ALL Sherpa outputs.
     try:
         import core.providers.asr.sherpa_onnx_local as _sherpa_mod
 
@@ -1241,10 +1636,13 @@ def _install_memory_optimizations():
                         self.model.decode_stream(s)
                         return s.result.text
 
-                    text = await asyncio.to_thread(_decode)
+                    loop = asyncio.get_running_loop()
+                    text = await loop.run_in_executor(get_asr_executor(), _decode)
                     asr_sec = time.monotonic() - t_asr_start
                     if text:
                         text = _TAG_RE.sub("", text).strip()
+                    if text:
+                        text = asr_corrections.apply_asr_corrections(text)
                     _sherpa_mod.logger.bind(tag=_sherpa_mod.TAG).debug(
                         f"语音识别耗时: {asr_sec:.3f}s | 结果: {text}"
                     )
@@ -1280,24 +1678,16 @@ def _install_memory_optimizations():
         )
         print(f"[MemOpt] SherpaASR 异步补丁跳过: {_s_exc}", flush=True)
 
-    # 6c. Periodic glibc malloc_trim(0) so transient Python/ONNX heap returns to Linux/WSL2
+    # 6c. Idle-triggered gc.collect() + glibc malloc_trim(0) 25s after completed turns (G-1)
     try:
-        _libc = ctypes.CDLL("libc.so.6")
-        _malloc_trim = _libc.malloc_trim
-        _malloc_trim.argtypes = [ctypes.c_size_t]
-        _malloc_trim.restype = ctypes.c_int
-
-        def _trim_loop():
-            time.sleep(8)
-            while True:
-                try:
-                    gc.collect()
-                    _malloc_trim(0)
-                except Exception:
-                    pass
-                time.sleep(180)
-
-        threading.Thread(target=_trim_loop, name="glibc-malloc-trim", daemon=True).start()
+        if _idle_memory_trimmer is None:
+            trimmer = IdleMemoryTrimmer(
+                delay_seconds=IDLE_TRIM_DELAY_SECONDS,
+                trim_fn=_load_libc_malloc_trim(),
+            )
+            runtime_events.subscribe(trimmer.on_runtime_event)
+            trimmer.start()
+            _idle_memory_trimmer = trimmer
     except Exception:
         pass
 

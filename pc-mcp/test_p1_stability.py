@@ -208,15 +208,16 @@ class TestP1HostStability(unittest.TestCase):
                 conc["active"] -= 1
 
         def _fake_locate(desc: str):
-            _enter(desc)
+            # E-3: VLM grounding runs OUTSIDE _gui_lock; only screenshot/UIA and mouse click hold _gui_lock.
             time.sleep(0.06)
             return 100, 200, f"fake:{desc}"
 
         def _fake_move(x, y, duration=0):
+            _enter("mouse_click")
             time.sleep(0.04)
 
         def _fake_click(x, y):
-            _exit("click_done")
+            _exit("mouse_click")
 
         def _fake_shell_open(url, params=None):
             _enter("open_web")
