@@ -84,7 +84,7 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
         plan.append(
             (
                 "unit",
-                "Anima Brain & Obsidian Exporter (Docker isolated, incl. B-1 inbox & rollback)",
+                "Anima Brain & Obsidian Exporter (Docker isolated, built image + B-1 inbox & rollback)",
                 [
                     "docker",
                     "run",
@@ -95,14 +95,6 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
                     f"{ANIMA_DIR / 'tests'}:/app/tests:ro",
                     "-v",
                     f"{ANIMA_DIR / 'scripts'}:/app/scripts:ro",
-                    "-v",
-                    f"{ANIMA_DIR / 'obsidian_exporter.py'}:/app/obsidian_exporter.py:ro",
-                    "-v",
-                    f"{ANIMA_DIR / 'xiaozhi_anima_service.py'}:/app/xiaozhi_anima_service.py:ro",
-                    "-v",
-                    f"{ANIMA_DIR / 'src' / 'companion_engine' / 'automation.py'}:/app/src/companion_engine/automation.py:ro",
-                    "-v",
-                    f"{ANIMA_DIR / 'src' / 'companion_engine' / 'http_server.py'}:/app/src/companion_engine/http_server.py:ro",
                     "xiaozhi-anima-brain:local",
                     "-m",
                     "unittest",

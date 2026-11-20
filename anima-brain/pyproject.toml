@@ -36,6 +36,12 @@ companion = "companion_engine.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/companion_engine"]
+artifacts = [
+  "src/companion_engine/static/voice-player.html",
+  "src/companion_engine/static/voice-player-notices.txt",
+  "src/companion_engine/static/memory-panel.html",
+  "src/companion_engine/static/provider-settings.html",
+]
 
 [tool.hatch.build.targets.sdist]
 exclude = ["/examples/showcase/node_modules", "/examples/showcase/dist", "/examples/showcase/*.tsbuildinfo"]

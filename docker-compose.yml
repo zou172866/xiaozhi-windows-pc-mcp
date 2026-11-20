@@ -3,6 +3,8 @@ services:
     build:
       context: ./anima-brain
       dockerfile: Dockerfile
+      args:
+        BUILD_SHA: ${ANIMA_BUILD_VERSION:-dev}
     image: xiaozhi-anima-brain:local
     container_name: xiaozhi-anima-brain
     restart: always
@@ -58,11 +60,9 @@ services:
         max-file: "3"
     volumes:
       # 持久化 Anima Brain SQLite 数据库与访问令牌（仅挂载给 anima-brain，主容器完全不可见，A-1）
+      # H-3: 已移除全部单文件 :ro 源码覆盖挂载（避免镜像漂移与 Windows 原子保存 inode 失效）；
+      # 改动 anima-brain 源码后执行 `docker compose build anima-brain`，或本地开发复制 docker-compose.override.yml.example
       - ./anima-data:/data/anima
-      - ./anima-brain/xiaozhi_anima_service.py:/app/xiaozhi_anima_service.py:ro
-      - ./anima-brain/obsidian_exporter.py:/app/obsidian_exporter.py:ro
-      - ./anima-brain/src/companion_engine/automation.py:/app/src/companion_engine/automation.py:ro
-      - ./anima-brain/src/companion_engine/http_server.py:/app/src/companion_engine/http_server.py:ro
       # Obsidian 单向导出目录（默认挂载本地 ./data/obsidian_export，配置 OBSIDIAN_EXPORT_DIR 后直连指定 Vault）
       - ${OBSIDIAN_EXPORT_DIR:-./data/obsidian_export}:/obsidian
 
@@ -91,6 +91,7 @@ services:
       - HOST_DATA_DIR=${HOST_DATA_DIR:-/opt/xiaozhi-esp32-server/data}
       - HOST_VOICES_DIR=${HOST_VOICES_DIR:-}
       - HOST_GSV_WEIGHTS_DIR=${HOST_GSV_WEIGHTS_DIR:-}
+      - XIAOZHI_BUILD_VERSION=${XIAOZHI_BUILD_VERSION:-dev}
       - XIAOZHI_APP_DIR=/opt/xiaozhi-esp32-server/app
       - XIAOZHI_CONFIG_DIR=/opt/xiaozhi-esp32-server/data
       - XIAOZHI_STATE_DIR=/opt/xiaozhi-esp32-server/state

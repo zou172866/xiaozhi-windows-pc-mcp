@@ -1,0 +1,12 @@
+# Development-only Compose override example (H-3)
+# Copy to `docker-compose.override.yml` (gitignored) when iterating rapidly on anima-brain source code.
+# Mounts whole directories (NEVER single files) to avoid Windows atomic-save inode detachment.
+# For production, delete `docker-compose.override.yml` and rebuild via `docker compose build anima-brain`.
+
+services:
+  anima-brain:
+    environment:
+      - PYTHONPATH=/app_dev/src:/app_dev
+    volumes:
+      - ./anima-brain:/app_dev:ro
+    command: ["python", "/app_dev/xiaozhi_anima_service.py"]

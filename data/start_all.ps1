@@ -376,12 +376,38 @@ if (-not $env:DEEPSEEK_API_KEY -and -not $env:GEMINI_API_KEY) {
     Write-Host "[警告] 未检测到 DEEPSEEK_API_KEY 或 GEMINI_API_KEY 环境变量，请先配置！" -ForegroundColor Yellow
 }
 
+$gitShortSha = "dev"
+try {
+    $shaOut = (& git -C $serverDir rev-parse --short HEAD 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $shaOut) {
+        $gitShortSha = ($shaOut | Select-Object -First 1).ToString().Trim()
+    }
+} catch {}
+if (-not $env:ANIMA_BUILD_VERSION) { $env:ANIMA_BUILD_VERSION = $gitShortSha }
+if (-not $env:XIAOZHI_BUILD_VERSION) { $env:XIAOZHI_BUILD_VERSION = $gitShortSha }
+
 $animaImg = docker images -q xiaozhi-anima-brain:local 2>$null
-if ($animaImg) {
-    docker compose up -d
-} else {
-    docker compose up -d --build
+if (-not $animaImg) {
+    docker compose build anima-brain
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`n[错误] anima-brain 镜像构建失败，请检查上方报错信息！" -ForegroundColor Red
+        exit 1
+    }
 }
+
+# H-2 非 root (USER app, uid 1000) 平滑升级：若宿主机旧版 root-0600 遗留文件阻塞 uid 1000 读写，则一次性归属修正
+$animaDataHost = Join-Path $serverDir "anima-data"
+$obsidianHost = if ($env:OBSIDIAN_EXPORT_DIR) { $env:OBSIDIAN_EXPORT_DIR } else { Join-Path $serverDir "data\obsidian_export" }
+if (-not (Test-Path $obsidianHost)) { New-Item -ItemType Directory -Path $obsidianHost -Force | Out-Null }
+try {
+    docker run --rm --user 1000:1000 -v "${animaDataHost}:/data/anima" xiaozhi-anima-brain:local python -c "import os, pathlib, sys; p=pathlib.Path('/data/anima/brain.sqlite3'); sys.exit(0 if (not p.exists() or (os.access(p, os.R_OK) and os.access(p, os.W_OK))) else 1)" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[迁移] 检测到旧版 root 权限 brain.sqlite3，正在平滑调整 /data/anima 属主为 app (1000:1000)..." -ForegroundColor DarkGray
+        docker run --rm --user 0:0 -v "${animaDataHost}:/data/anima" -v "${obsidianHost}:/obsidian" xiaozhi-anima-brain:local chown -R 1000:1000 /data/anima /obsidian 2>$null
+    }
+} catch {}
+
+docker compose up -d
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`n[错误] 容器启动失败，请检查上方报错信息！" -ForegroundColor Red

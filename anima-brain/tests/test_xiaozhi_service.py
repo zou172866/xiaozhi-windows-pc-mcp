@@ -1471,6 +1471,48 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
         finally:
             dconn.close()
 
+    def test_batch4_h2_h3_h4_nonroot_build_version_and_baked_ui_assets(self):
+        """H-2/H-3/H-4: non-root runtime, non-editable wheel with built UI assets, and /health build_version."""
+        import os
+        import companion_engine
+        from starlette.testclient import TestClient
+
+        # 1. Built UI artifacts exist inside installed companion_engine package (not editable /app/src)
+        pkg_dir = Path(companion_engine.__file__).resolve().parent
+        static_dir = pkg_dir / "static"
+        self.assertIn("site-packages", str(pkg_dir), f"Expected non-editable install in site-packages, got {pkg_dir}")
+        for asset in (
+            "voice-player.html",
+            "voice-player-notices.txt",
+            "memory-panel.html",
+            "provider-settings.html",
+            "local-settings.html",
+        ):
+            fp = static_dir / asset
+            self.assertTrue(fp.is_file(), f"Missing baked static UI asset: {fp}")
+            self.assertGreater(fp.stat().st_size, 0, f"Empty static UI asset: {fp}")
+
+        # 2. Container runs as non-root USER app (uid != 0)
+        if hasattr(os, "getuid"):
+            self.assertNotEqual(os.getuid(), 0, "H-2: anima-brain container must run as non-root USER app")
+
+        # 3. Both /health and /xiaozhi/health expose build_version without auth
+        orig_bv = svc.BUILD_VERSION
+        svc.BUILD_VERSION = "abc1234"
+        try:
+            app = svc.create_combined_asgi_app(self.brain, "tok-h3-test-" + ("x" * 24))
+            with TestClient(app, base_url="http://127.0.0.1:18787") as client:
+                r1 = client.get("/xiaozhi/health")
+                self.assertEqual(r1.status_code, 200)
+                self.assertEqual(r1.json().get("build_version"), "abc1234")
+
+                r2 = client.get("/health")
+                self.assertEqual(r2.status_code, 200)
+                self.assertEqual(r2.json().get("build_version"), "abc1234")
+                self.assertTrue(r2.json().get("db_ok"))
+        finally:
+            svc.BUILD_VERSION = orig_bv
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

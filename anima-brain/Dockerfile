@@ -1,5 +1,6 @@
-# Stage 1: Build official Companion Studio React web console
-FROM node:22-slim AS web-builder
+# Stage 1: Build official Companion Studio React web console AND MCP UI static assets (H-2, H-4)
+FROM node:22-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS web-builder
+
 WORKDIR /build/examples/showcase
 COPY examples/showcase/package.json examples/showcase/package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -7,21 +8,51 @@ COPY docs /build/docs
 COPY examples/showcase/ ./
 RUN npm run build
 
-# Stage 2: Lightweight Python 3.12 runtime for Anima Brain + Companion Studio + XiaoZhi Bridge
-FROM python:3.12-slim
+WORKDIR /build/ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY ui/ ./
+RUN mkdir -p /build/src/companion_engine/static && npm run build
+
+# Stage 2: Lightweight reproducible Python 3.12 runtime for Anima Brain + Companion Studio + XiaoZhi Bridge (H-2)
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+
+ARG BUILD_SHA=dev
+LABEL org.opencontainers.image.revision="${BUILD_SHA}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    ANIMA_BUILD_VERSION="${BUILD_SHA}"
 
 WORKDIR /app
-COPY pyproject.toml README.md README.zh-CN.md LICENSE THIRD_PARTY_NOTICES.md ./
+
+# Layer 1: Install pinned runtime & build dependencies from pyproject.toml + constraints.txt (Py 3.12)
+COPY pyproject.toml constraints.txt ./
+RUN python -c "import tomllib, pathlib; d=tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']; deps=list(d.get('dependencies',[]))+list(d.get('optional-dependencies',{}).get('http',[]))+list(d.get('optional-dependencies',{}).get('calls',[])); pathlib.Path('/tmp/reqs.txt').write_text('\n'.join(deps)+'\n', encoding='utf-8')" \
+    && pip install --no-cache-dir -c constraints.txt hatchling -r /tmp/reqs.txt \
+    && rm -f /tmp/reqs.txt
+
+# Layer 2: Copy source + built static UI assets and install non-editable wheel (no -e, offline)
+COPY README.md README.zh-CN.md LICENSE THIRD_PARTY_NOTICES.md ./
 COPY src ./src
-COPY ui ./ui
-RUN pip install --no-cache-dir -e ".[http,calls]"
+COPY --from=web-builder /build/src/companion_engine/static/voice-player.html /app/src/companion_engine/static/voice-player.html
+COPY --from=web-builder /build/src/companion_engine/static/voice-player-notices.txt /app/src/companion_engine/static/voice-player-notices.txt
+COPY --from=web-builder /build/src/companion_engine/static/memory-panel.html /app/src/companion_engine/static/memory-panel.html
+COPY --from=web-builder /build/src/companion_engine/static/provider-settings.html /app/src/companion_engine/static/provider-settings.html
+RUN pip install --no-cache-dir --no-build-isolation --no-deps . \
+    && rm -rf /app/src
 
 COPY --from=web-builder /build/examples/showcase/dist /app/examples/showcase/dist
 COPY obsidian_exporter.py /app/obsidian_exporter.py
 COPY xiaozhi_anima_service.py /app/xiaozhi_anima_service.py
 
+# Non-root runtime user with explicit ownership of /app, /data/anima, and /obsidian (H-2)
+RUN groupadd --gid 1000 app \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin app \
+    && mkdir -p /data/anima /obsidian \
+    && chown -R app:app /app /data/anima /obsidian
+
+USER app
 EXPOSE 18787
 CMD ["python", "/app/xiaozhi_anima_service.py"]

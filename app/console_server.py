@@ -2876,6 +2876,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 {
                     "ok": security_ok and not degraded_list,
                     "status": health.get("status", "ok"),
+                    "build_version": (os.environ.get("XIAOZHI_BUILD_VERSION") or "dev").strip() or "dev",
                     "degraded": degraded_list,
                     "security_ok": security_ok,
                     "security_failures": list(health.get("security_failures") or []),

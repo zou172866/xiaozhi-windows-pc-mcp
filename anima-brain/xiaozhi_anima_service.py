@@ -57,6 +57,7 @@ URL_PATH = DATA_DIR / "studio_url.txt"
 FRONTEND_DIR = Path("/app/examples/showcase/dist")
 DEFAULT_CHARACTER_ID = os.environ.get("ANIMA_DEFAULT_CHARACTER", "xiaozhi")
 LAN_IP = os.environ.get("ANIMA_LAN_IP", "").strip()
+BUILD_VERSION = (os.environ.get("ANIMA_BUILD_VERSION") or "dev").strip() or "dev"
 
 def _env_int(name: str, default: int, lo: int, hi: int | None = None) -> int:
     raw = (os.environ.get(name) or "").strip()
@@ -2600,6 +2601,7 @@ def create_combined_asgi_app(
         healthy = len(reasons) == 0
         payload = {
             "status": "ok" if healthy else "unhealthy",
+            "build_version": BUILD_VERSION,
             "db_ok": db_ok,
             "worker_alive": worker_alive,
             "backlog_ok": backlog_ok,
@@ -2700,14 +2702,16 @@ def create_combined_asgi_app(
             headers_list = list(scope.get("headers", []))
             headers_dict = {k.decode("latin1").lower(): v.decode("latin1") for k, v in headers_list}
 
+            # Unauthenticated health probe alias (/health and /xiaozhi/health, H-3)
+            if scope["type"] == "http" and path in ("/health", "/xiaozhi/health"):
+                health_body, health_code = await _build_health_response()
+                resp = JSONResponse(health_body, status_code=health_code)
+                await resp(scope, receive, send)
+                return
+
             # Handle XiaoZhi fast bridge endpoints directly
             if scope["type"] == "http" and path.startswith("/xiaozhi/"):
                 req = Request(scope, receive=receive)
-                if path == "/xiaozhi/health":
-                    health_body, health_code = await _build_health_response()
-                    resp = JSONResponse(health_body, status_code=health_code)
-                    await resp(scope, receive, send)
-                    return
 
                 auth = headers_dict.get("authorization", "")
                 if not secrets.compare_digest(
