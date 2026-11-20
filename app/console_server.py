@@ -2888,6 +2888,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     "version_match": bool(health.get("version_match", True)),
                     "patch_counts": health.get("counts", {}),
                     "patches": health.get("patches", {}),
+                    "contract_self_check": health.get("contract_self_check", {}),
                     "degraded_reasons": health.get("degraded_reasons", []),
                 },
                 status=http_status,

@@ -73,7 +73,7 @@ services:
     depends_on:
       anima-brain:
         condition: service_healthy
-    command: ["python", "/opt/xiaozhi-esp32-server/app/start_with_env.py"]
+    command: ["python", "/opt/xiaozhi-esp32-server/app/boot.py"]
     env_file:
       # A-1 最小权限：主容器按需接收 18900 与 18787 两个独立环境文件，零令牌文件挂载
       - path: ./secrets/pc_mcp_tokens.env

@@ -1,22 +1,43 @@
 import asyncio
 import json
+import logging
 import os
 import time
 import weakref
 import httpx
 import patch_registry
 import xz_common
-from config.logger import setup_logging
-from plugins_func.register import (
-    Action,
-    ActionResponse,
-    FunctionItem,
-    ToolType,
-    all_function_registry,
-)
 
 TAG = "nmc_weather_patch"
-logger = setup_logging()
+
+
+class _LazyLoggerProxy:
+    """Lazy wrapper avoiding upstream `setup_logging()` side effects at import time (H-1)."""
+
+    def __init__(self) -> None:
+        self._real = None
+
+    def _get(self):
+        if self._real is None:
+            try:
+                from config.logger import setup_logging
+
+                self._real = setup_logging()
+            except Exception:
+                self._real = logging.getLogger(TAG)
+        return self._real
+
+    def bind(self, **kwargs):
+        real = self._get()
+        if hasattr(real, "bind"):
+            return real.bind(**kwargs)
+        return real
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+
+logger = _LazyLoggerProxy()
 
 DATA_DIR = xz_common.STATE_DIR
 STATIONS_CACHE_PATH = os.path.join(xz_common.STATE_DIR, "nmc_stations_cache.json")
@@ -357,6 +378,7 @@ async def _fetch_overseas_wttr(location: str) -> str | None:
 
 async def nmc_get_weather(conn, location: str = None, lang: str = "zh_CN", *args, **kwargs):
     from core.utils.cache.manager import CacheType, cache_manager
+    from plugins_func.register import Action, ActionResponse
 
     weather_cfg = conn.config.get("plugins", {}).get("get_weather", {})
     default_location = weather_cfg.get("default_location", "长沙")
@@ -452,6 +474,7 @@ async def nmc_get_weather(conn, location: str = None, lang: str = "zh_CN", *args
 def apply_nmc_weather_patch():
     # 先导入原始模块使其进入 sys.modules，防止后续 auto_import_modules 覆盖我们的注册项
     import plugins_func.functions.get_weather as orig_mod
+    from plugins_func.register import FunctionItem, ToolType, all_function_registry
 
     orig_fn = getattr(orig_mod, "get_weather", None)
     ok_sig, det_sig = patch_registry.verify_signature_contract(

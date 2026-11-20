@@ -1090,9 +1090,12 @@ class TestContainerOfflinePipeline(unittest.TestCase):
     def test_p05_turn_end_flush_avoids_tool_round_truncation_and_captures_meta(self):
         import time
         from unittest.mock import patch
+        import boot
         import anima_memory_provider
         import start_with_env
         from core.utils.dialogue import Dialogue, Message
+
+        boot.install_all(start_background_workers=False, run_contract_self_check=True)
 
         pushed = []
 
@@ -1799,9 +1802,12 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         import threading
         from http.server import ThreadingHTTPServer
         import httpx
+        import boot
         import patch_registry
         import start_with_env  # noqa: F401
         import console_server as cs
+
+        boot.install_all(start_background_workers=False, run_contract_self_check=True)
 
         # 1. All startup patches must be registered and healthy on expected SERVER_VERSION
         summary = patch_registry.get_health_summary()
@@ -2144,9 +2150,12 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         from unittest.mock import patch
         from core.utils.dialogue import Dialogue, Message
         import core.handle.sendAudioHandle as send_audio_mod
+        import boot
         import start_with_env  # noqa: F401
         import runtime_events
         import console_server as cs
+
+        boot.install_all(start_background_workers=False, run_contract_self_check=True)
 
         orig_msgs = list(cs._chat_messages)
         orig_dev = dict(cs._device_info)
@@ -2325,8 +2334,11 @@ class TestContainerOfflinePipeline(unittest.TestCase):
     def test_p112_universal_rebind_replaces_early_bound_send_tts_message(self):
         import sys
         import types
+        import boot
         import patch_registry
         import start_with_env  # noqa: F401
+
+        boot.install_all(start_background_workers=False, run_contract_self_check=True)
         import core.handle.sendAudioHandle as send_audio_mod
         import core.handle.helloHandle as hello_mod
         import core.handle.textHandler.listenMessageHandler as listen_mod
@@ -3355,8 +3367,11 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         import httpx
         import anima_memory_provider as amp
         import console_server as cs
+        import boot
         import patch_registry
         import start_with_env
+
+        boot.install_all(start_background_workers=False, run_contract_self_check=True)
 
         # --- C-1: Security category + fail-closed boot gate + XIAOZHI_ALLOW_INSECURE_BOOT=1 ---
         for sec_name in ("esp32_auth_ota", "esp32_auth_ws", "esp32_auth_vision", "mcp_token_injection"):

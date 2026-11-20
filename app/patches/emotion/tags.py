@@ -502,7 +502,7 @@ def load_mei_emotions(force_reload: bool = False) -> Dict[str, Dict[str, Any]]:
     manifest_candidates = [
         _to_local_fs_path(f"{MEI_DIR_HOST}/mei_emotions.json"),
         os.path.join(CONTAINER_VOICES_PREFIX, "raiden_mei", "mei_emotions.json"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices", "raiden_mei", "mei_emotions.json"),
+        os.path.join(xz_common.APP_DIR, "voices", "raiden_mei", "mei_emotions.json"),
     ]
     for mp in manifest_candidates:
         if os.path.isfile(mp):

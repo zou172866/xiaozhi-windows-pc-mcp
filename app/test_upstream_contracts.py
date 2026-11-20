@@ -25,10 +25,11 @@ for _p in (ROOT_DIR, APP_DIR):
 class TestUpstreamImageContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        # Import start_with_env once to trigger all 19 monkeypatches & contract verifications
-        import start_with_env  # noqa: F401
+        # Explicitly run boot.install_all() (H-1: importing boot/start_with_env has zero side effects)
+        import boot
         import patch_registry
 
+        boot.install_all(start_background_workers=False, run_contract_self_check=True)
         cls.patch_registry = patch_registry
 
     def test_upstream_server_version_matches_expected(self):
@@ -120,6 +121,42 @@ class TestUpstreamImageContracts(unittest.TestCase):
         self.assertTrue(callable(getattr(ConnectionHandler, "_handle_function_result", None)))
         self.assertTrue(callable(OpenAILLM.response))
         self.assertTrue(callable(OpenAILLM.response_with_functions))
+
+    def test_h1_zero_import_side_effects_and_boot_contract_self_check(self):
+        """H-1: Importing boot / start_with_env / patches has ZERO side effects; install_all records contract self-check."""
+        import json as _json
+        import subprocess
+        import tempfile
+
+        # 1. Verify startup lightweight contract self-check was recorded in registry
+        sc = self.patch_registry.get_contract_self_check()
+        self.assertTrue(sc.get("ran"), "boot.install_all() must run lightweight contract self-check")
+        self.assertTrue(sc.get("ok"), f"Boot contract self-check failed: {sc}")
+        for key in ("upstream_version", "prompt_anchors", "early_bound_rebind", "callable_contracts"):
+            self.assertIn(key, sc.get("checks") or {})
+            self.assertTrue(sc["checks"][key]["ok"], f"Self-check {key} failed: {sc['checks'][key]}")
+
+        # 2. Fresh subprocess import test: cwd unchanged, zero extra threads, zero patches installed on import
+        with tempfile.TemporaryDirectory() as td:
+            probe = (
+                "import json, os, sys, threading; "
+                f"sys.path.insert(0, {APP_DIR!r}); "
+                f"os.chdir({td!r}); "
+                "cwd0 = os.getcwd(); "
+                "th0 = {t.name for t in threading.enumerate()}; "
+                "import boot, start_with_env, patch_registry, mei_emotion_router, pc_audio_router, reply_length_router, nmc_weather_patch, console_server; "
+                "cwd1 = os.getcwd(); "
+                "th1 = {t.name for t in threading.enumerate()}; "
+                "patches = patch_registry.get_all_patches(); "
+                "print(json.dumps({'cwd_same': cwd0 == cwd1, 'new_threads': sorted(th1 - th0), 'patches_count': len(patches), 'installed': boot.is_installed()}))"
+            )
+            proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=20)
+            self.assertEqual(proc.returncode, 0, f"Subprocess import probe failed: {proc.stderr}")
+            data = _json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertTrue(data["cwd_same"], "Importing boot/start_with_env must NOT call os.chdir")
+            self.assertEqual(data["new_threads"], [], f"Importing modules must NOT start threads: {data['new_threads']}")
+            self.assertEqual(data["patches_count"], 0, "Importing modules must NOT apply monkeypatches")
+            self.assertFalse(data["installed"])
 
 
 if __name__ == "__main__":

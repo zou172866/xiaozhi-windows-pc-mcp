@@ -34,6 +34,7 @@ import runtime_settings as rs
 import vad_speculative_router as vsr
 
 try:
+    import boot
     import start_with_env  # noqa: F401
     import nmc_weather_patch as nmc
     from core.providers.asr.base import ASRProviderBase
@@ -42,6 +43,7 @@ try:
     from core.utils.audioRateController import AudioRateController
     from core.utils.dialogue import Dialogue, Message
 
+    boot.install_all(start_background_workers=False, run_contract_self_check=True)
     _HAS_XIAOZHI_CORE = True
 except Exception:
     _HAS_XIAOZHI_CORE = False
@@ -583,18 +585,27 @@ class TestBatch3ContainerPipeline(unittest.TestCase):
         import ast
         import anima_memory_provider
 
-        # 1. Static AST guarantee: zero threading.Timer calls/references in app/start_with_env.py
-        with open(os.path.join(APP_DIR, "start_with_env.py"), "r", encoding="utf-8") as f:
-            swe_tree = ast.parse(f.read(), filename="start_with_env.py")
-        timer_nodes = [
-            n
-            for n in ast.walk(swe_tree)
-            if isinstance(n, ast.Attribute)
-            and n.attr == "Timer"
-            and isinstance(n.value, ast.Name)
-            and n.value.id == "threading"
+        # 1. Static AST guarantee: zero threading.Timer calls/references across boot/start_with_env/patches
+        scan_files = [
+            os.path.join(APP_DIR, "boot.py"),
+            os.path.join(APP_DIR, "start_with_env.py"),
+            os.path.join(APP_DIR, "patches", "memory_hooks.py"),
+            os.path.join(APP_DIR, "patches", "auth.py"),
+            os.path.join(APP_DIR, "patches", "asr.py"),
         ]
-        self.assertEqual(timer_nodes, [], "C-8: start_with_env.py must not instantiate threading.Timer")
+        timer_nodes = []
+        for sf in scan_files:
+            with open(sf, "r", encoding="utf-8") as f:
+                swe_tree = ast.parse(f.read(), filename=sf)
+            for n in ast.walk(swe_tree):
+                if (
+                    isinstance(n, ast.Attribute)
+                    and n.attr == "Timer"
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id == "threading"
+                ):
+                    timer_nodes.append((sf, n.lineno))
+        self.assertEqual(timer_nodes, [], f"C-8: must not instantiate threading.Timer: {timer_nodes}")
 
         # 2. Inside running asyncio event loop: uses loop.call_later + TimerHandle + snapshot copy
         pushed = []
