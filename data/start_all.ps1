@@ -387,7 +387,23 @@ if (-not $env:ANIMA_BUILD_VERSION) { $env:ANIMA_BUILD_VERSION = $gitShortSha }
 if (-not $env:XIAOZHI_BUILD_VERSION) { $env:XIAOZHI_BUILD_VERSION = $gitShortSha }
 
 $animaImg = docker images -q xiaozhi-anima-brain:local 2>$null
-if (-not $animaImg) {
+$needAnimaBuild = (-not $animaImg)
+if (-not $needAnimaBuild -and $env:XIAOZHI_SKIP_ANIMA_BUILD -ne "1") {
+    $builtRev = ""
+    try {
+        $revOut = (docker inspect xiaozhi-anima-brain:local --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $revOut) { $builtRev = ($revOut | Select-Object -First 1).ToString().Trim() }
+    } catch {}
+    $animaDirty = $false
+    try {
+        $dirtyOut = (& git -C $serverDir status --porcelain -- anima-brain 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $dirtyOut) { $animaDirty = $true }
+    } catch {}
+    if ($animaDirty -or ($env:ANIMA_BUILD_VERSION -ne "dev" -and $builtRev -ne $env:ANIMA_BUILD_VERSION)) {
+        $needAnimaBuild = $true
+    }
+}
+if ($needAnimaBuild) {
     docker compose build anima-brain
     if ($LASTEXITCODE -ne 0) {
         Write-Host "`n[错误] anima-brain 镜像构建失败，请检查上方报错信息！" -ForegroundColor Red
@@ -397,10 +413,12 @@ if (-not $animaImg) {
 
 # H-2 非 root (USER app, uid 1000) 平滑升级：若宿主机旧版 root 遗留文件阻塞 uid 1000 读写 /data/anima 或 /obsidian，则一次性归属修正
 $animaDataHost = Join-Path $serverDir "anima-data"
+if (-not (Test-Path $animaDataHost)) { New-Item -ItemType Directory -Path $animaDataHost -Force | Out-Null }
 $obsidianHost = if ($env:OBSIDIAN_EXPORT_DIR) { $env:OBSIDIAN_EXPORT_DIR } else { Join-Path $serverDir "data\obsidian_export" }
 if (-not (Test-Path $obsidianHost)) { New-Item -ItemType Directory -Path $obsidianHost -Force | Out-Null }
 try {
-    docker run --rm --user 1000:1000 -v "${animaDataHost}:/data/anima" -v "${obsidianHost}:/obsidian" xiaozhi-anima-brain:local python -c "import os, pathlib, sys; db=pathlib.Path('/data/anima/brain.sqlite3'); ok_db=(not db.exists()) or (os.access(db, os.R_OK) and os.access(db, os.W_OK)); obs_dirs=[p for p in [pathlib.Path('/obsidian'), *pathlib.Path('/obsidian').rglob('*')] if p.is_dir()]; ok_obs=all(os.access(d, os.W_OK | os.X_OK) for d in obs_dirs); sys.exit(0 if (ok_db and ok_obs) else 1)" 2>$null
+    $permProbe = "import os, pathlib, sys`ndef ok_dir(p): return os.access(p, os.R_OK | os.W_OK | os.X_OK)`ndef ok_file(p): return (not p.exists()) or (os.access(p, os.R_OK | os.W_OK))`ndata = pathlib.Path('/data/anima')`nobs = pathlib.Path('/obsidian')`nchecks = [ok_dir(data), ok_file(data / 'brain.sqlite3'), ok_file(data / 'studio_token.txt'), (not (data / 'backups').exists()) or ok_dir(data / 'backups'), ok_dir(obs)]`ntry:`n    for dp, _, _ in os.walk(obs, onerror=lambda e: (_ for _ in ()).throw(e)):`n        checks.append(ok_dir(dp))`nexcept Exception:`n    checks.append(False)`nsys.exit(0 if all(checks) else 1)"
+    docker run --rm --user 1000:1000 -v "${animaDataHost}:/data/anima" -v "${obsidianHost}:/obsidian" xiaozhi-anima-brain:local python -c $permProbe 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[迁移] 检测到旧版 root 权限文件，正在平滑调整 /data/anima 与 /obsidian 属主为 app (1000:1000)..." -ForegroundColor DarkGray
         docker run --rm --user 0:0 -v "${animaDataHost}:/data/anima" -v "${obsidianHost}:/obsidian" xiaozhi-anima-brain:local chown -R 1000:1000 /data/anima /obsidian 2>$null

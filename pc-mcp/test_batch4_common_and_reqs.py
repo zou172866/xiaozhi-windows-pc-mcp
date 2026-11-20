@@ -119,6 +119,30 @@ class TestBatch4CommonAndReqs(unittest.TestCase):
         missing = sorted(direct_names - locked_names)
         self.assertEqual(missing, [], f"Direct deps missing from requirements.txt: {missing}")
 
+    def test_h5_atomic_write_retries_transient_windows_permission_error(self):
+        """H-5: common.fs.atomic_write_json retries transient Windows os.replace PermissionError cleanly."""
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "state.json"
+            real_replace = os.replace
+            calls = {"n": 0}
+
+            def _flaky_replace(src, dst):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise PermissionError("simulated transient AV lock")
+                return real_replace(src, dst)
+
+            with (
+                patch.object(pc_common.fs.os, "name", "nt"),
+                patch.object(pc_common.fs.os, "replace", side_effect=_flaky_replace),
+                patch.object(pc_common.fs.time, "sleep"),
+            ):
+                pc_common.atomic_write_json(target, {"ok": True})
+            self.assertEqual(calls["n"], 3)
+            self.assertTrue(target.is_file())
+            self.assertIn('"ok": true', target.read_text(encoding="utf-8"))
+            self.assertEqual(list(Path(td).glob("*.tmp")), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

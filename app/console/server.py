@@ -120,6 +120,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self.wfile.write(html_bytes)
             return
 
+        if path == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         if path in _STATIC_ASSETS:
             attr_name, ctype = _STATIC_ASSETS[path]
             self._serve_static_file(attr_name, ctype)

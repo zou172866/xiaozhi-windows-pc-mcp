@@ -64,7 +64,7 @@ HOST_VOICES_DIR = _HOST_DIRS["HOST_VOICES_DIR"]
 HOST_GSV_WEIGHTS_DIR = _HOST_DIRS["HOST_GSV_WEIGHTS_DIR"]
 HOST_LAN_IP = (os.environ.get("HOST_LAN_IP") or "").strip() or "127.0.0.1"
 
-# A-4: Per-boot random write token injected into console.html and required via X-Console-Token on ALL POSTs
+# A-4: Per-boot random write token injected into console/static/index.html and required via X-Console-Token on ALL POSTs
 _CONSOLE_WRITE_TOKEN = secrets.token_urlsafe(32)
 _CONSOLE_TOKEN_PLACEHOLDER = "__XIAOZHI_CONSOLE_TOKEN__"
 _INTERNAL_READONLY_PATHS = frozenset({"/api/health", "/api/state"})

@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 
 def atomic_write_text(path: Path | str, text: str, encoding: str = "utf-8") -> None:
-    """Atomically write text via a same-directory temp file + fsync + os.replace."""
+    """Atomically write text via a same-directory temp file + fsync + os.replace (with Windows sharing retry)."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_name = f".{target.name}.{os.getpid()}.{threading.get_ident()}.{os.urandom(3).hex()}.tmp"
@@ -23,7 +24,15 @@ def atomic_write_text(path: Path | str, text: str, encoding: str = "utf-8") -> N
                 os.fsync(f.fileno())
             except OSError:
                 pass
-        os.replace(tmp_path, target)
+        max_attempts = 5 if os.name == "nt" else 1
+        for attempt in range(max_attempts):
+            try:
+                os.replace(tmp_path, target)
+                break
+            except PermissionError:
+                if attempt + 1 >= max_attempts:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     except Exception:
         try:
             tmp_path.unlink(missing_ok=True)

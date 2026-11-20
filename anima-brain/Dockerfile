@@ -17,13 +17,10 @@ RUN mkdir -p /build/src/companion_engine/static && npm run build
 # Stage 2: Lightweight reproducible Python 3.12 runtime for Anima Brain + Companion Studio + XiaoZhi Bridge (H-2)
 FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
-ARG BUILD_SHA=dev
-LABEL org.opencontainers.image.revision="${BUILD_SHA}"
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
-    ANIMA_BUILD_VERSION="${BUILD_SHA}"
+    ANIMA_BUILT_STATIC_DIR=/app/built_static
 
 WORKDIR /app
 
@@ -44,6 +41,10 @@ RUN pip install --no-cache-dir --no-build-isolation --no-deps . \
     && rm -rf /app/src
 
 COPY --from=web-builder /build/examples/showcase/dist /app/examples/showcase/dist
+COPY --from=web-builder /build/src/companion_engine/static/voice-player.html /app/built_static/voice-player.html
+COPY --from=web-builder /build/src/companion_engine/static/voice-player-notices.txt /app/built_static/voice-player-notices.txt
+COPY --from=web-builder /build/src/companion_engine/static/memory-panel.html /app/built_static/memory-panel.html
+COPY --from=web-builder /build/src/companion_engine/static/provider-settings.html /app/built_static/provider-settings.html
 COPY obsidian_exporter.py /app/obsidian_exporter.py
 COPY xiaozhi_anima_service.py /app/xiaozhi_anima_service.py
 
@@ -52,6 +53,11 @@ RUN groupadd --gid 1000 app \
     && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin app \
     && mkdir -p /data/anima /obsidian \
     && chown -R app:app /app /data/anima /obsidian
+
+# Place volatile build metadata LAST so changing BUILD_SHA never invalidates pip/src layers (H-2)
+ARG BUILD_SHA=dev
+LABEL org.opencontainers.image.revision="${BUILD_SHA}"
+ENV ANIMA_BUILD_VERSION="${BUILD_SHA}"
 
 USER app
 EXPOSE 18787

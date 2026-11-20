@@ -1513,6 +1513,56 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
         finally:
             svc.BUILD_VERSION = orig_bv
 
+    def test_batch4_h3_h4_dev_override_static_html_fallback(self):
+        """H-3/H-4: Dev bind-mount (without gitignored built HTMLs in src/) falls back cleanly to ANIMA_BUILT_STATIC_DIR."""
+        import os
+        import tempfile
+        from unittest.mock import patch
+        from companion_engine import memory_ui, plugin_support, settings_ui
+
+        with tempfile.TemporaryDirectory() as td:
+            built_dir = Path(td) / "built_static"
+            built_dir.mkdir()
+            (built_dir / "voice-player.html").write_text("<html>voice-built</html>", encoding="utf-8")
+            (built_dir / "memory-panel.html").write_text("<html>memory-built</html>", encoding="utf-8")
+            (built_dir / "provider-settings.html").write_text("<html>settings-built</html>", encoding="utf-8")
+
+            empty_pkg = Path(td) / "empty_pkg"
+            (empty_pkg / "static").mkdir(parents=True)
+
+            # 1. plugin_support.player_html()
+            with (
+                patch.dict(os.environ, {"ANIMA_BUILT_STATIC_DIR": str(built_dir)}),
+                patch.object(plugin_support, "ROOT", empty_pkg),
+            ):
+                self.assertEqual(plugin_support.player_html(), "<html>voice-built</html>")
+
+            # 2. memory_ui resource reader
+            class _FakeServer:
+                def __init__(self):
+                    self.resources = {}
+                def resource(self, uri, **_kw):
+                    def _dec(fn):
+                        self.resources[uri] = fn
+                        return fn
+                    return _dec
+                def tool(self, **_kw):
+                    return lambda fn: fn
+
+            class _FakeRuntime:
+                engine = None
+
+            srv = _FakeServer()
+            memory_ui.register_memory_ui(srv, _FakeRuntime())
+            settings_ui.register_settings_ui(srv, _FakeRuntime())
+            with (
+                patch.dict(os.environ, {"ANIMA_BUILT_STATIC_DIR": str(built_dir)}),
+                patch.object(memory_ui, "__file__", str(empty_pkg / "memory_ui.py")),
+                patch.object(settings_ui, "__file__", str(empty_pkg / "settings_ui.py")),
+            ):
+                self.assertEqual(srv.resources[memory_ui.MEMORY_URI](), "<html>memory-built</html>")
+                self.assertEqual(srv.resources[settings_ui.SETTINGS_URI](), "<html>settings-built</html>")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

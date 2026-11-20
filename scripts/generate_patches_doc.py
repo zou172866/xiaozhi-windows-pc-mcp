@@ -57,7 +57,7 @@ def render_patches_markdown() -> str:
         "",
         f"- **锁定上游镜像版本**：`xiaozhi-esp32-server` `{expected_ver}`（`docker-compose.yml` 锁定 `@sha256` digest）",
         f"- **补丁总数**：`{len(catalog)}` 项（`security` 安全类 `{sec_count}` 项 + `experience` 体验类 `{exp_count}` 项）",
-        "- **唯一启动入口**：`app/boot.py`（模块导入零副作用，由 `install_all()` 显式挂载全部补丁 → `patches/contracts.py` 轻量契约自检写入注册表 → `assert_security_boot_gate()` 安全门禁 → 启动 `18080` 控制台与上游 `app.py`）",
+        "- **唯一启动入口**：`app/boot.py`（模块导入零副作用，由 `install_all()` 显式挂载全部补丁 → `patches/contracts.py` 轻量契约自检写入注册表 → `enforce_security_boot_gate()` 安全门禁 → 启动 `18080` 控制台与上游 `app.py`）",
         "- **实时自检接口**：`GET http://127.0.0.1:18080/api/health`（返回每个补丁的状态、契约结果、早绑重绑列表与 `contract_self_check` 结果）",
         "",
         "## 失败策略（安全 fail-closed / 体验 fail-soft）",

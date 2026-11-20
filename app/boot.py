@@ -100,6 +100,7 @@ def install_all(
     chdir: bool = True,
     start_background_workers: bool = True,
     run_contract_self_check: bool = True,
+    force: bool = False,
 ) -> Dict[str, Any]:
     """Explicitly install all XiaoZhi patches & run lightweight contract self-check (idempotent)."""
     global _installed
@@ -110,6 +111,11 @@ def install_all(
         import runtime_events
         import runtime_settings
         from patches import asr, auth, contracts, memory_hooks
+
+        if _installed and not force and patch_registry.get_all_patches():
+            if run_contract_self_check and not patch_registry.get_contract_self_check().get("ran"):
+                contracts.run_lightweight_contract_checks()
+            return patch_registry.get_health_summary()
 
         # 0. Verify upstream SERVER_VERSION & migrate legacy runtime JSONs
         ver_info = patch_registry.check_upstream_server_version()

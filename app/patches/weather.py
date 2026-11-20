@@ -476,6 +476,18 @@ def apply_nmc_weather_patch():
     import plugins_func.functions.get_weather as orig_mod
     from plugins_func.register import FunctionItem, ToolType, all_function_registry
 
+    if getattr(orig_mod, "_nmc_weather_patched", False):
+        if patch_registry.get_patch_status("nmc_weather") is None:
+            patch_registry.record_patch(
+                "nmc_weather",
+                "ok",
+                target="plugins_func.functions.get_weather",
+                detail="already applied",
+                contract_ok=True,
+                category="experience",
+            )
+        return
+
     orig_fn = getattr(orig_mod, "get_weather", None)
     ok_sig, det_sig = patch_registry.verify_signature_contract(
         orig_fn, required_params=("conn",), require_async=None
@@ -494,6 +506,7 @@ def apply_nmc_weather_patch():
 
     orig_mod.GET_WEATHER_FUNCTION_DESC = NMC_WEATHER_FUNCTION_DESC
     orig_mod.get_weather = nmc_get_weather
+    orig_mod._nmc_weather_patched = True
     rebound = patch_registry.rebind(orig_fn, nmc_get_weather) if orig_fn is not None else []
     all_function_registry["get_weather"] = FunctionItem(
         "get_weather",

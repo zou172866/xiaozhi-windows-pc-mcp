@@ -1,5 +1,6 @@
 """Inspectable MCP Apps memory UI backed by revision-checked engine operations."""
 
+import os
 from pathlib import Path
 
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
@@ -33,7 +34,12 @@ def register_memory_ui(server, runtime):
         },
     )
     def memory_panel_html() -> str:
-        return (Path(__file__).parent / "static/memory-panel.html").read_text(encoding="utf-8")
+        local = Path(__file__).parent / "static" / "memory-panel.html"
+        if not local.is_file():
+            fallback = Path(os.environ.get("ANIMA_BUILT_STATIC_DIR", "/app/built_static")) / "memory-panel.html"
+            if fallback.is_file():
+                local = fallback
+        return local.read_text(encoding="utf-8")
 
     @server.tool(
         annotations=read,

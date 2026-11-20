@@ -646,6 +646,7 @@ def apply_llm_prefix_cache_patch() -> None:
 
         return _patched_init
 
+    already_applied = bool(getattr(cls, "_prefix_cache_telemetry_patched", False))
     ok, _ = patch_registry.install_patch(
         "llm_prefix_cache",
         cls,
@@ -658,7 +659,7 @@ def apply_llm_prefix_cache_patch() -> None:
         flag_obj=cls,
         flag_attr="_prefix_cache_telemetry_patched",
     )
-    if ok:
+    if ok and not already_applied:
         print(
             f"[LLMCache] 已挂载 LLM 前缀缓存与 TTFT 遥测补丁 (turn_context_mode={get_turn_context_mode()})",
             flush=True,

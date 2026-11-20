@@ -127,35 +127,39 @@ class MtimeFileCache(Generic[T]):
         self._default_factory = default_factory
         self._retries = max(1, int(retries))
         self._lock = threading.RLock()
+        self._path: Optional[str] = None
         self._sig: Optional[tuple[int, int]] = None  # (mtime_ns, st_size)
         self._has_value = False
         self._value: Optional[T] = None
 
     def get(self, path: str, *, clone: Optional[Callable[[T], T]] = None) -> T:
+        norm_path = os.path.abspath(str(path or ""))
         with self._lock:
             try:
-                st = os.stat(path)
+                st = os.stat(norm_path)
             except FileNotFoundError:
+                self._path = None
                 self._sig = None
                 self._has_value = False
                 self._value = None
                 return self._default_factory()
             except OSError:
-                if self._has_value and self._value is not None:
+                if self._has_value and self._path == norm_path and self._value is not None:
                     return clone(self._value) if clone else self._value
                 return self._default_factory()
 
             sig = (int(st.st_mtime_ns), int(st.st_size))
-            if self._has_value and self._sig == sig and self._value is not None:
+            if self._has_value and self._path == norm_path and self._sig == sig and self._value is not None:
                 return clone(self._value) if clone else self._value
 
             last_err: Optional[Exception] = None
             for attempt in range(self._retries):
                 try:
-                    with open(path, "r", encoding="utf-8") as f:
+                    with open(norm_path, "r", encoding="utf-8") as f:
                         raw = f.read()
                     parsed = self._parser(raw)
                     self._value = parsed
+                    self._path = norm_path
                     self._sig = sig
                     self._has_value = True
                     return clone(parsed) if clone else parsed
@@ -164,22 +168,25 @@ class MtimeFileCache(Generic[T]):
                     if attempt + 1 < self._retries:
                         time.sleep(0.02)
             _ = last_err
-            if self._has_value and self._value is not None:
+            if self._has_value and self._path == norm_path and self._value is not None:
                 return clone(self._value) if clone else self._value
             return self._default_factory()
 
     def set(self, path: str, value: T) -> None:
+        norm_path = os.path.abspath(str(path or ""))
         with self._lock:
             self._value = value
+            self._path = norm_path
             self._has_value = True
             try:
-                st = os.stat(path)
+                st = os.stat(norm_path)
                 self._sig = (int(st.st_mtime_ns), int(st.st_size))
             except OSError:
                 self._sig = None
 
     def invalidate(self) -> None:
         with self._lock:
+            self._path = None
             self._sig = None
             self._has_value = False
             self._value = None

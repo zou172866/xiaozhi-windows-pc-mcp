@@ -7,6 +7,8 @@ services:
   anima-brain:
     environment:
       - PYTHONPATH=/app_dev/src:/app_dev
+      # Keep Dockerfile-built MCP UI static HTMLs available even when host src/ omits gitignored build outputs (H-4)
+      - ANIMA_BUILT_STATIC_DIR=/app/built_static
     volumes:
       - ./anima-brain:/app_dev:ro
     command: ["python", "/app_dev/xiaozhi_anima_service.py"]

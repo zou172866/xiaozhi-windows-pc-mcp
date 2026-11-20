@@ -149,6 +149,7 @@ class TestUpstreamImageContracts(unittest.TestCase):
                 "cwd0 = os.getcwd(); "
                 "th0 = {t.name for t in threading.enumerate()}; "
                 "import boot, start_with_env, patch_registry, mei_emotion_router, pc_audio_router, reply_length_router, nmc_weather_patch, console_server; "
+                "import patches, patches.auth, patches.memory_hooks, patches.asr, patches.contracts, patches.emotion, console.server, console.shared; "
                 "cwd1 = os.getcwd(); "
                 "th1 = {t.name for t in threading.enumerate()}; "
                 "patches = patch_registry.get_all_patches(); "
@@ -161,6 +162,37 @@ class TestUpstreamImageContracts(unittest.TestCase):
             self.assertEqual(data["new_threads"], [], f"Importing modules must NOT start threads: {data['new_threads']}")
             self.assertEqual(data["patches_count"], 0, "Importing modules must NOT apply monkeypatches")
             self.assertFalse(data["installed"])
+
+    def test_h1_install_all_is_strictly_idempotent_and_mtime_cache_tracks_path(self):
+        """H-1/H-5: Calling boot.install_all() twice is a clean no-op and MtimeJsonCache isolates distinct paths."""
+        import io
+        import tempfile
+        import threading
+        from contextlib import redirect_stdout
+        import boot
+        import xz_common
+
+        th_before = threading.active_count()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            summary = boot.install_all(start_background_workers=False, run_contract_self_check=True)
+        self.assertEqual(threading.active_count(), th_before)
+        self.assertEqual(buf.getvalue().strip(), "", f"Second boot.install_all() should be silent no-op, got: {buf.getvalue()!r}")
+        self.assertFalse(summary["degraded"])
+
+        # MtimeJsonCache must not collide when two distinct files have identical (mtime_ns, st_size)
+        with tempfile.TemporaryDirectory() as td:
+            p1 = os.path.join(td, "a.json")
+            p2 = os.path.join(td, "b.json")
+            with open(p1, "w", encoding="utf-8") as f:
+                f.write('{"v": 1}')
+            with open(p2, "w", encoding="utf-8") as f:
+                f.write('{"v": 2}')
+            st1 = os.stat(p1)
+            os.utime(p2, ns=(st1.st_atime_ns, st1.st_mtime_ns))
+            cache = xz_common.MtimeJsonCache()
+            self.assertEqual(cache.get(p1)["v"], 1)
+            self.assertEqual(cache.get(p2)["v"], 2)
 
 
 if __name__ == "__main__":

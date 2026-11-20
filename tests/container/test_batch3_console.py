@@ -1065,6 +1065,10 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
                     self.assertEqual(r_ac.status_code, 200)
                     self.assertEqual(r_ac.json()["asr_corrections"]["count"], 2)
                     self.assertEqual(ac.apply_asr_corrections("你好雷电牙医", path=asr_path), "你好雷电芽衣")
+
+                    # Browser favicon request must return 204 (zero 404 noise in DevTools console)
+                    r_fav = client.get(f"http://127.0.0.1:{port}/favicon.ico")
+                    self.assertEqual(r_fav.status_code, 204)
             finally:
                 real_ob.close()
                 cs.CONSOLE_PORT = orig_port

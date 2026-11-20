@@ -1,5 +1,6 @@
 """Native-style status card. Secret input remains outside the ChatGPT iframe."""
 
+import os
 from pathlib import Path
 
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
@@ -38,7 +39,12 @@ def register_settings_ui(server, runtime):
         },
     )
     def settings_html():
-        return (Path(__file__).parent / "static/provider-settings.html").read_text()
+        local = Path(__file__).parent / "static" / "provider-settings.html"
+        if not local.is_file():
+            fallback = Path(os.environ.get("ANIMA_BUILT_STATIC_DIR", "/app/built_static")) / "provider-settings.html"
+            if fallback.is_file():
+                local = fallback
+        return local.read_text(encoding="utf-8")
 
     @server.tool(
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
