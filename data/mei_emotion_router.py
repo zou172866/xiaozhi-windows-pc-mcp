@@ -15,11 +15,17 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import re
 import threading
+import time
 from typing import Any, Dict, Optional, Tuple
+
+import patch_registry
+import runtime_events
+import runtime_settings
 
 _LEGACY_HOST_DATA_PREFIX = "e:/故事/1/xiaozhi-server/data"
 CONTAINER_DATA_PREFIX = "/opt/xiaozhi-esp32-server/data"
@@ -268,7 +274,11 @@ _UNCLOSED_OPENERS = {
 
 _SPOKEN_CHAR_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
 _LEAKED_XML_TOOL_TAG_RE = re.compile(
-    r"</?\s*(?:parameter|invoke|tool_call|function_calls?|antml:[a-z_]+|minimax:[a-z_]+)\b[^>]*>",
+    r"(?:"
+    r"</?\s*[|｜]{1,2}\s*DSML\s*[|｜]{1,2}[^>]*>"
+    r"|<\s*[|｜]{1,2}\s*tool[\s_\u2581][a-z_\s\u2581]{2,32}\s*[|｜]{1,2}\s*>"
+    r"|</?\s*(?:parameter|invoke|calls|tool_call|function_calls?|antml:[a-z_]+|minimax:[a-z_]+)\b[^>]*>"
+    r")",
     flags=re.IGNORECASE,
 )
 _STRONG_PUNCT = ("。", "！", "!", "？", "?", "；", ";", "\n")
@@ -434,6 +444,21 @@ _cached_manifest: Optional[Dict[str, Dict[str, Any]]] = None
 _gsv_session_lock = threading.Lock()
 _gsv_session = None
 
+# Shared GPU synthesis/weights lock between live ESP32 TTS and 18080 Console preview (P1-14)
+GSV_GPU_LOCK = threading.RLock()
+_gsv_inflight_lock = threading.Lock()
+_gsv_live_inflight: int = 0
+
+FIRST_SENTENCE_MAX_STRONG_CHARS = 20
+SUBSEQUENT_MAX_STRONG_CHARS = 38
+DEFAULT_FIRST_SEG_SAMPLE_STEPS = 8
+
+
+def is_live_gsv_busy() -> bool:
+    """Return True while a live ESP32 GPT-SoVITS synthesis request is in flight."""
+    with _gsv_inflight_lock:
+        return _gsv_live_inflight > 0
+
 
 def _get_gsv_http_session():
     """Return a persistent keep-alive requests.Session with trust_env=False for local 19880 TTS."""
@@ -449,7 +474,13 @@ def _get_gsv_http_session():
     return _gsv_session
 
 
-def _resolve_gsv_sample_steps(provider, chosen_prof: Optional[Dict[str, Any]], is_mei: bool) -> Optional[int]:
+def _resolve_gsv_sample_steps(
+    provider,
+    chosen_prof: Optional[Dict[str, Any]],
+    is_mei: bool,
+    *,
+    is_first_segment: bool = False,
+) -> Optional[int]:
     cand = None
     if isinstance(chosen_prof, dict) and chosen_prof.get("sample_steps") is not None:
         cand = chosen_prof.get("sample_steps")
@@ -463,9 +494,27 @@ def _resolve_gsv_sample_steps(provider, chosen_prof: Optional[Dict[str, Any]], i
     if cand in (None, ""):
         return None
     try:
-        return max(4, min(64, int(cand)))
+        base_steps = max(4, min(64, int(cand)))
     except Exception:
-        return 16 if is_mei else None
+        base_steps = 16 if is_mei else None
+    if base_steps is None:
+        return None
+
+    # P1-10: Lower first-segment DiT sample_steps (default 8) to cut first-audio latency while keeping
+    # full quality on segment 2+ (which synthesize concurrently while segment 1 plays).
+    if is_first_segment and not getattr(provider, "_suppress_first_seg_fast_steps", False):
+        fast_cand = getattr(provider, "first_segment_sample_steps", None)
+        if fast_cand is None and isinstance(getattr(provider, "config", None), dict):
+            fast_cand = provider.config.get("first_segment_sample_steps")
+        if fast_cand in (None, ""):
+            env_fast = (os.environ.get("GSV_FIRST_SEG_SAMPLE_STEPS") or "").strip()
+            fast_cand = env_fast if env_fast else DEFAULT_FIRST_SEG_SAMPLE_STEPS
+        try:
+            fast_steps = max(4, min(base_steps, int(fast_cand)))
+            return fast_steps
+        except Exception:
+            return min(base_steps, DEFAULT_FIRST_SEG_SAMPLE_STEPS)
+    return base_steps
 
 
 def _rewrite_host_data_path(raw_path: str) -> str:
@@ -639,7 +688,11 @@ def extract_and_strip_emotion(
 
 def strip_emotion_tags(text: str) -> str:
     _, cleaned = extract_and_strip_emotion(text, flush_incomplete=False)
-    cleaned = _LEAKED_XML_TOOL_TAG_RE.sub("", cleaned)
+    cleaned_no_xml = _LEAKED_XML_TOOL_TAG_RE.sub("", cleaned)
+    if cleaned_no_xml != cleaned:
+        cleaned = cleaned_no_xml.rstrip()
+    else:
+        cleaned = cleaned_no_xml
     return cleaned.lstrip() if text and not text[0].isspace() else cleaned
 
 
@@ -706,7 +759,7 @@ def clean_segment_for_tts(text: str) -> str:
     return s
 
 
-def safe_clean_response_garbage(text: str) -> str:
+def safe_clean_response_garbage(text: str, *args, **kwargs) -> str:
     """Lossless replacement for upstream `ConnectionHandler._clean_response_garbage`.
 
     Strips genuine leaked JSON closure suffixes (e.g. `"}`, `"}}`, `\\n"}}`) without
@@ -731,11 +784,13 @@ def safe_clean_response_garbage(text: str) -> str:
             continue
         cleaned_lines.append(line)
     result = "\n".join(cleaned_lines)
-    result = _LEAKED_XML_TOOL_TAG_RE.sub("", result)
+    result_no_xml = _LEAKED_XML_TOOL_TAG_RE.sub("", result)
+    xml_removed = result_no_xml != result
+    result = result_no_xml
     m_tail = re.search(r'(?:["\']\s*\}+|\}{2,})\s*$', result)
     if m_tail:
         result = result[: m_tail.start()].rstrip()
-    elif removed_line:
+    elif removed_line or xml_removed:
         result = result.rstrip()
     return result
 
@@ -850,16 +905,21 @@ def strip_voice_tag_instruction_for_anima(prompt: str) -> str:
 def find_prosody_cut_pos(
     current_text: str, is_first_sentence: bool, quote_safe_cut_fn
 ) -> int:
-    """Find smooth clause boundary without chopping 2-3 char openings at the first comma."""
+    """Find smooth clause boundary without chopping 2-3 char openings at the first comma.
+
+    P1-10: Tightens first-sentence strong-punctuation ceiling to ~20 spoken chars (vs 38 for
+    later sentences) and allows soft comma split once >=14 spoken chars for faster first-audio.
+    """
     if not current_text:
         return -1
     if has_unclosed_leading_tag(current_text):
         return -1
 
     min_strong = 6 if is_first_sentence else 4
-    min_soft = 18 if is_first_sentence else 28
+    min_soft = 14 if is_first_sentence else 28
+    max_strong = FIRST_SENTENCE_MAX_STRONG_CHARS if is_first_sentence else SUBSEQUENT_MAX_STRONG_CHARS
 
-    # Check if a strong sentence boundary within comfortable breath length is already buffered
+    # Check if a strong sentence boundary within target first/breath length is already buffered
     first_strong_cut = -1
     for idx, ch in enumerate(current_text):
         if ch in _STRONG_PUNCT:
@@ -868,10 +928,10 @@ def find_prosody_cut_pos(
                 first_strong_cut = safe
                 break
 
-    if first_strong_cut != -1 and count_spoken_chars(current_text[: first_strong_cut + 1]) <= 38:
+    if first_strong_cut != -1 and count_spoken_chars(current_text[: first_strong_cut + 1]) <= max_strong:
         return first_strong_cut
 
-    # Otherwise allow soft comma/colon split only once the clause is long enough (>=18 / >=28 spoken chars)
+    # Otherwise allow soft comma/colon split once the clause is long enough (>=14 / >=28 spoken chars)
     for idx, ch in enumerate(current_text):
         if ch in _STRONG_PUNCT:
             safe = quote_safe_cut_fn(current_text, idx, _ALL_CUT_PUNCT)
@@ -925,11 +985,70 @@ def _push_esp32_emotion_async(conn, emoji: str, esp32_emotion: str) -> None:
         pass
 
 
+_PROMPT_REPLACEMENTS: Tuple[Tuple[str, str, str], ...] = (
+    (
+        "brackets_rule",
+        'NEVER use brackets to express inner thoughts or actions (e.g. ”[无奈地叹气]”,”(笑着说)”).',
+        'Start every spoken reply (including direct_answer.response) with ONE hidden English emotion tag from [calm], [gentle], [happy], [playful], [shy], [serious], [tender] (optional second tag only if mood genuinely shifts mid-reply). NEVER use stage-direction brackets like ”[无奈地叹气]” or ”(笑着说)”.',
+    ),
+    (
+        "get_to_the_point",
+        '1. [Get to the point] Never be verbose. The first sentence must directly address the topic — no unnecessary pleasantries or preamble.',
+        '1. [Natural pacing] Be engaging, warm, and thorough. Follow the length and conversational pacing described in <identity> rather than cutting answers overly short.',
+    ),
+    (
+        "slice_long_content",
+        '- [Slice long content] For long-form content like storytelling or knowledge sharing, NEVER dump everything at once. Start with the core content directly, then naturally ask the user whether to continue at the end (e.g., tell an actual segment first, then ask ”要继续听吗？”). Start on demand, stop on demand, yield to interruptions.',
+        '- [Rich storytelling & explanation] For storytelling, explanations, or thoughtful chat, give a full, vivid, satisfying multi-sentence segment instead of stopping after just one or two sentences; only pause to ask if the user wants to keep going after delivering a substantial part.',
+    ),
+    (
+        "colloquial_zahuishi",
+        '"咋回事"',
+        '"怎么啦"',
+    ),
+)
+
+
+def verify_prompt_base_anchors(
+    prompt_path: str = "/opt/xiaozhi-esp32-server/agent-base-prompt.txt",
+) -> Tuple[bool, str]:
+    """Verify upstream agent-base-prompt.txt still contains every anchor we .replace()."""
+    if not os.path.isfile(prompt_path):
+        return False, f"base prompt file missing: {prompt_path}"
+    try:
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except Exception as exc:
+        return False, f"failed to read base prompt: {exc}"
+    missing = [name for name, anchor, _ in _PROMPT_REPLACEMENTS if anchor not in raw]
+    if missing:
+        return False, f"missing prompt anchor(s): {', '.join(missing)}"
+    return True, f"verified {len(_PROMPT_REPLACEMENTS)} anchors"
+
+
+def apply_prompt_harmony_replacements(rendered: str) -> str:
+    """Apply prompt harmonization replacements after asserting every upstream anchor is present (P1-8)."""
+    out = rendered
+    for anchor_name, old_anchor, new_text in _PROMPT_REPLACEMENTS:
+        try:
+            assert old_anchor in out, f"Upstream prompt anchor missing: {anchor_name}"
+        except AssertionError:
+            patch_registry.record_patch(
+                "mei_prompt_anchors",
+                "failed",
+                target="agent-base-prompt.txt",
+                detail=f"runtime anchor assertion failed: {anchor_name}",
+                contract_ok=False,
+            )
+            raise
+        out = out.replace(old_anchor, new_text)
+    return out
+
+
 def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     """Patch xiaozhi-esp32-server TTS streaming, GPT-SoVITS v2/v4 emotion routing,
     direct_answer chunk cleaner, prompt harmony, subtitle firewall, and playback-synced
     ESP32 emotion indicator in memory at container startup."""
-    import requests
     from core.providers.tts.base import TTSProviderBase, logger as base_logger
     from core.providers.tts import gpt_sovits_v2 as gsv_mod
     import core.handle.sendAudioHandle as send_audio_mod
@@ -938,7 +1057,41 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     from core.utils.prompt_manager import PromptManager
 
     if getattr(TTSProviderBase, "_mei_prosody_patched", False):
+        if patch_registry.get_patch_status("mei_emotion_and_prosody") is None:
+            patch_registry.record_patch("mei_emotion_and_prosody", "ok", target="TTSProviderBase/GSV", detail="already applied")
         return
+
+    # P1-8: Startup contract verification for upstream targets + prompt anchors
+    contract_checks = [
+        ("ConnectionHandler._clean_response_garbage", ConnectionHandler.__dict__.get("_clean_response_garbage", getattr(ConnectionHandler, "_clean_response_garbage", None)), ("text",), False),
+        ("PromptManager.build_enhanced_prompt", PromptManager.build_enhanced_prompt, ("self", "user_prompt", "device_id"), False),
+        ("ConnectionHandler._inject_tool_call_fewshot", ConnectionHandler._inject_tool_call_fewshot, ("self",), False),
+        ("TTSProviderBase.store_tts_text", TTSProviderBase.store_tts_text, ("self", "sentence_id", "text"), False),
+        ("TTSProviderBase._get_segment_text", TTSProviderBase._get_segment_text, ("self",), False),
+        ("TTSProviderBase._process_remaining_text_stream", TTSProviderBase._process_remaining_text_stream, ("self",), False),
+        ("TTSProviderBase.to_tts_stream", TTSProviderBase.to_tts_stream, ("self", "text"), False),
+        ("TTSProviderBase.to_tts", TTSProviderBase.to_tts, ("self", "text"), False),
+        ("GSV.__init__", gsv_mod.TTSProvider.__init__, ("self", "config", "delete_audio_file"), False),
+        ("GSV.text_to_speak", gsv_mod.TTSProvider.text_to_speak, ("self", "text", "output_file"), True),
+        ("sendAudioHandle.send_tts_message", send_audio_mod.send_tts_message, ("conn", "state"), True),
+        ("textUtils.get_emotion", text_utils_mod.get_emotion, ("conn", "text"), True),
+    ]
+    contract_failures = []
+    for cname, cfn, req_params, req_async in contract_checks:
+        ok_sig, sig_detail = patch_registry.verify_signature_contract(
+            cfn, required_params=req_params, require_async=req_async
+        )
+        if not ok_sig:
+            contract_failures.append(f"{cname}: {sig_detail}")
+
+    anchors_ok, anchors_detail = verify_prompt_base_anchors()
+    patch_registry.record_patch(
+        "mei_prompt_anchors",
+        "ok" if anchors_ok else "failed",
+        target="agent-base-prompt.txt",
+        detail=anchors_detail,
+        contract_ok=anchors_ok,
+    )
 
     # 0. Fix upstream direct_answer delta cleaner eating closing `]` on [gentle] / [playful] / [安全挡]
     ConnectionHandler._clean_response_garbage = staticmethod(safe_clean_response_garbage)
@@ -947,35 +1100,24 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     _orig_build_enhanced_prompt = PromptManager.build_enhanced_prompt
     _orig_inject_fewshot = ConnectionHandler._inject_tool_call_fewshot
 
+    @functools.wraps(_orig_build_enhanced_prompt)
     def _patched_build_enhanced_prompt(
-        self, user_prompt: str, device_id: str, client_ip: str = None, *args, **kwargs
+        self, user_prompt: str, device_id: str, *args, **kwargs
     ) -> str:
         if has_voice_emotion_tag_rule(user_prompt):
             kw = dict(kwargs)
             kw["emoji_enabled"] = False
             rendered = _orig_build_enhanced_prompt(
-                self, user_prompt, device_id, client_ip, *args, **kw
+                self, user_prompt, device_id, *args, **kw
             )
-            rendered = rendered.replace(
-                'NEVER use brackets to express inner thoughts or actions (e.g. ”[无奈地叹气]”,”(笑着说)”).',
-                'Start every spoken reply (including direct_answer.response) with ONE hidden English emotion tag from [calm], [gentle], [happy], [playful], [shy], [serious], [tender] (optional second tag only if mood genuinely shifts mid-reply). NEVER use stage-direction brackets like ”[无奈地叹气]” or ”(笑着说)”.',
-            )
-            rendered = rendered.replace(
-                '1. [Get to the point] Never be verbose. The first sentence must directly address the topic — no unnecessary pleasantries or preamble.',
-                '1. [Natural pacing] Be engaging, warm, and thorough. Follow the length and conversational pacing described in <identity> rather than cutting answers overly short.',
-            )
-            rendered = rendered.replace(
-                '- [Slice long content] For long-form content like storytelling or knowledge sharing, NEVER dump everything at once. Start with the core content directly, then naturally ask the user whether to continue at the end (e.g., tell an actual segment first, then ask ”要继续听吗？”). Start on demand, stop on demand, yield to interruptions.',
-                '- [Rich storytelling & explanation] For storytelling, explanations, or thoughtful chat, give a full, vivid, satisfying multi-sentence segment instead of stopping after just one or two sentences; only pause to ask if the user wants to keep going after delivering a substantial part.',
-            )
-            rendered = rendered.replace('"咋回事"', '"怎么啦"')
-            return rendered
+            return apply_prompt_harmony_replacements(rendered)
         return _orig_build_enhanced_prompt(
-            self, user_prompt, device_id, client_ip, *args, **kwargs
+            self, user_prompt, device_id, *args, **kwargs
         )
 
-    def _patched_inject_tool_call_fewshot(self):
-        res = _orig_inject_fewshot(self)
+    @functools.wraps(_orig_inject_fewshot)
+    def _patched_inject_tool_call_fewshot(self, *args, **kwargs):
+        res = _orig_inject_fewshot(self, *args, **kwargs)
         try:
             if has_voice_emotion_tag_rule(str((self.config or {}).get("prompt") or "")):
                 for m in getattr(self.dialogue, "dialogue", []) or []:
@@ -998,27 +1140,32 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
 
     # 1. Patch TTSProviderBase.tts_text_priority_thread FIRST reset + smooth segmentation
     _orig_store_tts_text = TTSProviderBase.store_tts_text
+    _orig_get_segment_text = TTSProviderBase._get_segment_text
+    _orig_process_remaining = TTSProviderBase._process_remaining_text_stream
     _orig_to_tts = TTSProviderBase.to_tts
     _orig_to_tts_stream = TTSProviderBase.to_tts_stream
 
-    def _patched_store_tts_text(self, sentence_id, text):
+    @functools.wraps(_orig_store_tts_text)
+    def _patched_store_tts_text(self, sentence_id, text, *args, **kwargs):
         clean = strip_emotion_tags(text or "")
-        return _orig_store_tts_text(self, sentence_id, clean)
+        return _orig_store_tts_text(self, sentence_id, clean, *args, **kwargs)
 
-    def _patched_get_segment_text(self) -> Optional[str]:
+    @functools.wraps(_orig_get_segment_text)
+    def _patched_get_segment_text(self, *args, **kwargs) -> Optional[str]:
         while True:
             full_text = "".join(self.tts_text_buff)
             current_text = full_text[self.processed_chars :]
             if not current_text:
                 return None
 
-            # Reset per-turn emotion state when a brand-new sentence_id starts
+            # Reset per-turn emotion & first-segment state when a brand-new sentence_id starts
             cur_sid = getattr(self, "current_sentence_id", None)
             if getattr(self, "_emotion_turn_sid", None) != cur_sid:
                 self._emotion_turn_sid = cur_sid
                 self._turn_explicit_emotion = None
                 self._pending_segment_emotion = None
                 self._segment_emotion_queue = []
+                self._first_segment_done_sid = None
 
             # Absorb leading tag early ONLY for the very first unspoken sentence of the turn
             s_lead = _strip_leading_ws_and_emojis(current_text)
@@ -1073,7 +1220,9 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
 
             return None
 
-    def _patched_process_remaining_text_stream(self, opus_handler=None):
+    @functools.wraps(_orig_process_remaining)
+    def _patched_process_remaining_text_stream(self, *args, **kwargs):
+        opus_handler = kwargs.get("opus_handler", args[0] if args else None)
         did_any = False
         # First drain all complete prosodic sentences individually (preserving per-sentence emotion tags)
         while True:
@@ -1094,6 +1243,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
             self._turn_explicit_emotion = None
             self._pending_segment_emotion = None
             self._segment_emotion_queue = []
+            self._first_segment_done_sid = None
         seg_emo, stripped = extract_and_strip_emotion(remaining_text, flush_incomplete=True)
         if seg_emo:
             self._turn_explicit_emotion = seg_emo
@@ -1104,7 +1254,8 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
             return True
         return did_any
 
-    def _patched_to_tts_stream(self, text, opus_handler=None):
+    @functools.wraps(_orig_to_tts_stream)
+    def _patched_to_tts_stream(self, text, *args, **kwargs):
         seg_emo, stripped = extract_and_strip_emotion(text or "", flush_incomplete=True)
         if seg_emo:
             self._turn_explicit_emotion = seg_emo
@@ -1112,9 +1263,10 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         cleaned = clean_segment_for_tts(stripped)
         if not cleaned:
             return None
-        return _orig_to_tts_stream(self, cleaned, opus_handler=opus_handler)
+        return _orig_to_tts_stream(self, cleaned, *args, **kwargs)
 
-    def _patched_to_tts(self, text):
+    @functools.wraps(_orig_to_tts)
+    def _patched_to_tts(self, text, *args, **kwargs):
         seg_emo, stripped = extract_and_strip_emotion(text or "", flush_incomplete=True)
         if seg_emo:
             self._turn_explicit_emotion = seg_emo
@@ -1122,7 +1274,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         cleaned = clean_segment_for_tts(stripped)
         if not cleaned:
             return None
-        return _orig_to_tts(self, cleaned)
+        return _orig_to_tts(self, cleaned, *args, **kwargs)
 
     TTSProviderBase.store_tts_text = _patched_store_tts_text
     TTSProviderBase._get_segment_text = _patched_get_segment_text
@@ -1130,11 +1282,13 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     TTSProviderBase.to_tts_stream = _patched_to_tts_stream
     TTSProviderBase.to_tts = _patched_to_tts
 
-    # 2. Patch GPT_SOVITS_V2.TTSProvider for dynamic multi-emotion reference routing + cut0 + V4 sample_steps + Session keep-alive
+    # 2. Patch GPT_SOVITS_V2.TTSProvider for dynamic multi-emotion reference routing + cut0 + V4 fast first-seg sample_steps + Session keep-alive
     _orig_gsv_init = gsv_mod.TTSProvider.__init__
+    _orig_gsv_text_to_speak = gsv_mod.TTSProvider.text_to_speak
 
-    def _patched_gsv_init(self, config, delete_audio_file):
-        _orig_gsv_init(self, config, delete_audio_file)
+    @functools.wraps(_orig_gsv_init)
+    def _patched_gsv_init(self, config, delete_audio_file, *args, **kwargs):
+        _orig_gsv_init(self, config, delete_audio_file, *args, **kwargs)
         raw_steps = (config or {}).get("sample_steps")
         if raw_steps not in (None, ""):
             try:
@@ -1143,14 +1297,32 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
                 self.sample_steps = None
         else:
             self.sample_steps = None
+        raw_fast = (config or {}).get("first_segment_sample_steps")
+        if raw_fast not in (None, ""):
+            try:
+                self.first_segment_sample_steps = max(4, min(64, int(raw_fast)))
+            except Exception:
+                self.first_segment_sample_steps = None
+        else:
+            self.first_segment_sample_steps = None
 
     gsv_mod.TTSProvider.__init__ = _patched_gsv_init
 
-    async def _patched_gsv_text_to_speak(self, text, output_file):
+    @functools.wraps(_orig_gsv_text_to_speak)
+    async def _patched_gsv_text_to_speak(self, text, output_file, *args, **kwargs):
+        global _gsv_live_inflight
         seg_emo, stripped = extract_and_strip_emotion(text or "", flush_incomplete=True)
         clean_text = clean_segment_for_tts(stripped)
         if not clean_text:
             return b""
+
+        conn = getattr(self, "conn", None)
+        cur_sid = getattr(self, "current_sentence_id", None) or getattr(conn, "sentence_id", None)
+        is_first_segment = bool(
+            cur_sid
+            and getattr(self, "_first_segment_done_sid", None) != cur_sid
+            and not getattr(self, "_suppress_first_seg_fast_steps", False)
+        )
 
         pending_emo = getattr(self, "_pending_segment_emotion", None)
         explicit_seg = seg_emo or pending_emo
@@ -1212,20 +1384,28 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
             "parallel_infer": self.parallel_infer,
             "repetition_penalty": self.repetition_penalty,
         }
-        sample_steps = _resolve_gsv_sample_steps(self, chosen_prof, is_mei)
+        sample_steps = _resolve_gsv_sample_steps(
+            self, chosen_prof, is_mei, is_first_segment=is_first_segment
+        )
         if sample_steps is not None:
             request_json["sample_steps"] = sample_steps
 
         sess = _get_gsv_http_session()
-        resp = sess.post(self.url, json=request_json, timeout=self.tts_timeout)
+        with _gsv_inflight_lock:
+            _gsv_live_inflight += 1
+        try:
+            with GSV_GPU_LOCK:
+                resp = sess.post(self.url, json=request_json, timeout=self.tts_timeout)
+        finally:
+            with _gsv_inflight_lock:
+                _gsv_live_inflight = max(0, _gsv_live_inflight - 1)
+
         if resp.status_code == 200:
             # Clear pending segment emotion only after synthesis succeeds (safe across retries)
             self._pending_segment_emotion = None
+            if cur_sid and is_first_segment:
+                self._first_segment_done_sid = cur_sid
             if chosen_prof is not None:
-                conn = getattr(self, "conn", None)
-                cur_sid = getattr(self, "current_sentence_id", None) or getattr(
-                    conn, "sentence_id", None
-                )
                 q = getattr(self, "_segment_emotion_queue", None)
                 if q is None:
                     q = []
@@ -1265,10 +1445,11 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         lambda self: "raiden_mei" if is_raiden_mei_voice(getattr(self, "ref_audio_path", "")) else "default"
     )
 
-    # 3. Subtitle firewall + playback-synchronized ESP32 emotion update on sentence_start
+    # 3. Subtitle firewall + playback-synchronized ESP32 emotion update + P1-11 ring buffer event
     _orig_send_tts_message = send_audio_mod.send_tts_message
 
-    async def _patched_send_tts_message(conn, state, text=None):
+    @functools.wraps(_orig_send_tts_message)
+    async def _patched_send_tts_message(conn, state, text=None, *args, **kwargs):
         if text is not None:
             text = strip_emotion_tags(text).strip()
             if not text and state == "sentence_start":
@@ -1287,14 +1468,40 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
                 if matched_idx is not None:
                     _, _, emj, esp_emo = q.pop(matched_idx)
                     await _send_esp32_emotion_ws(conn, emj, esp_emo)
-        return await _orig_send_tts_message(conn, state, text)
+        if state == "stop":
+            try:
+                return await _orig_send_tts_message(conn, state, text, *args, **kwargs)
+            finally:
+                try:
+                    runtime_events.publish_event(
+                        "tts_state",
+                        state="stop",
+                        text=None,
+                        device_id=str(getattr(conn, "device_id", "") or ""),
+                        sentence_id=str(getattr(conn, "sentence_id", "") or ""),
+                    )
+                except Exception:
+                    pass
+        try:
+            runtime_events.publish_event(
+                "tts_state",
+                state=str(state or ""),
+                text=text if isinstance(text, str) else None,
+                device_id=str(getattr(conn, "device_id", "") or ""),
+                sentence_id=str(getattr(conn, "sentence_id", "") or ""),
+            )
+        except Exception:
+            pass
+        return await _orig_send_tts_message(conn, state, text, *args, **kwargs)
 
     send_audio_mod.send_tts_message = _patched_send_tts_message
+    rebound_tts = patch_registry.rebind(_orig_send_tts_message, _patched_send_tts_message)
 
     # 4. Enhance textUtils.get_emotion so first-chunk tag/cue maps accurately without misfiring on "["
     _orig_get_emotion = text_utils_mod.get_emotion
 
-    async def _patched_get_emotion(conn, text):
+    @functools.wraps(_orig_get_emotion)
+    async def _patched_get_emotion(conn, text, *args, **kwargs):
         if text and has_unclosed_leading_tag(text):
             # Wait for TTSProvider to push exact emotion once closing bracket arrives
             return
@@ -1306,10 +1513,20 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         if conn and has_voice_emotion_tag_rule(str((getattr(conn, "config", None) or {}).get("prompt") or "")):
             # Avoid upstream default `🙂 happy` misfiring before Mei's first clause resolves
             return
-        return await _orig_get_emotion(conn, stripped)
+        return await _orig_get_emotion(conn, stripped, *args, **kwargs)
 
     text_utils_mod.get_emotion = _patched_get_emotion
+    rebound_emo = patch_registry.rebind(_orig_get_emotion, _patched_get_emotion)
+
     TTSProviderBase._mei_prosody_patched = True
+    patch_registry.record_patch(
+        "mei_emotion_and_prosody",
+        "ok" if not contract_failures else "failed",
+        target="TTSProviderBase/GSV/send_tts_message/PromptManager",
+        detail="; ".join(contract_failures) if contract_failures else "ok",
+        contract_ok=not contract_failures,
+        rebound=rebound_tts + rebound_emo,
+    )
     print("[MeiEmotionRouter] 已挂载芽衣7情绪动态参考音频路由 + 防碎句韵律切分补丁 (cut0)", flush=True)
 
 
@@ -1374,7 +1591,6 @@ def get_wakeup_responses_for_tts(tts) -> list:
 def apply_mei_wakeup_responses_patch() -> None:
     """Call AFTER pc_audio_router.apply_pc_audio_playback_patches() so helloHandle import order is preserved."""
     import random
-    import sys
     import time
     import uuid
     import core.handle.helloHandle as hello_mod
@@ -1382,6 +1598,8 @@ def apply_mei_wakeup_responses_patch() -> None:
     from core.utils.dialogue import Message
 
     if getattr(hello_mod, "_mei_wakeup_patched", False):
+        if patch_registry.get_patch_status("mei_wakeup_responses") is None:
+            patch_registry.record_patch("mei_wakeup_responses", "ok", target="helloHandle", detail="already applied")
         return
 
     _orig_check_wakeup = hello_mod.checkWakeupWords
@@ -1389,11 +1607,24 @@ def apply_mei_wakeup_responses_patch() -> None:
     _orig_preheat = hello_mod.preheat_wakeup_audio_cache
     _last_mei_reply = {"text": ""}
 
-    async def _mei_aware_wakeup_words_response(conn):
+    wk_checks = [
+        ("helloHandle.checkWakeupWords", _orig_check_wakeup, ("conn", "text"), True),
+        ("helloHandle.wakeupWordsResponse", _orig_wakeup_response, ("conn",), True),
+        ("helloHandle.preheat_wakeup_audio_cache", _orig_preheat, (), True),
+    ]
+    wk_failures = []
+    for cname, cfn, req_p, req_a in wk_checks:
+        ok_s, det = patch_registry.verify_signature_contract(cfn, required_params=req_p, require_async=req_a)
+        if not ok_s:
+            wk_failures.append(f"{cname}: {det}")
+
+    @functools.wraps(_orig_wakeup_response)
+    async def _mei_aware_wakeup_words_response(conn, *args, **kwargs):
         tts = getattr(conn, "tts", None)
         if tts is None or not is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
-            return await _orig_wakeup_response(conn)
+            return await _orig_wakeup_response(conn, *args, **kwargs)
 
+        prev_suppress = getattr(tts, "_suppress_first_seg_fast_steps", False)
         try:
             if not await hello_mod._wakeup_response_lock.acquire():
                 return
@@ -1402,9 +1633,10 @@ def apply_mei_wakeup_responses_patch() -> None:
             result = random.choice(pool)
             _last_mei_reply["text"] = result
 
-            # Guide GPT-SoVITS into Mei's warm 'gentle' reference clip without putting tags into OLED subtitles
+            # Guide GPT-SoVITS into Mei's warm 'gentle' reference clip (full sample_steps in background cache)
             tts._pending_segment_emotion = "gentle"
             tts._turn_explicit_emotion = "gentle"
+            tts._suppress_first_seg_fast_steps = True
             tts_result = await asyncio.to_thread(tts.to_tts, result)
             if not tts_result:
                 return
@@ -1424,10 +1656,15 @@ def apply_mei_wakeup_responses_patch() -> None:
             hello_mod.wakeup_words_config.update_wakeup_response(voice, file_path, result)
             await hello_mod.audio_to_data(file_path, use_cache=True)
         finally:
+            try:
+                tts._suppress_first_seg_fast_steps = prev_suppress
+            except Exception:
+                pass
             if hello_mod._wakeup_response_lock.locked():
                 hello_mod._wakeup_response_lock.release()
 
-    async def _mei_aware_check_wakeup_words(conn, text):
+    @functools.wraps(_orig_check_wakeup)
+    async def _mei_aware_check_wakeup_words(conn, text, *args, **kwargs):
         tts = getattr(conn, "tts", None)
         # Wait briefly if TTS is still initializing (same behavior as upstream)
         if tts is None:
@@ -1439,7 +1676,7 @@ def apply_mei_wakeup_responses_patch() -> None:
                 await asyncio.sleep(0.1)
 
         if tts is None or not is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
-            return await _orig_check_wakeup(conn, text)
+            return await _orig_check_wakeup(conn, text, *args, **kwargs)
 
         if not conn.config.get("enable_wakeup_words_response_cache"):
             return False
@@ -1493,8 +1730,9 @@ def apply_mei_wakeup_responses_patch() -> None:
                 asyncio.create_task(_mei_aware_wakeup_words_response(conn))
         return True
 
-    async def _mei_aware_preheat():
-        await _orig_preheat()
+    @functools.wraps(_orig_preheat)
+    async def _mei_aware_preheat(*args, **kwargs):
+        await _orig_preheat(*args, **kwargs)
         try:
             resp = hello_mod.wakeup_words_config.get_wakeup_response("raiden_mei")
             fp = (resp or {}).get("file_path") or (
@@ -1510,21 +1748,24 @@ def apply_mei_wakeup_responses_patch() -> None:
     hello_mod.preheat_wakeup_audio_cache = _mei_aware_preheat
     hello_mod._mei_wakeup_patched = True
 
-    # Ensure already-imported references in intent/text/audio handlers point to the patched checkWakeupWords
-    for mod_name in (
-        "core.handle.intentHandler",
-        "core.handle.textHandler.listenMessageHandler",
-        "core.handle.receiveAudioHandle",
-    ):
-        try:
-            m = sys.modules.get(mod_name) or __import__(mod_name, fromlist=["checkWakeupWords"])
-        except Exception:
-            m = sys.modules.get(mod_name)
-        if m is not None and hasattr(m, "checkWakeupWords"):
-            setattr(m, "checkWakeupWords", _mei_aware_check_wakeup_words)
+    # P1-12: Rebind ALL already-imported module references across sys.modules
+    rebound_wk = (
+        patch_registry.rebind(_orig_check_wakeup, _mei_aware_check_wakeup_words)
+        + patch_registry.rebind(_orig_wakeup_response, _mei_aware_wakeup_words_response)
+        + patch_registry.rebind(_orig_preheat, _mei_aware_preheat)
+    )
+    patch_registry.record_patch(
+        "mei_wakeup_responses",
+        "ok" if not wk_failures else "failed",
+        target="helloHandle",
+        detail="; ".join(wk_failures) if wk_failures else "ok",
+        contract_ok=not wk_failures,
+        rebound=rebound_wk,
+    )
 
     # Patch ListenTextMessageHandler so offline interrupt words (e.g. "听我说") switch straight to
-    # listening with ZERO greeting TTS and ZERO 2s just_woken_up VAD suppression (even from IDLE).
+    # listening with ZERO greeting TTS and ZERO 2s just_woken_up VAD suppression (even from IDLE),
+    # and publish listen_start to runtime_events (P1-11).
     try:
         import core.handle.textHandler.listenMessageHandler as listen_mod
         import core.handle.abortHandle as abort_mod
@@ -1532,8 +1773,20 @@ def apply_mei_wakeup_responses_patch() -> None:
         cls = getattr(listen_mod, "ListenTextMessageHandler", None)
         if cls is not None and not getattr(cls, "_interrupt_word_patched", False):
             _orig_listen_handle = cls.handle
+            ok_lh, det_lh = patch_registry.verify_signature_contract(
+                _orig_listen_handle, required_params=("self", "conn", "msg_json"), require_async=True
+            )
 
-            async def _interrupt_aware_listen_handle(self, conn, msg_json):
+            @functools.wraps(_orig_listen_handle)
+            async def _interrupt_aware_listen_handle(self, conn, msg_json, *args, **kwargs):
+                if isinstance(msg_json, dict) and msg_json.get("state") == "start":
+                    try:
+                        runtime_events.publish_event(
+                            "listen_start",
+                            device_id=str(getattr(conn, "device_id", "") or ""),
+                        )
+                    except Exception:
+                        pass
                 if isinstance(msg_json, dict) and msg_json.get("state") == "detect" and "text" in msg_json:
                     original_text = str(msg_json.get("text") or "")
                     _, filtered_text = listen_mod.remove_punctuation_and_length(original_text)
@@ -1567,11 +1820,407 @@ def apply_mei_wakeup_responses_patch() -> None:
                             f"收到打断词「{original_text}」，已静音并直接进入聆听模式"
                         )
                         return
-                return await _orig_listen_handle(self, conn, msg_json)
+                return await _orig_listen_handle(self, conn, msg_json, *args, **kwargs)
 
             cls.handle = _interrupt_aware_listen_handle
             cls._interrupt_word_patched = True
+            patch_registry.record_patch(
+                "listen_interrupt_handler",
+                "ok" if ok_lh else "failed",
+                target="ListenTextMessageHandler.handle",
+                detail=det_lh,
+                contract_ok=ok_lh,
+            )
     except Exception as exc:
+        patch_registry.record_patch(
+            "listen_interrupt_handler",
+            "failed",
+            target="ListenTextMessageHandler.handle",
+            detail=str(exc),
+            contract_ok=False,
+        )
         print(f"[MeiEmotionRouter] 挂载打断词直通聆听补丁跳过: {exc}", flush=True)
 
     print("[MeiEmotionRouter] 已挂载芽衣专属唤醒词秒回语 + 打断词直通聆听补丁 (raiden_mei 独立缓存 + gentle 温柔音色)", flush=True)
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_MD_DECOR_RE = re.compile(r"[*`#>]+")
+
+
+def select_idle_farewell_text(messages: list[str] | tuple[str, ...], last_text: str = "") -> str:
+    """Pick a non-empty farewell line randomly while avoiding immediate repeats."""
+    import random
+
+    clean = [str(m or "").strip() for m in (messages or []) if str(m or "").strip()]
+    if not clean:
+        return ""
+    pool = [m for m in clean if m != last_text] or clean
+    return random.choice(pool)
+
+
+def format_idle_farewell_for_tts(
+    text: str,
+    *,
+    is_mei_voice: bool = False,
+    default_emotion: str = "gentle",
+) -> str:
+    """Prefix Mei's warm default emotion tag when the line has no explicit emotion tag."""
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    if is_mei_voice:
+        emo, _ = extract_and_strip_emotion(s, flush_incomplete=True)
+        if not emo:
+            tag = default_emotion if default_emotion in ("gentle", "tender", "shy", "calm", "happy", "playful", "serious") else "gentle"
+            return f"[{tag}] {s}"
+    return s
+
+
+def extract_session_dialogue_snippet(conn: Any, max_turns: int = 8) -> list[tuple[str, str]]:
+    """Extract clean recent (role, text) turns from current session Dialogue without mutating it."""
+    dlg_obj = getattr(conn, "dialogue", None)
+    raw_list = getattr(dlg_obj, "dialogue", None)
+    if not isinstance(raw_list, list) or not raw_list:
+        return []
+
+    turns: list[tuple[str, str]] = []
+    for msg in raw_list:
+        if getattr(msg, "is_temporary", False) or getattr(msg, "_standalone_assistant", False):
+            continue
+        role = str(getattr(msg, "role", "") or "").strip().lower()
+        if role not in ("user", "assistant"):
+            continue
+        if getattr(msg, "tool_calls", None):
+            continue
+        raw_content = getattr(msg, "content", None)
+        if not isinstance(raw_content, str):
+            continue
+        cleaned = strip_emotion_tags(safe_clean_response_garbage(raw_content)).strip()
+        if not cleaned:
+            continue
+        if len(cleaned) > 180:
+            cleaned = cleaned[:180].rstrip() + "…"
+        turns.append((role, cleaned))
+
+    if not any(r == "user" for r, _ in turns):
+        return []
+    limit = max(2, int(max_turns) * 2)
+    return turns[-limit:]
+
+
+async def generate_llm_idle_farewell(
+    conn: Any,
+    summary_prompt: str,
+    *,
+    is_mei_voice: bool = False,
+    timeout_sec: float = 6.0,
+) -> str:
+    """Bypass conn.dialogue/Anima to generate a concise warm farewell summarizing the current session."""
+    llm = getattr(conn, "llm", None)
+    client = getattr(llm, "client", None)
+    model_name = getattr(llm, "model_name", None)
+    if llm is None or client is None or not model_name:
+        return ""
+
+    turns = extract_session_dialogue_snippet(conn, max_turns=8)
+    if not turns:
+        return ""
+
+    transcript_lines = [
+        f"{'对方' if role == 'user' else '你'}：{txt}"
+        for role, txt in turns
+    ]
+    transcript = "\n".join(transcript_lines)
+
+    base_persona = str((getattr(conn, "config", None) or {}).get("prompt") or "").strip()
+    if len(base_persona) > 1200:
+        base_persona = base_persona[:1200]
+    sys_parts = []
+    if base_persona:
+        sys_parts.append(base_persona)
+    sys_parts.append(
+        "【当前任务：空闲超时道别】这是本轮对话结束前的最后一句告别，严禁调用任何工具，"
+        "严格遵循下方用户的字数与语气要求直接说出告别台词。"
+    )
+    if is_mei_voice:
+        sys_parts.append("请在开头附上最贴合依恋温柔心境的一个英文方括号情绪标签（如 [tender]、[gentle] 或 [shy]）。")
+
+    instr = str(summary_prompt or "").strip() or runtime_settings.DEFAULT_IDLE_FAREWELL_SUMMARY_PROMPT
+    user_msg = (
+        f"以下是我们刚才这段对话的记录：\n{transcript}\n\n"
+        f"请按以下要求说一句告别的话：\n{instr}"
+    )
+
+    request_params: Dict[str, Any] = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": "\n\n".join(sys_parts)},
+            {"role": "user", "content": user_msg},
+        ],
+        "stream": False,
+        "max_tokens": 160,
+        "temperature": 0.85,
+        "timeout": float(timeout_sec),
+    }
+    apply_think = getattr(llm, "_apply_thinking_disabled", None)
+    if callable(apply_think):
+        try:
+            apply_think(request_params)
+        except Exception:
+            pass
+
+    def _call_sync() -> str:
+        resp = client.chat.completions.create(**request_params)
+        choices = getattr(resp, "choices", None) or []
+        if not choices:
+            return ""
+        msg = getattr(choices[0], "message", None)
+        content = getattr(msg, "content", "") if msg is not None else ""
+        return str(content or "")
+
+    try:
+        raw_out = await asyncio.wait_for(
+            asyncio.to_thread(_call_sync),
+            timeout=float(timeout_sec) + 1.5,
+        )
+    except Exception:
+        return ""
+
+    cleaned = _THINK_BLOCK_RE.sub("", raw_out)
+    cleaned = safe_clean_response_garbage(cleaned)
+    cleaned = _MD_DECOR_RE.sub("", cleaned)
+    cleaned = " ".join(ln.strip() for ln in cleaned.splitlines() if ln.strip()).strip()
+    if len(cleaned) > 150:
+        # Trim gracefully at a sentence boundary if LLM over-generated
+        cut_idx = max(cleaned.rfind("。", 0, 145), cleaned.rfind("！", 0, 145), cleaned.rfind("？", 0, 145))
+        cleaned = cleaned[: cut_idx + 1] if cut_idx >= 15 else cleaned[:145].rstrip()
+    return cleaned
+
+
+def apply_idle_farewell_patch() -> None:
+    """Replace upstream idle-timeout prompt with customizable fixed or zero-pollution LLM summary TTS farewell."""
+    import uuid
+    import core.handle.receiveAudioHandle as recv_mod
+    import core.handle.sendAudioHandle as send_audio_mod
+    from core.providers.tts.dto.dto import ContentType, SentenceType, TTSMessageDTO
+
+    if getattr(recv_mod, "_idle_farewell_patched", False):
+        if patch_registry.get_patch_status("idle_farewell") is None:
+            patch_registry.record_patch(
+                "idle_farewell",
+                "ok",
+                target="receiveAudioHandle.no_voice_close_connect",
+                detail="already applied",
+            )
+        return
+
+    _orig_no_voice_close = recv_mod.no_voice_close_connect
+    ok_sig, det_sig = patch_registry.verify_signature_contract(
+        _orig_no_voice_close,
+        required_params=("conn", "have_voice"),
+        require_async=True,
+    )
+    _last_farewell = {"text": ""}
+
+    async def _speak_or_close(conn: Any, chosen: str, *, timeout_sec: int, default_emotion: str, reason: str) -> None:
+        conn.close_after_chat = True
+        conn.client_abort = False
+
+        if not chosen:
+            conn.logger.bind(tag=recv_mod.TAG).info(
+                f"无声超时 {timeout_sec}s（{reason}），无有效告别台词，静默断开连接"
+            )
+            await conn.close()
+            return
+
+        tts = getattr(conn, "tts", None)
+        tts_q = getattr(tts, "tts_text_queue", None)
+        if tts is None or tts_q is None:
+            conn.logger.bind(tag=recv_mod.TAG).info("无声超时但 TTS 通道未就绪，直接断开连接")
+            await conn.close()
+            return
+
+        mei_active = is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""))
+        tts_payload_text = format_idle_farewell_for_tts(
+            chosen,
+            is_mei_voice=mei_active,
+            default_emotion=default_emotion,
+        )
+        _, stripped_spoken = extract_and_strip_emotion(tts_payload_text, flush_incomplete=True)
+        if not clean_segment_for_tts(stripped_spoken):
+            conn.logger.bind(tag=recv_mod.TAG).info(
+                f"无声超时 {timeout_sec}s，告别语无有效朗读内容，静默断开连接"
+            )
+            await conn.close()
+            return
+
+        sid = uuid.uuid4().hex
+        conn.sentence_id = sid
+        conn.client_is_speaking = True
+        conn.logger.bind(tag=recv_mod.TAG).info(
+            f"无声超时 {timeout_sec}s（{reason}），直接播报告别语并结束对话: {strip_emotion_tags(chosen)}"
+        )
+        await send_audio_mod.send_tts_message(conn, "start")
+        tts_q.put(
+            TTSMessageDTO(
+                sentence_id=sid,
+                sentence_type=SentenceType.FIRST,
+                content_type=ContentType.ACTION,
+            )
+        )
+        tts_q.put(
+            TTSMessageDTO(
+                sentence_id=sid,
+                sentence_type=SentenceType.MIDDLE,
+                content_type=ContentType.TEXT,
+                content_detail=tts_payload_text,
+            )
+        )
+        tts_q.put(
+            TTSMessageDTO(
+                sentence_id=sid,
+                sentence_type=SentenceType.LAST,
+                content_type=ContentType.ACTION,
+            )
+        )
+
+    @functools.wraps(_orig_no_voice_close)
+    async def _custom_no_voice_close_connect(conn, have_voice, *args, **kwargs):
+        now_ms = time.time() * 1000.0
+        if have_voice:
+            conn.last_activity_time = now_ms
+            if getattr(conn, "_idle_farewell_inflight", False):
+                conn._idle_farewell_cancelled = True
+            return
+
+        # Never trigger idle timeout while TTS / PC audio playback is actively speaking
+        if (
+            getattr(conn, "client_is_speaking", False)
+            or getattr(conn, "_pc_audio_active_sid", None) is not None
+        ):
+            conn.last_activity_time = now_ms
+            return
+
+        farewell_cfg = runtime_settings.get_idle_farewell()
+        timeout_sec = int(farewell_cfg.get("timeout_seconds", 120))
+        desired_hard_timeout = max(60, timeout_sec + 60)
+        if getattr(conn, "timeout_seconds", None) != desired_hard_timeout:
+            conn.timeout_seconds = desired_hard_timeout
+
+        if getattr(conn, "last_activity_time", 0.0) <= 0.0:
+            return
+        if getattr(conn, "close_after_chat", False) or getattr(conn, "_idle_farewell_inflight", False):
+            return
+
+        no_voice_ms = now_ms - float(conn.last_activity_time)
+        if no_voice_ms <= 1000.0 * timeout_sec:
+            return
+
+        if not farewell_cfg.get("enabled", True):
+            conn.close_after_chat = True
+            conn.client_abort = False
+            conn.logger.bind(tag=recv_mod.TAG).info(
+                f"无声超时 {timeout_sec}s，已关闭超时告别语，静默断开连接"
+            )
+            await conn.close()
+            return
+
+        mode = str(farewell_cfg.get("mode") or "fixed").strip().lower()
+        fallback_messages = farewell_cfg.get("messages") or []
+
+        if mode == "llm_summary":
+            tts = getattr(conn, "tts", None)
+            mei_active = is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")) if tts is not None else False
+            has_turns = bool(extract_session_dialogue_snippet(conn, max_turns=1))
+            if has_turns and getattr(conn, "llm", None) is not None:
+                trigger_activity_ts = float(conn.last_activity_time)
+                summary_prompt = str(farewell_cfg.get("summary_prompt") or "")
+                conn._idle_farewell_inflight = True
+                conn._idle_farewell_cancelled = False
+
+                async def _run_llm_farewell_task():
+                    try:
+                        generated = await generate_llm_idle_farewell(
+                            conn,
+                            summary_prompt,
+                            is_mei_voice=mei_active,
+                            timeout_sec=6.0,
+                        )
+                        stop_ev = getattr(conn, "stop_event", None)
+                        if (
+                            getattr(conn, "_idle_farewell_cancelled", False)
+                            or getattr(conn, "client_abort", False)
+                            or getattr(conn, "close_after_chat", False)
+                            or getattr(conn, "client_is_speaking", False)
+                            or (stop_ev is not None and stop_ev.is_set())
+                            or float(getattr(conn, "last_activity_time", 0.0)) > trigger_activity_ts
+                        ):
+                            conn.logger.bind(tag=recv_mod.TAG).info(
+                                "生成超时告别语期间检测到用户重新活跃，已自动取消挂断"
+                            )
+                            return
+
+                        if generated:
+                            await _speak_or_close(
+                                conn,
+                                generated,
+                                timeout_sec=timeout_sec,
+                                default_emotion="tender",
+                                reason="AI总结依恋告别",
+                            )
+                        else:
+                            fb = select_idle_farewell_text(fallback_messages, last_text=_last_farewell["text"])
+                            if fb:
+                                _last_farewell["text"] = fb
+                            await _speak_or_close(
+                                conn,
+                                fb,
+                                timeout_sec=timeout_sec,
+                                default_emotion="gentle",
+                                reason="AI生成超时降级固定台词",
+                            )
+                    except Exception as exc:
+                        conn.logger.bind(tag=recv_mod.TAG).warning(
+                            f"AI 总结告别任务异常，尝试安全收尾: {exc}"
+                        )
+                        if not getattr(conn, "_idle_farewell_cancelled", False) and not getattr(
+                            conn, "close_after_chat", False
+                        ):
+                            fb = select_idle_farewell_text(fallback_messages, last_text=_last_farewell["text"])
+                            await _speak_or_close(
+                                conn,
+                                fb,
+                                timeout_sec=timeout_sec,
+                                default_emotion="gentle",
+                                reason="异常兜底告别",
+                            )
+                    finally:
+                        conn._idle_farewell_inflight = False
+
+                conn._idle_farewell_task = asyncio.create_task(_run_llm_farewell_task())
+                return
+
+        chosen = select_idle_farewell_text(fallback_messages, last_text=_last_farewell["text"])
+        if chosen:
+            _last_farewell["text"] = chosen
+        await _speak_or_close(
+            conn,
+            chosen,
+            timeout_sec=timeout_sec,
+            default_emotion="gentle",
+            reason="无本轮对话降级固定台词" if mode == "llm_summary" else "固定随机台词",
+        )
+
+    recv_mod.no_voice_close_connect = _custom_no_voice_close_connect
+    recv_mod._idle_farewell_patched = True
+    rebound = patch_registry.rebind(_orig_no_voice_close, _custom_no_voice_close_connect)
+    patch_registry.record_patch(
+        "idle_farewell",
+        "ok" if ok_sig else "failed",
+        target="receiveAudioHandle.no_voice_close_connect",
+        detail=det_sig,
+        contract_ok=ok_sig,
+        rebound=rebound,
+    )
+    print("[MeiEmotionRouter] 已挂载自定义空闲超时告别语补丁（固定随机 / AI总结依恋双模式 · 零记忆污染 · 18080 免重启热改）", flush=True)

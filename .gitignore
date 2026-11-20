@@ -19,13 +19,22 @@ data/tts_infer_xiaozhi.yaml
 data/.wakeup_words.yaml
 data/audio_output_mode.json
 data/reply_length_config.json
+data/runtime_settings.json
+data/*.migrated.bak
 data/pc_mcp_token.txt
 data/anima/
+data/anima_outbox.sqlite
+data/anima_outbox.sqlite-wal
+data/anima_outbox.sqlite-shm
+data/obsidian_export/
 data/agy_tasks/
 data/bin/
 data/*.log
 data/*.log.*
 data/last_som_grounding.jpg
+
+# Host-private L3 state, Antigravity sidecar tasks & L2 audit log (never mounted in Docker)
+pc-mcp/state/
 
 # Large local model weights & voice reference audio
 models/

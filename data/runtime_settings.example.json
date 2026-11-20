@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "pc_control": {
+    "mode": "safe"
+  },
+  "audio_output": {
+    "target": "esp32",
+    "volume": 1.0
+  },
+  "reply_length": {
+    "preset": "balanced",
+    "chat_chars": 150,
+    "story_chars": 450
+  },
+  "idle_farewell": {
+    "enabled": true,
+    "mode": "fixed",
+    "timeout_seconds": 120,
+    "summary_prompt": "现在对方有一小会儿没说话，对话即将暂时结束。请以角色本人的口吻，先用半句话自然、简短地呼应总结一下刚才我们聊的内容，再真诚温柔地表达一点依恋和不舍，提醒对方有空或想聊天时随时再叫自己。严格控制在 35 到 65 字以内（1～2 句口语），直接说出告别的话，不要以“时间过得真快”开头，不要客套寒暄，不要输出 Markdown、括号动作或表情符号。",
+    "messages": [
+      "先去忙吧，有事随时叫我。",
+      "那我先安静待在一旁啦，需要的时候再叫我哦。"
+    ]
+  }
+}

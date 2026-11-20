@@ -37,7 +37,8 @@ class TestPluggableL3Backends(unittest.TestCase):
         self.dotenv_file = self.tmp_root / ".env"
 
         self._initial_threads = set(threading.enumerate())
-        self._prod_active_dir = MCP_DIR.parent / "data" / "agy_tasks" / "active"
+        self._prod_active_dir = MCP_DIR / "state" / "agy_tasks" / "active"
+        self._legacy_prod_active_dir = MCP_DIR.parent / "data" / "agy_tasks" / "active"
         self._patches = [
             patch.object(l3_backends, "PENDING_DIR", self.pending),
             patch.object(l3_backends, "ACTIVE_DIR", self.active),
@@ -109,31 +110,50 @@ class TestPluggableL3Backends(unittest.TestCase):
             self.assertNotIn("C:\\Users\\Administrator", src)
             self.assertNotIn("e:\\故事\\1", src)
             self.assertNotIn("e:/故事/1", src)
+        server_dir = MCP_DIR.parent
+        personal_vault = "E:" + "\\love"
+        for rel in (".env.example", "data/init_setup.ps1", "anima-brain/obsidian_exporter.py"):
+            src = (server_dir / rel).read_text(encoding="utf-8-sig")
+            self.assertNotIn(personal_vault, src, f"Hardcoded personal vault path found in {rel}")
+        ps1_src = (server_dir / "data/init_setup.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('Join-Path $serverDir "data\\obsidian_export"', ps1_src)
 
     def test_config_roundtrip_and_normalization(self):
-        saved = l3_backends.write_l3_config(
-            {
-                "backend": "dsh",
-                "workdir": str(self.tmp_root),
-                "dsh_cmd": "dsh",
-                "workbuddy_cmd": "codebuddy",
-                "workbuddy_auto_approve": False,
-                "timeout_seconds": 99999,
-            }
+        self.dotenv_file.write_text(
+            f'XIAOZHI_L3_WORKDIR="{self.tmp_root}"\n'
+            "DSH_CMD=dsh\n"
+            "WORKBUDDY_CMD=codebuddy\n",
+            encoding="utf-8",
         )
-        self.assertEqual(saved["backend"], "dsh")
-        self.assertEqual(saved["timeout_seconds"], 1800)
-        self.assertFalse(saved["workbuddy_auto_approve"])
+        with patch.dict(os.environ, {}, clear=True), patch("winreg.OpenKey", side_effect=FileNotFoundError):
+            saved = l3_backends.write_l3_config(
+                {
+                    "backend": "dsh",
+                    "timeout_seconds": 99999,
+                }
+            )
+            self.assertEqual(saved["backend"], "dsh")
+            self.assertEqual(saved["timeout_seconds"], 1800)
+            self.assertFalse(saved["workbuddy_auto_approve"])
+            self.assertEqual(saved["workdir"], str(self.tmp_root))
+            self.assertEqual(saved["dsh_cmd"], "dsh")
+            self.assertEqual(saved["workbuddy_cmd"], "codebuddy")
 
-        loaded = l3_backends.read_l3_config()
-        self.assertEqual(loaded["backend"], "dsh")
-        self.assertEqual(loaded["workdir"], str(self.tmp_root))
+            raw_disk = json.loads(self.cfg_file.read_text(encoding="utf-8"))
+            self.assertEqual(raw_disk, {"backend": "dsh", "timeout_seconds": 1800})
+
+            loaded = l3_backends.read_l3_config()
+            self.assertEqual(loaded["backend"], "dsh")
+            self.assertEqual(loaded["workdir"], str(self.tmp_root))
+            self.assertFalse(loaded["workbuddy_auto_approve"])
 
     def test_dsh_dispatch_headless_and_followup_context(self):
         backend = DshBackend()
-        cfg = l3_backends.write_l3_config(
-            {"backend": "dsh", "workdir": str(self.tmp_root), "dsh_cmd": "dsh"}
-        )
+        with patch.dict(
+            os.environ,
+            {"XIAOZHI_L3_WORKDIR": str(self.tmp_root), "DSH_CMD": "dsh"},
+        ):
+            cfg = l3_backends.write_l3_config({"backend": "dsh"})
 
         captured_cmds = []
         fake_outputs = [
@@ -172,27 +192,34 @@ class TestPluggableL3Backends(unittest.TestCase):
                 self.assertIn("Markdown 文件", backend.check_status(cfg))
                 self.assertFalse((self._prod_active_dir / "t_dsh_1.json").exists())
                 self.assertFalse((self._prod_active_dir / "t_dsh_2.json").exists())
+                self.assertFalse((self._legacy_prod_active_dir / "t_dsh_1.json").exists())
+                self.assertFalse((self._legacy_prod_active_dir / "t_dsh_2.json").exists())
             finally:
                 # Drain without asserting so any original test failure is never masked
                 self._join_test_threads(("t_dsh_1", "t_dsh_2"), timeout=5.0)
 
     def test_dsh_npx_fallback_detection(self):
+        from l3_backends.dsh import DSH_NPX_PACKAGE
+
         cfg = {"dsh_cmd": ""}
         with patch("l3_backends.dsh.shutil.which", side_effect=lambda x: r"C:\node\npx.cmd" if x == "npx.cmd" else None):
             prefix, desc = resolve_dsh_prefix(cfg)
-            self.assertEqual(prefix, [r"C:\node\npx.cmd", "-y", "@deepseek-ai/dsh"])
+            self.assertEqual(prefix, [r"C:\node\npx.cmd", "-y", DSH_NPX_PACKAGE])
+            self.assertRegex(prefix[2], r"^@deepseek-ai/dsh@\d+\.\d+\.\d+")
             self.assertIn("npx", desc)
 
     def test_workbuddy_dispatch_flags_and_continue(self):
         backend = WorkBuddyBackend()
-        cfg = l3_backends.write_l3_config(
+        with patch.dict(
+            os.environ,
             {
-                "backend": "workbuddy",
-                "workdir": str(self.tmp_root),
-                "workbuddy_cmd": "codebuddy",
-                "workbuddy_auto_approve": True,
-            }
-        )
+                "XIAOZHI_L3_WORKDIR": str(self.tmp_root),
+                "WORKBUDDY_CMD": "codebuddy",
+                "WORKBUDDY_AUTO_APPROVE": "true",
+            },
+        ):
+            cfg = l3_backends.write_l3_config({"backend": "workbuddy"})
+        self.assertTrue(cfg["workbuddy_auto_approve"])
 
         captured_cmds = []
         fake_outputs = [
@@ -233,6 +260,8 @@ class TestPluggableL3Backends(unittest.TestCase):
                 self.assertIn("三条核心重点", backend.check_status(cfg))
                 self.assertFalse((self._prod_active_dir / "t_wb_1.json").exists())
                 self.assertFalse((self._prod_active_dir / "t_wb_2.json").exists())
+                self.assertFalse((self._legacy_prod_active_dir / "t_wb_1.json").exists())
+                self.assertFalse((self._legacy_prod_active_dir / "t_wb_2.json").exists())
             finally:
                 # Drain without asserting so any original test failure is never masked
                 self._join_test_threads(("t_wb_1", "t_wb_2"), timeout=5.0)

@@ -8,17 +8,14 @@ Write-Host "=========================================================" -Foregrou
 Write-Host "  小智 ESP32 · 三层电脑操控与长期记忆系统 一键启动" -ForegroundColor Cyan
 Write-Host "=========================================================" -ForegroundColor Cyan
 
-# 0. 确保模型目录存在，加载本地 .env，并自动推导宿主机路径与局域网 IP
-foreach ($relDir in @("models\sherpa-onnx-sense-voice", "models\SenseVoiceSmall", "data\anima", "data\agy_tasks\pending", "data\agy_tasks\active")) {
+# 0. 确保模型与宿主机私有状态目录存在，加载本地 .env，并自动推导宿主机路径与局域网 IP
+foreach ($relDir in @("models\sherpa-onnx-sense-voice", "models\SenseVoiceSmall", "data\anima", "data\obsidian_export", "pc-mcp\state", "pc-mcp\state\agy_tasks\pending", "pc-mcp\state\agy_tasks\active")) {
     $fullD = Join-Path $serverDir $relDir
     if (-not (Test-Path $fullD)) { New-Item -ItemType Directory -Path $fullD -Force | Out-Null }
 }
 
 $runtimeTemplates = @(
     @{ Tpl = "data\.config.example.yaml";             Dst = "data\.config.yaml" },
-    @{ Tpl = "data\pc_control_mode.example.json";     Dst = "data\pc_control_mode.json" },
-    @{ Tpl = "data\audio_output_mode.example.json";   Dst = "data\audio_output_mode.json" },
-    @{ Tpl = "data\reply_length_config.example.json"; Dst = "data\reply_length_config.json" },
     @{ Tpl = "data\tts_infer_xiaozhi.example.yaml";   Dst = "data\tts_infer_xiaozhi.yaml" },
     @{ Tpl = "data\.wakeup_words.example.yaml";       Dst = "data\.wakeup_words.yaml" }
 )
@@ -29,6 +26,15 @@ foreach ($rt in $runtimeTemplates) {
         Copy-Item $tplP $dstP
         Write-Host "[初始化] 已从 $($rt.Tpl) 生成默认运行文件 $($rt.Dst)" -ForegroundColor Yellow
     }
+}
+$rsDst = Join-Path $serverDir "data\runtime_settings.json"
+$rsTpl = Join-Path $serverDir "data\runtime_settings.example.json"
+$hasLegacyRs = (Test-Path (Join-Path $serverDir "data\pc_control_mode.json")) -or
+               (Test-Path (Join-Path $serverDir "data\audio_output_mode.json")) -or
+               (Test-Path (Join-Path $serverDir "data\reply_length_config.json"))
+if (-not (Test-Path $rsDst) -and -not $hasLegacyRs -and (Test-Path $rsTpl)) {
+    Copy-Item $rsTpl $rsDst
+    Write-Host "[初始化] 已从 data\runtime_settings.example.json 生成默认统一运行配置 data\runtime_settings.json" -ForegroundColor Yellow
 }
 
 $dotEnvPath = Join-Path $serverDir ".env"
@@ -62,6 +68,34 @@ foreach ($envName in @("DEEPSEEK_API_KEY", "GEMINI_API_KEY", "ANIMA_LLM_API_KEY"
 }
 
 $env:HOST_DATA_DIR = (Join-Path $serverDir "data").Replace("\", "/")
+if (-not $env:ESP32_AUTH_KEY) {
+    try {
+        $randBytes = New-Object byte[] 32
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        $rng.GetBytes($randBytes)
+        $rng.Dispose()
+        $genKey = ([System.BitConverter]::ToString($randBytes)).Replace("-", "").ToLowerInvariant()
+        $env:ESP32_AUTH_KEY = $genKey
+        if (Test-Path $dotEnvPath) {
+            $curEnvText = [System.IO.File]::ReadAllText($dotEnvPath, [System.Text.Encoding]::UTF8)
+            if ($curEnvText -notmatch '(?m)^\s*ESP32_AUTH_KEY\s*=') {
+                $sep = if ($curEnvText.EndsWith("`n")) { "" } else { "`r`n" }
+                [System.IO.File]::AppendAllText($dotEnvPath, "${sep}ESP32_AUTH_KEY=$genKey`r`n", [System.Text.UTF8Encoding]::new($false))
+            }
+        } else {
+            [System.IO.File]::WriteAllText($dotEnvPath, "ESP32_AUTH_KEY=$genKey`r`n", [System.Text.UTF8Encoding]::new($false))
+        }
+        Write-Host "[安全] 已自动生成 ESP32 通道签名密钥并写入本地 .env（已被 .gitignore 隔离）" -ForegroundColor Green
+    } catch {
+        Write-Host "[提示] 自动生成 ESP32_AUTH_KEY 失败，将由容器内存随机生成: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+if (-not $env:ESP32_ALLOWED_DEVICES) {
+    Write-Host "[提示] .env 中尚未配置 ESP32_ALLOWED_DEVICES（设备 MAC 白名单），开启鉴权后需填入 ESP32 MAC 才能接入 18000/18003。" -ForegroundColor Yellow
+}
+if ($env:OBSIDIAN_EXPORT_DIR -and -not (Test-Path $env:OBSIDIAN_EXPORT_DIR)) {
+    try { New-Item -ItemType Directory -Path $env:OBSIDIAN_EXPORT_DIR -Force | Out-Null } catch {}
+}
 if (-not $env:HOST_LAN_IP) {
     try {
         $lanIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -102,23 +136,108 @@ if ($LASTEXITCODE -ne 0 -or -not $ver) {
 }
 Write-Host "[1/4] Docker 引擎已就绪 (v$ver)" -ForegroundColor Green
 
-# 2. 启动本机三层电脑操控 MCP 服务 (端口 18900，仅绑定 127.0.0.1 + 自动 Bearer Token + 日志轮转)
+# 2. 启动或重启本机三层电脑操控 MCP 服务 (端口 18900，仅绑定 127.0.0.1 + 自动 Bearer Token + 看门狗守护)
+$mcpPy = Join-Path $serverDir "pc-mcp\.venv\Scripts\python.exe"
+if (-not (Test-Path $mcpPy)) { $mcpPy = "python" }
+$mcpScript = Join-Path $serverDir "pc-mcp\pc_control_mcp.py"
+$mcpWatchdogScript = Join-Path $serverDir "pc-mcp\pc_mcp_watchdog.py"
+$mcpBootLog = Join-Path $serverDir "data\pc_mcp_18900_boot.log"
+$mcpRuntimeLog = Join-Path $serverDir "data\pc_mcp_18900.log"
+$mcpTokenFile = Join-Path $serverDir "data\pc_mcp_token.txt"
+$watchdogStopFlag = Join-Path $serverDir "pc-mcp\state\watchdog_stop.flag"
+
+function Test-PcMcpAlive {
+    param([string]$TokenPath)
+    if (-not (Test-Path $TokenPath)) { return $false }
+    try {
+        $tok = (Get-Content -Path $TokenPath -Raw -Encoding UTF8 -ErrorAction Stop).Trim()
+        if (-not $tok) { return $false }
+        $resp = Invoke-RestMethod -Uri "http://127.0.0.1:18900/audio/status" `
+            -Headers @{ Authorization = "Bearer $tok" } -TimeoutSec 2 -ErrorAction Stop
+        return ($null -ne $resp -and $resp.ok -eq $true)
+    } catch {
+        return $false
+    }
+}
+
+# 先停止旧看门狗，避免重启 18900 过程中并发拉起
+try {
+    New-Item -ItemType File -Path $watchdogStopFlag -Force -ErrorAction SilentlyContinue | Out-Null
+    $oldWatchdogs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^python(w)?(\.exe)?$' -and $_.CommandLine -and $_.CommandLine -like '*pc_mcp_watchdog.py*' }
+    foreach ($ow in $oldWatchdogs) {
+        Stop-Process -Id $ow.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+} catch {}
+
 $mcpListening = Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue
-if (-not $mcpListening) {
-    Write-Host "[2/4] 正在后台启动三层电脑操控 MCP + 电脑音响直通服务 (127.0.0.1:18900)..." -ForegroundColor Cyan
-    $mcpPy = Join-Path $serverDir "pc-mcp\.venv\Scripts\python.exe"
-    if (-not (Test-Path $mcpPy)) { $mcpPy = "python" }
-    $mcpScript = Join-Path $serverDir "pc-mcp\pc_control_mcp.py"
-    $mcpBootLog = Join-Path $serverDir "data\pc_mcp_18900_boot.log"
-    $mcpCmd = "cmd.exe /c `"set PYTHONUTF8=1&& `"$mcpPy`" -X utf8 `"$mcpScript`" > `"$mcpBootLog`" 2>&1`""
-    $hideSi = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
-    Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $mcpCmd; ProcessStartupInformation = $hideSi } | Out-Null
-    for ($m = 0; $m -lt 14; $m++) {
-        if (Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue) { break }
-        Start-Sleep -Milliseconds 500
+$oldMcpPidSet = @{}
+if ($mcpListening) {
+    foreach ($omp in ($mcpListening | Select-Object -ExpandProperty OwningProcess -Unique)) {
+        if ($omp) { $oldMcpPidSet[[int]$omp] = $true }
+    }
+}
+try {
+    $oldMcpPyProcs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^python(w)?(\.exe)?$' -and $_.CommandLine -and $_.CommandLine -like '*pc_control_mcp.py*' }
+    foreach ($op in $oldMcpPyProcs) {
+        if ($op.ProcessId) { $oldMcpPidSet[[int]$op.ProcessId] = $true }
+    }
+} catch {}
+
+if ($mcpListening -or $oldMcpPidSet.Count -gt 0) {
+    $wasAlive = Test-PcMcpAlive -TokenPath $mcpTokenFile
+    if ($wasAlive) {
+        Write-Host "[2/4] 检测到旧 18900 MCP 服务在线，正在平滑重启以加载最新代码与配置..." -ForegroundColor Cyan
+    } else {
+        Write-Host "[2/4] 检测到旧 18900 MCP 进程但 /audio/status 验活失败，正在强制重启..." -ForegroundColor Yellow
+    }
+    if (Test-Path $mcpWatchdogScript) {
+        try { & $mcpPy -X utf8 $mcpWatchdogScript --cleanup-l3 2>$null | Out-Null } catch {}
+    }
+    foreach ($omp in $oldMcpPidSet.Keys) {
+        Stop-Process -Id $omp -Force -ErrorAction SilentlyContinue
+    }
+    for ($w = 0; $w -lt 12; $w++) {
+        if (-not (Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 250
     }
 } else {
-    Write-Host "[2/4] 三层电脑操控 MCP 服务已在运行中 (端口 18900)" -ForegroundColor Green
+    Write-Host "[2/4] 正在后台启动三层电脑操控 MCP + 电脑音响直通服务 (127.0.0.1:18900)..." -ForegroundColor Cyan
+}
+
+$mcpCmd = "cmd.exe /c `"set PYTHONUTF8=1&& `"$mcpPy`" -X utf8 `"$mcpScript`" > `"$mcpBootLog`" 2>&1`""
+$hideSi = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $mcpCmd; ProcessStartupInformation = $hideSi } | Out-Null
+
+$mcpHealthy = $false
+for ($m = 0; $m -lt 24; $m++) {
+    if (Test-PcMcpAlive -TokenPath $mcpTokenFile) {
+        $mcpHealthy = $true
+        break
+    }
+    Start-Sleep -Milliseconds 500
+}
+
+if ($mcpHealthy) {
+    Write-Host "[2/4] 三层电脑操控 MCP 服务已就绪并通过 /audio/status 鉴权验活 (127.0.0.1:18900)" -ForegroundColor Green
+    Remove-Item -Path $watchdogStopFlag -Force -ErrorAction SilentlyContinue
+    if (Test-Path $mcpWatchdogScript) {
+        $wdCmd = "cmd.exe /c `"set PYTHONUTF8=1&& `"$mcpPy`" -X utf8 `"$mcpWatchdogScript`" --port 18900 --interval 8`""
+        $hideWd = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+        Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $wdCmd; ProcessStartupInformation = $hideWd } | Out-Null
+        Write-Host "[2/4] 已启动宿主机 18900 无黑框看门狗守护进程 (pc_mcp_watchdog.py)" -ForegroundColor DarkGreen
+    }
+} else {
+    Write-Host "[警告] 宿主机 18900 MCP 服务未通过 /audio/status 鉴权验活！" -ForegroundColor Red
+    $tailSrc = if ((Test-Path $mcpBootLog) -and ((Get-Item $mcpBootLog).Length -gt 0)) { $mcpBootLog } else { $mcpRuntimeLog }
+    if (Test-Path $tailSrc) {
+        Write-Host "----- $tailSrc (最后 40 行) -----" -ForegroundColor Yellow
+        Get-Content -Path $tailSrc -Tail 40 -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkYellow }
+        Write-Host "----------------------------------" -ForegroundColor Yellow
+    } else {
+        Write-Host "  未找到启动日志文件: $mcpBootLog" -ForegroundColor DarkYellow
+    }
 }
 
 # 3. 可选：启动本机 GPU GPT-SoVITS 语音合成服务 (127.0.0.1:19880)；无独显/未安装则自动优雅跳过并走 EdgeTTS

@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import (
     L3Backend,
+    get_process_create_time,
     load_last_active_task,
     read_env_key,
     resolve_workdir,
@@ -18,13 +19,16 @@ from . import (
     split_command,
     start_worker_thread,
     summarize_text_for_voice,
+    validate_task_id,
 )
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+DSH_PINNED_VERSION = "0.2.2-rc.5"
+DSH_NPX_PACKAGE = f"@deepseek-ai/dsh@{DSH_PINNED_VERSION}"
 
 
 def resolve_dsh_prefix(cfg: Dict[str, Any]) -> Tuple[List[str], str]:
-    """Return (command_prefix, source_description). Uses `dsh` if installed, else `npx -y @deepseek-ai/dsh`."""
+    """Return (command_prefix, source_description). Uses `dsh` if installed, else pinned `npx -y @deepseek-ai/dsh@<ver>`."""
     custom = split_command(str(cfg.get("dsh_cmd") or ""))
     if custom:
         return custom, f"自定义命令 ({custom[0]})"
@@ -37,7 +41,7 @@ def resolve_dsh_prefix(cfg: Dict[str, Any]) -> Tuple[List[str], str]:
     for npx_cand in ("npx.cmd", "npx"):
         found = shutil.which(npx_cand)
         if found:
-            return [found, "-y", "@deepseek-ai/dsh"], "npx @deepseek-ai/dsh（免全局安装）"
+            return [found, "-y", DSH_NPX_PACKAGE], f"npx {DSH_NPX_PACKAGE}（锁定版本，免全局安装）"
 
     return [], ""
 
@@ -67,6 +71,7 @@ class DshBackend(L3Backend):
     def dispatch(
         self, task_id: str, instruction: str, follow_up_last: bool, cfg: Dict[str, Any]
     ) -> str:
+        task_id = validate_task_id(task_id)
         instr = (instruction or "").strip()
         if not instr:
             return "任务内容不能为空。"
@@ -75,7 +80,7 @@ class DshBackend(L3Backend):
         if not prefix:
             return (
                 "当前未检测到 DeepSeek DSH 命令行工具（也未找到 npx）。"
-                "请先安装 Node.js 或运行 npm i -g @deepseek-ai/dsh，或在 18080 控制台填写 DSH 命令路径。"
+                "请先安装 Node.js 或运行 npm i -g @deepseek-ai/dsh，或在宿主机 .env 中配置 DSH_CMD。"
             )
 
         workdir = resolve_workdir(cfg)
@@ -100,7 +105,9 @@ class DshBackend(L3Backend):
             "command_source": source,
             "status": "running",
             "owner_pid": os.getpid(),
+            "owner_create_time": get_process_create_time(os.getpid()),
             "pid": None,
+            "pid_create_time": None,
             "timeout_seconds": timeout_sec,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_ts": time.time(),
@@ -111,6 +118,7 @@ class DshBackend(L3Backend):
 
         def _on_spawn(child_pid: int) -> None:
             task_record["pid"] = child_pid
+            task_record["pid_create_time"] = get_process_create_time(child_pid)
             save_active_task(task_id, task_record)
 
         def _worker():

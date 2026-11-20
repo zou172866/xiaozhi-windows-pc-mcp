@@ -27,6 +27,10 @@ services:
       - COMPANION_EMBEDDING_BASE_URL=${ANIMA_EMBEDDING_BASE_URL-https://generativelanguage.googleapis.com/v1beta/openai}
       - COMPANION_EMBEDDING_MODEL=${ANIMA_EMBEDDING_MODEL-gemini-embedding-001}
       - COMPANION_EMBEDDING_KEY=${ANIMA_EMBEDDING_API_KEY-${GEMINI_API_KEY:-}}
+      - OBSIDIAN_SYNC_ENABLED=${OBSIDIAN_SYNC_ENABLED:-false}
+      - OBSIDIAN_EXPORT_DIR=/obsidian
+      - OBSIDIAN_HOST_DIR=${OBSIDIAN_EXPORT_DIR:-./data/obsidian_export}
+      - OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS=${OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS:-600}
       - NO_PROXY=localhost,127.0.0.1,anima-brain,xiaozhi-esp32-server,host.docker.internal
       - no_proxy=localhost,127.0.0.1,anima-brain,xiaozhi-esp32-server,host.docker.internal
       # 如果未开启全局 TUN 代理，可取消下面两行注释填写宿主机代理端口（本地回环与宿主机桥接已在上方 NO_PROXY 中直连排除）：
@@ -50,7 +54,10 @@ services:
       # 持久化 Anima Brain SQLite 数据库与访问令牌
       - ./data/anima:/data/anima
       - ./anima-brain/xiaozhi_anima_service.py:/app/xiaozhi_anima_service.py:ro
+      - ./anima-brain/obsidian_exporter.py:/app/obsidian_exporter.py:ro
       - ./anima-brain/src/companion_engine/automation.py:/app/src/companion_engine/automation.py:ro
+      # Obsidian 单向导出目录（默认挂载本地 ./data/obsidian_export，配置 OBSIDIAN_EXPORT_DIR 后直连指定 Vault）
+      - ${OBSIDIAN_EXPORT_DIR:-./data/obsidian_export}:/obsidian
 
   xiaozhi-esp32-server:
     image: ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest@sha256:cececd7752e00e044bf9f099751a140834053573bbe6dd55ecbcedcb20c19c25
@@ -66,7 +73,9 @@ services:
       - OMP_NUM_THREADS=2
       - HOST_LAN_IP=${HOST_LAN_IP:-127.0.0.1}
       - HOST_DATA_DIR=${HOST_DATA_DIR:-/opt/xiaozhi-esp32-server/data}
-      - L3_BACKEND=${L3_BACKEND:-antigravity}
+      - ESP32_AUTH_KEY=${ESP32_AUTH_KEY:-}
+      - ESP32_ALLOWED_DEVICES=${ESP32_ALLOWED_DEVICES:-}
+      - L3_BACKEND=${L3_BACKEND:-dsh}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - NO_PROXY=localhost,127.0.0.1,anima-brain,xiaozhi-esp32-server,host.docker.internal

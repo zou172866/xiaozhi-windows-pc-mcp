@@ -6,15 +6,21 @@ Stored in data/reply_length_config.json with mtime caching so adjustments made f
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
 import threading
 from typing import Dict, Optional
 
+import patch_registry
+import runtime_settings
+import xz_common
+
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
 DATA_DIR = os.path.join(ROOT_DIR, "data")
-REPLY_LEN_PATH = os.path.join(DATA_DIR, "reply_length_config.json")
+_DEFAULT_REPLY_LEN_PATH = os.path.join(DATA_DIR, "reply_length_config.json")
+REPLY_LEN_PATH = _DEFAULT_REPLY_LEN_PATH
 
 PRESETS: Dict[str, Dict[str, int]] = {
     "concise": {"chat_chars": 60, "story_chars": 200},
@@ -75,8 +81,10 @@ def _normalize(data: dict) -> dict:
 
 
 def read_reply_length_config() -> dict:
-    """Read reply_length_config.json with mtime cache (sub-microsecond hot path)."""
+    """Read reply_length settings from unified runtime_settings.json (or custom monkeypatched path)."""
     global _cfg_mtime, _cfg_cache
+    if REPLY_LEN_PATH == _DEFAULT_REPLY_LEN_PATH:
+        return _normalize(runtime_settings.get_reply_length())
     try:
         if not os.path.exists(REPLY_LEN_PATH):
             return _normalize(_cfg_cache)
@@ -98,6 +106,13 @@ def write_reply_length_config(
     preset: Optional[str] = None,
 ) -> dict:
     global _cfg_mtime, _cfg_cache
+    if REPLY_LEN_PATH == _DEFAULT_REPLY_LEN_PATH:
+        saved = runtime_settings.set_reply_length(
+            chat_chars=chat_chars,
+            story_chars=story_chars,
+            preset=preset,
+        )
+        return _normalize(saved)
     cur = read_reply_length_config()
     payload = {}
     p_key = str(preset or "").strip().lower()
@@ -112,24 +127,7 @@ def write_reply_length_config(
         "chat_chars": norm["chat_chars"],
         "story_chars": norm["story_chars"],
     }
-    os.makedirs(os.path.dirname(REPLY_LEN_PATH), exist_ok=True)
-    tmp_path = f"{REPLY_LEN_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(disk_data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_path, REPLY_LEN_PATH)
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    xz_common.atomic_write_json(REPLY_LEN_PATH, disk_data)
     with _cfg_lock:
         _cfg_cache = dict(norm)
         try:
@@ -172,29 +170,54 @@ def apply_reply_length_llm_patch() -> None:
     from core.providers.llm.openai.openai import LLMProvider
 
     if getattr(LLMProvider, "_reply_len_patched", False):
+        if patch_registry.get_patch_status("reply_length_llm") is None:
+            patch_registry.record_patch("reply_length_llm", "ok", target="LLMProvider", detail="already applied")
         return
 
     _orig_response = LLMProvider.response
     _orig_response_with_functions = LLMProvider.response_with_functions
 
+    ok1, d1 = patch_registry.verify_signature_contract(
+        _orig_response, required_params=("self", "session_id", "dialogue"), require_async=False
+    )
+    ok2, d2 = patch_registry.verify_signature_contract(
+        _orig_response_with_functions, required_params=("self", "session_id", "dialogue"), require_async=False
+    )
+
     def _sync_max_tokens(self):
         try:
-            dyn = read_reply_length_config()["dynamic_max_tokens"]
-            cur = getattr(self, "max_tokens", None)
-            if cur is None or int(cur) < dyn:
-                self.max_tokens = dyn
+            if not hasattr(self, "_reply_len_base_max_tokens"):
+                raw_base = getattr(self, "max_tokens", None)
+                try:
+                    self._reply_len_base_max_tokens = int(raw_base) if raw_base is not None else None
+                except (TypeError, ValueError):
+                    self._reply_len_base_max_tokens = None
+            dyn = int(read_reply_length_config()["dynamic_max_tokens"])
+            base = self._reply_len_base_max_tokens
+            # Sync both upward AND downward with dynamic_max_tokens (P2-23);
+            # preserve explicit >4096 YAML override if present.
+            self.max_tokens = dyn if (base is None or base <= 4096) else max(base, dyn)
         except Exception:
             pass
 
-    def _patched_response(self, session_id, dialogue, **kwargs):
+    @functools.wraps(_orig_response)
+    def _patched_response(self, *args, **kwargs):
         _sync_max_tokens(self)
-        return _orig_response(self, session_id, dialogue, **kwargs)
+        return _orig_response(self, *args, **kwargs)
 
-    def _patched_response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
+    @functools.wraps(_orig_response_with_functions)
+    def _patched_response_with_functions(self, *args, **kwargs):
         _sync_max_tokens(self)
-        return _orig_response_with_functions(self, session_id, dialogue, functions=functions, **kwargs)
+        return _orig_response_with_functions(self, *args, **kwargs)
 
     LLMProvider.response = _patched_response
     LLMProvider.response_with_functions = _patched_response_with_functions
     LLMProvider._reply_len_patched = True
+    patch_registry.record_patch(
+        "reply_length_llm",
+        "ok" if (ok1 and ok2) else "failed",
+        target="OpenAI.LLMProvider.response/response_with_functions",
+        detail=f"{d1}; {d2}",
+        contract_ok=(ok1 and ok2),
+    )
     print("[ReplyLengthRouter] 已挂载回复字数与讲故事篇幅实时热调补丁 (免重启生效)", flush=True)

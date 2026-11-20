@@ -16,6 +16,8 @@ from . import (
     atomic_write_json,
     load_last_active_task,
     read_env_key,
+    resolve_task_file,
+    validate_task_id,
 )
 
 
@@ -27,9 +29,16 @@ def _get_brain_dir() -> Path:
 
 
 def _summarize_transcript(conv_id: str) -> str:
-    t_path = _get_brain_dir() / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+    try:
+        safe_conv = validate_task_id(conv_id)
+    except ValueError:
+        return "会话 ID 格式无效，拒绝读取会话记录。"
+    brain_root = _get_brain_dir().resolve()
+    t_path = (brain_root / safe_conv / ".system_generated" / "logs" / "transcript.jsonl").resolve()
+    if not t_path.is_relative_to(brain_root):
+        return "会话路径越界，拒绝读取会话记录。"
     if not t_path.exists():
-        return f"会话 ({conv_id[:8]}) 已创建，正在初始化或等待执行中。"
+        return f"会话 ({safe_conv[:8]}) 已创建，正在初始化或等待执行中。"
 
     lines = t_path.read_text(encoding="utf-8", errors="replace").splitlines()
     last_model_reply = ""
@@ -82,6 +91,7 @@ class AntigravityBackend(L3Backend):
     def dispatch(
         self, task_id: str, instruction: str, follow_up_last: bool, cfg: Dict[str, Any]
     ) -> str:
+        safe_task_id = validate_task_id(task_id)
         instr = (instruction or "").strip()
         if not instr:
             return "任务内容不能为空。"
@@ -90,10 +100,15 @@ class AntigravityBackend(L3Backend):
         if follow_up_last:
             last = load_last_active_task(backend="antigravity")
             if last and last.get("conversation_id"):
-                conv_id = str(last["conversation_id"])
+                cand_conv = str(last["conversation_id"]).strip()
+                try:
+                    if not cand_conv.startswith("-"):
+                        conv_id = validate_task_id(cand_conv)
+                except ValueError:
+                    conv_id = ""
 
         task_obj = {
-            "id": task_id,
+            "id": safe_task_id,
             "backend": "antigravity",
             "title": f"[小智派单] {instr[:24]}",
             "prompt": instr,
@@ -101,7 +116,7 @@ class AntigravityBackend(L3Backend):
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         PENDING_DIR.mkdir(parents=True, exist_ok=True)
-        pending_file = PENDING_DIR / f"{task_id}.json"
+        pending_file = resolve_task_file(PENDING_DIR, safe_task_id)
         atomic_write_json(pending_file, task_obj)
 
         if not _is_worker_alive():
@@ -110,7 +125,7 @@ class AntigravityBackend(L3Backend):
                 "请在 Antigravity 的 Automations 面板点一下启用，启用后队列里的任务就会立刻自动跑起来。"
             )
 
-        active_file = ACTIVE_DIR / f"{task_id}.json"
+        active_file = resolve_task_file(ACTIVE_DIR, safe_task_id)
         for _ in range(14):
             if active_file.exists():
                 try:

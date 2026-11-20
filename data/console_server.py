@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import socket
 import struct
 import threading
 import time
@@ -11,15 +12,19 @@ import wave
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import edge_tts
 import httpx
 import yaml
 
 import mei_emotion_router
+import patch_registry
 import pc_audio_router
 import reply_length_router
+import runtime_events
+import runtime_settings
+import xz_common
 
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
 DATA_DIR = os.path.join(ROOT_DIR, "data")
@@ -27,15 +32,16 @@ CONFIG_PATH = os.path.join(DATA_DIR, ".config.yaml")
 HTML_PATH = os.path.join(DATA_DIR, "console.html")
 HISTORY_PATH = os.path.join(DATA_DIR, "chat_history.json")
 LOG_CURSOR_PATH = os.path.join(DATA_DIR, ".console_log_cursor.json")
-MODE_PATH = os.path.join(DATA_DIR, "pc_control_mode.json")
-AGY_HB_PATH = os.path.join(DATA_DIR, "agy_tasks", "worker_heartbeat.json")
+_DEFAULT_MODE_PATH = os.path.join(DATA_DIR, "pc_control_mode.json")
+MODE_PATH = _DEFAULT_MODE_PATH
 LOG_PATH = os.path.join(ROOT_DIR, "tmp", "server.log")
 
 CONSOLE_PORT = int(os.environ.get("CONSOLE_PORT", "18080"))
 GSV_Host = "http://host.docker.internal:19880"
 PC_MCP_HOST = os.environ.get("PC_AUDIO_BRIDGE_URL", "http://host.docker.internal:18900").rstrip("/")
 GSV_INFER_YAML = os.path.join(DATA_DIR, "tts_infer_xiaozhi.yaml")
-L3_CONFIG_PATH = os.path.join(DATA_DIR, "l3_backend_config.json")
+ALLOWED_L3_UPDATE_KEYS = frozenset({"backend", "timeout_seconds", "timeout"})
+VALID_L3_BACKENDS = ("antigravity", "dsh", "workbuddy", "none")
 HOST_DATA_DIR = (
     (os.environ.get("HOST_DATA_DIR") or "").replace("\\", "/").rstrip("/")
     or DATA_DIR
@@ -101,7 +107,8 @@ GSV_PROFILES = {
         },
     },
 }
-_gsv_weights_lock = threading.RLock()
+# Share the exact same RLock with live ESP32 GPT-SoVITS synthesis (P1-14)
+_gsv_weights_lock = mei_emotion_router.GSV_GPU_LOCK
 _active_gsv_loaded = None
 
 
@@ -147,24 +154,7 @@ def _redact_secrets(text: str) -> str:
 
 
 def _atomic_write_text(path: str, content: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    xz_common.atomic_write_text(path, content)
 
 
 def validate_console_request(method: str, headers: dict, port: int = CONSOLE_PORT) -> tuple[bool, int, str]:
@@ -245,6 +235,9 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
             r1 = client.get(f"{GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=25.0)
             if r1.status_code != 200:
                 raise RuntimeError(f"切换 GPT 权重失败 (HTTP {r1.status_code}): {r1.text[:160]}")
+            # GPT weights are now mutated on GPU: mark state dirty (distinct from None) so a SoVITS
+            # failure forces restoration instead of falling back to _detect_boot_gsv_voice().
+            _active_gsv_loaded = "__dirty__"
             r2 = client.get(f"{GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=30.0)
             if r2.status_code != 200:
                 raise RuntimeError(f"切换 SoVITS 权重失败 (HTTP {r2.status_code}): {r2.text[:160]}")
@@ -271,7 +264,8 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
 
 _state_lock = threading.Lock()
 _chat_messages = []
-_raw_logs = deque(maxlen=150)
+_raw_logs: deque[tuple[int, str]] = deque(maxlen=150)
+_raw_log_seq = 0
 _device_info = {
     "device_id": "",
     "last_seen": "",
@@ -279,7 +273,184 @@ _device_info = {
     "server_ready": False,
 }
 _current_ai_turn_open = False
+_turn_has_tts = False
+_turn_dialogue_bubble_open = False
+_last_event_seq = 0
 _log_offset = 0
+
+
+def _append_raw_log_locked(line: str) -> int:
+    global _raw_log_seq
+    _raw_log_seq += 1
+    _raw_logs.append((_raw_log_seq, _redact_secrets(line)))
+    return _raw_log_seq
+
+
+def _get_logs_for_state(cursor: int | None) -> tuple[list[str], int, bool, bool]:
+    """Return (lines, latest_cursor, incremental, reset) for /api/state (P2-22).
+
+    Without `cursor`, returns full tail (up to 100 lines) for full backward compatibility.
+    With `cursor`, returns only lines with seq > cursor unless the ring wrapped or restarted.
+    """
+    with _state_lock:
+        latest_seq = _raw_log_seq
+        snapshot = list(_raw_logs)
+
+    if cursor is None:
+        return [txt for _, txt in snapshot[-100:]], latest_seq, False, False
+
+    if not snapshot:
+        reset = cursor > latest_seq
+        return [], latest_seq, not reset, reset
+
+    earliest_seq = snapshot[0][0]
+    if cursor < 0 or cursor > latest_seq or cursor < (earliest_seq - 1):
+        return [txt for _, txt in snapshot[-100:]], latest_seq, False, True
+
+    delta = [txt for seq, txt in snapshot if seq > cursor]
+    return delta, latest_seq, True, False
+
+
+def _is_device_busy() -> bool:
+    """Return True if ESP32 is actively speaking or a live GPT-SoVITS GPU synthesis is running (P1-14)."""
+    if mei_emotion_router.is_live_gsv_busy():
+        return True
+    if runtime_events.is_any_device_speaking():
+        return True
+    with _state_lock:
+        return _device_info.get("activity") == "speaking"
+
+
+def _norm_spoken_key(text: str) -> str:
+    """Normalize text to alphanumeric/CJK characters for Markdown-tolerant dedup."""
+    return "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", str(text or ""))).lower()
+
+
+def _is_segment_already_covered(existing_text: str, seg_text: str) -> bool:
+    if not seg_text:
+        return True
+    if seg_text in existing_text:
+        return True
+    norm_seg = _norm_spoken_key(seg_text)
+    if norm_seg and norm_seg in _norm_spoken_key(existing_text):
+        return True
+    return False
+
+
+def _apply_runtime_event(evt: dict) -> None:
+    """Consume a structured in-process runtime event into console chat & device state (P1-11)."""
+    global _current_ai_turn_open, _turn_has_tts, _turn_dialogue_bubble_open, _last_event_seq
+    if not isinstance(evt, dict):
+        return
+    seq = int(evt.get("seq") or 0)
+    etype = str(evt.get("type") or "")
+    ts_short = str(evt.get("time") or time.strftime("%H:%M:%S"))
+    dev_id = str(evt.get("device_id") or "").strip()
+
+    with _state_lock:
+        if seq > 0:
+            if seq <= _last_event_seq:
+                return
+            _last_event_seq = seq
+
+        if dev_id:
+            _device_info["device_id"] = dev_id
+            _device_info["last_seen"] = ts_short
+
+        if etype == "server_ready":
+            _device_info["server_ready"] = True
+            return
+
+        if etype == "device_seen":
+            _device_info["last_seen"] = ts_short
+            return
+
+        if etype == "listen_start":
+            _finalize_open_ai_turn()
+            _turn_has_tts = False
+            _turn_dialogue_bubble_open = False
+            _device_info["activity"] = "listening"
+            _device_info["last_seen"] = ts_short
+            return
+
+        if etype == "user_message":
+            _finalize_open_ai_turn()
+            _turn_has_tts = False
+            _turn_dialogue_bubble_open = False
+            text = str(evt.get("text") or "").strip()
+            _device_info["activity"] = "speaking"
+            _device_info["last_seen"] = ts_short
+            if text and not _is_duplicate_chat_message("user", ts_short, text):
+                _chat_messages.append({"role": "user", "text": text, "time": ts_short})
+                _trim_chat_messages()
+                _save_history()
+            return
+
+        if etype == "connection_closed":
+            _finalize_open_ai_turn()
+            _turn_has_tts = False
+            _turn_dialogue_bubble_open = False
+            if not runtime_events.is_any_device_speaking():
+                _device_info["activity"] = "idle"
+            _save_history()
+            return
+
+        if etype == "tts_state":
+            state = str(evt.get("state") or "")
+            raw_txt = evt.get("text")
+            _device_info["last_seen"] = ts_short
+            if state == "start":
+                _device_info["activity"] = "speaking"
+            elif state == "stop":
+                _finalize_open_ai_turn()
+                _turn_has_tts = False
+                _turn_dialogue_bubble_open = False
+                _device_info["activity"] = "idle"
+                _save_history()
+            elif state == "sentence_start" and raw_txt:
+                content = mei_emotion_router.strip_emotion_tags(str(raw_txt)).strip()
+                if content:
+                    _device_info["activity"] = "speaking"
+                    if _turn_dialogue_bubble_open and _chat_messages and _chat_messages[-1]["role"] == "assistant":
+                        if not _is_segment_already_covered(_chat_messages[-1]["text"], content):
+                            _chat_messages[-1]["text"] = _join_cn_clauses(_chat_messages[-1]["text"], content)
+                        _current_ai_turn_open = True
+                    elif _current_ai_turn_open and _chat_messages and _chat_messages[-1]["role"] == "assistant":
+                        _chat_messages[-1]["text"] = _join_cn_clauses(_chat_messages[-1]["text"], content)
+                    else:
+                        _chat_messages.append({"role": "assistant", "text": content, "time": ts_short})
+                        _current_ai_turn_open = True
+                    _turn_has_tts = True
+                    _trim_chat_messages()
+            return
+
+        if etype == "assistant_message":
+            content = mei_emotion_router.strip_emotion_tags(str(evt.get("text") or "")).strip()
+            if not content:
+                return
+            _device_info["last_seen"] = ts_short
+            if _turn_has_tts:
+                # Spoken segments already streamed via send_tts_message("sentence_start"); avoid duplicate bubble
+                return
+            if _turn_dialogue_bubble_open and _chat_messages and _chat_messages[-1]["role"] == "assistant":
+                if not _is_segment_already_covered(_chat_messages[-1]["text"], content):
+                    _chat_messages[-1]["text"] = _join_cn_clauses(_chat_messages[-1]["text"], content)
+                    _save_history()
+            elif not _is_duplicate_chat_message("assistant", ts_short, content):
+                _chat_messages.append({"role": "assistant", "text": content, "time": ts_short})
+                _current_ai_turn_open = True
+                _turn_dialogue_bubble_open = True
+                _trim_chat_messages()
+                _save_history()
+
+
+def _sync_runtime_events() -> None:
+    """Drain any unconsumed events from the in-process runtime ring buffer."""
+    with _state_lock:
+        since = _last_event_seq
+    pending = runtime_events.get_events_since(since)
+    for evt in pending:
+        _apply_runtime_event(evt)
 
 
 def _dedup_chat_items(items: list) -> list:
@@ -302,14 +473,21 @@ def _dedup_chat_items(items: list) -> list:
 
 def _load_history():
     global _chat_messages
+    loaded = None
     if os.path.exists(HISTORY_PATH):
         try:
             with open(HISTORY_PATH, "r", encoding="utf-8") as f:
                 items = json.load(f)
                 if isinstance(items, list):
-                    _chat_messages = _dedup_chat_items(items)[-100:]
+                    loaded = _dedup_chat_items(items)[-100:]
         except Exception:
-            _chat_messages = []
+            loaded = []
+    if loaded is not None:
+        with _state_lock:
+            if not _chat_messages:
+                _chat_messages = loaded
+            else:
+                _chat_messages = _dedup_chat_items(loaded + _chat_messages)[-100:]
 
 
 def _save_history():
@@ -323,6 +501,8 @@ def _save_history():
 
 
 def _read_pc_mode() -> str:
+    if MODE_PATH == _DEFAULT_MODE_PATH:
+        return runtime_settings.get_pc_mode()
     try:
         if os.path.exists(MODE_PATH):
             with open(MODE_PATH, "r", encoding="utf-8") as f:
@@ -335,17 +515,102 @@ def _read_pc_mode() -> str:
 
 
 def _write_pc_mode(mode: str):
-    _atomic_write_text(MODE_PATH, json.dumps({"mode": mode}, ensure_ascii=False, indent=2))
+    if MODE_PATH == _DEFAULT_MODE_PATH:
+        runtime_settings.set_pc_mode(mode)
+        return
+    xz_common.atomic_write_json(MODE_PATH, {"mode": mode})
 
 
-def _check_agy_bridge_online() -> bool:
+def _update_idle_farewell_config(payload: dict) -> tuple[bool, dict | str]:
+    """Validate, persist, and live-sync idle timeout farewell settings across active connections."""
+    if not isinstance(payload, dict):
+        return False, "请求体必须为 JSON 对象"
+
+    enabled_arg: bool | None = None
+    if "enabled" in payload:
+        raw_en = payload.get("enabled")
+        if not isinstance(raw_en, bool):
+            return False, "字段 enabled 必须为布尔值"
+        enabled_arg = raw_en
+
+    mode_arg: str | None = None
+    if "mode" in payload:
+        raw_mode = payload.get("mode")
+        if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in runtime_settings.VALID_IDLE_FAREWELL_MODES:
+            return False, "字段 mode 必须为 fixed 或 llm_summary"
+        mode_arg = raw_mode.strip().lower()
+
+    timeout_arg: int | None = None
+    if "timeout_seconds" in payload:
+        raw_to = payload.get("timeout_seconds")
+        if isinstance(raw_to, bool):
+            return False, "字段 timeout_seconds 必须为整数（30～1800）"
+        try:
+            timeout_arg = int(raw_to)
+        except (TypeError, ValueError):
+            return False, "字段 timeout_seconds 必须为整数（30～1800）"
+        if timeout_arg < 30 or timeout_arg > 1800:
+            return False, "无声超时秒数必须在 30～1800 秒之间"
+
+    summary_prompt_arg: str | None = None
+    if "summary_prompt" in payload:
+        raw_sp = payload.get("summary_prompt")
+        if not isinstance(raw_sp, str):
+            return False, "字段 summary_prompt 必须为字符串"
+        summary_prompt_arg = raw_sp
+
+    messages_arg = None
+    if "messages" in payload:
+        raw_msgs = payload.get("messages")
+        if not isinstance(raw_msgs, (list, tuple, str)):
+            return False, "字段 messages 必须为字符串数组或换行分隔文本"
+        messages_arg = raw_msgs
+
+    if (
+        enabled_arg is None
+        and mode_arg is None
+        and timeout_arg is None
+        and summary_prompt_arg is None
+        and messages_arg is None
+    ):
+        return False, "请至少提供 enabled、mode、timeout_seconds、summary_prompt 或 messages"
+
+    saved = runtime_settings.set_idle_farewell(
+        enabled=enabled_arg,
+        mode=mode_arg,
+        timeout_seconds=timeout_arg,
+        summary_prompt=summary_prompt_arg,
+        messages=messages_arg,
+    )
+    eff_timeout = int(saved["timeout_seconds"])
+    eff_hard = max(60, eff_timeout + 60)
     try:
-        if os.path.exists(AGY_HB_PATH):
-            with open(AGY_HB_PATH, "r", encoding="utf-8") as f:
-                hb = json.load(f)
-            return (time.time() - float(hb.get("ts", 0))) < 15.0
+        for srv in runtime_events.get_ws_servers():
+            if isinstance(getattr(srv, "config", None), dict):
+                srv.config["close_connection_no_voice_time"] = eff_timeout
+        for conn in runtime_events.get_active_connections():
+            if hasattr(conn, "timeout_seconds"):
+                conn.timeout_seconds = eff_hard
+            if isinstance(getattr(conn, "config", None), dict):
+                conn.config["close_connection_no_voice_time"] = eff_timeout
     except Exception:
         pass
+    return True, saved
+
+
+def _check_agy_bridge_online(l3_status: dict | None = None) -> bool:
+    """Derive Antigravity sidecar heartbeat solely from host-private 18900 /l3/status (never ./data)."""
+    src = l3_status
+    if src is None:
+        with _l3_cache_lock:
+            src = dict(_l3_cache) if _l3_cache is not None else None
+    if not isinstance(src, dict):
+        return False
+    detected = src.get("detected")
+    if isinstance(detected, dict):
+        agy = detected.get("antigravity")
+        if isinstance(agy, dict):
+            return bool(agy.get("ready"))
     return False
 
 
@@ -356,23 +621,10 @@ _L3_CACHE_TTL = 3.0
 
 
 def _read_local_l3_fallback() -> dict:
-    cfg = {
-        "backend": (os.environ.get("L3_BACKEND") or "antigravity").strip().lower(),
-        "workdir": "",
-        "dsh_cmd": "",
-        "workbuddy_cmd": "",
-        "workbuddy_auto_approve": True,
-        "timeout_seconds": 300,
-    }
-    if os.path.isfile(L3_CONFIG_PATH):
-        try:
-            raw = json.loads(open(L3_CONFIG_PATH, "r", encoding="utf-8").read())
-            if isinstance(raw, dict):
-                cfg.update(raw)
-        except Exception:
-            pass
-    agy_on = _check_agy_bridge_online()
-    b = cfg["backend"]
+    """Read-only offline fallback when 18900 is unreachable (never reads or writes ./data L3 files)."""
+    b = (os.environ.get("L3_BACKEND") or "dsh").strip().lower()
+    if b not in VALID_L3_BACKENDS:
+        b = "dsh"
     labels = {
         "antigravity": "Google Antigravity（反重力）",
         "dsh": "DeepSeek DSH（DeepSeek Harness）",
@@ -384,20 +636,22 @@ def _read_local_l3_fallback() -> dict:
         "mcp_online": False,
         "backend": b,
         "label_zh": labels.get(b, b),
-        "ready": agy_on if b == "antigravity" else (b == "none"),
+        "ready": b == "none",
         "detail": (
-            "宿主机 18900 MCP 离线（已读取本地配置）"
+            "宿主机 18900 MCP 离线（L3 配置仅存宿主机私有目录 pc-mcp/state/）"
             if b != "none"
             else "已关闭 L3 后台 Agent（仅保留 L1/L2）"
         ),
-        "workdir": cfg.get("workdir", ""),
-        "effective_workdir": cfg.get("workdir", ""),
-        "dsh_cmd": cfg.get("dsh_cmd", ""),
-        "workbuddy_cmd": cfg.get("workbuddy_cmd", ""),
-        "workbuddy_auto_approve": bool(cfg.get("workbuddy_auto_approve", True)),
-        "timeout_seconds": int(cfg.get("timeout_seconds", 300)),
+        "workdir": "",
+        "effective_workdir": "",
+        "dsh_cmd": "",
+        "workbuddy_cmd": "",
+        "workbuddy_auto_approve": False,
+        "timeout_seconds": 300,
+        "writable_fields": ["backend", "timeout_seconds"],
+        "host_env_only_fields": ["workdir", "dsh_cmd", "workbuddy_cmd", "workbuddy_auto_approve"],
         "detected": {
-            "antigravity": {"ready": agy_on, "detail": "伴生桥接在线" if agy_on else "待开启 Antigravity 伴生桥接"},
+            "antigravity": {"ready": False, "detail": "待宿主机 18900 MCP 在线探测"},
             "dsh": {"ready": False, "detail": "待宿主机 18900 MCP 在线探测"},
             "workbuddy": {"ready": False, "detail": "待宿主机 18900 MCP 在线探测"},
             "none": {"ready": True, "detail": "已关闭 L3 后台派单"},
@@ -434,14 +688,59 @@ def _fetch_l3_backend_status(force: bool = False) -> dict:
     return fb
 
 
+def _sanitize_l3_update_payload(payload: dict) -> tuple[bool, dict | str]:
+    """Allow ONLY backend and timeout_seconds (or alias timeout); strictly reject host-env-only fields."""
+    if not isinstance(payload, dict):
+        return False, "请求体必须是 JSON 对象"
+    forbidden = sorted(str(k) for k in payload.keys() if k not in ALLOWED_L3_UPDATE_KEYS)
+    if forbidden:
+        return (
+            False,
+            f"仅允许修改 backend / timeout_seconds，宿主机命令与目录仅可从宿主机 .env 配置，已拒绝字段: {', '.join(forbidden)}",
+        )
+
+    out: dict = {}
+    if "backend" in payload:
+        b = str(payload.get("backend") or "").strip().lower()
+        if b not in VALID_L3_BACKENDS:
+            return False, "无效的 L3 后端名称（可选: antigravity / dsh / workbuddy / none）"
+        out["backend"] = b
+
+    has_ts = "timeout_seconds" in payload
+    has_t = "timeout" in payload
+    if has_ts or has_t:
+        parsed_vals = []
+        for k in ("timeout_seconds", "timeout"):
+            if k in payload:
+                raw_v = payload[k]
+                if isinstance(raw_v, bool):
+                    return False, f"字段 {k} 必须为整数（30～1800）"
+                try:
+                    iv = int(raw_v)
+                except (TypeError, ValueError):
+                    return False, f"字段 {k} 必须为整数（30～1800）"
+                parsed_vals.append(max(30, min(1800, iv)))
+        if len(parsed_vals) == 2 and parsed_vals[0] != parsed_vals[1]:
+            return False, "timeout_seconds 与 timeout 参数冲突"
+        out["timeout_seconds"] = parsed_vals[0]
+
+    if not out:
+        return False, "请至少提供 backend 或 timeout_seconds"
+    return True, out
+
+
 def _update_l3_backend_config(payload: dict) -> tuple[bool, dict | str]:
     global _l3_cache, _l3_cache_ts
+    ok_clean, clean_or_err = _sanitize_l3_update_payload(payload)
+    if not ok_clean:
+        return False, str(clean_or_err)
+    forward_payload = clean_or_err
     try:
         client = _get_console_http_client()
         resp = client.post(
             f"{PC_MCP_HOST}/l3/config",
             headers=pc_audio_router.get_pc_mcp_auth_headers(),
-            json=payload or {},
+            json=forward_payload,
             timeout=3.5,
         )
         if resp.status_code == 200:
@@ -452,30 +751,8 @@ def _update_l3_backend_config(payload: dict) -> tuple[bool, dict | str]:
                 _l3_cache_ts = time.monotonic()
             return True, data
         return False, f"宿主机 MCP 返回 HTTP {resp.status_code}: {resp.text[:160]}"
-    except Exception:
-        # Offline fallback: persist directly to shared data/l3_backend_config.json so next 18900 start picks it up
-        try:
-            cur = _read_local_l3_fallback()
-            new_cfg = {
-                "backend": str(payload.get("backend") or cur["backend"]).strip().lower(),
-                "workdir": str(payload.get("workdir", cur["workdir"]) or "").strip(),
-                "dsh_cmd": str(payload.get("dsh_cmd", cur["dsh_cmd"]) or "").strip(),
-                "workbuddy_cmd": str(payload.get("workbuddy_cmd", cur["workbuddy_cmd"]) or "").strip(),
-                "workbuddy_auto_approve": bool(
-                    payload.get("workbuddy_auto_approve", cur["workbuddy_auto_approve"])
-                ),
-                "timeout_seconds": int(payload.get("timeout_seconds", cur["timeout_seconds"])),
-            }
-            if new_cfg["backend"] not in ("antigravity", "dsh", "workbuddy", "none"):
-                return False, "无效的 L3 后端名称"
-            _atomic_write_text(L3_CONFIG_PATH, json.dumps(new_cfg, ensure_ascii=False, indent=2))
-            fb = _read_local_l3_fallback()
-            with _l3_cache_lock:
-                _l3_cache = dict(fb)
-                _l3_cache_ts = time.monotonic()
-            return True, fb
-        except Exception as exc:
-            return False, str(exc)
+    except Exception as exc:
+        return False, f"宿主机 18900 MCP 离线，无法更新 L3 配置（L3 配置仅存宿主机私有目录 pc-mcp/state/）: {exc}"
 
 
 _RE_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
@@ -559,7 +836,7 @@ def _process_log_line(line: str, *, status_only: bool = False):
         return
 
     with _state_lock:
-        _raw_logs.append(_redact_secrets(s))
+        _append_raw_log_locked(s)
 
         m_time = _RE_TIME.match(s)
         ts_short = m_time.group(1)[11:19] if m_time else time.strftime("%H:%M:%S")
@@ -721,7 +998,7 @@ def _replay_boot_lines_merged(lines: list[str]) -> None:
             _save_history()
 
 
-def _poll_log_once(watcher_state: dict) -> None:
+def _poll_log_once(watcher_state: dict, *, raw_logs_only: bool = False) -> None:
     global _log_offset
     if not os.path.exists(LOG_PATH):
         return
@@ -731,7 +1008,22 @@ def _poll_log_once(watcher_state: dict) -> None:
         watcher_state["initialized"] = True
         saved_ino = watcher_state.get("saved_inode")
         saved_off = int(watcher_state.get("saved_offset") or 0)
-        if saved_ino == st.st_ino and 0 < saved_off <= st.st_size:
+        if raw_logs_only:
+            # Structured runtime event bus owns chat & device status; tail recent log lines only for log drawer
+            tail_bytes = 65536
+            _log_offset = max(0, st.st_size - tail_bytes)
+            if _log_offset > 0:
+                try:
+                    with open(LOG_PATH, "rb") as _rf:
+                        _rf.seek(_log_offset)
+                        _first_chunk = _rf.read(4096)
+                    _nl = _first_chunk.find(b"\n")
+                    if _nl >= 0:
+                        _log_offset += _nl + 1
+                except Exception:
+                    pass
+            watcher_state["last_inode"] = st.st_ino
+        elif saved_ino == st.st_ino and 0 < saved_off <= st.st_size:
             _stream_status_prefix(LOG_PATH, saved_off)
             _log_offset = saved_off
             watcher_state["last_inode"] = st.st_ino
@@ -752,7 +1044,13 @@ def _poll_log_once(watcher_state: dict) -> None:
             to_consume = raw[: last_nl + 1]
             _log_offset += len(to_consume)
             lines = to_consume.decode("utf-8", errors="replace").splitlines()
-            if is_boot_replay and _chat_messages:
+            if raw_logs_only:
+                with _state_lock:
+                    for ln in lines:
+                        s = ln.strip()
+                        if s:
+                            _append_raw_log_locked(s)
+            elif is_boot_replay and _chat_messages:
                 _replay_boot_lines_merged(lines)
             else:
                 for ln in lines:
@@ -764,6 +1062,7 @@ def _poll_log_once(watcher_state: dict) -> None:
 
 def _log_watcher_loop():
     _load_history()
+    _sync_runtime_events()
     saved_ino, saved_off = _load_log_cursor()
     watcher_state = {
         "initialized": False,
@@ -773,7 +1072,8 @@ def _log_watcher_loop():
     }
     while True:
         try:
-            _poll_log_once(watcher_state)
+            _sync_runtime_events()
+            _poll_log_once(watcher_state, raw_logs_only=runtime_events.is_hooks_active())
         except Exception:
             pass
         time.sleep(0.4)
@@ -795,13 +1095,7 @@ _ANIMA_REL_TTL = 3.0
 
 
 def _read_anima_token() -> str:
-    if not os.path.isfile(ANIMA_TOKEN_PATH):
-        return ""
-    try:
-        with open(ANIMA_TOKEN_PATH, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
+    return xz_common.read_token_file(ANIMA_TOKEN_PATH)
 
 
 def _get_anima_character_id(cfg: dict | None = None) -> str:
@@ -902,6 +1196,378 @@ def _update_anima_relationship(payload: dict) -> tuple[bool, dict | str]:
         return False, f"无法连接 Anima Brain (18787): {exc}"
 
 
+_obsidian_lock = threading.Lock()
+_obsidian_cache: dict | None = None
+_obsidian_ts = 0.0
+_OBSIDIAN_TTL = 3.0
+
+
+def _default_offline_obsidian() -> dict:
+    return {
+        "online": False,
+        "enabled": False,
+        "writable": False,
+        "export_dir": "/obsidian",
+        "host_export_dir": "",
+        "snapshot_interval_seconds": 600,
+        "last_export_at": "",
+        "last_export_ts": 0.0,
+        "last_export_reason": "",
+        "last_error": "无法连接 Anima Brain (18787)",
+        "stats": {
+            "turns": 0,
+            "days": 0,
+            "active_facts": 0,
+            "historical_revisions": 0,
+            "open_loops": 0,
+            "episodes": 0,
+            "files_written": 0,
+            "files_skipped": 0,
+        },
+    }
+
+
+def _mark_obsidian_cache_offline(err_msg: str = "") -> dict:
+    global _obsidian_cache, _obsidian_ts
+    with _obsidian_lock:
+        if _obsidian_cache is not None:
+            offline = dict(_obsidian_cache)
+            offline["online"] = False
+            if err_msg:
+                offline["last_error"] = err_msg
+        else:
+            offline = _default_offline_obsidian()
+            if err_msg:
+                offline["last_error"] = err_msg
+        _obsidian_cache = dict(offline)
+        _obsidian_ts = time.monotonic()
+        return offline
+
+
+def _get_cached_obsidian_snapshot() -> dict:
+    with _obsidian_lock:
+        if _obsidian_cache is not None:
+            return dict(_obsidian_cache)
+    return _default_offline_obsidian()
+
+
+def _fetch_obsidian_status(force: bool = False) -> dict:
+    global _obsidian_cache, _obsidian_ts
+    now = time.monotonic()
+    with _obsidian_lock:
+        if not force and _obsidian_cache is not None and (now - _obsidian_ts) < _OBSIDIAN_TTL:
+            return dict(_obsidian_cache)
+
+    token = _read_anima_token()
+    if not token:
+        return _mark_obsidian_cache_offline("未找到 Anima Brain 访问令牌 (studio_token.txt)")
+    try:
+        client = _get_console_http_client()
+        resp = client.get(
+            f"{ANIMA_HOST}/xiaozhi/obsidian/status",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=1.8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            data["online"] = True
+            with _obsidian_lock:
+                _obsidian_cache = dict(data)
+                _obsidian_ts = time.monotonic()
+            return data
+    except Exception:
+        pass
+    return _mark_obsidian_cache_offline()
+
+
+def _update_obsidian_config(payload: dict) -> tuple[bool, dict | str]:
+    global _obsidian_cache, _obsidian_ts
+    token = _read_anima_token()
+    if not token:
+        msg = "未找到 Anima Brain 访问令牌 (studio_token.txt)"
+        _mark_obsidian_cache_offline(msg)
+        return False, msg
+    if "enabled" not in (payload or {}) or not isinstance(payload.get("enabled"), bool):
+        return False, "缺少布尔字段 enabled"
+    try:
+        client = _get_console_http_client()
+        resp = client.post(
+            f"{ANIMA_HOST}/xiaozhi/obsidian/config",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"enabled": bool(payload["enabled"])},
+            timeout=15.0,
+        )
+        if resp.status_code == 200:
+            raw = resp.json()
+            data = dict(raw.get("obsidian") or raw)
+            data["online"] = True
+            with _obsidian_lock:
+                _obsidian_cache = dict(data)
+                _obsidian_ts = time.monotonic()
+            return True, data
+        return False, f"Anima Brain 返回 HTTP {resp.status_code}: {resp.text[:160]}"
+    except Exception as exc:
+        msg = f"无法连接 Anima Brain (18787): {exc}"
+        _mark_obsidian_cache_offline(msg)
+        return False, msg
+
+
+def _trigger_obsidian_rebuild() -> tuple[bool, dict | str]:
+    global _obsidian_cache, _obsidian_ts
+    token = _read_anima_token()
+    if not token:
+        msg = "未找到 Anima Brain 访问令牌 (studio_token.txt)"
+        _mark_obsidian_cache_offline(msg)
+        return False, msg
+    try:
+        client = _get_console_http_client()
+        resp = client.post(
+            f"{ANIMA_HOST}/xiaozhi/obsidian/rebuild",
+            headers={"Authorization": f"Bearer {token}"},
+            json={},
+            timeout=30.0,
+        )
+        raw = {}
+        try:
+            raw = resp.json()
+        except Exception:
+            raw = {}
+        if resp.status_code == 200 and raw.get("ok"):
+            status_data = dict(raw.get("obsidian") or {})
+            status_data["online"] = True
+            with _obsidian_lock:
+                _obsidian_cache = dict(status_data)
+                _obsidian_ts = time.monotonic()
+            return True, {"obsidian": status_data, "result": raw.get("result") or raw}
+        err = raw.get("error") or f"Anima Brain 返回 HTTP {resp.status_code}: {resp.text[:160]}"
+        if isinstance(raw.get("obsidian"), dict):
+            status_data = dict(raw["obsidian"])
+            status_data["online"] = True
+            with _obsidian_lock:
+                _obsidian_cache = dict(status_data)
+                _obsidian_ts = time.monotonic()
+        return False, str(err)
+    except Exception as exc:
+        msg = f"无法连接 Anima Brain (18787): {exc}"
+        _mark_obsidian_cache_offline(msg)
+        return False, msg
+
+
+_probe_lock = threading.Lock()
+_pc_audio_online_cache: bool = False
+_gsv_online_cache: bool = False
+_probe_fail_counts: dict[str, int] = {
+    "pc_audio": 0,
+    "l3": 0,
+    "anima_rel": 0,
+    "obsidian": 0,
+    "gsv": 0,
+}
+_PROBE_OFFLINE_THRESHOLD = 2
+_PROBE_INTERVAL_SECONDS = 3.0
+
+
+def _get_cached_pc_audio_online() -> bool:
+    with _probe_lock:
+        return bool(_pc_audio_online_cache)
+
+
+def _set_cached_pc_audio_online(val: bool) -> None:
+    with _probe_lock:
+        global _pc_audio_online_cache
+        _pc_audio_online_cache = bool(val)
+        _probe_fail_counts["pc_audio"] = 0 if val else _PROBE_OFFLINE_THRESHOLD
+
+
+def _get_cached_gsv_online() -> bool:
+    with _probe_lock:
+        return bool(_gsv_online_cache)
+
+
+def _get_cached_l3_backend_snapshot() -> dict:
+    with _l3_cache_lock:
+        if _l3_cache is not None:
+            return dict(_l3_cache)
+    return _read_local_l3_fallback()
+
+
+def _get_cached_anima_relationship_snapshot(cfg: dict | None = None) -> dict:
+    with _anima_rel_lock:
+        if _anima_rel_cache is not None:
+            return dict(_anima_rel_cache)
+    return _default_offline_relationship(_get_anima_character_id(cfg))
+
+
+def _probe_gsv_tcp_once() -> bool:
+    """Lightweight TCP connect check for 19880 without touching GPU weights or locks."""
+    try:
+        u = urlparse(GSV_Host)
+        host = u.hostname or "host.docker.internal"
+        port = int(u.port or 19880)
+        with socket.create_connection((host, port), timeout=0.4):
+            return True
+    except Exception:
+        return False
+
+
+def _probe_background_services_once() -> dict[str, bool]:
+    """Probe 18900 / 19880 / 18787 off the /api/state request path with anti-flap hysteresis (P2-22)."""
+    global _pc_audio_online_cache, _gsv_online_cache, _l3_cache, _l3_cache_ts
+    global _anima_rel_cache, _anima_rel_ts, _obsidian_cache, _obsidian_ts
+
+    # 1. 18900 PC Audio Bridge
+    audio_ok = False
+    try:
+        audio_ok = bool(pc_audio_router.is_pc_audio_bridge_online(force=True))
+    except Exception:
+        audio_ok = False
+    with _probe_lock:
+        if audio_ok:
+            _probe_fail_counts["pc_audio"] = 0
+            _pc_audio_online_cache = True
+        else:
+            _probe_fail_counts["pc_audio"] += 1
+            if _probe_fail_counts["pc_audio"] >= _PROBE_OFFLINE_THRESHOLD:
+                _pc_audio_online_cache = False
+
+    # 2. 18900 L3 Backend Status
+    l3_ok = False
+    try:
+        client = _get_console_http_client()
+        resp = client.get(
+            f"{PC_MCP_HOST}/l3/status",
+            headers=pc_audio_router.get_pc_mcp_auth_headers(),
+            timeout=1.6,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            data["mcp_online"] = True
+            with _l3_cache_lock:
+                _l3_cache = dict(data)
+                _l3_cache_ts = time.monotonic()
+            l3_ok = True
+    except Exception:
+        l3_ok = False
+    with _probe_lock:
+        if l3_ok:
+            _probe_fail_counts["l3"] = 0
+        else:
+            _probe_fail_counts["l3"] += 1
+            should_flip_l3 = _probe_fail_counts["l3"] >= _PROBE_OFFLINE_THRESHOLD
+    if not l3_ok:
+        with _l3_cache_lock:
+            was_never_set = _l3_cache is None
+        if was_never_set or should_flip_l3:
+            fb = _read_local_l3_fallback()
+            with _l3_cache_lock:
+                _l3_cache = dict(fb)
+                _l3_cache_ts = time.monotonic()
+
+    # 3. 18787 Anima Relationship
+    rel_ok = False
+    cfg = None
+    try:
+        cfg = _read_raw_yaml()
+    except Exception:
+        cfg = None
+    char_id = _get_anima_character_id(cfg)
+    anima_tok = _read_anima_token()
+    if anima_tok:
+        try:
+            client = _get_console_http_client()
+            resp = client.get(
+                f"{ANIMA_HOST}/xiaozhi/relationship",
+                params={"character_id": char_id},
+                headers={"Authorization": f"Bearer {anima_tok}"},
+                timeout=1.8,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                data["online"] = True
+                with _anima_rel_lock:
+                    _anima_rel_cache = dict(data)
+                    _anima_rel_ts = time.monotonic()
+                rel_ok = True
+        except Exception:
+            rel_ok = False
+    with _probe_lock:
+        if rel_ok:
+            _probe_fail_counts["anima_rel"] = 0
+        else:
+            _probe_fail_counts["anima_rel"] += 1
+            should_flip_rel = _probe_fail_counts["anima_rel"] >= _PROBE_OFFLINE_THRESHOLD
+    if not rel_ok:
+        with _anima_rel_lock:
+            if _anima_rel_cache is None:
+                _anima_rel_cache = _default_offline_relationship(char_id)
+                _anima_rel_ts = time.monotonic()
+            elif should_flip_rel:
+                stale = dict(_anima_rel_cache)
+                stale["online"] = False
+                _anima_rel_cache = stale
+                _anima_rel_ts = time.monotonic()
+
+    # 4. 18787 Obsidian Sync Status
+    obs_ok = False
+    if anima_tok:
+        try:
+            client = _get_console_http_client()
+            resp = client.get(
+                f"{ANIMA_HOST}/xiaozhi/obsidian/status",
+                headers={"Authorization": f"Bearer {anima_tok}"},
+                timeout=1.8,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                data["online"] = True
+                with _obsidian_lock:
+                    _obsidian_cache = dict(data)
+                    _obsidian_ts = time.monotonic()
+                obs_ok = True
+        except Exception:
+            obs_ok = False
+    with _probe_lock:
+        if obs_ok:
+            _probe_fail_counts["obsidian"] = 0
+        else:
+            _probe_fail_counts["obsidian"] += 1
+            should_flip_obs = _probe_fail_counts["obsidian"] >= _PROBE_OFFLINE_THRESHOLD
+    if not obs_ok:
+        with _obsidian_lock:
+            was_never_set_obs = _obsidian_cache is None
+        if was_never_set_obs or should_flip_obs:
+            err_msg = "" if anima_tok else "未找到 Anima Brain 访问令牌 (studio_token.txt)"
+            _mark_obsidian_cache_offline(err_msg)
+
+    # 5. 19880 GPT-SoVITS TCP Liveness
+    gsv_ok = _probe_gsv_tcp_once()
+    with _probe_lock:
+        if gsv_ok:
+            _probe_fail_counts["gsv"] = 0
+            _gsv_online_cache = True
+        else:
+            _probe_fail_counts["gsv"] += 1
+            if _probe_fail_counts["gsv"] >= _PROBE_OFFLINE_THRESHOLD:
+                _gsv_online_cache = False
+
+    return {
+        "pc_audio": _get_cached_pc_audio_online(),
+        "l3": l3_ok,
+        "anima_rel": rel_ok,
+        "obsidian": obs_ok,
+        "gsv": _get_cached_gsv_online(),
+    }
+
+
+def _service_probe_loop() -> None:
+    while True:
+        try:
+            _probe_background_services_once()
+        except Exception:
+            pass
+        time.sleep(_PROBE_INTERVAL_SECONDS)
+
+
 def _infer_character_name(prompt: str) -> str:
     p = (prompt or "").strip()
     if "雷电芽衣" in p:
@@ -919,11 +1585,10 @@ def _infer_character_name(prompt: str) -> str:
 def _sync_persona_to_anima(prompt: str):
     """将 18080 控制台的角色姓名与提示词自动同步至 18787 Anima Brain 数据库，确保双端一致。"""
     clean_prompt = (prompt or "").strip()
-    if not clean_prompt or not os.path.isfile(ANIMA_TOKEN_PATH):
+    if not clean_prompt:
         return
     try:
-        with open(ANIMA_TOKEN_PATH, "r", encoding="utf-8") as f:
-            token = f.read().strip()
+        token = _read_anima_token()
         if not token:
             return
         headers = {"Authorization": f"Bearer {token}"}
@@ -949,55 +1614,308 @@ def _sync_persona_to_anima(prompt: str):
         print(f"[WebConsole] 同步 Anima Brain 设定跳过: {exc}", flush=True)
 
 
-def _write_updated_yaml(prompt: str, llm_provider: str, model_name: str, voice: str):
+def _deep_merge_dict(base: dict, overlay: dict) -> dict:
+    """Recursively merge `overlay` onto `base` without discarding unrelated sibling keys (P1-13)."""
+    out = dict(base) if isinstance(base, dict) else {}
+    if not isinstance(overlay, dict):
+        return out
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _get_current_voice_id(cfg: dict) -> str:
+    selected = (cfg or {}).get("selected_module") or {}
+    tts_key = selected.get("TTS", "GPT_SOVITS_V2")
+    tts_cfg = ((cfg or {}).get("TTS") or {}).get(tts_key) or {}
+    if tts_key == "GPT_SOVITS_V2":
+        ref_p = str(tts_cfg.get("ref_audio_path") or "")
+        return "__gsv_raiden_mei__" if "raiden_mei" in ref_p else "__gsv_xiaozhi_tw__"
+    return str(tts_cfg.get("voice") or "zh-CN-XiaoxiaoNeural")
+
+
+_GSV_VOICE_IDENTITY_KEYS = (
+    "ref_audio_path",
+    "aux_ref_audio_paths",
+    "prompt_text",
+    "prompt_lang",
+    "speed_factor",
+    "top_k",
+    "top_p",
+    "temperature",
+    "text_split_method",
+)
+
+_LLM_PROVIDER_DEFAULTS = {
+    "DeepSeekLLM": {
+        "type": "openai",
+        "base_url": "https://api.deepseek.com",
+        "model_name": "deepseek-flash",
+        "api_key": "${DEEPSEEK_API_KEY}",
+    },
+    "GeminiOpenAI": {
+        "type": "openai",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "model_name": "gemini-3.5-flash-lite",
+        "api_key": "${GEMINI_API_KEY}",
+    },
+}
+
+
+def _write_updated_yaml(
+    prompt: str | None = None,
+    llm_provider: str | None = None,
+    model_name: str | None = None,
+    voice: str | None = None,
+) -> dict:
+    """Deep-merge ONLY user-modified keys into data/.config.yaml without clobbering LLM/TTS blocks (P1-13)."""
     cfg = _read_raw_yaml()
-    cfg["prompt"] = prompt.strip() + "\n"
+    selected = cfg.get("selected_module") or {}
+    cur_prompt = str(cfg.get("prompt") or "").strip()
+    cur_llm_provider = str(selected.get("LLM") or "DeepSeekLLM").strip()
+    cur_llm_cfg = ((cfg.get("LLM") or {}).get(cur_llm_provider)) or {}
+    cur_model = str(cur_llm_cfg.get("model_name") or "").strip()
+    cur_voice = _get_current_voice_id(cfg)
 
-    selected = cfg.setdefault("selected_module", {})
-    llm_section = cfg.setdefault("LLM", {})
+    patch: dict = {}
+    changed_fields: list[str] = []
 
-    # Ensure both DeepSeekLLM and GeminiOpenAI blocks always remain intact
-    ds_cfg = llm_section.setdefault("DeepSeekLLM", {})
-    ds_cfg["type"] = "openai"
-    ds_cfg["base_url"] = "https://api.deepseek.com"
-    ds_cfg.setdefault("model_name", "deepseek-flash")
-    ds_cfg["api_key"] = "${DEEPSEEK_API_KEY}"
+    if prompt is not None:
+        new_prompt = prompt.strip()
+        if new_prompt and new_prompt != cur_prompt:
+            patch["prompt"] = new_prompt + "\n"
+            changed_fields.append("prompt")
 
-    gem_cfg = llm_section.setdefault("GeminiOpenAI", {})
-    gem_cfg["type"] = "openai"
-    gem_cfg["base_url"] = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    gem_cfg.setdefault("model_name", "gemini-3.5-flash-lite")
-    gem_cfg["api_key"] = "${GEMINI_API_KEY}"
+    target_provider = cur_llm_provider
+    if llm_provider is not None and llm_provider.strip():
+        cand_prov = llm_provider.strip()
+        if cand_prov in _LLM_PROVIDER_DEFAULTS or cand_prov in (cfg.get("LLM") or {}):
+            target_provider = cand_prov
+        else:
+            target_provider = "DeepSeekLLM"
 
-    if llm_provider == "GeminiOpenAI":
-        selected["LLM"] = "GeminiOpenAI"
-        gem_cfg["model_name"] = model_name.strip() or "gemini-3.5-flash-lite"
-    else:
-        selected["LLM"] = "DeepSeekLLM"
-        ds_cfg["model_name"] = model_name.strip() or "deepseek-flash"
+    provider_changed = target_provider != cur_llm_provider
+    target_model = (model_name or "").strip()
+    if provider_changed:
+        changed_fields.append("llm_provider")
+        patch.setdefault("selected_module", {})["LLM"] = target_provider
+        existing_prov_blk = ((cfg.get("LLM") or {}).get(target_provider)) or {}
+        if not existing_prov_blk and target_provider in _LLM_PROVIDER_DEFAULTS:
+            patch.setdefault("LLM", {})[target_provider] = dict(_LLM_PROVIDER_DEFAULTS[target_provider])
 
-    tts_section = cfg.setdefault("TTS", {})
-    v_id = voice.strip()
-    if v_id in GSV_PROFILES:
-        _ensure_gsv_weights(v_id, persist_boot_yaml=True)
-        selected["TTS"] = "GPT_SOVITS_V2"
-        tts_section["GPT_SOVITS_V2"] = dict(GSV_PROFILES[v_id]["block"])
-    else:
-        selected["TTS"] = "EdgeTTS"
-        tts_cfg = tts_section.setdefault("EdgeTTS", {})
-        tts_cfg.setdefault("type", "edge")
-        tts_cfg["voice"] = v_id
-        tts_cfg.setdefault("output_dir", "tmp/")
+    existing_target_model = str(
+        (((cfg.get("LLM") or {}).get(target_provider)) or {}).get("model_name") or ""
+    ).strip()
+    if target_model and target_model != (cur_model if not provider_changed else existing_target_model):
+        changed_fields.append("model_name")
+        prov_patch = patch.setdefault("LLM", {}).setdefault(target_provider, {})
+        if not ((cfg.get("LLM") or {}).get(target_provider)) and target_provider in _LLM_PROVIDER_DEFAULTS:
+            for dk, dv in _LLM_PROVIDER_DEFAULTS[target_provider].items():
+                prov_patch.setdefault(dk, dv)
+        prov_patch["model_name"] = target_model
 
+    if voice is not None and voice.strip():
+        v_id = voice.strip()
+        if v_id != cur_voice:
+            changed_fields.append("voice")
+            if v_id in GSV_PROFILES:
+                _ensure_gsv_weights(v_id, persist_boot_yaml=True)
+                patch.setdefault("selected_module", {})["TTS"] = "GPT_SOVITS_V2"
+                existing_gsv = ((cfg.get("TTS") or {}).get("GPT_SOVITS_V2")) or {}
+                prof_blk = GSV_PROFILES[v_id]["block"]
+                gsv_patch: dict = {}
+                # Populate missing defaults only once, never overwriting user-customized tuning keys
+                for dk, dv in prof_blk.items():
+                    if dk not in existing_gsv:
+                        gsv_patch[dk] = dv
+                # Update only voice-identity fields for the newly selected GSV speaker profile
+                for ik in _GSV_VOICE_IDENTITY_KEYS:
+                    if ik in prof_blk:
+                        gsv_patch[ik] = prof_blk[ik]
+                if "sample_steps" in prof_blk and "sample_steps" not in existing_gsv:
+                    gsv_patch["sample_steps"] = prof_blk["sample_steps"]
+                patch.setdefault("TTS", {})["GPT_SOVITS_V2"] = gsv_patch
+            else:
+                patch.setdefault("selected_module", {})["TTS"] = "EdgeTTS"
+                existing_edge = ((cfg.get("TTS") or {}).get("EdgeTTS")) or {}
+                edge_patch = {"voice": v_id}
+                if "type" not in existing_edge:
+                    edge_patch["type"] = "edge"
+                if "output_dir" not in existing_edge:
+                    edge_patch["output_dir"] = "tmp/"
+                patch.setdefault("TTS", {})["EdgeTTS"] = edge_patch
+
+    if not changed_fields:
+        return {"changed_fields": [], "written": False}
+
+    merged_cfg = _deep_merge_dict(cfg, patch)
     header = (
         "# =====================================================================\n"
         "# 小智 ESP32 本地服务端精简配置（由本地 Web 控制台管理）\n"
         "# 自动读取 DEEPSEEK_API_KEY 与 GEMINI_API_KEY 环境变量，不落盘明文密钥\n"
         "# =====================================================================\n\n"
     )
-    body = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    body = yaml.safe_dump(merged_cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
     _atomic_write_text(CONFIG_PATH, header + body)
-    threading.Thread(target=_sync_persona_to_anima, args=(prompt,), daemon=True).start()
+    if "prompt" in changed_fields and prompt is not None:
+        threading.Thread(target=_sync_persona_to_anima, args=(prompt,), daemon=True).start()
+    return {"changed_fields": changed_fields, "written": True}
+
+
+def _apply_tts_attrs_in_place(tts_obj, tts_module_name: str, tts_cfg: dict) -> bool:
+    """Update live TTS provider parameters in-place when engine class stays unchanged."""
+    if tts_obj is None or not isinstance(tts_cfg, dict):
+        return False
+    cls_mod = str(getattr(type(tts_obj), "__module__", "") or "")
+    if tts_module_name == "GPT_SOVITS_V2" and "gpt_sovits" in cls_mod:
+        for attr in ("ref_audio_path", "prompt_text", "prompt_lang", "text_split_method", "url"):
+            if attr in tts_cfg and tts_cfg[attr] is not None:
+                setattr(tts_obj, attr, tts_cfg[attr])
+        if "aux_ref_audio_paths" in tts_cfg:
+            raw_aux = tts_cfg["aux_ref_audio_paths"]
+            tts_obj.aux_ref_audio_paths = list(raw_aux) if isinstance(raw_aux, (list, tuple)) else []
+        for f_attr in ("speed_factor", "temperature", "top_p"):
+            if f_attr in tts_cfg and tts_cfg[f_attr] is not None:
+                try:
+                    setattr(tts_obj, f_attr, float(tts_cfg[f_attr]))
+                except Exception:
+                    pass
+        for i_attr in ("top_k", "sample_steps"):
+            if i_attr in tts_cfg and tts_cfg[i_attr] is not None:
+                try:
+                    setattr(tts_obj, i_attr, int(tts_cfg[i_attr]))
+                except Exception:
+                    pass
+        if isinstance(getattr(tts_obj, "config", None), dict):
+            tts_obj.config.update(tts_cfg)
+        return True
+    if tts_module_name == "EdgeTTS" and "edge" in cls_mod:
+        if tts_cfg.get("voice"):
+            tts_obj.voice = tts_cfg["voice"]
+        if isinstance(getattr(tts_obj, "config", None), dict):
+            tts_obj.config.update(tts_cfg)
+        return True
+    return False
+
+
+def _hot_reload_runtime_config(changed_fields: list[str]) -> tuple[bool, str]:
+    """Apply saved prompt / LLM / voice config changes live in-process without killing the server (P1-13)."""
+    if not changed_fields:
+        return True, "no_changes"
+    try:
+        import config.config_loader as config_loader
+        from core.utils.cache.manager import CacheType, cache_manager
+        from core.utils.modules_initialize import initialize_modules
+
+        default_cfg_path = config_loader.get_project_dir() + "config.yaml"
+        custom_cfg_path = CONFIG_PATH
+        default_cfg = config_loader.read_config(default_cfg_path)
+        custom_cfg = config_loader.read_config(custom_cfg_path)
+        new_cfg = config_loader.merge_configs(default_cfg, custom_cfg)
+        config_loader.ensure_directories(new_cfg)
+
+        # Preserve runtime-generated auth_key if live server holds one
+        servers = runtime_events.get_ws_servers()
+        if servers:
+            old_auth_key = ((getattr(servers[0], "config", None) or {}).get("server") or {}).get("auth_key")
+            if old_auth_key and not (new_cfg.get("server") or {}).get("auth_key"):
+                new_cfg.setdefault("server", {})["auth_key"] = old_auth_key
+
+        try:
+            cache_manager.set(CacheType.CONFIG, "main_config", new_cfg)
+        except Exception:
+            pass
+
+        llm_changed = "llm_provider" in changed_fields or "model_name" in changed_fields
+        prompt_changed = "prompt" in changed_fields
+        voice_changed = "voice" in changed_fields
+
+        new_llm = None
+        for srv in servers:
+            if isinstance(getattr(srv, "config", None), dict):
+                # Atomic in-place update without clearing to {} (avoids empty-config race window)
+                srv.config.update(new_cfg)
+                for stale_k in list(srv.config.keys()):
+                    if stale_k not in new_cfg:
+                        srv.config.pop(stale_k, None)
+            else:
+                srv.config = new_cfg
+            if llm_changed:
+                mods = initialize_modules(srv.logger, srv.config, init_llm=True)
+                if "llm" in mods:
+                    srv._llm = mods["llm"]
+                    new_llm = mods["llm"]
+
+        if llm_changed and new_llm is None and not servers:
+            # Offline/test environment without WebSocketServer: still validate LLM config instantiability
+            pass
+
+        tts_mod_name = str((new_cfg.get("selected_module") or {}).get("TTS") or "")
+        tts_cfg = ((new_cfg.get("TTS") or {}).get(tts_mod_name)) or {}
+        tts_class_mismatch = False
+
+        for conn in runtime_events.get_active_connections():
+            try:
+                if isinstance(getattr(conn, "common_config", None), dict):
+                    conn.common_config = new_cfg
+                if isinstance(getattr(conn, "config", None), dict):
+                    if prompt_changed:
+                        conn.config["prompt"] = new_cfg.get("prompt", "")
+                    if llm_changed:
+                        conn.config.setdefault("selected_module", {})["LLM"] = (
+                            new_cfg.get("selected_module") or {}
+                        ).get("LLM")
+                        conn.config["LLM"] = new_cfg.get("LLM", {})
+                    if voice_changed:
+                        conn.config.setdefault("selected_module", {})["TTS"] = tts_mod_name
+                        conn.config["TTS"] = new_cfg.get("TTS", {})
+                if prompt_changed and hasattr(conn, "prompt_manager") and hasattr(conn, "change_system_prompt"):
+                    enhanced = conn.prompt_manager.build_enhanced_prompt(
+                        new_cfg.get("prompt", ""),
+                        getattr(conn, "device_id", "") or "",
+                        getattr(conn, "client_ip", None),
+                        emoji_enabled=(getattr(conn, "features", None) or {}).get("emoji", True),
+                    )
+                    if enhanced:
+                        conn.change_system_prompt(enhanced)
+                if llm_changed and new_llm is not None:
+                    conn.llm = new_llm
+                    intent_obj = getattr(conn, "intent", None)
+                    if intent_obj is not None and hasattr(intent_obj, "set_llm"):
+                        intent_sel = (new_cfg.get("selected_module") or {}).get("Intent")
+                        intent_llm_override = ((new_cfg.get("Intent") or {}).get(intent_sel) or {}).get("llm")
+                        if not intent_llm_override:
+                            try:
+                                intent_obj.set_llm(new_llm)
+                            except Exception:
+                                pass
+                    mem_obj = getattr(conn, "memory", None)
+                    if mem_obj is not None and hasattr(mem_obj, "set_llm"):
+                        try:
+                            mem_obj.set_llm(new_llm)
+                        except Exception:
+                            pass
+                if voice_changed and getattr(conn, "tts", None) is not None:
+                    if not _apply_tts_attrs_in_place(conn.tts, tts_mod_name, tts_cfg):
+                        tts_class_mismatch = True
+            except Exception as conn_exc:
+                print(f"[WebConsole] 单连接热更新跳过: {conn_exc}", flush=True)
+
+        if tts_class_mismatch:
+            print(
+                f"[WebConsole] 检测到活跃连接切换了 TTS 引擎类型 ({tts_mod_name})，需平滑重启生效",
+                flush=True,
+            )
+            return False, "tts_engine_class_changed_on_active_conn"
+
+        print(f"[WebConsole] 配置已热更新生效（免重启）: {', '.join(changed_fields)}", flush=True)
+        return True, "hot_reloaded"
+    except Exception as exc:
+        print(f"[WebConsole] 配置热更新失败，回退重启动作: {exc}", flush=True)
+        return False, str(exc)
 
 
 def _generate_test_chime_wav(duration_sec: float = 0.4, sample_rate: int = 48000) -> bytes:
@@ -1083,9 +2001,25 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
+            _sync_runtime_events()
             with _state_lock:
                 ready = bool(_device_info.get("server_ready"))
-            self._send_json({"ok": True, "server_ready": ready})
+            health = patch_registry.get_health_summary()
+            degraded = bool(health.get("degraded"))
+            self._send_json(
+                {
+                    "ok": not degraded,
+                    "status": health.get("status", "ok"),
+                    "degraded": degraded,
+                    "server_ready": ready,
+                    "server_version": health.get("server_version", ""),
+                    "expected_server_version": health.get("expected_server_version", ""),
+                    "version_match": bool(health.get("version_match", True)),
+                    "patch_counts": health.get("counts", {}),
+                    "patches": health.get("patches", {}),
+                    "degraded_reasons": health.get("degraded_reasons", []),
+                }
+            )
             return
         if parsed.path in ("/", "/index.html"):
             if not os.path.exists(HTML_PATH):
@@ -1124,15 +2058,29 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             else:
                 active_voice = tts_cfg.get("voice", "zh-CN-XiaoxiaoNeural")
 
+            qs = parse_qs(parsed.query)
+            req_cursor: int | None = None
+            raw_cursor_vals = qs.get("log_cursor")
+            if raw_cursor_vals:
+                try:
+                    req_cursor = int(raw_cursor_vals[0])
+                except (TypeError, ValueError):
+                    req_cursor = None
+
+            _sync_runtime_events()
             with _state_lock:
                 dev = dict(_device_info)
                 msgs = list(_chat_messages[-60:])
-                logs = list(_raw_logs)[-100:]
+            logs, latest_log_cursor, logs_inc, logs_reset = _get_logs_for_state(req_cursor)
+            health_summary = patch_registry.get_health_summary()
 
             audio_cfg = pc_audio_router.read_audio_output_config()
             reply_len_cfg = reply_length_router.read_reply_length_config()
-            rel_cfg = _fetch_anima_relationship(force=False, cfg=cfg)
-            l3_cfg = _fetch_l3_backend_status(force=False)
+            idle_farewell_cfg = runtime_settings.get_idle_farewell()
+            # P2-22: Pure in-memory cached snapshots only (zero synchronous HTTP probes on /api/state)
+            rel_cfg = _get_cached_anima_relationship_snapshot(cfg=cfg)
+            l3_cfg = _get_cached_l3_backend_snapshot()
+            obs_cfg = _get_cached_obsidian_snapshot()
 
             self._send_json(
                 {
@@ -1151,19 +2099,31 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "pc_mode": _read_pc_mode(),
                         "audio_output": audio_cfg["target"],
                         "pc_audio_volume": audio_cfg["volume"],
-                        "pc_audio_online": pc_audio_router.is_pc_audio_bridge_online(),
+                        "pc_audio_online": _get_cached_pc_audio_online(),
+                        "gsv_online": _get_cached_gsv_online(),
                         "reply_length": reply_len_cfg,
+                        "idle_farewell": idle_farewell_cfg,
                         "relationship": rel_cfg,
+                        "obsidian": obs_cfg,
                         "l3_backend": l3_cfg,
-                        "agy_bridge_online": _check_agy_bridge_online(),
+                        "agy_bridge_online": _check_agy_bridge_online(l3_cfg),
                         "mei_emotions": [
                             {"id": k, "label": v.get("label_zh", k)}
                             for k, v in mei_emotion_router.load_mei_emotions().items()
                         ],
                     },
                     "device": dev,
+                    "health": {
+                        "status": health_summary.get("status", "ok"),
+                        "degraded": bool(health_summary.get("degraded")),
+                        "server_version": health_summary.get("server_version", ""),
+                        "degraded_reasons": health_summary.get("degraded_reasons", []),
+                    },
                     "messages": msgs,
                     "logs": logs,
+                    "log_cursor": latest_log_cursor,
+                    "logs_incremental": logs_inc,
+                    "logs_reset": logs_reset,
                 }
             )
             return
@@ -1173,9 +2133,18 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": bool(rel_cfg.get("online")), "relationship": rel_cfg})
             return
 
+        if parsed.path == "/api/obsidian":
+            obs_cfg = _fetch_obsidian_status(force=True)
+            self._send_json({"ok": bool(obs_cfg.get("online")), "obsidian": obs_cfg})
+            return
+
         if parsed.path == "/api/l3-backend":
             l3_cfg = _fetch_l3_backend_status(force=True)
             self._send_json({"ok": True, "l3_backend": l3_cfg})
+            return
+
+        if parsed.path == "/api/idle-farewell":
+            self._send_json({"ok": True, "idle_farewell": runtime_settings.get_idle_farewell()})
             return
 
         self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
@@ -1217,12 +2186,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "error": "无效的音频输出目标"}, HTTPStatus.BAD_REQUEST)
                     return
                 saved = pc_audio_router.write_audio_output_config(target, volume)
+                pc_online = pc_audio_router.is_pc_audio_bridge_online(force=True)
+                _set_cached_pc_audio_online(pc_online)
                 self._send_json(
                     {
                         "ok": True,
                         "target": saved["target"],
                         "volume": saved["volume"],
-                        "pc_audio_online": pc_audio_router.is_pc_audio_bridge_online(force=True),
+                        "pc_audio_online": pc_online,
                     }
                 )
             except _BadRequestError:
@@ -1246,6 +2217,20 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
+        if parsed.path == "/api/idle-farewell":
+            try:
+                body = self._read_body_json()
+                ok_if, res_or_err = _update_idle_farewell_config(body)
+                if ok_if:
+                    self._send_json({"ok": True, "idle_farewell": res_or_err})
+                else:
+                    self._send_json({"ok": False, "error": str(res_or_err)}, HTTPStatus.BAD_REQUEST)
+            except _BadRequestError:
+                raise
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         if parsed.path == "/api/relationship":
             try:
                 body = self._read_body_json()
@@ -1254,6 +2239,47 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     self._send_json({"ok": True, "relationship": result})
                 else:
                     self._send_json({"ok": False, "error": str(result)}, HTTPStatus.BAD_GATEWAY)
+            except _BadRequestError:
+                raise
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/obsidian/config":
+            try:
+                body = self._read_body_json()
+                ok, result = _update_obsidian_config(body)
+                if ok:
+                    self._send_json({"ok": True, "obsidian": result})
+                else:
+                    status = HTTPStatus.BAD_REQUEST if "enabled" in str(result) else HTTPStatus.BAD_GATEWAY
+                    err_payload = {"ok": False, "error": str(result)}
+                    if status == HTTPStatus.BAD_GATEWAY:
+                        err_payload["obsidian"] = _get_cached_obsidian_snapshot()
+                    self._send_json(err_payload, status)
+            except _BadRequestError:
+                raise
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if parsed.path == "/api/obsidian/rebuild":
+            try:
+                self._read_body_json()
+                ok, result = _trigger_obsidian_rebuild()
+                if ok and isinstance(result, dict):
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "obsidian": result.get("obsidian"),
+                            "result": result.get("result"),
+                        }
+                    )
+                else:
+                    self._send_json(
+                        {"ok": False, "error": str(result), "obsidian": _get_cached_obsidian_snapshot()},
+                        HTTPStatus.BAD_GATEWAY,
+                    )
             except _BadRequestError:
                 raise
             except Exception as e:
@@ -1300,26 +2326,46 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/config":
             try:
                 body = self._read_body_json()
-                prompt = str(body.get("prompt") or "").strip()
-                llm_provider = str(body.get("llm_provider") or "DeepSeekLLM").strip()
-                model_name = str(body.get("model_name") or "").strip()
-                voice = str(body.get("voice") or "__gsv_raiden_mei__").strip()
-                restart_now = bool(body.get("restart", True))
+                has_prompt = "prompt" in body
+                prompt = str(body.get("prompt") or "").strip() if has_prompt else None
+                llm_provider = str(body.get("llm_provider")).strip() if "llm_provider" in body and body.get("llm_provider") is not None else None
+                model_name = str(body.get("model_name")).strip() if "model_name" in body and body.get("model_name") is not None else None
+                voice = str(body.get("voice")).strip() if "voice" in body and body.get("voice") is not None else None
+                force_restart = bool(body.get("force_restart", False))
+                allow_restart = bool(body.get("restart", True))
 
-                if not prompt:
+                if has_prompt and not prompt:
                     self._send_json({"ok": False, "error": "角色提示词不能为空"}, HTTPStatus.BAD_REQUEST)
                     return
 
-                _write_updated_yaml(
+                write_res = _write_updated_yaml(
                     prompt=prompt,
                     llm_provider=llm_provider,
                     model_name=model_name,
                     voice=voice,
                 )
-                self._send_json({"ok": True, "restarting": restart_now})
+                changed_fields = list(write_res.get("changed_fields") or [])
+                hot_ok, hot_detail = _hot_reload_runtime_config(changed_fields)
+                will_restart = bool(force_restart or (allow_restart and not hot_ok))
 
-                if restart_now:
+                self._send_json(
+                    {
+                        "ok": True,
+                        "restarting": will_restart,
+                        "hot_reloaded": bool(hot_ok and not will_restart),
+                        "changed_fields": changed_fields,
+                        "detail": hot_detail,
+                    }
+                )
+
+                if will_restart:
                     def _delayed_restart():
+                        try:
+                            import anima_memory_provider
+
+                            anima_memory_provider.flush_outbox(timeout=3.5)
+                        except Exception:
+                            pass
                         time.sleep(0.5)
                         os._exit(0)
 
@@ -1350,9 +2396,45 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 clean_text = mei_emotion_router.clean_segment_for_tts(stripped_text) or "欢迎回来，今天辛苦了。"
                 if voice in GSV_PROFILES:
                     configured_gsv = _get_configured_gsv_voice()
-                    with _gsv_weights_lock:
-                        _ensure_gsv_weights(voice, persist_boot_yaml=False)
+                    needs_weight_swap = bool(configured_gsv and configured_gsv != voice)
+                    # P1-14: Refuse swapping GPU weights to a non-active voice while ESP32 is busy
+                    if needs_weight_swap and _is_device_busy():
+                        self._send_json(
+                            {
+                                "ok": False,
+                                "busy": True,
+                                "error": "ESP32 设备正在语音播报或合成中，为避免抢占 GPU 显存权重，已拒绝试听非当前音色，请稍后再试。",
+                            },
+                            HTTPStatus.CONFLICT,
+                        )
+                        return
+
+                    lock_timeout = 0.25 if needs_weight_swap else 10.0
+                    acquired = _gsv_weights_lock.acquire(timeout=lock_timeout)
+                    if not acquired:
+                        self._send_json(
+                            {
+                                "ok": False,
+                                "busy": True,
+                                "error": "本地 GPU 语音合成引擎正忙，请等待当前播报结束后再试听。",
+                            },
+                            HTTPStatus.CONFLICT,
+                        )
+                        return
+                    try:
+                        # Re-check busy status after acquiring shared GPU lock
+                        if needs_weight_swap and _is_device_busy():
+                            self._send_json(
+                                {
+                                    "ok": False,
+                                    "busy": True,
+                                    "error": "ESP32 设备正在语音播报或合成中，已取消非当前音色试听。",
+                                },
+                                HTTPStatus.CONFLICT,
+                            )
+                            return
                         try:
+                            _ensure_gsv_weights(voice, persist_boot_yaml=False)
                             req_payload = dict(GSV_PROFILES[voice]["block"])
                             if isinstance(req_payload.get("ref_audio_path"), str):
                                 req_payload["ref_audio_path"] = req_payload["ref_audio_path"].replace(
@@ -1399,6 +2481,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                                     _ensure_gsv_weights(configured_gsv, persist_boot_yaml=False)
                                 except Exception:
                                     pass
+                    finally:
+                        _gsv_weights_lock.release()
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "audio/wav")
                     self.send_header("Cache-Control", "no-store")
@@ -1423,8 +2507,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
 
 def start_console_background():
+    _load_history()
+    runtime_events.subscribe(_apply_runtime_event)
+    _sync_runtime_events()
     watcher = threading.Thread(target=_log_watcher_loop, name="console-log-watcher", daemon=True)
     watcher.start()
+    prober = threading.Thread(target=_service_probe_loop, name="console-service-prober", daemon=True)
+    prober.start()
 
     def _boot_sync():
         time.sleep(2.0)

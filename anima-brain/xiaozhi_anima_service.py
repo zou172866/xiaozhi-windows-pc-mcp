@@ -74,6 +74,13 @@ def _env_float(name: str, default: float, lo: float, hi: float | None = None) ->
     return min(hi, val) if hi is not None else val
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
 SUMMARY_BATCH_MESSAGES = _env_int("ANIMA_SUMMARY_BATCH_MESSAGES", 8, 2, 60)
 KEEP_TURN_DRAFTS = _env_int("ANIMA_KEEP_TURN_DRAFTS", 40, 5)
 OP_EMBED_PRUNE_AGE_SECONDS = _env_int("ANIMA_OP_PRUNE_AGE_SECONDS", 3600, 60)
@@ -83,6 +90,21 @@ REVIEW_BACKOFF_MAX_SECONDS = _env_int("ANIMA_REVIEW_BACKOFF_MAX_SECONDS", 7200, 
 SHUTDOWN_DRAIN_SECONDS = _env_float("ANIMA_SHUTDOWN_DRAIN_SECONDS", 15.0, 1.0)
 DEFAULT_TIMEOUT_SECONDS = _env_float("COMPANION_TIMEOUT_SECONDS", 150.0, 10.0, 600.0)
 TERMINAL_REVIEW_ERROR = "auto_retry_exhausted"
+
+# Ingest queue / retry hardening (P0-7)
+INGEST_QUEUE_MAXSIZE = _env_int("ANIMA_INGEST_QUEUE_MAXSIZE", 256, 1)
+INGEST_PENDING_INLINE_WAIT_SECONDS = _env_float("ANIMA_PENDING_INLINE_WAIT_SECONDS", 5.0, 0.0, 30.0)
+INGEST_PENDING_MAX_RETRIES = _env_int("ANIMA_INGEST_PENDING_MAX_RETRIES", 12, 1, 100)
+INGEST_PENDING_BACKOFF_BASE = _env_float("ANIMA_INGEST_PENDING_BACKOFF_BASE", 1.5, 0.02, 60.0)
+INGEST_OVERFLOW_MAX_TASKS = _env_int("ANIMA_INGEST_OVERFLOW_MAX_TASKS", 128, 0, 1024)
+INGEST_ENQUEUE_WAIT_SECONDS = _env_float("ANIMA_INGEST_ENQUEUE_WAIT_SECONDS", 0.25, 0.01, 10.0)
+
+# Obsidian one-way export settings
+OBSIDIAN_SYNC_ENABLED = _env_bool("OBSIDIAN_SYNC_ENABLED", False)
+OBSIDIAN_EXPORT_DIR = Path(os.environ.get("OBSIDIAN_EXPORT_DIR", "/obsidian"))
+OBSIDIAN_HOST_DIR = (os.environ.get("OBSIDIAN_HOST_DIR") or "").strip() or str(OBSIDIAN_EXPORT_DIR)
+OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS = _env_int("OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS", 600, 15, 86400)
+OBSIDIAN_DEBOUNCE_SECONDS = _env_float("OBSIDIAN_DEBOUNCE_SECONDS", 5.0, 0.1, 60.0)
 
 DEFAULT_PERSONA = (
     "你是小智，住在桌面小屏幕音箱里的贴心 AI 伙伴。说话自然、真诚、简短有温度，"
@@ -148,14 +170,60 @@ Strict rules:
 """
 
 
-def load_or_create_token() -> str:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if TOKEN_PATH.is_file():
-        existing = TOKEN_PATH.read_text(encoding="utf-8").strip()
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def load_or_create_token(token_path: Path | None = None, *, retries: int = 3) -> str:
+    """Load studio_token.txt or atomically generate one; never clobber on transient I/O errors (P2-23)."""
+    tf = Path(token_path) if token_path is not None else TOKEN_PATH
+    tf.parent.mkdir(parents=True, exist_ok=True)
+    last_io_err: Exception | None = None
+    max_tries = max(1, int(retries))
+
+    for attempt in range(max_tries):
+        try:
+            existing = tf.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            last_io_err = None
+            break
+        except (OSError, UnicodeDecodeError) as exc:
+            last_io_err = exc
+            if attempt + 1 < max_tries:
+                time.sleep(0.05 * (attempt + 1))
+            continue
         if len(existing) >= 24:
             return existing
+        if attempt + 1 < max_tries and existing == "":
+            time.sleep(0.05)
+            continue
+        last_io_err = None
+        break
+
+    if last_io_err is not None:
+        raise RuntimeError(
+            f"Failed to read {tf} due to I/O error; refusing to overwrite existing token: {last_io_err}"
+        ) from last_io_err
+
     token = secrets.token_urlsafe(32)
-    TOKEN_PATH.write_text(token, encoding="utf-8")
+    _atomic_write_text(tf, token)
     return token
 
 
@@ -921,12 +989,143 @@ def _safe_key(raw_key: str, fallback_idx: int) -> str:
     return cleaned[:100]
 
 
+def ensure_xiaozhi_turn_meta_table(engine) -> None:
+    """Create side table storing true occurred_at, source, device_id, and used_tools per turn."""
+    with engine._lock:
+        with engine._transaction():
+            engine.db.execute(
+                "CREATE TABLE IF NOT EXISTS xiaozhi_turn_meta ("
+                "turn_id TEXT PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE, "
+                "occurred_at REAL NOT NULL, "
+                "source TEXT NOT NULL DEFAULT 'esp32', "
+                "device_id TEXT NOT NULL DEFAULT '', "
+                "used_tools INTEGER NOT NULL DEFAULT 0, "
+                "updated_at REAL NOT NULL"
+                ")"
+            )
+            engine.db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_xiaozhi_turn_meta_occurred "
+                "ON xiaozhi_turn_meta(occurred_at)"
+            )
+
+
+def _normalize_turn_meta(meta: dict[str, Any] | None, fallback_ts: float) -> dict[str, Any]:
+    raw = meta if isinstance(meta, dict) else {}
+    raw_occ = raw.get("occurred_at")
+    if isinstance(raw_occ, (int, float)) and not isinstance(raw_occ, bool) and raw_occ > 0:
+        occurred_at = float(raw_occ)
+    else:
+        occurred_at = float(fallback_ts)
+    source = str(raw.get("source") or "esp32").strip()[:32] or "esp32"
+    device_id = str(raw.get("device_id") or "").strip()[:64]
+    used_tools = 1 if raw.get("used_tools") else 0
+    return {
+        "occurred_at": occurred_at,
+        "source": source,
+        "device_id": device_id,
+        "used_tools": used_tools,
+    }
+
+
+def _upsert_turn_meta_tx_detailed(
+    engine, turn_id: str, meta: dict[str, Any] | None, fallback_ts: float
+) -> tuple[float, bool, float | None]:
+    """Upsert xiaozhi_turn_meta inside an active transaction.
+
+    Returns (effective_occurred_at, changed, previous_occurred_at).
+    """
+    norm = _normalize_turn_meta(meta, fallback_ts)
+    prev = engine.db.execute(
+        "SELECT occurred_at, source, device_id, used_tools FROM xiaozhi_turn_meta WHERE turn_id=?",
+        (turn_id,),
+    ).fetchone()
+    prev_occ = float(prev["occurred_at"]) if prev is not None else None
+    now = time.time()
+    engine.db.execute(
+        "INSERT INTO xiaozhi_turn_meta(turn_id, occurred_at, source, device_id, used_tools, updated_at) "
+        "VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(turn_id) DO UPDATE SET "
+        "occurred_at = MIN(xiaozhi_turn_meta.occurred_at, excluded.occurred_at), "
+        "source = CASE WHEN excluded.source != '' THEN excluded.source ELSE xiaozhi_turn_meta.source END, "
+        "device_id = CASE WHEN excluded.device_id != '' THEN excluded.device_id ELSE xiaozhi_turn_meta.device_id END, "
+        "used_tools = MAX(xiaozhi_turn_meta.used_tools, excluded.used_tools), "
+        "updated_at = excluded.updated_at",
+        (turn_id, norm["occurred_at"], norm["source"], norm["device_id"], norm["used_tools"], now),
+    )
+    row = engine.db.execute(
+        "SELECT occurred_at, source, device_id, used_tools FROM xiaozhi_turn_meta WHERE turn_id=?",
+        (turn_id,),
+    ).fetchone()
+    eff_occ = float(row["occurred_at"]) if row else norm["occurred_at"]
+    if prev is None:
+        changed = True
+    elif row is None:
+        changed = False
+    else:
+        changed = (
+            abs(float(prev["occurred_at"]) - float(row["occurred_at"])) > 1e-6
+            or str(prev["source"]) != str(row["source"])
+            or str(prev["device_id"]) != str(row["device_id"])
+            or int(prev["used_tools"]) != int(row["used_tools"])
+        )
+    return eff_occ, changed, prev_occ
+
+
+def _upsert_turn_meta_tx(
+    engine, turn_id: str, meta: dict[str, Any] | None, fallback_ts: float
+) -> float:
+    """Upsert xiaozhi_turn_meta inside an active transaction, keeping earliest occurred_at and OR-ing used_tools."""
+    eff_occ, _changed, _prev_occ = _upsert_turn_meta_tx_detailed(engine, turn_id, meta, fallback_ts)
+    return eff_occ
+
+
+def _upsert_longer_reply_tx(
+    engine,
+    character_id: str,
+    turn_id: str,
+    new_reply: str,
+    turn_meta: dict[str, Any] | None,
+    fallback_ts: float,
+) -> tuple[float, float | None]:
+    """Update a committed turn's assistant_reply when a fuller post-tool reply arrives with the same request_id."""
+    engine.db.execute(
+        "UPDATE turns SET assistant_reply=? WHERE id=? AND owner=? AND character_id=?",
+        (new_reply, turn_id, engine.owner, character_id),
+    )
+    eid = f"{turn_id}:assistant"
+    ev_row = engine.db.execute("SELECT 1 FROM evidence WHERE id=?", (eid,)).fetchone()
+    if ev_row:
+        engine.db.execute("UPDATE evidence SET text=? WHERE id=?", (new_reply, eid))
+        try:
+            engine.memory._index(eid, new_reply)
+        except Exception:
+            pass
+    draft_row = engine.db.execute(
+        "SELECT payload FROM turn_drafts WHERE turn_id=?", (turn_id,)
+    ).fetchone()
+    if draft_row:
+        try:
+            payload = json.loads(draft_row["payload"])
+            if isinstance(payload, dict) and isinstance(payload.get("commit_request"), dict):
+                payload["commit_request"]["assistant_reply"] = new_reply
+                engine.db.execute(
+                    "UPDATE turn_drafts SET payload=? WHERE turn_id=?",
+                    (json.dumps(payload, ensure_ascii=False), turn_id),
+                )
+        except Exception:
+            pass
+    eff_occ, _changed, prev_occ = _upsert_turn_meta_tx_detailed(engine, turn_id, turn_meta, fallback_ts)
+    return eff_occ, prev_occ
+
+
 def extract_and_commit_turn(
     brain: CompanionBrain,
     character_id: str,
     request_id: str,
     user_message: str,
     assistant_reply: str,
+    *,
+    turn_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Synchronously run in worker thread: extract grounded facts/appraisal & commit turn."""
     engine = brain.engine
@@ -937,6 +1136,7 @@ def extract_and_commit_turn(
         return {"skipped": "empty_message"}
 
     request_id = re.sub(r"[^a-zA-Z0-9_\-:.]", "_", request_id)[:110] or f"xz-{int(time.time()*1000)}"
+    ensure_xiaozhi_turn_meta_table(engine)
 
     with engine._lock:
         try:
@@ -947,11 +1147,50 @@ def extract_and_commit_turn(
             row = engine._character(character_id)
 
         existing_turn = engine.db.execute(
-            "SELECT id, status FROM turns WHERE owner=? AND character_id=? AND request_id=?",
+            "SELECT id, status, assistant_reply, created_at FROM turns "
+            "WHERE owner=? AND character_id=? AND request_id=?",
             (engine.owner, character_id, request_id),
         ).fetchone()
         if existing_turn and existing_turn["status"] == "committed":
-            return {"committed": True, "replayed": True, "turn_id": existing_turn["id"]}
+            old_reply = (existing_turn["assistant_reply"] or "").strip()
+            turn_id = existing_turn["id"]
+            created_at = float(existing_turn["created_at"] or time.time())
+            if len(assistant_reply) > len(old_reply) and assistant_reply != old_reply:
+                with engine._transaction():
+                    eff_occ, prev_occ = _upsert_longer_reply_tx(
+                        engine, character_id, turn_id, assistant_reply, turn_meta, created_at
+                    )
+                log.info(
+                    "Upserted fuller reply for committed turn %s (%d -> %d chars)",
+                    turn_id[:8],
+                    len(old_reply),
+                    len(assistant_reply),
+                )
+                return {
+                    "committed": True,
+                    "updated": True,
+                    "replayed": False,
+                    "turn_id": turn_id,
+                    "occurred_at": eff_occ,
+                    "prev_occurred_at": prev_occ,
+                }
+            meta_changed = False
+            prev_occ = None
+            if turn_meta:
+                with engine._transaction():
+                    eff_occ, meta_changed, prev_occ = _upsert_turn_meta_tx_detailed(
+                        engine, turn_id, turn_meta, created_at
+                    )
+            else:
+                eff_occ = created_at
+            return {
+                "committed": True,
+                "replayed": True,
+                "updated": bool(meta_changed),
+                "turn_id": turn_id,
+                "occurred_at": eff_occ,
+                "prev_occurred_at": prev_occ,
+            }
 
         spec = CharacterSpec.model_validate_json(row["spec"])
         today = local_today(engine, character_id)
@@ -1094,11 +1333,12 @@ def extract_and_commit_turn(
             log.warning("Extraction call failed (will still commit raw voice turn): %s", exc)
 
     # Wait briefly if Companion Studio web chat currently holds a pending turn
-    for _ in range(25):
+    inline_wait_deadline = time.monotonic() + INGEST_PENDING_INLINE_WAIT_SECONDS
+    while time.monotonic() < inline_wait_deadline:
         pending = engine.pending_turn(character_id)
         if not pending or pending["request_id"] == request_id:
             break
-        time.sleep(0.2)
+        time.sleep(0.1)
 
     started = time.monotonic()
     with brain._lock:
@@ -1154,6 +1394,11 @@ def extract_and_commit_turn(
                 "INSERT OR REPLACE INTO turn_drafts VALUES(?,?)",
                 (ctx.turn_id, json.dumps(draft_payload, ensure_ascii=False)),
             )
+            t_row = engine.db.execute(
+                "SELECT created_at FROM turns WHERE id=?", (ctx.turn_id,)
+            ).fetchone()
+            fallback_ts = float(t_row["created_at"]) if t_row else time.time()
+            eff_occ = _upsert_turn_meta_tx(engine, ctx.turn_id, turn_meta, fallback_ts)
             _prune_old_turn_drafts_tx(engine, KEEP_TURN_DRAFTS)
 
     log.info(
@@ -1167,10 +1412,32 @@ def extract_and_commit_turn(
         "committed": True,
         "turn_id": ctx.turn_id,
         "memory_ids": committed.get("memory_ids", []),
+        "occurred_at": eff_occ,
     }
 
 
-def create_combined_asgi_app(brain: CompanionBrain, token: str):
+_STUDIO_WRITE_ACTIONS = frozenset(
+    {
+        "/api/chat",
+        "/api/approve",
+        "/api/correct_memory",
+        "/api/delete_memory",
+        "/api/maintain",
+        "/api/update_character",
+    }
+)
+
+
+def create_combined_asgi_app(
+    brain: CompanionBrain,
+    token: str,
+    *,
+    obsidian_exporter: Any = None,
+):
+    from obsidian_exporter import ObsidianExporter, ObsidianSyncRunner
+
+    ensure_xiaozhi_turn_meta_table(brain.engine)
+
     studio_app = create_app(
         brain.runtime,
         token,
@@ -1181,6 +1448,21 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
         preview_mode=False,
     )
 
+    if obsidian_exporter is None:
+        obsidian_exporter = ObsidianExporter(
+            brain,
+            character_id=DEFAULT_CHARACTER_ID,
+            export_dir=OBSIDIAN_EXPORT_DIR,
+            host_export_dir=OBSIDIAN_HOST_DIR,
+            config_path=DATA_DIR / "obsidian_sync_config.json",
+            default_enabled=OBSIDIAN_SYNC_ENABLED,
+            snapshot_interval_seconds=OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS,
+        )
+    obsidian_runner = ObsidianSyncRunner(
+        obsidian_exporter,
+        debounce_seconds=OBSIDIAN_DEBOUNCE_SECONDS,
+    )
+
     allowed_hosts = {
         f"127.0.0.1:{PORT}",
         f"localhost:{PORT}",
@@ -1189,20 +1471,137 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
     if LAN_IP:
         allowed_hosts.add(f"{LAN_IP}:{PORT}")
 
-    ingest_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue(maxsize=256)
+    ingest_queue: asyncio.Queue[tuple[str, str, str, str, dict[str, Any], int]] = asyncio.Queue(
+        maxsize=INGEST_QUEUE_MAXSIZE
+    )
+    retry_tasks: set[asyncio.Task] = set()
+    retry_items: dict[asyncio.Task, tuple[str, str, str, str, dict[str, Any], int]] = {}
+    shutting_down = False
+    ingest_stats: dict[str, int] = {
+        "enqueued_total": 0,
+        "committed_total": 0,
+        "retried_total": 0,
+        "dropped_total": 0,
+        "dropped_queue_full": 0,
+        "dropped_pending_exhausted": 0,
+    }
+
+    def _schedule_delayed_reenqueue(
+        item: tuple[str, str, str, str, dict[str, Any], int],
+        delay_sec: float,
+        reason: str,
+    ) -> bool:
+        if shutting_down or len(retry_tasks) >= INGEST_OVERFLOW_MAX_TASKS:
+            return False
+
+        async def _retry_put():
+            cur_task = asyncio.current_task()
+            try:
+                await asyncio.sleep(delay_sec)
+                if shutting_down:
+                    return
+                await asyncio.wait_for(ingest_queue.put(item), timeout=1.5)
+                if cur_task is not None:
+                    retry_items.pop(cur_task, None)
+            except asyncio.CancelledError:
+                return
+            except asyncio.TimeoutError:
+                if cur_task is not None:
+                    retry_items.pop(cur_task, None)
+                req_id = item[1]
+                attempt = item[5]
+                if attempt < INGEST_PENDING_MAX_RETRIES and not shutting_down:
+                    ingest_stats["retried_total"] += 1
+                    next_item = (item[0], item[1], item[2], item[3], item[4], attempt + 1)
+                    next_delay = min(30.0, INGEST_PENDING_BACKOFF_BASE * (2 ** min(attempt, 4)))
+                    if not _schedule_delayed_reenqueue(next_item, next_delay, reason):
+                        ingest_stats["dropped_total"] += 1
+                        if reason == "queue_full":
+                            ingest_stats["dropped_queue_full"] += 1
+                        else:
+                            ingest_stats["dropped_pending_exhausted"] += 1
+                        log.warning(
+                            "Dropped turn %s after %s retry saturation",
+                            req_id,
+                            reason,
+                        )
+                else:
+                    ingest_stats["dropped_total"] += 1
+                    if reason == "queue_full":
+                        ingest_stats["dropped_queue_full"] += 1
+                    else:
+                        ingest_stats["dropped_pending_exhausted"] += 1
+                    log.warning("Dropped turn %s after exhausting %s retries", req_id, reason)
+
+        def _on_retry_done(t: asyncio.Task) -> None:
+            retry_tasks.discard(t)
+            retry_items.pop(t, None)
+
+        task = asyncio.create_task(_retry_put())
+        retry_tasks.add(task)
+        retry_items[task] = item
+        task.add_done_callback(_on_retry_done)
+        return True
 
     async def ingest_worker():
         while True:
-            character_id, req_id, user_msg, reply_msg = await ingest_queue.get()
+            character_id, req_id, user_msg, reply_msg, turn_meta, attempt = await ingest_queue.get()
             try:
-                await asyncio.to_thread(
-                    extract_and_commit_turn,
-                    brain,
-                    character_id,
-                    req_id,
-                    user_msg,
-                    reply_msg,
-                )
+                if turn_meta:
+                    result = await asyncio.to_thread(
+                        extract_and_commit_turn,
+                        brain,
+                        character_id,
+                        req_id,
+                        user_msg,
+                        reply_msg,
+                        turn_meta=turn_meta,
+                    )
+                else:
+                    result = await asyncio.to_thread(
+                        extract_and_commit_turn,
+                        brain,
+                        character_id,
+                        req_id,
+                        user_msg,
+                        reply_msg,
+                    )
+                if isinstance(result, dict) and result.get("skipped") == "another_turn_pending":
+                    if attempt < INGEST_PENDING_MAX_RETRIES and not shutting_down:
+                        delay = min(30.0, INGEST_PENDING_BACKOFF_BASE * (2 ** min(attempt, 4)))
+                        scheduled = _schedule_delayed_reenqueue(
+                            (character_id, req_id, user_msg, reply_msg, turn_meta, attempt + 1),
+                            delay,
+                            "another_turn_pending",
+                        )
+                        if scheduled:
+                            ingest_stats["retried_total"] += 1
+                            log.info(
+                                "Turn %s deferred (another_turn_pending); scheduled retry %d/%d in %.2fs",
+                                req_id,
+                                attempt + 1,
+                                INGEST_PENDING_MAX_RETRIES,
+                                delay,
+                            )
+                        else:
+                            ingest_stats["dropped_total"] += 1
+                            ingest_stats["dropped_pending_exhausted"] += 1
+                            log.warning("Turn %s dropped (retry buffer saturated during pending turn)", req_id)
+                    else:
+                        ingest_stats["dropped_total"] += 1
+                        ingest_stats["dropped_pending_exhausted"] += 1
+                        log.warning(
+                            "Turn %s dropped after %d pending-turn retries",
+                            req_id,
+                            attempt,
+                        )
+                elif isinstance(result, dict) and result.get("committed"):
+                    ingest_stats["committed_total"] += 1
+                    if not result.get("replayed") or result.get("updated"):
+                        obsidian_runner.notify_turn(
+                            result.get("occurred_at") or (turn_meta or {}).get("occurred_at"),
+                            extra_occurred_at=result.get("prev_occurred_at"),
+                        )
             except Exception as exc:
                 log.error("Background ingest error for %s: %s", req_id, exc)
             finally:
@@ -1225,22 +1624,62 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
             except Exception as exc:
                 log.warning("review_healer iteration failed: %s", exc)
 
+    def _health_payload() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "character": DEFAULT_CHARACTER_ID,
+            "ingest": {
+                "queue_size": ingest_queue.qsize(),
+                "queue_maxsize": INGEST_QUEUE_MAXSIZE,
+                "pending_retries": len(retry_tasks),
+                **ingest_stats,
+            },
+            "obsidian": obsidian_exporter.status(),
+        }
+
     async def combined_app(scope, receive, send):
-        nonlocal worker_task, heal_task
+        nonlocal worker_task, heal_task, shutting_down
         if scope["type"] == "lifespan":
             async def wrapped_receive():
                 msg = await receive()
-                nonlocal worker_task, heal_task
+                nonlocal worker_task, heal_task, shutting_down
                 if msg["type"] == "lifespan.startup":
+                    shutting_down = False
                     worker_task = asyncio.create_task(ingest_worker())
                     heal_task = asyncio.create_task(review_healer())
+                    obsidian_runner.start()
                 elif msg["type"] == "lifespan.shutdown":
+                    shutting_down = True
                     if heal_task:
                         heal_task.cancel()
                         try:
                             await heal_task
                         except asyncio.CancelledError:
                             pass
+                    harvested_retries: list[tuple[str, str, str, str, dict[str, Any], int]] = []
+                    if retry_tasks:
+                        pending_rt = list(retry_tasks)
+                        for rt in pending_rt:
+                            saved = retry_items.pop(rt, None)
+                            if saved is not None:
+                                harvested_retries.append(saved)
+                            rt.cancel()
+                        await asyncio.gather(*pending_rt, return_exceptions=True)
+                    if harvested_retries:
+                        log.info(
+                            "Re-enqueuing %d deferred retry turn(s) for graceful shutdown drain...",
+                            len(harvested_retries),
+                        )
+                        for h_item in harvested_retries:
+                            try:
+                                ingest_queue.put_nowait(h_item)
+                            except asyncio.QueueFull:
+                                try:
+                                    await asyncio.wait_for(ingest_queue.put(h_item), timeout=1.5)
+                                except asyncio.TimeoutError:
+                                    ingest_stats["dropped_total"] += 1
+                                    ingest_stats["dropped_queue_full"] += 1
+                                    log.warning("Shutdown drain dropped overflow turn %s", h_item[1])
                     if worker_task and not worker_task.done():
                         pending_cnt = max(
                             ingest_queue.qsize(),
@@ -1267,6 +1706,7 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
                             await worker_task
                         except asyncio.CancelledError:
                             pass
+                    await obsidian_runner.stop()
                 return msg
 
             await studio_app(scope, wrapped_receive, send)
@@ -1281,7 +1721,7 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
             if scope["type"] == "http" and path.startswith("/xiaozhi/"):
                 req = Request(scope, receive=receive)
                 if path == "/xiaozhi/health":
-                    resp = JSONResponse({"status": "ok", "character": DEFAULT_CHARACTER_ID})
+                    resp = JSONResponse(_health_payload())
                     await resp(scope, receive, send)
                     return
 
@@ -1332,9 +1772,39 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
                         return
                     if req.method == "POST":
                         data = await asyncio.to_thread(update_relationship_settings, brain, char_id, body)
+                        obsidian_runner.notify_db_change()
                         resp = JSONResponse(data)
                         await resp(scope, receive, send)
                         return
+
+                if path == "/xiaozhi/obsidian/status" and req.method == "GET":
+                    resp = JSONResponse(obsidian_exporter.status())
+                    await resp(scope, receive, send)
+                    return
+
+                if path == "/xiaozhi/obsidian/config" and req.method == "POST":
+                    if "enabled" not in body or not isinstance(body.get("enabled"), bool):
+                        resp = JSONResponse(
+                            {"error": "Field 'enabled' (boolean) is required"},
+                            status_code=400,
+                        )
+                        await resp(scope, receive, send)
+                        return
+                    status_data = await obsidian_runner.set_enabled_async(bool(body["enabled"]))
+                    resp = JSONResponse({"ok": True, "obsidian": status_data, **status_data})
+                    await resp(scope, receive, send)
+                    return
+
+                if path == "/xiaozhi/obsidian/rebuild" and req.method == "POST":
+                    result = await obsidian_runner.rebuild_now()
+                    status_data = obsidian_exporter.status()
+                    code = 200 if result.get("ok") else 500
+                    resp = JSONResponse(
+                        {"result": result, "obsidian": status_data, **result},
+                        status_code=code,
+                    )
+                    await resp(scope, receive, send)
+                    return
 
                 if path == "/xiaozhi/recall" and req.method == "POST":
                     query = str(body.get("query") or "")
@@ -1347,20 +1817,98 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
                     turns = body.get("turns")
                     if not isinstance(turns, list):
                         turns = [body]
+                    if shutting_down:
+                        rej_ids = [
+                            str(item.get("request_id") or f"xz-{int(time.time()*1000)}").strip()
+                            for item in turns
+                            if isinstance(item, dict)
+                            and str(item.get("user_message") or "").strip()
+                            and str(item.get("assistant_reply") or "").strip()
+                        ]
+                        resp = JSONResponse(
+                            {
+                                "queued": 0,
+                                "accepted_ids": [],
+                                "rejected_ids": rej_ids,
+                                "error": "shutting_down",
+                            },
+                            status_code=503,
+                        )
+                        await resp(scope, receive, send)
+                        return
                     enqueued = 0
+                    accepted_ids: list[str] = []
+                    rejected_ids: list[str] = []
                     for item in turns:
                         if not isinstance(item, dict):
                             continue
                         u_msg = str(item.get("user_message") or "").strip()
                         a_msg = str(item.get("assistant_reply") or "").strip()
                         r_id = str(item.get("request_id") or f"xz-{int(time.time()*1000)}").strip()
-                        if u_msg and a_msg:
+                        if not (u_msg and a_msg):
+                            continue
+                        item_meta: dict[str, Any] = {}
+                        if "occurred_at" in item and item["occurred_at"] is not None:
+                            item_meta["occurred_at"] = item["occurred_at"]
+                        if "source" in item and item["source"]:
+                            item_meta["source"] = str(item["source"])
+                        if "device_id" in item and item["device_id"]:
+                            item_meta["device_id"] = str(item["device_id"])
+                        if "used_tools" in item and item["used_tools"] is not None:
+                            item_meta["used_tools"] = bool(item["used_tools"])
+
+                        q_item = (char_id, r_id, u_msg, a_msg, item_meta, 0)
+                        try:
+                            ingest_queue.put_nowait(q_item)
+                            enqueued += 1
+                            ingest_stats["enqueued_total"] += 1
+                            accepted_ids.append(r_id)
+                        except asyncio.QueueFull:
+                            placed = False
                             try:
-                                ingest_queue.put_nowait((char_id, r_id, u_msg, a_msg))
+                                await asyncio.wait_for(
+                                    ingest_queue.put(q_item),
+                                    timeout=INGEST_ENQUEUE_WAIT_SECONDS,
+                                )
+                                placed = True
                                 enqueued += 1
-                            except asyncio.QueueFull:
-                                log.warning("Ingest queue full; dropping turn %s", r_id)
-                    resp = JSONResponse({"queued": enqueued})
+                                ingest_stats["enqueued_total"] += 1
+                                accepted_ids.append(r_id)
+                            except asyncio.TimeoutError:
+                                pass
+                            if not placed:
+                                scheduled = _schedule_delayed_reenqueue(
+                                    (char_id, r_id, u_msg, a_msg, item_meta, 1),
+                                    INGEST_PENDING_BACKOFF_BASE,
+                                    "queue_full",
+                                )
+                                if scheduled:
+                                    enqueued += 1
+                                    ingest_stats["enqueued_total"] += 1
+                                    ingest_stats["retried_total"] += 1
+                                    accepted_ids.append(r_id)
+                                    log.warning(
+                                        "Ingest queue full; scheduled delayed retry for turn %s",
+                                        r_id,
+                                    )
+                                else:
+                                    ingest_stats["dropped_total"] += 1
+                                    ingest_stats["dropped_queue_full"] += 1
+                                    rejected_ids.append(r_id)
+                                    log.warning(
+                                        "Ingest queue & retry buffer full; rejecting turn %s",
+                                        r_id,
+                                    )
+
+                    status_code = 503 if (rejected_ids and enqueued == 0) else 200
+                    payload: dict[str, Any] = {
+                        "queued": enqueued,
+                        "accepted_ids": accepted_ids,
+                        "rejected_ids": rejected_ids,
+                    }
+                    if status_code == 503:
+                        payload["error"] = "ingest_queue_full"
+                    resp = JSONResponse(payload, status_code=status_code)
                     await resp(scope, receive, send)
                     return
 
@@ -1382,7 +1930,14 @@ def create_combined_asgi_app(brain: CompanionBrain, token: str):
                         new_headers.append((k, v))
                 scope = dict(scope, headers=new_headers)
 
+        is_studio_write = (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path", "") in _STUDIO_WRITE_ACTIONS
+        )
         await studio_app(scope, receive, send)
+        if is_studio_write:
+            obsidian_runner.notify_db_change()
 
     return combined_app
 
@@ -1427,6 +1982,7 @@ def main():
         ),
     ) as brain:
         ensure_default_character(brain)
+        ensure_xiaozhi_turn_meta_table(brain.engine)
         tighten_legacy_summary_batch_size(brain)
         prune_database_bloat(brain, allow_vacuum=True)
         clear_stale_review_jobs(brain, is_startup=True)
@@ -1434,6 +1990,13 @@ def main():
         log.info("==========================================================")
         log.info("Anima Brain + Companion Studio is READY on port %d", PORT)
         log.info("Database: %s", DB_PATH)
+        log.info(
+            "Obsidian Sync: enabled=%s export_dir=%s host_dir=%s interval=%ds",
+            OBSIDIAN_SYNC_ENABLED,
+            OBSIDIAN_EXPORT_DIR,
+            OBSIDIAN_HOST_DIR,
+            OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS,
+        )
         log.info("Studio URL: http://localhost:%d/#token=*** (full URL saved to %s)", PORT, URL_PATH)
         log.info("==========================================================")
         uvicorn.run(

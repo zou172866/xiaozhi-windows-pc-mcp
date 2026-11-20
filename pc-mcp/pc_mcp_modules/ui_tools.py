@@ -1,0 +1,295 @@
+"""L2 UI inspection & guarded click / type_text / hotkey / scroll execution (P2-20)."""
+
+from __future__ import annotations
+
+import time
+
+import pyautogui
+import pyperclip
+
+from . import _CF_UNICODETEXT, _clipboard_lock, _com_mta_scope, _gui_lock, facade_attr
+from .security import (
+    _check_foreground_input_guard,
+    _check_hotkey_blacklist,
+    _get_audit_extra_secrets,
+    _parse_and_normalize_hotkey,
+    _validate_hotkey_keys,
+    _write_l2_audit_log,
+    redact_secrets,
+)
+from .vision import _smart_locate_target, _walk_uia_controls
+from .winapi import _get_foreground_window_info, _user32
+
+
+def inspect_window_ui(window_keyword: str = "") -> str:
+    import uiautomation as auto
+
+    pg = facade_attr("pyautogui", pyautogui)
+    walk_fn = facade_attr("_walk_uia_controls", _walk_uia_controls)
+    audit_fn = facade_attr("_write_l2_audit_log", _write_l2_audit_log)
+
+    with _gui_lock:
+        sw, sh = pg.size()
+        with _com_mta_scope():
+            target_win = None
+            if window_keyword.strip():
+                kw_low = window_keyword.strip().lower()
+                for w in auto.GetRootControl().GetChildren():
+                    if kw_low in (w.Name or "").lower():
+                        target_win = w
+                        break
+                if not target_win:
+                    audit_fn(
+                        tool="pc_inspect_window_ui",
+                        action="inspect_window_ui",
+                        outcome="blocked",
+                        reason="window_not_found",
+                        target=window_keyword,
+                    )
+                    return f"未找到标题包含「{window_keyword}」的顶层窗口。"
+            else:
+                target_win = auto.GetForegroundControl()
+            win_name = (target_win.Name or "当前窗口") if target_win else "当前窗口"
+            elems = walk_fn(auto, target_win, 45, sw, sh)
+
+    audit_fn(
+        tool="pc_inspect_window_ui",
+        action="inspect_window_ui",
+        outcome="allowed",
+        reason="ok",
+        target=window_keyword or win_name,
+        detail=f"elements={len(elems)}",
+    )
+    if not elems:
+        return f"窗口「{win_name}」未暴露标准 UIA 子控件，可直接调用 pc_ui_action(action='click', element_name='目标视觉描述') 进行视觉定位点击。"
+    lines = [f"- [{e['id']}:{e['type']}] {e['name'][:38] or '(无文字控件)'} @({e['cx']},{e['cy']})" for e in elems]
+    return f"窗口「{win_name}」可交互元素（前 {len(lines)} 项，1:1 物理像素）：\n" + "\n".join(lines)
+
+
+def _pc_ui_action_locked(
+    *,
+    act: str,
+    raw_action: str,
+    element_name: str = "",
+    x: int = -1,
+    y: int = -1,
+    text: str = "",
+    press_enter: bool = False,
+    hotkey: str = "",
+    scroll_clicks: int = -5,
+) -> str:
+    pg = facade_attr("pyautogui", pyautogui)
+    clip = facade_attr("pyperclip", pyperclip)
+    tmod = facade_attr("time", time)
+    u32 = facade_attr("_user32", _user32)
+    locate_fn = facade_attr("_smart_locate_target", _smart_locate_target)
+    fg_info_fn = facade_attr("_get_foreground_window_info", _get_foreground_window_info)
+    fg_guard_fn = facade_attr("_check_foreground_input_guard", _check_foreground_input_guard)
+    audit_fn = facade_attr("_write_l2_audit_log", _write_l2_audit_log)
+
+    def _move_and_click(cx: int, cy: int, click_kind: str = "click"):
+        pg.moveTo(cx, cy, duration=0.12)
+        tmod.sleep(0.05)
+        if click_kind == "double_click":
+            pg.doubleClick(cx, cy)
+        elif click_kind == "right_click":
+            pg.rightClick(cx, cy)
+        else:
+            pg.click(cx, cy)
+
+    if act in ("click", "double_click", "right_click"):
+        if element_name.strip():
+            loc = locate_fn(element_name)
+            if not loc:
+                audit_fn(
+                    tool="pc_ui_action",
+                    action=act,
+                    outcome="blocked",
+                    reason="target_not_found",
+                    target=element_name,
+                )
+                return f"未能在当前画面上定位到「{element_name}」，请确认目标是否在屏幕可见区域或尝试向下滚动页面。"
+            cx, cy, src_desc = loc
+            _move_and_click(cx, cy, act)
+            audit_fn(
+                tool="pc_ui_action",
+                action=act,
+                outcome="allowed",
+                reason="ok",
+                target=f"{element_name.strip()} @({cx},{cy})",
+                detail=src_desc,
+            )
+            verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
+            return f"已精准{verb} {src_desc}，物理像素坐标 ({cx}, {cy})。"
+        elif x >= 0 and y >= 0:
+            _move_and_click(x, y, act)
+            audit_fn(
+                tool="pc_ui_action",
+                action=act,
+                outcome="allowed",
+                reason="ok",
+                target=f"({x},{y})",
+            )
+            return f"已点击屏幕物理坐标 ({x}, {y})。"
+        audit_fn(
+            tool="pc_ui_action",
+            action=act,
+            outcome="blocked",
+            reason="invalid_args",
+        )
+        return "click 操作需要提供 element_name（推荐）或有效的 x, y 坐标。"
+
+    if act == "type_text":
+        target_desc = element_name.strip()
+        if target_desc:
+            loc = locate_fn(target_desc)
+            if not loc:
+                audit_fn(
+                    tool="pc_ui_action",
+                    action=act,
+                    outcome="blocked",
+                    reason="target_not_found",
+                    target=target_desc,
+                    text=text,
+                    press_enter=press_enter,
+                    detail="target element not located; fail-closed without typing",
+                )
+                return f"未能在当前画面上定位到「{target_desc}」，已中止输入，未向当前焦点窗口输入任何内容。"
+            _move_and_click(loc[0], loc[1], "click")
+            tmod.sleep(0.15)
+            target_desc = f"{target_desc} @({loc[0]},{loc[1]})"
+
+        fg_info = fg_info_fn()
+        fg_err = fg_guard_fn(fg_info)
+        if fg_err:
+            audit_fn(
+                tool="pc_ui_action",
+                action=act,
+                outcome="blocked",
+                reason="foreground_blocked",
+                fg_info=fg_info,
+                target=target_desc,
+                text=text,
+                press_enter=press_enter,
+                detail=fg_err,
+            )
+            return fg_err
+
+        with _clipboard_lock:
+            had_text_clip = False
+            old_clip = ""
+            try:
+                had_text_clip = bool(u32.IsClipboardFormatAvailable(_CF_UNICODETEXT))
+                if had_text_clip:
+                    old_clip = clip.paste()
+            except Exception:
+                had_text_clip = False
+            try:
+                clip.copy(text)
+                tmod.sleep(0.04)
+                pg.hotkey("ctrl", "v")
+                tmod.sleep(0.25)
+                if press_enter:
+                    pg.press("enter")
+            finally:
+                if had_text_clip:
+                    try:
+                        if clip.paste() == text:
+                            clip.copy(old_clip)
+                    except Exception:
+                        pass
+        audit_fn(
+            tool="pc_ui_action",
+            action=act,
+            outcome="allowed",
+            reason="ok",
+            fg_info=fg_info,
+            target=target_desc,
+            text=text,
+            press_enter=press_enter,
+        )
+        return f"已输入文本：「{redact_secrets(text[:30], _get_audit_extra_secrets())}」" + (
+            " 并按下回车。" if press_enter else "。"
+        )
+
+    if act == "hotkey":
+        exec_keys, canon_keys = _parse_and_normalize_hotkey(hotkey)
+        if not exec_keys:
+            audit_fn(
+                tool="pc_ui_action",
+                action=act,
+                outcome="blocked",
+                reason="invalid_args",
+                hotkey=hotkey,
+            )
+            return "未提供有效的 hotkey。"
+
+        canon_str = "+".join(canon_keys)
+        hk_err = _check_hotkey_blacklist(canon_keys, hotkey)
+        if hk_err:
+            audit_fn(
+                tool="pc_ui_action",
+                action=act,
+                outcome="blocked",
+                reason="hotkey_blacklisted",
+                hotkey=canon_str,
+                detail=hk_err,
+            )
+            return hk_err
+
+        invalid_keys = _validate_hotkey_keys(exec_keys)
+        if invalid_keys:
+            inv_msg = f"安全护栏已拦截：快捷键包含无效或未识别按键（{', '.join(invalid_keys)}）。"
+            audit_fn(
+                tool="pc_ui_action",
+                action=act,
+                outcome="blocked",
+                reason="invalid_hotkey_key",
+                hotkey=canon_str,
+                detail=inv_msg,
+            )
+            return inv_msg
+
+        fg_info = fg_info_fn()
+        fg_err = fg_guard_fn(fg_info)
+        if fg_err:
+            audit_fn(
+                tool="pc_ui_action",
+                action=act,
+                outcome="blocked",
+                reason="foreground_blocked",
+                fg_info=fg_info,
+                hotkey=canon_str,
+                detail=fg_err,
+            )
+            return fg_err
+
+        pg.hotkey(*exec_keys)
+        audit_fn(
+            tool="pc_ui_action",
+            action=act,
+            outcome="allowed",
+            reason="ok",
+            fg_info=fg_info,
+            hotkey=canon_str,
+        )
+        return f"已按下快捷键: {'+'.join(exec_keys)}"
+
+    if act == "scroll":
+        pg.scroll(int(scroll_clicks) * 120)
+        audit_fn(
+            tool="pc_ui_action",
+            action=act,
+            outcome="allowed",
+            reason="ok",
+            target=f"scroll:{int(scroll_clicks)}",
+        )
+        return f"已{'向下' if scroll_clicks < 0 else '向上'}滚动页面。"
+
+    audit_fn(
+        tool="pc_ui_action",
+        action=act,
+        outcome="blocked",
+        reason="unknown_action",
+    )
+    return f"未知的 UI 操作类型: {raw_action}"

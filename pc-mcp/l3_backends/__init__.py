@@ -19,19 +19,54 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import psutil
 
-SERVER_DIR = Path(__file__).resolve().parent.parent.parent
+MCP_DIR = Path(__file__).resolve().parent.parent
+SERVER_DIR = MCP_DIR.parent
 DOTENV_FILE = SERVER_DIR / ".env"
-DATA_DIR = SERVER_DIR / "data"
-TASKS_ROOT = DATA_DIR / "agy_tasks"
+STATE_DIR = MCP_DIR / "state"
+TASKS_ROOT = STATE_DIR / "agy_tasks"
 PENDING_DIR = TASKS_ROOT / "pending"
 ACTIVE_DIR = TASKS_ROOT / "active"
 HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
-L3_CONFIG_FILE = DATA_DIR / "l3_backend_config.json"
+L3_CONFIG_FILE = STATE_DIR / "l3_backend_config.json"
 
-for _d in (PENDING_DIR, ACTIVE_DIR):
+for _d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 VALID_BACKENDS = ("antigravity", "dsh", "workbuddy", "none")
+ALLOWED_L3_CONFIG_KEYS = frozenset({"backend", "timeout_seconds", "timeout"})
+HOST_ENV_ONLY_L3_KEYS = frozenset({"workdir", "dsh_cmd", "workbuddy_cmd", "workbuddy_auto_approve"})
+TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_WINDOWS_RESERVED_TASK_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+
+
+def validate_task_id(task_id: Any) -> str:
+    """Strictly validate an L3 task ID to prevent path traversal or reserved-device writes."""
+    if not isinstance(task_id, str):
+        raise ValueError("invalid task_id: must be a string")
+    if not TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(f"invalid task_id: {task_id!r}")
+    if task_id.upper() in _WINDOWS_RESERVED_TASK_NAMES:
+        raise ValueError(f"reserved task_id: {task_id!r}")
+    return task_id
+
+
+def resolve_task_file(base_dir: Path, task_id: Any) -> Path:
+    """Resolve `<base_dir>/<task_id>.json` with strict regex + `.resolve().is_relative_to()` containment."""
+    safe_id = validate_task_id(task_id)
+    root = Path(base_dir).resolve()
+    candidate = (root / f"{safe_id}.json").resolve()
+    if not candidate.is_relative_to(root) or candidate.parent != root:
+        raise ValueError(f"task path escapes base directory: {task_id!r}")
+    return candidate
 
 _cfg_lock = threading.Lock()
 _dotenv_lock = threading.Lock()
@@ -348,11 +383,47 @@ def prepare_subprocess_command(cmd: List[str]) -> List[str]:
     return unwrapped
 
 
+def _safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        f = float(val)
+        if f != f or f in (float("inf"), float("-inf")):
+            return default
+        return f
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def get_process_create_time(pid: Optional[int]) -> Optional[float]:
+    """Return psutil create_time() for a live PID, or None if unavailable/not running."""
+    pid_i = _safe_int(pid, None)
+    if not pid_i or pid_i <= 0:
+        return None
+    try:
+        proc = psutil.Process(pid_i)
+        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+            return None
+        return float(proc.create_time())
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, OSError):
+        return None
+
+
 def _is_pid_running(pid: Optional[int]) -> bool:
-    if not pid or int(pid) <= 0:
+    pid_i = _safe_int(pid, None)
+    if not pid_i or pid_i <= 0:
         return False
     try:
-        proc = psutil.Process(int(pid))
+        proc = psutil.Process(pid_i)
         return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
     except psutil.AccessDenied:
         return True
@@ -360,16 +431,64 @@ def _is_pid_running(pid: Optional[int]) -> bool:
         return False
 
 
-def kill_process_tree(pid: int, grace_seconds: float = 2.0) -> None:
-    """Terminate ONLY the specified task subprocess and its descendant process tree."""
-    if not pid or int(pid) <= 0:
-        return
+def is_same_process(
+    pid: Optional[int],
+    expected_create_time: Optional[float],
+    *,
+    started_ts: Optional[float] = None,
+    role: str = "child",
+    max_drift: float = 2.0,
+) -> bool:
+    """Verify PID is alive AND matches expected create_time() so PID reuse never kills an unrelated process (P1-17)."""
+    pid_i = _safe_int(pid, None)
+    if not pid_i or pid_i <= 0:
+        return False
+    actual_ct = get_process_create_time(pid_i)
+    if actual_ct is None:
+        return False
+    exp_ct = _safe_float(expected_create_time, 0.0)
+    if exp_ct > 0.0:
+        return abs(actual_ct - exp_ct) <= max(0.5, float(max_drift))
+    # Legacy record without explicit create_time: bound by started_ts to protect against PID reuse
+    st_ts = _safe_float(started_ts, 0.0)
+    if st_ts <= 0.0:
+        return False
+    if role == "owner":
+        # Owner process must have existed BEFORE the task was started
+        return actual_ct <= st_ts + 5.0
+    # Child process must have been spawned close to task start time
+    return (st_ts - 5.0) <= actual_ct <= (st_ts + 30.0)
+
+
+def kill_process_tree(
+    pid: int,
+    grace_seconds: float = 2.0,
+    *,
+    expected_create_time: Optional[float] = None,
+) -> bool:
+    """Terminate ONLY the specified task subprocess and its descendant process tree.
+
+    When `expected_create_time` is provided, verifies `psutil.Process.create_time()` before
+    terminating and before the Windows `taskkill /T` fallback to prevent killing a reused PID.
+    Returns True if a matching process was targeted, False if skipped or already gone.
+    """
+    pid_i = _safe_int(pid, None)
+    if not pid_i or pid_i <= 0:
+        return False
+    exp_ct = _safe_float(expected_create_time, 0.0)
     try:
-        root = psutil.Process(int(pid))
+        root = psutil.Process(pid_i)
+        if exp_ct > 0.0:
+            actual_ct = float(root.create_time())
+            if abs(actual_ct - exp_ct) > 2.0:
+                return False
         children = root.children(recursive=True)
     except psutil.NoSuchProcess:
-        return
+        return False
     except Exception:
+        if exp_ct > 0.0:
+            # Fail closed when identity cannot be verified against expected_create_time
+            return False
         children = []
         root = None
 
@@ -399,17 +518,22 @@ def kill_process_tree(pid: int, grace_seconds: float = 2.0) -> None:
             except Exception:
                 pass
 
-    # Targeted Windows fallback ONLY for this specific task PID if still alive
-    if os.name == "nt" and _is_pid_running(pid):
+    # Targeted Windows fallback ONLY for this specific verified task PID if still alive
+    if os.name == "nt" and _is_pid_running(pid_i):
+        if exp_ct > 0.0:
+            cur_ct = get_process_create_time(pid_i)
+            if cur_ct is None or abs(cur_ct - exp_ct) > 2.0:
+                return True
         try:
             subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                ["taskkill", "/F", "/T", "/PID", str(pid_i)],
                 capture_output=True,
                 timeout=5,
                 creationflags=0x08000000,
             )
         except Exception:
             pass
+    return True
 
 
 def run_subprocess_with_tree_kill(
@@ -436,6 +560,7 @@ def run_subprocess_with_tree_kill(
         kwargs["creationflags"] = creationflags
 
     proc = subprocess.Popen(prepared, **kwargs)
+    proc_create_time = get_process_create_time(proc.pid)
     if on_spawn is not None:
         try:
             on_spawn(proc.pid)
@@ -445,7 +570,7 @@ def run_subprocess_with_tree_kill(
         stdout, stderr = proc.communicate(timeout=timeout)
         return subprocess.CompletedProcess(prepared, proc.returncode, stdout=stdout, stderr=stderr)
     except subprocess.TimeoutExpired:
-        kill_process_tree(proc.pid)
+        kill_process_tree(proc.pid, expected_create_time=proc_create_time)
         try:
             stdout, stderr = proc.communicate(timeout=5)
         except Exception:
@@ -465,9 +590,40 @@ def split_command(cmd_str: str) -> List[str]:
     return [p.strip('"').strip("'") for p in parts if p.strip()]
 
 
+def _parse_env_bool(raw: str, default: bool = False) -> bool:
+    val = (raw or "").strip().lower()
+    if not val:
+        return default
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+DEFAULT_L3_BACKEND = "dsh"
+
+
 def _default_backend() -> str:
-    env_b = (read_env_key("L3_BACKEND") or "antigravity").strip().lower()
-    return env_b if env_b in VALID_BACKENDS else "antigravity"
+    env_b = (read_env_key("L3_BACKEND") or DEFAULT_L3_BACKEND).strip().lower()
+    return env_b if env_b in VALID_BACKENDS else DEFAULT_L3_BACKEND
+
+
+def _parse_timeout_seconds(value: Any, *, strict: bool = False) -> int:
+    if isinstance(value, bool):
+        if strict:
+            raise ValueError("timeout_seconds 必须为整数（30-1800）")
+        return 300
+    try:
+        if isinstance(value, float) and not value.is_integer():
+            if strict:
+                raise ValueError("timeout_seconds 必须为整数（30-1800）")
+        t = int(value)
+    except Exception as exc:
+        if strict:
+            raise ValueError("timeout_seconds 必须为整数（30-1800）") from exc
+        return 300
+    return max(30, min(1800, t))
 
 
 def default_l3_config() -> Dict[str, Any]:
@@ -476,29 +632,33 @@ def default_l3_config() -> Dict[str, Any]:
         "workdir": read_env_key("XIAOZHI_L3_WORKDIR"),
         "dsh_cmd": read_env_key("DSH_CMD"),
         "workbuddy_cmd": read_env_key("WORKBUDDY_CMD"),
-        "workbuddy_auto_approve": True,
+        "workbuddy_auto_approve": _parse_env_bool(
+            read_env_key("WORKBUDDY_AUTO_APPROVE"), default=False
+        ),
         "timeout_seconds": 300,
     }
 
 
 def _normalize_config(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize persisted L3 config; host-env-only fields NEVER come from JSON."""
     base = default_l3_config()
     merged = dict(base)
     if isinstance(raw, dict):
-        merged.update(raw)
-    b = str(merged.get("backend") or base["backend"]).strip().lower()
-    if b not in VALID_BACKENDS:
-        b = base["backend"]
-    merged["backend"] = b
-    merged["workdir"] = str(merged.get("workdir") or "").strip()
-    merged["dsh_cmd"] = str(merged.get("dsh_cmd") or "").strip()
-    merged["workbuddy_cmd"] = str(merged.get("workbuddy_cmd") or "").strip()
-    merged["workbuddy_auto_approve"] = bool(merged.get("workbuddy_auto_approve", True))
-    try:
-        t = int(merged.get("timeout_seconds", 300))
-    except Exception:
-        t = 300
-    merged["timeout_seconds"] = max(30, min(1800, t))
+        raw_backend = raw.get("backend")
+        if isinstance(raw_backend, str):
+            b = raw_backend.strip().lower()
+            if b in VALID_BACKENDS:
+                merged["backend"] = b
+        raw_timeout = raw.get("timeout_seconds")
+        if raw_timeout is None and "timeout" in raw:
+            raw_timeout = raw.get("timeout")
+        if raw_timeout is not None:
+            merged["timeout_seconds"] = _parse_timeout_seconds(raw_timeout, strict=False)
+    # Explicitly guarantee host-env-only fields always come from host env / .env
+    merged["workdir"] = str(base["workdir"] or "").strip()
+    merged["dsh_cmd"] = str(base["dsh_cmd"] or "").strip()
+    merged["workbuddy_cmd"] = str(base["workbuddy_cmd"] or "").strip()
+    merged["workbuddy_auto_approve"] = bool(base["workbuddy_auto_approve"])
     return merged
 
 
@@ -514,6 +674,42 @@ def read_l3_config() -> Dict[str, Any]:
 
 
 def write_l3_config(patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and persist ONLY `backend` and `timeout_seconds` (alias `timeout`) to host-private state."""
+    if not isinstance(patch, dict):
+        raise ValueError("配置参数必须为 JSON 对象")
+
+    disallowed = sorted(str(k) for k in patch.keys() if k not in ALLOWED_L3_CONFIG_KEYS)
+    if disallowed:
+        raise ValueError(
+            f"不允许通过 /l3/config 修改字段: {', '.join(disallowed)}（仅允许 backend 与 timeout_seconds；"
+            "命令路径、工作目录与自动批准仅可由宿主机 .env 配置）"
+        )
+
+    parsed_backend: Optional[str] = None
+    if "backend" in patch and patch["backend"] is not None:
+        if not isinstance(patch["backend"], str):
+            raise ValueError("backend 必须为字符串")
+        b = patch["backend"].strip().lower()
+        if b not in VALID_BACKENDS:
+            raise ValueError(
+                f"不支持的 L3 后端: {patch['backend']!r}（可选: {', '.join(VALID_BACKENDS)}）"
+            )
+        parsed_backend = b
+
+    parsed_timeout: Optional[int] = None
+    has_ts = "timeout_seconds" in patch and patch["timeout_seconds"] is not None
+    has_t = "timeout" in patch and patch["timeout"] is not None
+    if has_ts and has_t:
+        t1 = _parse_timeout_seconds(patch["timeout_seconds"], strict=True)
+        t2 = _parse_timeout_seconds(patch["timeout"], strict=True)
+        if t1 != t2:
+            raise ValueError("timeout 与 timeout_seconds 数值不一致")
+        parsed_timeout = t1
+    elif has_ts:
+        parsed_timeout = _parse_timeout_seconds(patch["timeout_seconds"], strict=True)
+    elif has_t:
+        parsed_timeout = _parse_timeout_seconds(patch["timeout"], strict=True)
+
     with _cfg_lock:
         cur = default_l3_config()
         if L3_CONFIG_FILE.is_file():
@@ -521,12 +717,70 @@ def write_l3_config(patch: Dict[str, Any]) -> Dict[str, Any]:
                 cur = _normalize_config(json.loads(L3_CONFIG_FILE.read_text(encoding="utf-8")))
             except Exception:
                 pass
-        for k in ("backend", "workdir", "dsh_cmd", "workbuddy_cmd", "workbuddy_auto_approve", "timeout_seconds"):
-            if k in patch and patch[k] is not None:
-                cur[k] = patch[k]
+        if parsed_backend is not None:
+            cur["backend"] = parsed_backend
+        if parsed_timeout is not None:
+            cur["timeout_seconds"] = parsed_timeout
         norm = _normalize_config(cur)
-        atomic_write_json(L3_CONFIG_FILE, norm)
+        persisted = {
+            "backend": norm["backend"],
+            "timeout_seconds": norm["timeout_seconds"],
+        }
+        atomic_write_json(L3_CONFIG_FILE, persisted)
         return norm
+
+
+def migrate_legacy_l3_state(legacy_data_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Explicit one-time safe migration from legacy `./data` into host-private `pc-mcp/state/`.
+
+    SECURITY: Never trusts or migrates `dsh_cmd`, `workbuddy_cmd`, `workdir`, or
+    `workbuddy_auto_approve` from `./data`, and never migrates untrusted `pending/` tasks.
+    """
+    legacy_dir = Path(legacy_data_dir) if legacy_data_dir is not None else (SERVER_DIR / "data")
+    result: Dict[str, Any] = {"migrated_config": False, "migrated_active_tasks": 0}
+
+    legacy_cfg = legacy_dir / "l3_backend_config.json"
+    with _cfg_lock:
+        if not L3_CONFIG_FILE.is_file() and legacy_cfg.is_file() and not legacy_cfg.is_symlink():
+            try:
+                raw = json.loads(legacy_cfg.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    norm = _normalize_config(raw)
+                    atomic_write_json(
+                        L3_CONFIG_FILE,
+                        {
+                            "backend": norm["backend"],
+                            "timeout_seconds": norm["timeout_seconds"],
+                        },
+                    )
+                    result["migrated_config"] = True
+            except Exception:
+                pass
+
+    legacy_active = legacy_dir / "agy_tasks" / "active"
+    if legacy_active.is_dir() and not legacy_active.is_symlink():
+        ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
+        legacy_root = legacy_active.resolve()
+        for fp in sorted(legacy_active.glob("*.json")):
+            if fp.is_symlink():
+                continue
+            try:
+                if not fp.resolve().is_relative_to(legacy_root):
+                    continue
+                target = resolve_task_file(ACTIVE_DIR, fp.stem)
+                if target.exists():
+                    continue
+                obj = json.loads(fp.read_text(encoding="utf-8"))
+                if not isinstance(obj, dict):
+                    continue
+                if "id" in obj:
+                    validate_task_id(obj["id"])
+                atomic_write_json(target, obj)
+                result["migrated_active_tasks"] += 1
+            except Exception:
+                continue
+
+    return result
 
 
 def resolve_workdir(cfg: Optional[Dict[str, Any]] = None) -> Path:
@@ -541,7 +795,7 @@ def resolve_workdir(cfg: Optional[Dict[str, Any]] = None) -> Path:
 
 def save_active_task(task_id: str, payload: Dict[str, Any]) -> Path:
     ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
-    out = ACTIVE_DIR / f"{task_id}.json"
+    out = resolve_task_file(ACTIVE_DIR, task_id)
     atomic_write_json(out, payload)
     return out
 
@@ -559,68 +813,149 @@ def _task_recency_key(fp: Path, obj: Dict[str, Any], st_mtime_ns: int) -> tuple[
 
 
 def reap_stale_running_tasks(now: Optional[float] = None) -> int:
-    """Recover zombie `status == 'running'` task records whose worker/subprocess died or exceeded timeout."""
-    if not ACTIVE_DIR.exists():
+    """Recover zombie `status == 'running'` task records whose worker/subprocess died or exceeded timeout.
+
+    P1-17: Every file is isolated in its own try/except so one corrupt task JSON can NEVER crash 18900
+    startup, and every PID kill verifies psutil create_time() to prevent killing a reused PID.
+    """
+    try:
+        if not ACTIVE_DIR.exists():
+            return 0
+        task_files = sorted(ACTIVE_DIR.glob("*.json"))
+    except Exception:
         return 0
-    cur_ts = float(time.time() if now is None else now)
+
+    cur_ts = _safe_float(time.time() if now is None else now, time.time())
     cur_pid = os.getpid()
+    cur_pid_ct = get_process_create_time(cur_pid)
     reaped = 0
-    for fp in sorted(ACTIVE_DIR.glob("*.json")):
+
+    for fp in task_files:
         try:
+            if fp.is_symlink():
+                continue
             orig_stat = fp.stat()
             obj = json.loads(fp.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not isinstance(obj, dict) or obj.get("status") != "running":
-            continue
+            if not isinstance(obj, dict) or obj.get("status") != "running":
+                continue
 
-        task_id = str(obj.get("id") or fp.stem)
-        started_ts = float(obj.get("started_ts") or 0.0)
-        timeout_sec = max(30, int(obj.get("timeout_seconds") or 300))
-        elapsed = (cur_ts - started_ts) if started_ts > 0 else (timeout_sec + 999)
-        owner_pid = obj.get("owner_pid")
-        child_pid = obj.get("pid")
-        worker_alive_here = (
-            owner_pid is not None
-            and int(owner_pid) == cur_pid
-            and is_worker_thread_alive(task_id)
-        )
+            task_id = str(obj.get("id") or fp.stem)
+            started_ts = _safe_float(obj.get("started_ts"), 0.0)
+            timeout_sec = max(30, _safe_int(obj.get("timeout_seconds"), 300) or 300)
+            elapsed = (cur_ts - started_ts) if started_ts > 0 else (timeout_sec + 999)
+            owner_pid = _safe_int(obj.get("owner_pid"), None)
+            child_pid = _safe_int(obj.get("pid"), None)
+            owner_ct = _safe_float(obj.get("owner_create_time"), 0.0) or None
+            child_ct = _safe_float(obj.get("pid_create_time"), 0.0) or None
 
-        reason = ""
-        if elapsed > timeout_sec + 30:
-            if child_pid and _is_pid_running(int(child_pid)):
-                kill_process_tree(int(child_pid))
-            reason = f"后台任务超过 {timeout_sec} 秒仍未结束，已自动回收清理"
-        elif owner_pid is not None and int(owner_pid) != cur_pid and not _is_pid_running(int(owner_pid)):
-            if child_pid and _is_pid_running(int(child_pid)):
-                kill_process_tree(int(child_pid))
-            reason = "原宿主机服务已重启或退出，遗留运行中任务已自动回收"
-        elif (
-            child_pid is not None
-            and elapsed > 5.0
-            and not worker_alive_here
-            and not _is_pid_running(int(child_pid))
-        ):
-            reason = "后台任务子进程已提前退出，僵尸状态已自动回收"
-        elif owner_pid is None and child_pid is None and elapsed > timeout_sec:
-            reason = "历史遗留运行中任务已超时失联，已自动回收"
+            worker_alive_here = is_worker_thread_alive(task_id)
+            same_owner_here = (
+                owner_pid is not None
+                and owner_pid == cur_pid
+                and (
+                    worker_alive_here
+                    or (owner_ct is not None and (cur_pid_ct is None or abs(cur_pid_ct - owner_ct) <= 2.0))
+                    or (
+                        owner_ct is None
+                        and (cur_pid_ct is None or started_ts <= 0.0 or cur_pid_ct <= started_ts + 5.0)
+                    )
+                )
+            )
+            worker_alive_here = same_owner_here and worker_alive_here
 
-        if reason:
-            obj["status"] = "error"
-            obj["stderr"] = reason
-            obj["summary"] = reason
-            obj["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            obj["reaped_zombie"] = True
-            try:
+            owner_alive = False
+            if owner_pid is not None:
+                if same_owner_here:
+                    owner_alive = True
+                else:
+                    owner_alive = is_same_process(
+                        owner_pid, owner_ct, started_ts=started_ts, role="owner"
+                    )
+
+            child_verified_alive = (
+                is_same_process(child_pid, child_ct, started_ts=started_ts, role="child")
+                if child_pid is not None
+                else False
+            )
+            verified_child_ct = (
+                child_ct
+                if child_ct is not None
+                else (get_process_create_time(child_pid) if child_verified_alive else None)
+            )
+
+            reason = ""
+            if elapsed > timeout_sec + 30:
+                if child_pid and child_verified_alive:
+                    kill_process_tree(child_pid, expected_create_time=verified_child_ct)
+                reason = f"后台任务超过 {timeout_sec} 秒仍未结束，已自动回收清理"
+            elif owner_pid is not None and not same_owner_here and not owner_alive:
+                if child_pid and child_verified_alive:
+                    kill_process_tree(child_pid, expected_create_time=verified_child_ct)
+                reason = "原宿主机服务已重启或退出，遗留运行中任务已自动回收"
+            elif (
+                child_pid is not None
+                and elapsed > 5.0
+                and not worker_alive_here
+                and not child_verified_alive
+            ):
+                reason = "后台任务子进程已提前退出，僵尸状态已自动回收"
+            elif owner_pid is None and child_pid is None and elapsed > timeout_sec:
+                reason = "历史遗留运行中任务已超时失联，已自动回收"
+
+            if reason:
+                obj["status"] = "error"
+                obj["stderr"] = reason
+                obj["summary"] = reason
+                obj["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                obj["reaped_zombie"] = True
                 atomic_write_json(fp, obj)
                 try:
                     os.utime(fp, ns=(orig_stat.st_atime_ns, orig_stat.st_mtime_ns))
                 except OSError:
                     pass
                 reaped += 1
-            except Exception:
-                pass
+        except Exception:
+            # Isolate corrupt/unreadable task files so one bad record never aborts startup or blocks other tasks
+            continue
     return reaped
+
+
+def cleanup_running_task_processes() -> int:
+    """Safely terminate ONLY verified active L3 task subprocess trees during shutdown/restart (P1-15 + P1-17).
+
+    Never touches user browser windows opened via L1 `pc_open_app_or_web`.
+    """
+    try:
+        if not ACTIVE_DIR.exists():
+            return 0
+        task_files = sorted(ACTIVE_DIR.glob("*.json"))
+    except Exception:
+        return 0
+
+    cleaned = 0
+    for fp in task_files:
+        try:
+            if fp.is_symlink():
+                continue
+            obj = json.loads(fp.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict) or obj.get("status") != "running":
+                continue
+            started_ts = _safe_float(obj.get("started_ts"), 0.0)
+            child_pid = _safe_int(obj.get("pid"), None)
+            child_ct = _safe_float(obj.get("pid_create_time"), 0.0) or None
+            if child_pid and is_same_process(child_pid, child_ct, started_ts=started_ts, role="child"):
+                verified_ct = child_ct or get_process_create_time(child_pid)
+                kill_process_tree(child_pid, grace_seconds=1.5, expected_create_time=verified_ct)
+                cleaned += 1
+            obj["status"] = "error"
+            obj["stderr"] = "宿主机 MCP 服务关闭/重启，已清理 L3 子进程树"
+            obj["summary"] = obj["stderr"]
+            obj["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            obj["reaped_zombie"] = True
+            atomic_write_json(fp, obj)
+        except Exception:
+            continue
+    return cleaned
 
 
 def load_last_active_task(backend: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -685,7 +1020,7 @@ BACKENDS: Dict[str, L3Backend] = {
 
 def get_backend(name: Optional[str] = None) -> L3Backend:
     key = (name or read_l3_config()["backend"]).strip().lower()
-    return BACKENDS.get(key, BACKENDS["antigravity"])
+    return BACKENDS.get(key, BACKENDS[DEFAULT_L3_BACKEND])
 
 
 def get_status_overview() -> Dict[str, Any]:
@@ -710,6 +1045,8 @@ def get_status_overview() -> Dict[str, Any]:
         "workbuddy_cmd": cfg["workbuddy_cmd"],
         "workbuddy_auto_approve": cfg["workbuddy_auto_approve"],
         "timeout_seconds": cfg["timeout_seconds"],
+        "writable_fields": ["backend", "timeout_seconds"],
+        "host_env_only_fields": ["workdir", "dsh_cmd", "workbuddy_cmd", "workbuddy_auto_approve"],
         "detected": detected,
         "checked_at": time.strftime("%H:%M:%S"),
     }

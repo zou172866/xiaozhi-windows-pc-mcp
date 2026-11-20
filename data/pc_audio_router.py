@@ -8,6 +8,7 @@ Falls back seamlessly to ESP32 built-in speaker if host 18900 audio bridge is un
 from __future__ import annotations
 
 import asyncio
+import functools
 import io
 import json
 import math
@@ -20,19 +21,21 @@ from typing import Dict, Optional, Tuple
 
 import httpx
 
+import patch_registry
+import runtime_events
+import runtime_settings
+import xz_common
+
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
 DATA_DIR = os.path.join(ROOT_DIR, "data")
-AUDIO_MODE_PATH = os.path.join(DATA_DIR, "audio_output_mode.json")
+_DEFAULT_AUDIO_MODE_PATH = os.path.join(DATA_DIR, "audio_output_mode.json")
+AUDIO_MODE_PATH = _DEFAULT_AUDIO_MODE_PATH
 PC_MCP_TOKEN_PATH = os.path.join(DATA_DIR, "pc_mcp_token.txt")
 PC_AUDIO_HOST = os.environ.get("PC_AUDIO_BRIDGE_URL", "http://host.docker.internal:18900").rstrip("/")
 
 _cfg_lock = threading.Lock()
 _cfg_mtime = -1.0
 _cfg_cache = {"target": "esp32", "volume": 1.0}
-
-_tok_lock = threading.Lock()
-_tok_mtime = -1.0
-_tok_cache = ""
 
 _health_lock = threading.Lock()
 _health_ts = 0.0
@@ -49,28 +52,12 @@ _async_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.Asyn
 
 
 def read_pc_mcp_token() -> str:
-    """Read shared local 18900 Bearer token with mtime cache."""
-    global _tok_mtime, _tok_cache
-    try:
-        if not os.path.isfile(PC_MCP_TOKEN_PATH):
-            return ""
-        st = os.stat(PC_MCP_TOKEN_PATH)
-        with _tok_lock:
-            if st.st_mtime != _tok_mtime:
-                with open(PC_MCP_TOKEN_PATH, "r", encoding="utf-8") as f:
-                    _tok_cache = f.read().strip()
-                _tok_mtime = st.st_mtime
-            return _tok_cache
-    except Exception:
-        return _tok_cache
+    """Read shared local 18900 Bearer token with mtime cache via xz_common."""
+    return xz_common.read_token_file(PC_MCP_TOKEN_PATH)
 
 
 def get_pc_mcp_auth_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    headers = dict(extra) if extra else {}
-    tok = read_pc_mcp_token()
-    if tok:
-        headers["Authorization"] = f"Bearer {tok}"
-    return headers
+    return xz_common.get_pc_mcp_auth_headers(extra, token_path=PC_MCP_TOKEN_PATH)
 
 
 def _get_sync_client() -> httpx.Client:
@@ -97,29 +84,14 @@ def _get_async_client() -> httpx.AsyncClient:
 
 
 def _atomic_write_json(path: str, payload: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    xz_common.atomic_write_json(path, payload)
 
 
 def read_audio_output_config() -> dict:
-    """Read audio_output_mode.json with mtime caching (sub-microsecond hot path)."""
+    """Read audio_output settings from unified runtime_settings.json (or custom monkeypatched path)."""
     global _cfg_mtime, _cfg_cache
+    if AUDIO_MODE_PATH == _DEFAULT_AUDIO_MODE_PATH:
+        return runtime_settings.get_audio_output()
     try:
         if not os.path.exists(AUDIO_MODE_PATH):
             return dict(_cfg_cache)
@@ -128,15 +100,7 @@ def read_audio_output_config() -> dict:
             if st.st_mtime != _cfg_mtime:
                 with open(AUDIO_MODE_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f) or {}
-                target = str(data.get("target") or "esp32").strip().lower()
-                if target not in ("esp32", "pc"):
-                    target = "esp32"
-                try:
-                    vol = float(data.get("volume", 1.0))
-                except Exception:
-                    vol = 1.0
-                vol = round(max(0.2, min(1.5, vol)), 2)
-                _cfg_cache = {"target": target, "volume": vol}
+                _cfg_cache = runtime_settings.normalize_audio_output(data)
                 _cfg_mtime = st.st_mtime
             return dict(_cfg_cache)
     except Exception:
@@ -145,6 +109,8 @@ def read_audio_output_config() -> dict:
 
 def write_audio_output_config(target: str, volume: Optional[float] = None) -> dict:
     global _cfg_mtime, _cfg_cache
+    if AUDIO_MODE_PATH == _DEFAULT_AUDIO_MODE_PATH:
+        return runtime_settings.set_audio_output(target=target, volume=volume)
     cur = read_audio_output_config()
     t = str(target or cur["target"]).strip().lower()
     if t not in ("esp32", "pc"):
@@ -403,11 +369,18 @@ def apply_pc_audio_to_tts_patch() -> None:
     MarkdownCleaner = getattr(tts_base_mod, "MarkdownCleaner", None)
 
     if getattr(TTSProviderBase, "_pc_audio_tts_patched", False):
+        if patch_registry.get_patch_status("pc_audio_tts") is None:
+            patch_registry.record_patch("pc_audio_tts", "ok", target="TTSProviderBase.to_tts_stream", detail="already applied")
         return
 
     _orig_to_tts_stream = TTSProviderBase.to_tts_stream
+    ok_sig, sig_det = patch_registry.verify_signature_contract(
+        _orig_to_tts_stream, required_params=("self", "text"), require_async=False
+    )
 
-    def _pc_aware_to_tts_stream(self, text, opus_handler=None):
+    @functools.wraps(_orig_to_tts_stream)
+    def _pc_aware_to_tts_stream(self, text, *args, **kwargs):
+        opus_handler = kwargs.get("opus_handler", args[0] if args else None)
         cfg = read_audio_output_config()
         conn = getattr(self, "conn", None)
         if (
@@ -417,7 +390,7 @@ def apply_pc_audio_to_tts_patch() -> None:
             or opus_handler is None
             or not is_pc_audio_bridge_online()
         ):
-            return _orig_to_tts_stream(self, text, opus_handler=opus_handler)
+            return _orig_to_tts_stream(self, text, *args, **kwargs)
 
         original_text = text
         clean_text = MarkdownCleaner.clean_markdown(text) if MarkdownCleaner is not None else text
@@ -452,7 +425,7 @@ def apply_pc_audio_to_tts_patch() -> None:
             base_logger.bind(tag=BASE_TAG).warning(
                 f"[PCAudioRouter] WAV 转换失败，自动回退 ESP32 喇叭: {exc}"
             )
-            return _orig_to_tts_stream(self, text, opus_handler=opus_handler)
+            return _orig_to_tts_stream(self, text, *args, **kwargs)
 
         cur_sid = getattr(self, "current_sentence_id", None) or getattr(conn, "sentence_id", None)
         _enqueue_pc_clip(conn, cur_sid, original_text, wav_bytes, dur_ms, cfg["volume"])
@@ -474,6 +447,13 @@ def apply_pc_audio_to_tts_patch() -> None:
 
     TTSProviderBase.to_tts_stream = _pc_aware_to_tts_stream
     TTSProviderBase._pc_audio_tts_patched = True
+    patch_registry.record_patch(
+        "pc_audio_tts",
+        "ok" if ok_sig else "failed",
+        target="TTSProviderBase.to_tts_stream",
+        detail=sig_det,
+        contract_ok=ok_sig,
+    )
 
 
 def apply_pc_audio_playback_patches() -> None:
@@ -484,26 +464,45 @@ def apply_pc_audio_playback_patches() -> None:
     from core.providers.tts.dto.dto import SentenceType
 
     if getattr(send_audio_mod, "_pc_audio_playback_patched", False):
+        if patch_registry.get_patch_status("pc_audio_playback") is None:
+            patch_registry.record_patch("pc_audio_playback", "ok", target="sendAudioHandle/helloHandle/abortHandle", detail="already applied")
         return
 
     # 1. Wrap _wait_for_audio_completion so PC mode doesn't pay the 240ms+ ESP32 drain sleep TWICE
     _orig_wait_completion = send_audio_mod._wait_for_audio_completion
+    _orig_send_tts_message = send_audio_mod.send_tts_message
+    import core.handle.helloHandle as hello_mod
+    _orig_hello_send_audio = hello_mod.sendAudioMessage
+    _orig_abort = abort_mod.handleAbortMessage
 
-    async def _pc_aware_wait_completion(conn):
+    pb_checks = [
+        ("sendAudioHandle._wait_for_audio_completion", _orig_wait_completion, ("conn",), True),
+        ("sendAudioHandle.send_tts_message", _orig_send_tts_message, ("conn", "state"), True),
+        ("helloHandle.sendAudioMessage", _orig_hello_send_audio, ("conn", "sentenceType", "audios", "text"), True),
+        ("abortHandle.handleAbortMessage", _orig_abort, ("conn",), True),
+    ]
+    pb_failures = []
+    for cname, cfn, req_p, req_a in pb_checks:
+        ok_s, det = patch_registry.verify_signature_contract(cfn, required_params=req_p, require_async=req_a)
+        if not ok_s:
+            pb_failures.append(f"{cname}: {det}")
+
+    @functools.wraps(_orig_wait_completion)
+    async def _pc_aware_wait_completion(conn, *args, **kwargs):
         if conn is not None:
             skip_sid = getattr(conn, "_pc_audio_skip_wait_once", None)
             if skip_sid is not None and skip_sid == getattr(conn, "sentence_id", None):
                 conn._pc_audio_skip_wait_once = None
                 if not (getattr(conn, "config", None) or {}).get("enable_stop_tts_notify", False):
                     return
-        return await _orig_wait_completion(conn)
+        return await _orig_wait_completion(conn, *args, **kwargs)
 
     send_audio_mod._wait_for_audio_completion = _pc_aware_wait_completion
+    rebound_all = patch_registry.rebind(_orig_wait_completion, _pc_aware_wait_completion)
 
-    # 2. Patch send_tts_message FIRST (before importing helloHandle) so every module binds to it
-    _orig_send_tts_message = send_audio_mod.send_tts_message
-
-    async def _pc_aware_send_tts_message(conn, state, text=None):
+    # 2. Patch send_tts_message and rebind across ALL sys.modules (including listenMessageHandler & helloHandle!)
+    @functools.wraps(_orig_send_tts_message)
+    async def _pc_aware_send_tts_message(conn, state, text=None, *args, **kwargs):
         if conn is not None:
             _ensure_conn_pc_state(conn)
             cur_sid = getattr(conn, "sentence_id", None)
@@ -542,23 +541,22 @@ def apply_pc_audio_playback_patches() -> None:
                 conn._pc_audio_queued_ms = 0
                 conn._pc_audio_skip_wait_once = cur_sid
                 try:
-                    return await _orig_send_tts_message(conn, state, text)
+                    return await _orig_send_tts_message(conn, state, text, *args, **kwargs)
                 finally:
                     if getattr(conn, "_pc_audio_skip_wait_once", None) == cur_sid:
                         conn._pc_audio_skip_wait_once = None
 
-        return await _orig_send_tts_message(conn, state, text)
+        return await _orig_send_tts_message(conn, state, text, *args, **kwargs)
 
     send_audio_mod.send_tts_message = _pc_aware_send_tts_message
     send_audio_mod._pc_audio_playback_patched = True
+    # P1-12: Rebind EVERY imported reference (including early-bound listenMessageHandler.send_tts_message!)
+    rebound_all += patch_registry.rebind(_orig_send_tts_message, _pc_aware_send_tts_message)
+    hello_mod.send_tts_message = _pc_aware_send_tts_message
 
     # 3. Patch helloHandle.sendAudioMessage so wakeup replies ("我在这里哦！") also play on PC speakers
-    import core.handle.helloHandle as hello_mod
-
-    hello_mod.send_tts_message = _pc_aware_send_tts_message
-    _orig_hello_send_audio = hello_mod.sendAudioMessage
-
-    async def _pc_aware_hello_send_audio(conn, sentenceType, audios, text, sentence_id=None):
+    @functools.wraps(_orig_hello_send_audio)
+    async def _pc_aware_hello_send_audio(conn, sentenceType, audios, text, *args, **kwargs):
         cfg = read_audio_output_config()
         if (
             cfg["target"] == "pc"
@@ -582,14 +580,16 @@ def apply_pc_audio_playback_patches() -> None:
                     audios = [silent_pkt] * max(1, int(math.ceil(dur_ms / 60.0)))
             except Exception as exc:
                 print(f"[PCAudioRouter] 唤醒回复转电脑音响跳过，回退 ESP32: {exc}", flush=True)
-        return await _orig_hello_send_audio(conn, sentenceType, audios, text, sentence_id)
+        return await _orig_hello_send_audio(conn, sentenceType, audios, text, *args, **kwargs)
 
     hello_mod.sendAudioMessage = _pc_aware_hello_send_audio
+    # Only rebind hello_mod's own sendAudioMessage references (not sendAudioHandle.sendAudioMessage!)
+    rebound_all += patch_registry.rebind(_orig_hello_send_audio, _pc_aware_hello_send_audio, module_prefixes=("core.handle.helloHandle",))
 
-    # 4. Patch abortHandle.handleAbortMessage (and any importers) to cut off PC speakers in <5ms
-    _orig_abort = abort_mod.handleAbortMessage
-
-    async def _pc_aware_abort(conn):
+    # 4. Patch abortHandle.handleAbortMessage (and all importers via universal rebind) to cut off PC speakers in <5ms
+    #    and publish tts_state("stop") to runtime_events because upstream handleAbortMessage sends WS JSON directly.
+    @functools.wraps(_orig_abort)
+    async def _pc_aware_abort(conn, *args, **kwargs):
         if conn is not None:
             _ensure_conn_pc_state(conn)
             _clear_pc_clips(conn)
@@ -598,13 +598,30 @@ def apply_pc_audio_playback_patches() -> None:
             conn._pc_audio_queued_ms = 0
             if was_pc:
                 await _post_stop_to_pc()
-        return await _orig_abort(conn)
+        try:
+            return await _orig_abort(conn, *args, **kwargs)
+        finally:
+            try:
+                runtime_events.publish_event(
+                    "tts_state",
+                    state="stop",
+                    text=None,
+                    device_id=str(getattr(conn, "device_id", "") or ""),
+                    sentence_id=str(getattr(conn, "sentence_id", "") or ""),
+                    reason="abort",
+                )
+            except Exception:
+                pass
 
     abort_mod.handleAbortMessage = _pc_aware_abort
-    # Update any module that may already have imported handleAbortMessage
-    for mod_name in ("core.handle.receiveAudioHandle", "core.handle.textHandler.abortMessageHandler"):
-        mod = __import__("sys").modules.get(mod_name)
-        if mod is not None and hasattr(mod, "handleAbortMessage"):
-            setattr(mod, "handleAbortMessage", _pc_aware_abort)
+    rebound_all += patch_registry.rebind(_orig_abort, _pc_aware_abort)
 
+    patch_registry.record_patch(
+        "pc_audio_playback",
+        "ok" if not pb_failures else "failed",
+        target="sendAudioHandle/helloHandle/abortHandle",
+        detail="; ".join(pb_failures) if pb_failures else "ok",
+        contract_ok=not pb_failures,
+        rebound=rebound_all,
+    )
     print("[PCAudioRouter] 已挂载电脑音响直出桥接 (48kHz 无损 + 18080 热切换 + 毫秒级打断停止)", flush=True)

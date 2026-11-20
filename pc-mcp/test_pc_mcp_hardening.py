@@ -249,29 +249,41 @@ class TestPcControlMcpHardening(unittest.TestCase):
         def _fake_copy(val):
             copied_calls.append(val)
 
-        with (
-            patch.object(pcm, "_check_permission", return_value=None),
-            patch.object(pcm.pyautogui, "hotkey"),
-            patch.object(pcm.pyautogui, "press"),
-            patch.object(pcm.time, "sleep"),
-            patch.object(pcm.pyperclip, "copy", side_effect=_fake_copy),
-            patch.object(pcm.pyperclip, "paste", return_value="hello"),
-        ):
-            # Case A: clipboard holds non-text (e.g. screenshot image) -> IsClipboardFormatAvailable(13) == 0 -> must NOT overwrite with ""
-            with patch.object(pcm._user32, "IsClipboardFormatAvailable", return_value=0):
-                copied_calls.clear()
-                res = pcm.pc_ui_action(action="type_text", text="hello")
-                self.assertIn("已输入文本", res)
-                self.assertEqual(copied_calls, ["hello"])
+        benign_fg = {
+            "hwnd": 1001,
+            "pid": 4321,
+            "process": "notepad.exe",
+            "class": "Notepad",
+            "title": "无标题 - 记事本",
+        }
 
-            # Case B: clipboard holds previous text -> restores previous text after paste
+        with tempfile.TemporaryDirectory() as td:
+            audit_file = Path(td) / "l2_audit.jsonl"
             with (
-                patch.object(pcm._user32, "IsClipboardFormatAvailable", return_value=1),
-                patch.object(pcm.pyperclip, "paste", side_effect=["previous-clip", "hello"]),
+                patch.object(pcm, "_check_permission", return_value=None),
+                patch.object(pcm, "_get_foreground_window_info", return_value=benign_fg),
+                patch.object(pcm, "L2_AUDIT_LOG_FILE", audit_file),
+                patch.object(pcm.pyautogui, "hotkey"),
+                patch.object(pcm.pyautogui, "press"),
+                patch.object(pcm.time, "sleep"),
+                patch.object(pcm.pyperclip, "copy", side_effect=_fake_copy),
+                patch.object(pcm.pyperclip, "paste", return_value="hello"),
             ):
-                copied_calls.clear()
-                pcm.pc_ui_action(action="type_text", text="hello")
-                self.assertEqual(copied_calls, ["hello", "previous-clip"])
+                # Case A: clipboard holds non-text (e.g. screenshot image) -> IsClipboardFormatAvailable(13) == 0 -> must NOT overwrite with ""
+                with patch.object(pcm._user32, "IsClipboardFormatAvailable", return_value=0):
+                    copied_calls.clear()
+                    res = pcm.pc_ui_action(action="type_text", text="hello")
+                    self.assertIn("已输入文本", res)
+                    self.assertEqual(copied_calls, ["hello"])
+
+                # Case B: clipboard holds previous text -> restores previous text after paste
+                with (
+                    patch.object(pcm._user32, "IsClipboardFormatAvailable", return_value=1),
+                    patch.object(pcm.pyperclip, "paste", side_effect=["previous-clip", "hello"]),
+                ):
+                    copied_calls.clear()
+                    pcm.pc_ui_action(action="type_text", text="hello")
+                    self.assertEqual(copied_calls, ["hello", "previous-clip"])
 
 
 if __name__ == "__main__":

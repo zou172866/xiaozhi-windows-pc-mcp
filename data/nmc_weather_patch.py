@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import httpx
+import patch_registry
+import xz_common
 from config.logger import setup_logging
 from plugins_func.register import (
     Action,
@@ -63,6 +65,13 @@ NMC_WEATHER_FUNCTION_DESC = {
 
 _stations_list: list[dict] = []
 _stations_lock = asyncio.Lock()
+_MIN_COMPLETE_STATIONS = 500
+_MIN_PROVINCE_SUCCESS_RATIO = 0.90
+_MIN_EXPECTED_PROVINCES = 25
+
+
+def _atomic_write_stations_cache(path: str, stations: list[dict]) -> None:
+    xz_common.atomic_write_json(path, stations, indent=None)
 
 
 def _is_valid_val(v) -> bool:
@@ -82,38 +91,53 @@ async def _ensure_stations_loaded() -> list[dict]:
     async with _stations_lock:
         if _stations_list:
             return _stations_list
+        existing_disk: list[dict] = []
         if os.path.exists(STATIONS_CACHE_PATH):
             try:
                 with open(STATIONS_CACHE_PATH, "r", encoding="utf-8") as f:
                     cached = json.load(f)
-                    if isinstance(cached, list) and len(cached) > 500:
-                        _stations_list = cached
-                        return _stations_list
+                    if isinstance(cached, list):
+                        existing_disk = cached
+                        if len(cached) > _MIN_COMPLETE_STATIONS:
+                            _stations_list = cached
+                            return _stations_list
             except Exception:
                 pass
 
         # 从中央气象台一次性拉取全国 34 省级行政区全部站点并本地持久化
         sem = asyncio.Semaphore(8)
         collected: list[dict] = []
-        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0), headers=HEADERS) as client:
-            prov_resp = await client.get("https://www.nmc.cn/rest/province/all")
-            provinces = prov_resp.json()
+        total_provinces = 0
+        ok_provinces = 0
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0), headers=HEADERS) as client:
+                prov_resp = await client.get("https://www.nmc.cn/rest/province/all")
+                if prov_resp.status_code != 200:
+                    raise RuntimeError(f"province/all HTTP {prov_resp.status_code}")
+                provinces = prov_resp.json()
+                if not isinstance(provinces, list):
+                    provinces = []
+                prov_codes = [p["code"] for p in provinces if isinstance(p, dict) and p.get("code")]
+                total_provinces = len(prov_codes)
 
-            async def _fetch_prov(pcode: str):
-                async with sem:
-                    try:
-                        r = await client.get(f"https://www.nmc.cn/rest/province/{pcode}")
-                        if r.status_code == 200:
-                            return r.json()
-                    except Exception:
-                        pass
-                return []
+                async def _fetch_prov(pcode: str) -> tuple[bool, list]:
+                    async with sem:
+                        try:
+                            r = await client.get(f"https://www.nmc.cn/rest/province/{pcode}")
+                            if r.status_code == 200:
+                                data = r.json()
+                                if isinstance(data, list):
+                                    return True, data
+                        except Exception:
+                            pass
+                    return False, []
 
-            results = await asyncio.gather(*[_fetch_prov(p["code"]) for p in provinces if p.get("code")])
-            for arr in results:
-                if isinstance(arr, list):
+                results = await asyncio.gather(*[_fetch_prov(code) for code in prov_codes])
+                for ok_flag, arr in results:
+                    if ok_flag:
+                        ok_provinces += 1
                     for item in arr:
-                        if item.get("code") and item.get("city"):
+                        if isinstance(item, dict) and item.get("code") and item.get("city"):
                             collected.append(
                                 {
                                     "code": item["code"],
@@ -121,15 +145,30 @@ async def _ensure_stations_loaded() -> list[dict]:
                                     "city": item["city"],
                                 }
                             )
+        except Exception as exc:
+            logger.bind(tag=TAG).warning(f"拉取中央气象台站点列表失败: {exc}")
+            return existing_disk
 
-        if collected:
+        is_complete = (
+            total_provinces >= _MIN_EXPECTED_PROVINCES
+            and (ok_provinces / float(total_provinces)) >= _MIN_PROVINCE_SUCCESS_RATIO
+            and len(collected) > _MIN_COMPLETE_STATIONS
+        )
+        if is_complete:
             _stations_list = collected
-            try:
-                with open(STATIONS_CACHE_PATH, "w", encoding="utf-8") as f:
-                    json.dump(collected, f, ensure_ascii=False)
-            except Exception:
-                pass
-        return _stations_list
+            if len(collected) >= len(existing_disk):
+                try:
+                    _atomic_write_stations_cache(STATIONS_CACHE_PATH, collected)
+                except Exception as exc:
+                    logger.bind(tag=TAG).warning(f"写入气象站点缓存失败: {exc}")
+            return _stations_list
+
+        # 部分省份抓取失败时绝不将残缺站点表写盘覆盖完整缓存，也不永久锁死内存表，下次查询继续重试
+        logger.bind(tag=TAG).warning(
+            f"中央气象台站点表拉取不完整 ({ok_provinces}/{total_provinces} 省, {len(collected)} 站点)，"
+            "跳过落盘以免覆盖完整缓存"
+        )
+        return collected if len(collected) >= len(existing_disk) else existing_disk
 
 
 def _match_station(query: str, stations: list[dict]) -> dict | None:
@@ -197,7 +236,7 @@ async def _fetch_overseas_wttr(location: str) -> str | None:
         return None
 
 
-async def nmc_get_weather(conn, location: str = None, lang: str = "zh_CN"):
+async def nmc_get_weather(conn, location: str = None, lang: str = "zh_CN", *args, **kwargs):
     from core.utils.cache.manager import CacheType, cache_manager
 
     weather_cfg = conn.config.get("plugins", {}).get("get_weather", {})
@@ -291,12 +330,26 @@ def apply_nmc_weather_patch():
     # 先导入原始模块使其进入 sys.modules，防止后续 auto_import_modules 覆盖我们的注册项
     import plugins_func.functions.get_weather as orig_mod
 
+    orig_fn = getattr(orig_mod, "get_weather", None)
+    ok_sig, det_sig = patch_registry.verify_signature_contract(
+        orig_fn, required_params=("conn",), require_async=None
+    )
+
     orig_mod.GET_WEATHER_FUNCTION_DESC = NMC_WEATHER_FUNCTION_DESC
     orig_mod.get_weather = nmc_get_weather
+    rebound = patch_registry.rebind(orig_fn, nmc_get_weather) if orig_fn is not None else []
     all_function_registry["get_weather"] = FunctionItem(
         "get_weather",
         NMC_WEATHER_FUNCTION_DESC,
         nmc_get_weather,
         ToolType.SYSTEM_CTL,
+    )
+    patch_registry.record_patch(
+        "nmc_weather",
+        "ok" if ok_sig else "failed",
+        target="plugins_func.functions.get_weather",
+        detail=det_sig,
+        contract_ok=ok_sig,
+        rebound=rebound,
     )
     print("[NMCWeather] 已启用中央气象台免Key全国实时+7天天气插件", flush=True)

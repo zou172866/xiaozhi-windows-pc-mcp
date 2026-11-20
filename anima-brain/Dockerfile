@@ -20,6 +20,7 @@ COPY ui ./ui
 RUN pip install --no-cache-dir -e ".[http,calls]"
 
 COPY --from=web-builder /build/examples/showcase/dist /app/examples/showcase/dist
+COPY obsidian_exporter.py /app/obsidian_exporter.py
 COPY xiaozhi_anima_service.py /app/xiaozhi_anima_service.py
 
 EXPOSE 18787

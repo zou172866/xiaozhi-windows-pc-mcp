@@ -261,6 +261,7 @@
   .toggle-switch input:checked + .toggle-slider { background: var(--accent); }
   .toggle-switch input:checked + .toggle-slider::before { transform: translateX(18px); }
   .toggle-switch input:focus-visible + .toggle-slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .toggle-switch input:disabled + .toggle-slider { opacity: 0.5; cursor: not-allowed; }
   .rel-stage-badge {
     font-size: 12px;
     font-weight: 550;
@@ -532,17 +533,17 @@
         </button>
         <button type="button" class="mode-btn active" data-mode="safe">
           <strong>日常 / 游戏安全挡（推荐）</strong>
-          <span>开启 L1 音量/开软件/看屏幕 + L3 后台 Agent 派单；锁定鼠标键盘防误触</span>
+          <span>仅开启 L1 音量/开软件/看屏幕；锁定 L2 鼠标键盘与 L3 后台 Agent 派单防误触</span>
         </button>
         <button type="button" class="mode-btn" data-mode="full">
-          <strong>全权操控挡（解锁键鼠）</strong>
-          <span>L1 + L2 窗口按钮点击/打字输入 + L3 后台 Agent 全权限开放</span>
+          <strong>全权操控挡（解锁键鼠与 L3）</strong>
+          <span>L1 + L2 窗口按钮点击/打字输入（含安全护栏）+ L3 后台 Agent 派单全权限开放</span>
         </button>
       </div>
 
       <div class="l3-box">
         <div class="l3-head">
-          <strong>L3 后台 Agent 引擎（复杂任务派单 · 免重启切换）</strong>
+          <strong>L3 后台 Agent 引擎（复杂任务派单 · 仅「全权操控挡」放行）</strong>
           <span id="l3BackendBadge" class="rel-stage-badge">检测中…</span>
         </div>
         <div class="preset-bar" id="l3BackendBar" style="margin-bottom:6px;">
@@ -553,33 +554,37 @@
         </div>
         <div class="field-foot" style="margin-top:4px;">
           <span>后端探测状态：<strong id="agyStatusText">检测中…</strong></span>
-          <span>切换引擎即刻生效，无需重启</span>
+          <span id="l3ModeGateHint" style="color:var(--warn);">当前挡位已锁定 L3（需切至「全权操控挡」才允许派单）</span>
         </div>
         <details class="l3-adv" id="l3AdvDetails">
-          <summary>高级设置（默认工作目录 / 自定义 DSH 或 WorkBuddy 命令路径）</summary>
+          <summary>高级设置与宿主机环境信息（超时热调 / 宿主机 .env 只读配置）</summary>
           <div class="l3-adv-grid">
             <div>
-              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WorkdirInput">默认工作目录（留空自动取项目上级目录）</label>
-              <input type="text" id="l3WorkdirInput" placeholder="例如 D:\Projects 或留空自动探测">
+              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3TimeoutInput">任务超时秒数（30～1800 秒 · 免重启生效）</label>
+              <input type="number" id="l3TimeoutInput" min="30" max="1800" step="30" value="300" style="font-size:12.5px;padding:6px 9px;">
             </div>
             <div>
-              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3DshCmdInput">DSH 自定义命令（留空自动探测 dsh / npx）</label>
-              <input type="text" id="l3DshCmdInput" placeholder="留空自动探测 dsh 或 npx @deepseek-ai/dsh">
+              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WorkdirInput">宿主机工作目录（只读 · 仅限宿主机 .env）</label>
+              <input type="text" id="l3WorkdirInput" readonly placeholder="自动取项目上级目录（宿主机 .env XIAOZHI_L3_WORKDIR）">
             </div>
             <div>
-              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WbCmdInput">WorkBuddy / CodeBuddy 自定义命令</label>
-              <input type="text" id="l3WbCmdInput" placeholder="留空自动探测 workbuddy / codebuddy / cbc">
+              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3DshCmdInput">DSH 命令路径（只读 · 仅限宿主机 .env）</label>
+              <input type="text" id="l3DshCmdInput" readonly placeholder="自动探测或由宿主机 .env DSH_CMD 指定">
+            </div>
+            <div>
+              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WbCmdInput">WorkBuddy / CodeBuddy 命令（只读 · 仅限宿主机 .env）</label>
+              <input type="text" id="l3WbCmdInput" readonly placeholder="自动探测或由宿主机 .env WORKBUDDY_CMD 指定">
             </div>
             <div style="display:flex;align-items:flex-end;">
-              <label style="display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-size:12.5px;color:var(--ink);">
-                <input type="checkbox" id="l3WbAutoApprove" checked style="width:auto;accent-color:var(--accent);">
-                <span>WorkBuddy 非交互自动确认（附加 -y 防卡住）</span>
+              <label style="display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink-muted);">
+                <input type="checkbox" id="l3WbAutoApprove" disabled style="width:auto;accent-color:var(--accent);">
+                <span>WorkBuddy 自动确认 -y（默认关闭 · 仅限宿主机 .env WORKBUDDY_AUTO_APPROVE）</span>
               </label>
             </div>
           </div>
           <div class="l3-adv-foot">
             <span style="font-size:12px;color:var(--ink-muted);" id="l3EffectiveWorkdirText">当前生效目录：--</span>
-            <button type="button" class="btn" id="l3SaveAdvBtn" style="padding:5px 12px;font-size:12.5px;">保存高级设置</button>
+            <button type="button" class="btn" id="l3SaveAdvBtn" style="padding:5px 12px;font-size:12.5px;">保存超时设置</button>
           </div>
         </details>
       </div>
@@ -648,6 +653,66 @@
       </div>
     </div>
 
+    <!-- Section 1c-2: Custom Idle Timeout Farewell (Fixed or Zero-Pollution LLM Summary, Hot-Update) -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">空闲超时告别语（免重启热更新）</h2>
+        <span id="idleFarewellBadge" class="rel-stage-badge num">120 秒</span>
+      </div>
+      <p class="section-desc">无人说话超过设定时长后触发告别并挂断；支持「固定随机台词」或「AI 总结本轮对话并表达依恋不舍」，全程不显示假用户字幕，也不会污染 Anima 长期记忆与 Obsidian。</p>
+
+      <div class="switch-row">
+        <div class="switch-row-label">
+          <strong>启用超时告别语音</strong>
+          <span id="idleFarewellToggleHint">开启后按所选模式播报告别语；关闭则静默断开连接</span>
+        </div>
+        <label class="toggle-switch" aria-label="启用空闲超时告别语音开关">
+          <input type="checkbox" id="idleFarewellToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="mode-grid-2" id="idleFarewellModeGrid" style="margin-bottom:10px;">
+        <button type="button" class="mode-btn active" data-farewell-mode="fixed">
+          <strong>固定随机台词（零 LLM）</strong>
+          <span>直接随机念下方自定义短句，零 token 消耗、秒级响应</span>
+        </button>
+        <button type="button" class="mode-btn" data-farewell-mode="llm_summary">
+          <strong>总结本轮对话 + 依恋不舍（AI 现场生成）</strong>
+          <span>简短呼应刚聊的话题并温柔道别，不入记忆；无对话或超时自动回退下方兜底句</span>
+        </button>
+      </div>
+
+      <div class="preset-bar" id="idleTimeoutPresetBar" style="margin-bottom:10px;">
+        <button type="button" class="preset-pill" data-idle-timeout="60">60 秒（1 分钟）</button>
+        <button type="button" class="preset-pill active" data-idle-timeout="120">120 秒（2 分钟 · 默认）</button>
+        <button type="button" class="preset-pill" data-idle-timeout="300">300 秒（5 分钟）</button>
+        <button type="button" class="preset-pill" data-idle-timeout="600">600 秒（10 分钟）</button>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:0;">
+        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">无声超时时长</span>
+        <input type="range" id="idleTimeoutRange" min="30" max="600" step="10" value="120" aria-label="无声超时秒数">
+        <strong id="idleTimeoutVal" class="num" style="font-size:12.5px;min-width:118px;text-align:right;">120 秒（2分）</strong>
+      </div>
+
+      <div id="idleFarewellSummaryWrap" style="display:none;margin-top:10px;">
+        <label class="field-label" for="idleFarewellPromptInput">AI 总结告别提示词（决定总结方式、依恋语气与字数上限）</label>
+        <textarea id="idleFarewellPromptInput" spellcheck="false" style="min-height:76px;" placeholder="描述你希望她如何总结本轮对话并表达不舍…"></textarea>
+      </div>
+
+      <label class="field-label" id="idleFarewellInputLabel" for="idleFarewellInput" style="margin-top:10px;">自定义告别台词（每行一句，超时随机播报；芽衣默认温柔声线，也支持 [tender] / [shy] 等标签）</label>
+      <textarea id="idleFarewellInput" spellcheck="false" style="min-height:84px;" placeholder="每行写一句告别台词，例如：&#10;哥哥先去忙吧，有事随时叫我。&#10;[tender] 那我先安静陪在一旁了，记得早点休息哦。"></textarea>
+
+      <div class="field-foot" style="margin-top:8px;align-items:center;">
+        <span id="idleFarewellMeta" class="num">已配置 2 句 · 修改后点右侧按钮立即生效</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button type="button" class="btn" id="idleFarewellPreviewBtn" style="padding:5px 11px;font-size:12.5px;">试听首句</button>
+          <button type="button" class="btn primary" id="idleFarewellSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存告别语</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Section 1d: Relationship & Intimacy Hot-Control (Instant Hot-Update, No Restart Required) -->
     <div class="config-section">
       <div class="section-head">
@@ -703,6 +768,39 @@
       </div>
     </div>
 
+    <!-- Section 1e: Obsidian One-Way Memory & Dialogue Export -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">Obsidian 同步（单向记忆与对话导出 · 免重启）</h2>
+        <span id="obsStatusBadge" class="rel-stage-badge num">检测中…</span>
+      </div>
+      <p class="section-desc">由 Anima Brain 自动将对话流水、芽衣记得的事、未完待续与关系状态单向导出为 Markdown（已自动脱敏 API Key 与密码）；平时冻结历史日，点「立即全量重建」可按最新模板重刷全部日期。</p>
+
+      <div class="switch-row">
+        <div class="switch-row-label">
+          <strong>启用自动单向导出</strong>
+          <span id="obsToggleHint">开启后每轮对话结束防抖 5 秒自动更新当天日志与记忆快照</span>
+        </div>
+        <label class="toggle-switch" aria-label="启用 Obsidian 单向同步开关">
+          <input type="checkbox" id="obsSyncToggle" disabled>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:0;justify-content:space-between;">
+        <div style="display:flex;flex-direction:column;gap:2px;min-width:0;flex:1;">
+          <span style="font-size:12px;color:var(--ink-secondary);">导出目录：<strong id="obsExportDirText" style="font-family:var(--font-mono);color:var(--ink);">--</strong></span>
+          <span style="font-size:12px;color:var(--ink-secondary);">上次导出：<strong id="obsLastExportText" class="num" style="color:var(--ink);">尚未导出</strong></span>
+        </div>
+        <button type="button" class="btn" id="obsRebuildBtn" style="padding:6px 13px;font-size:12.5px;white-space:nowrap;" disabled>立即全量重建</button>
+      </div>
+
+      <div class="field-foot">
+        <span>同步概览：<strong id="obsStatsText" class="num">检测中…</strong></span>
+        <span id="obsErrText" style="color:var(--ink-muted);">哈希未变自动跳过写入</span>
+      </div>
+    </div>
+
     <!-- Section 2: LLM Provider Switch (DeepSeek <-> Gemini) -->
     <div class="config-section">
       <h2 class="section-title" style="margin-bottom:6px;">对话与调度大模型 API（DeepSeek / Gemini 双模切换）</h2>
@@ -728,7 +826,7 @@
 
       <div class="field-foot">
         <span>环境变量状态：DeepSeek <strong id="dsKeyBadge">--</strong> · Gemini <strong id="gemKeyBadge">--</strong></span>
-        <span>切换 API 或模型后需点右上角「保存并重启生效」</span>
+        <span>修改后点击右上角「保存并立即生效」（支持免重启热更新）</span>
       </div>
     </div>
 
@@ -870,7 +968,9 @@
     agyStatusText: document.getElementById("agyStatusText"),
     l3BackendBar: document.getElementById("l3BackendBar"),
     l3BackendBadge: document.getElementById("l3BackendBadge"),
+    l3ModeGateHint: document.getElementById("l3ModeGateHint"),
     l3AdvDetails: document.getElementById("l3AdvDetails"),
+    l3TimeoutInput: document.getElementById("l3TimeoutInput"),
     l3WorkdirInput: document.getElementById("l3WorkdirInput"),
     l3DshCmdInput: document.getElementById("l3DshCmdInput"),
     l3WbCmdInput: document.getElementById("l3WbCmdInput"),
@@ -888,6 +988,20 @@
     storyCharsRange: document.getElementById("storyCharsRange"),
     storyCharsVal: document.getElementById("storyCharsVal"),
     replyMaxTokText: document.getElementById("replyMaxTokText"),
+    idleFarewellBadge: document.getElementById("idleFarewellBadge"),
+    idleFarewellToggle: document.getElementById("idleFarewellToggle"),
+    idleFarewellToggleHint: document.getElementById("idleFarewellToggleHint"),
+    idleFarewellModeGrid: document.getElementById("idleFarewellModeGrid"),
+    idleFarewellSummaryWrap: document.getElementById("idleFarewellSummaryWrap"),
+    idleFarewellPromptInput: document.getElementById("idleFarewellPromptInput"),
+    idleFarewellInputLabel: document.getElementById("idleFarewellInputLabel"),
+    idleTimeoutPresetBar: document.getElementById("idleTimeoutPresetBar"),
+    idleTimeoutRange: document.getElementById("idleTimeoutRange"),
+    idleTimeoutVal: document.getElementById("idleTimeoutVal"),
+    idleFarewellInput: document.getElementById("idleFarewellInput"),
+    idleFarewellMeta: document.getElementById("idleFarewellMeta"),
+    idleFarewellPreviewBtn: document.getElementById("idleFarewellPreviewBtn"),
+    idleFarewellSaveBtn: document.getElementById("idleFarewellSaveBtn"),
     relStageBadge: document.getElementById("relStageBadge"),
     relPresetBar: document.getElementById("relPresetBar"),
     relRomanceToggle: document.getElementById("relRomanceToggle"),
@@ -902,6 +1016,14 @@
     relRomRange: document.getElementById("relRomRange"),
     relRomVal: document.getElementById("relRomVal"),
     relStatusText: document.getElementById("relStatusText"),
+    obsStatusBadge: document.getElementById("obsStatusBadge"),
+    obsSyncToggle: document.getElementById("obsSyncToggle"),
+    obsToggleHint: document.getElementById("obsToggleHint"),
+    obsExportDirText: document.getElementById("obsExportDirText"),
+    obsLastExportText: document.getElementById("obsLastExportText"),
+    obsRebuildBtn: document.getElementById("obsRebuildBtn"),
+    obsStatsText: document.getElementById("obsStatsText"),
+    obsErrText: document.getElementById("obsErrText"),
     providerSelect: document.getElementById("providerSelect"),
     modelSelect: document.getElementById("modelSelect"),
     modelCustomInput: document.getElementById("modelCustomInput"),
@@ -929,7 +1051,8 @@
   let savedConfig = null;
   let isRestarting = false;
   let lastChatJson = "";
-  let lastLogsJson = "";
+  let logCursor = null;
+  let logLines = [];
 
   function showBanner(type, text, rightText = "") {
     els.banner.className = `banner show ${type}`;
@@ -946,6 +1069,15 @@
         btn.classList.add(m === "full" ? "active-full" : "active");
       }
     });
+    if (els.l3ModeGateHint) {
+      if (activeMode === "full") {
+        els.l3ModeGateHint.textContent = "全权操控挡已解锁 L3 派单（切换引擎即刻生效）";
+        els.l3ModeGateHint.style.color = "var(--accent)";
+      } else {
+        els.l3ModeGateHint.textContent = "当前挡位已锁定 L3（需切至「全权操控挡」才允许派单）";
+        els.l3ModeGateHint.style.color = "var(--warn)";
+      }
+    }
   }
 
   els.modeGrid.addEventListener("click", async (e) => {
@@ -961,7 +1093,7 @@
       });
       const res = await resp.json();
       if (res.ok) {
-        const names = { off: "关闭电脑操控", safe: "日常 / 游戏安全挡", full: "全权操控挡（已解锁键鼠）" };
+        const names = { off: "关闭电脑操控", safe: "日常 / 游戏安全挡", full: "全权操控挡（已解锁键鼠与 L3）" };
         showBanner("info", `电脑操控权限已即时切换为：${names[mode]}`);
         setTimeout(hideBanner, 2800);
       }
@@ -1006,10 +1138,13 @@
     }
     const advOpen = Boolean(els.l3AdvDetails && els.l3AdvDetails.open);
     if (!l3AdvSynced || !advOpen) {
+      if (els.l3TimeoutInput && typeof l3.timeout_seconds === "number") {
+        els.l3TimeoutInput.value = String(l3.timeout_seconds);
+      }
       if (els.l3WorkdirInput) els.l3WorkdirInput.value = l3.workdir || "";
       if (els.l3DshCmdInput) els.l3DshCmdInput.value = l3.dsh_cmd || "";
       if (els.l3WbCmdInput) els.l3WbCmdInput.value = l3.workbuddy_cmd || "";
-      if (els.l3WbAutoApprove) els.l3WbAutoApprove.checked = Boolean(l3.workbuddy_auto_approve !== false);
+      if (els.l3WbAutoApprove) els.l3WbAutoApprove.checked = Boolean(l3.workbuddy_auto_approve);
       l3AdvSynced = true;
     }
   }
@@ -1049,14 +1184,11 @@
 
   if (els.l3SaveAdvBtn) {
     els.l3SaveAdvBtn.addEventListener("click", () => {
+      const rawTimeout = els.l3TimeoutInput ? parseInt(els.l3TimeoutInput.value, 10) : 300;
+      const timeoutSeconds = Number.isFinite(rawTimeout) ? Math.max(30, Math.min(1800, rawTimeout)) : 300;
       saveL3Backend(
-        {
-          workdir: els.l3WorkdirInput ? els.l3WorkdirInput.value.trim() : "",
-          dsh_cmd: els.l3DshCmdInput ? els.l3DshCmdInput.value.trim() : "",
-          workbuddy_cmd: els.l3WbCmdInput ? els.l3WbCmdInput.value.trim() : "",
-          workbuddy_auto_approve: Boolean(els.l3WbAutoApprove && els.l3WbAutoApprove.checked)
-        },
-        "L3 后台 Agent 高级设置已保存并立即生效！"
+        { timeout_seconds: timeoutSeconds },
+        `L3 后台任务超时已更新为 ${timeoutSeconds} 秒！`
       );
     });
   }
@@ -1218,6 +1350,256 @@
       });
     });
   });
+
+  let idleFarewellDirty = false;
+  let idleFarewellDragging = false;
+  let idleFarewellSaving = false;
+  let idleFarewellMode = "fixed";
+
+  function formatIdleSeconds(sec) {
+    const s = Math.max(30, Math.min(1800, Math.round(Number(sec) || 120)));
+    const mins = Math.floor(s / 60);
+    const rem = s % 60;
+    if (mins <= 0) return `${s} 秒`;
+    return rem === 0 ? `${s} 秒（${mins}分）` : `${s} 秒（${mins}分${rem}秒）`;
+  }
+
+  function parseIdleFarewellLines(rawText) {
+    const out = [];
+    const seen = new Set();
+    for (const ln of String(rawText || "").split(/\r?\n/)) {
+      const s = ln.trim();
+      if (!s || seen.has(s)) continue;
+      seen.add(s);
+      out.push(s);
+      if (out.length >= 20) break;
+    }
+    return out;
+  }
+
+  function updateIdleFarewellDraftMeta() {
+    const lines = parseIdleFarewellLines(els.idleFarewellInput ? els.idleFarewellInput.value : "");
+    const enabled = Boolean(els.idleFarewellToggle && els.idleFarewellToggle.checked);
+    const isSummary = idleFarewellMode === "llm_summary";
+    const sec = Number(els.idleTimeoutRange ? els.idleTimeoutRange.value : 120) || 120;
+    if (els.idleTimeoutVal) els.idleTimeoutVal.textContent = formatIdleSeconds(sec);
+    if (els.idleFarewellModeGrid) {
+      els.idleFarewellModeGrid.querySelectorAll(".mode-btn").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.farewellMode === idleFarewellMode);
+      });
+    }
+    if (els.idleFarewellSummaryWrap) {
+      els.idleFarewellSummaryWrap.style.display = isSummary ? "block" : "none";
+    }
+    if (els.idleFarewellInputLabel) {
+      els.idleFarewellInputLabel.textContent = isSummary
+        ? "无对话或超时兜底台词（每行一句；当本轮未聊天或模型超时时自动改念这里）"
+        : "自定义告别台词（每行一句，超时随机播报；芽衣默认温柔声线，也支持 [tender] / [shy] 等标签）";
+    }
+    if (els.idleFarewellBadge) {
+      if (!enabled) {
+        els.idleFarewellBadge.textContent = `${sec} 秒 · 已关闭`;
+      } else if (isSummary) {
+        els.idleFarewellBadge.textContent = `${sec} 秒 · AI 总结`;
+      } else {
+        els.idleFarewellBadge.textContent = lines.length > 0 ? `${sec} 秒 · ${lines.length} 句` : `${sec} 秒 · 静默`;
+      }
+    }
+    if (els.idleTimeoutPresetBar) {
+      els.idleTimeoutPresetBar.querySelectorAll(".preset-pill").forEach(btn => {
+        btn.classList.toggle("active", Number(btn.dataset.idleTimeout) === sec);
+      });
+    }
+    if (els.idleFarewellToggleHint) {
+      els.idleFarewellToggleHint.textContent = enabled
+        ? (isSummary
+          ? "开启中：超时后由 AI 简短总结本轮对话并表达依恋不舍（不污染记忆）"
+          : "开启中：超时后直接随机播报下方自定义台词（零 LLM 消耗）")
+        : "已关闭超时告别语：无声达到设定时长后将直接静默断开连接";
+    }
+    if (els.idleFarewellMeta) {
+      const stateTag = idleFarewellDirty ? "未保存更改 · " : "";
+      if (isSummary) {
+        els.idleFarewellMeta.textContent = `${stateTag}AI 总结依恋模式 · 兜底句 ${lines.length} 条 · 免重启生效`;
+      } else {
+        els.idleFarewellMeta.textContent = lines.length > 0
+          ? `${stateTag}共 ${lines.length} 句（最多 20 句）· 免重启生效`
+          : `${stateTag}当前未填写台词（超时将静默断开）`;
+      }
+    }
+  }
+
+  function renderIdleFarewellUI(cfg) {
+    if (!cfg || idleFarewellDirty || idleFarewellDragging || idleFarewellSaving) return;
+    const enabled = cfg.enabled !== false;
+    idleFarewellMode = cfg.mode === "llm_summary" ? "llm_summary" : "fixed";
+    const sec = Math.max(30, Math.min(1800, Number(cfg.timeout_seconds) || 120));
+    const msgs = Array.isArray(cfg.messages) ? cfg.messages : [];
+    if (els.idleFarewellToggle) els.idleFarewellToggle.checked = enabled;
+    if (els.idleTimeoutRange) {
+      els.idleTimeoutRange.value = String(Math.min(600, Math.max(30, sec)));
+    }
+    if (els.idleFarewellPromptInput && typeof cfg.summary_prompt === "string") {
+      els.idleFarewellPromptInput.value = cfg.summary_prompt;
+    }
+    if (els.idleFarewellInput) {
+      els.idleFarewellInput.value = msgs.join("\n");
+    }
+    updateIdleFarewellDraftMeta();
+  }
+
+  async function saveIdleFarewell(overridePayload = null, toastText = "") {
+    if (idleFarewellSaving) return;
+    idleFarewellSaving = true;
+    if (els.idleFarewellSaveBtn) els.idleFarewellSaveBtn.disabled = true;
+    const payload = overridePayload || {
+      enabled: Boolean(els.idleFarewellToggle && els.idleFarewellToggle.checked),
+      mode: idleFarewellMode,
+      timeout_seconds: Number(els.idleTimeoutRange ? els.idleTimeoutRange.value : 120) || 120,
+      summary_prompt: els.idleFarewellPromptInput ? els.idleFarewellPromptInput.value.trim() : "",
+      messages: parseIdleFarewellLines(els.idleFarewellInput ? els.idleFarewellInput.value : "")
+    };
+    try {
+      const resp = await fetch("/api/idle-farewell", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const res = await resp.json();
+      if (!resp.ok || !res || !res.ok || !res.idle_farewell) {
+        throw new Error((res && res.error) || "保存超时告别语失败");
+      }
+      idleFarewellDirty = false;
+      idleFarewellSaving = false;
+      renderIdleFarewellUI(res.idle_farewell);
+      const saved = res.idle_farewell;
+      let msg = toastText;
+      if (!msg) {
+        if (!saved.enabled) {
+          msg = `超时设置已免重启生效（${saved.timeout_seconds} 秒无声 · 静默断开）`;
+        } else if (saved.mode === "llm_summary") {
+          msg = `已切至「总结本轮对话 + 依恋不舍」模式（${saved.timeout_seconds} 秒无声 · 兜底 ${saved.messages.length} 句）`;
+        } else if ((saved.messages || []).length > 0) {
+          msg = `超时告别语已免重启生效（${saved.timeout_seconds} 秒无声 · 共 ${saved.messages.length} 句随机）`;
+        } else {
+          msg = `超时设置已免重启生效（${saved.timeout_seconds} 秒无声 · 静默断开）`;
+        }
+      }
+      showBanner("info", msg);
+      setTimeout(hideBanner, 3200);
+    } catch (err) {
+      showBanner("err", `保存超时告别语失败：${err.message}`);
+    } finally {
+      idleFarewellSaving = false;
+      if (els.idleFarewellSaveBtn) els.idleFarewellSaveBtn.disabled = false;
+    }
+  }
+
+  if (els.idleFarewellToggle) {
+    els.idleFarewellToggle.addEventListener("change", () => {
+      updateIdleFarewellDraftMeta();
+      saveIdleFarewell();
+    });
+  }
+
+  if (els.idleFarewellModeGrid) {
+    els.idleFarewellModeGrid.addEventListener("click", (e) => {
+      const btn = e.target.closest(".mode-btn");
+      if (!btn) return;
+      const nextMode = btn.dataset.farewellMode;
+      if (!nextMode || nextMode === idleFarewellMode) return;
+      idleFarewellMode = nextMode;
+      updateIdleFarewellDraftMeta();
+      saveIdleFarewell();
+    });
+  }
+
+  if (els.idleFarewellPromptInput) {
+    els.idleFarewellPromptInput.addEventListener("input", () => {
+      idleFarewellDirty = true;
+      updateIdleFarewellDraftMeta();
+    });
+  }
+
+  if (els.idleTimeoutPresetBar) {
+    els.idleTimeoutPresetBar.addEventListener("click", (e) => {
+      const btn = e.target.closest(".preset-pill");
+      if (!btn) return;
+      const sec = Number(btn.dataset.idleTimeout);
+      if (!Number.isFinite(sec)) return;
+      if (els.idleTimeoutRange) els.idleTimeoutRange.value = String(sec);
+      updateIdleFarewellDraftMeta();
+      saveIdleFarewell();
+    });
+  }
+
+  if (els.idleTimeoutRange) {
+    els.idleTimeoutRange.addEventListener("input", () => {
+      idleFarewellDragging = true;
+      updateIdleFarewellDraftMeta();
+    });
+    els.idleTimeoutRange.addEventListener("change", () => {
+      idleFarewellDragging = false;
+      updateIdleFarewellDraftMeta();
+      saveIdleFarewell();
+    });
+  }
+
+  if (els.idleFarewellInput) {
+    els.idleFarewellInput.addEventListener("input", () => {
+      idleFarewellDirty = true;
+      updateIdleFarewellDraftMeta();
+    });
+  }
+
+  if (els.idleFarewellSaveBtn) {
+    els.idleFarewellSaveBtn.addEventListener("click", () => saveIdleFarewell());
+  }
+
+  if (els.idleFarewellPreviewBtn) {
+    els.idleFarewellPreviewBtn.addEventListener("click", async () => {
+      const lines = parseIdleFarewellLines(els.idleFarewellInput ? els.idleFarewellInput.value : "");
+      if (!lines.length) {
+        showBanner("warn", "请先输入至少一句自定义告别台词再试听。");
+        setTimeout(hideBanner, 2600);
+        return;
+      }
+      const sampleLine = lines[0];
+      const hasExplicitTag = /^[\s]*[\[\【<\（]/.test(sampleLine);
+      const oldText = els.idleFarewellPreviewBtn.textContent;
+      els.idleFarewellPreviewBtn.disabled = true;
+      els.idleFarewellPreviewBtn.textContent = "合成中…";
+      try {
+        const resp = await fetch("/api/tts-preview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            voice: els.voiceSelect.value,
+            text: sampleLine,
+            emotion: hasExplicitTag ? "auto" : "gentle"
+          })
+        });
+        if (!resp.ok) {
+          let errMsg = "告别语试听失败，请确认本机语音合成服务运行正常。";
+          try {
+            const errJson = await resp.json();
+            if (errJson && errJson.error) errMsg = errJson.error;
+          } catch (_) {}
+          throw new Error(errMsg);
+        }
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        els.previewAudio.src = url;
+        els.previewAudio.onended = () => URL.revokeObjectURL(url);
+        await els.previewAudio.play();
+      } catch (err) {
+        showBanner("err", (err && err.message) ? err.message : "告别语试听失败。");
+      } finally {
+        els.idleFarewellPreviewBtn.disabled = false;
+        els.idleFarewellPreviewBtn.textContent = oldText;
+      }
+    });
+  }
 
   let relDragging = false;
   let relSaving = false;
@@ -1387,6 +1769,189 @@
     });
   });
 
+  let obsBusy = false;
+  let obsOnline = false;
+  let obsPendingState = null;
+  const OBS_REASON_ZH = {
+    startup_backfill: "启动回填",
+    turn_commit: "对话触发",
+    db_change: "记忆变更",
+    snapshot_poll: "定时快照",
+    toggle_enabled: "开启同步",
+    manual_rebuild: "全量重建",
+    shutdown_flush: "关停刷盘"
+  };
+
+  function renderObsidianUI(obs) {
+    if (!obs || !els.obsStatusBadge) return;
+    const online = Boolean(obs.online);
+    obsOnline = online;
+    const enabled = Boolean(obs.enabled);
+    const writable = Boolean(obs.writable);
+    const st = obs.stats || {};
+
+    if (els.obsSyncToggle) els.obsSyncToggle.checked = enabled;
+    if (els.obsExportDirText) {
+      els.obsExportDirText.textContent = obs.host_export_dir || obs.export_dir || "--";
+    }
+    if (els.obsLastExportText) {
+      if (obs.last_export_at) {
+        const reasonZh = OBS_REASON_ZH[obs.last_export_reason] || obs.last_export_reason || "";
+        els.obsLastExportText.textContent = reasonZh ? `${obs.last_export_at}（${reasonZh}）` : obs.last_export_at;
+      } else {
+        els.obsLastExportText.textContent = enabled ? "等待首次同步" : "未开启";
+      }
+    }
+    if (els.obsToggleHint) {
+      els.obsToggleHint.textContent = enabled
+        ? "已开启：每轮对话结束防抖 5 秒自动更新当天日志与记忆快照"
+        : "已暂停：不会自动写入 Vault，仍可随时点击右侧「立即全量重建」手动导出";
+    }
+    if (els.obsStatusBadge) {
+      if (!online) {
+        els.obsStatusBadge.textContent = "Anima 离线";
+      } else if (!writable) {
+        els.obsStatusBadge.textContent = "目录不可写";
+      } else if (enabled) {
+        els.obsStatusBadge.textContent = "自动同步 · 就绪";
+      } else {
+        els.obsStatusBadge.textContent = "已暂停";
+      }
+    }
+    if (els.obsStatsText) {
+      if (!online) {
+        els.obsStatsText.textContent = "离线（请检查 18787 Anima Brain 容器）";
+        els.obsStatsText.style.color = "var(--danger)";
+      } else if (!obs.last_export_at && !enabled) {
+        els.obsStatsText.textContent = "尚未同步（开启开关或点右侧立即全量重建）";
+        els.obsStatsText.style.color = "var(--ink-muted)";
+      } else {
+        els.obsStatsText.textContent = `${st.turns || 0} 轮对话 · ${st.days || 0} 天 · ${st.active_facts || 0} 条有效记忆 · ${st.episodes || 0} 篇片段`;
+        els.obsStatsText.style.color = writable ? "var(--accent)" : "var(--warn)";
+      }
+    }
+    if (els.obsErrText) {
+      if (obs.last_error) {
+        els.obsErrText.textContent = obs.last_error;
+        els.obsErrText.style.color = "var(--danger)";
+      } else if (online && obs.last_export_at) {
+        els.obsErrText.textContent = `上次写入 ${st.files_written || 0} 份 · 跳过未变更 ${st.files_skipped || 0} 份`;
+        els.obsErrText.style.color = "var(--ink-muted)";
+      } else {
+        els.obsErrText.textContent = "哈希未变自动跳过写入";
+        els.obsErrText.style.color = "var(--ink-muted)";
+      }
+    }
+    if (!obsBusy) {
+      if (els.obsSyncToggle) els.obsSyncToggle.disabled = !online;
+      if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = !online;
+    }
+  }
+
+  if (els.obsSyncToggle) {
+    els.obsSyncToggle.addEventListener("change", async () => {
+      const enabled = Boolean(els.obsSyncToggle.checked);
+      if (obsBusy) {
+        els.obsSyncToggle.checked = !enabled;
+        return;
+      }
+      obsBusy = true;
+      obsPendingState = null;
+      let appliedFreshState = false;
+      let httpStatus = 0;
+      els.obsSyncToggle.disabled = true;
+      if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = true;
+      try {
+        const resp = await fetch("/api/obsidian/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled })
+        });
+        httpStatus = resp.status || 0;
+        const res = await resp.json();
+        if (res && res.obsidian) {
+          renderObsidianUI(res.obsidian);
+          appliedFreshState = true;
+        }
+        if (!resp.ok || !res || !res.ok || !res.obsidian) {
+          throw new Error((res && res.error) || "切换失败");
+        }
+        showBanner("info", enabled ? "已开启 Obsidian 单向自动同步并完成检查！" : "已暂停 Obsidian 自动同步（已有笔记保留不动）。");
+        setTimeout(hideBanner, 3000);
+      } catch (err) {
+        if (!appliedFreshState) {
+          els.obsSyncToggle.checked = !enabled;
+          if (httpStatus === 0 || httpStatus >= 500) {
+            obsOnline = false;
+          }
+        }
+        showBanner("err", `切换 Obsidian 同步开关失败：${err.message}`);
+      } finally {
+        obsBusy = false;
+        const pending = obsPendingState;
+        obsPendingState = null;
+        if (!appliedFreshState && pending) {
+          renderObsidianUI(pending);
+        }
+        if (els.obsSyncToggle) els.obsSyncToggle.disabled = !obsOnline;
+        if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = !obsOnline;
+      }
+    });
+  }
+
+  if (els.obsRebuildBtn) {
+    els.obsRebuildBtn.addEventListener("click", async () => {
+      if (obsBusy) return;
+      obsBusy = true;
+      obsPendingState = null;
+      let appliedFreshState = false;
+      let httpStatus = 0;
+      const oldLabel = els.obsRebuildBtn.textContent;
+      els.obsRebuildBtn.disabled = true;
+      if (els.obsSyncToggle) els.obsSyncToggle.disabled = true;
+      els.obsRebuildBtn.textContent = "正在重建…";
+      try {
+        const resp = await fetch("/api/obsidian/rebuild", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}"
+        });
+        httpStatus = resp.status || 0;
+        const res = await resp.json();
+        if (res && res.obsidian) {
+          renderObsidianUI(res.obsidian);
+          appliedFreshState = true;
+        }
+        if (!resp.ok || !res || !res.ok) {
+          throw new Error((res && res.error) || "全量重建失败");
+        }
+        const r = res.result || {};
+        showBanner(
+          "info",
+          `Obsidian 全量重建完成：写入 ${r.written || 0} 份，哈希未变跳过 ${r.skipped || 0} 份（耗时 ${r.duration_ms || 0} ms）`
+        );
+        setTimeout(hideBanner, 3600);
+      } catch (err) {
+        if (!appliedFreshState && (httpStatus === 0 || httpStatus >= 500)) {
+          obsOnline = false;
+        }
+        showBanner("err", `Obsidian 全量重建失败：${err.message}`);
+      } finally {
+        obsBusy = false;
+        const pending = obsPendingState;
+        obsPendingState = null;
+        if (!appliedFreshState && pending) {
+          renderObsidianUI(pending);
+        }
+        if (els.obsRebuildBtn) {
+          els.obsRebuildBtn.disabled = !obsOnline;
+          els.obsRebuildBtn.textContent = oldLabel;
+        }
+        if (els.obsSyncToggle) els.obsSyncToggle.disabled = !obsOnline;
+      }
+    });
+  }
+
   function populateModelOptions(provider, selectedModel) {
     const list = PROVIDER_MODELS[provider] || PROVIDER_MODELS.DeepSeekLLM;
     els.modelSelect.innerHTML = "";
@@ -1420,7 +1985,7 @@
     if (dirty) {
       els.saveBtn.disabled = false;
       els.saveBtn.classList.add("has-dirty");
-      els.saveBtnLabel.textContent = "保存并重启生效";
+      els.saveBtnLabel.textContent = "保存并立即生效";
     } else if (!isRestarting) {
       els.saveBtn.disabled = true;
       els.saveBtn.classList.remove("has-dirty");
@@ -1522,22 +2087,21 @@
     } catch (_) {}
   });
 
-  els.tabChat.addEventListener("click", () => {
-    els.tabChat.classList.add("active");
-    els.tabLogs.classList.remove("active");
-    els.chatStream.classList.remove("hidden");
-    els.logStream.classList.remove("active");
-    els.clearHistoryBtn.style.visibility = "visible";
-  });
+  function switchMonitorTab(tab) {
+    const isChat = tab === "chat";
+    const isLogs = tab === "logs";
+    els.tabChat.classList.toggle("active", isChat);
+    els.tabLogs.classList.toggle("active", isLogs);
+    els.chatStream.classList.toggle("hidden", !isChat);
+    els.logStream.classList.toggle("active", isLogs);
+    els.clearHistoryBtn.style.visibility = isChat ? "visible" : "hidden";
+    if (isLogs) {
+      els.logStream.scrollTop = els.logStream.scrollHeight;
+    }
+  }
 
-  els.tabLogs.addEventListener("click", () => {
-    els.tabLogs.classList.add("active");
-    els.tabChat.classList.remove("active");
-    els.logStream.classList.add("active");
-    els.chatStream.classList.add("hidden");
-    els.clearHistoryBtn.style.visibility = "hidden";
-    els.logStream.scrollTop = els.logStream.scrollHeight;
-  });
+  els.tabChat.addEventListener("click", () => switchMonitorTab("chat"));
+  els.tabLogs.addEventListener("click", () => switchMonitorTab("logs"));
 
   els.clearHistoryBtn.addEventListener("click", async () => {
     await fetch("/api/clear-history", {
@@ -1568,7 +2132,14 @@
           emotion: selectedMeiEmotion
         })
       });
-      if (!resp.ok) throw new Error("合成失败");
+      if (!resp.ok) {
+        let errMsg = "音色试听失败，请确认本机语音合成服务运行正常。";
+        try {
+          const errJson = await resp.json();
+          if (errJson && errJson.error) errMsg = errJson.error;
+        } catch (_) {}
+        throw new Error(errMsg);
+      }
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
       els.previewAudio.src = url;
@@ -1579,10 +2150,10 @@
         URL.revokeObjectURL(url);
       };
       await els.previewAudio.play();
-    } catch (_) {
+    } catch (err) {
       els.previewBtn.disabled = false;
       els.previewBtnText.textContent = "试听音色";
-      showBanner("err", "音色试听失败，请确认本机语音合成服务运行正常。");
+      showBanner("err", (err && err.message) ? err.message : "音色试听失败，请确认本机语音合成服务运行正常。");
     }
   });
 
@@ -1600,13 +2171,9 @@
       return;
     }
 
-    isRestarting = true;
     els.saveBtn.disabled = true;
     els.saveBtn.classList.remove("has-dirty");
-    els.saveBtnLabel.textContent = "正在重启生效…";
-    els.statusPill.className = "status-pill restarting";
-    els.statusText.textContent = "正在重新加载语音服务…";
-    showBanner("warn", "新配置已写入，正在平滑重启语音服务并加载 MCP 工具（约需 8～12 秒）…");
+    els.saveBtnLabel.textContent = "正在应用配置…";
 
     try {
       const resp = await fetch("/api/config", {
@@ -1622,7 +2189,21 @@
         model_name: payload.model_name,
         voice: payload.voice
       };
-      await new Promise(r => setTimeout(r, 2500));
+      if (res.restarting) {
+        isRestarting = true;
+        els.saveBtnLabel.textContent = "正在重启生效…";
+        els.statusPill.className = "status-pill restarting";
+        els.statusText.textContent = "正在重新加载语音服务…";
+        showBanner("warn", "新配置已写入，正在平滑重启语音服务并加载 MCP 工具（约需 8～12 秒）…");
+        await new Promise(r => setTimeout(r, 2500));
+      } else {
+        isRestarting = false;
+        checkDirty();
+        const changedCount = Array.isArray(res.changed_fields) ? res.changed_fields.length : 0;
+        showBanner("info", changedCount > 0 ? "新配置已热更新生效（免重启）！" : "配置无变化。");
+        setTimeout(hideBanner, 3600);
+        pollState();
+      }
     } catch (err) {
       isRestarting = false;
       checkDirty();
@@ -1667,12 +2248,31 @@
     if (nearBottom) els.chatStream.scrollTop = els.chatStream.scrollHeight;
   }
 
-  function renderLogs(logs) {
-    const jsonStr = JSON.stringify(logs);
-    if (jsonStr === lastLogsJson) return;
-    lastLogsJson = jsonStr;
+  function applyLogsDelta(logs, nextCursor, incremental, reset) {
+    const incoming = Array.isArray(logs) ? logs : [];
+    const hasCursor = typeof nextCursor === "number" && Number.isFinite(nextCursor);
+    let changed = false;
+
+    if (!incremental || reset || logCursor === null) {
+      const nextStr = incoming.join("\n");
+      if (nextStr !== logLines.join("\n") || reset) {
+        logLines = incoming.slice(-150);
+        changed = true;
+      }
+    } else if (incoming.length > 0) {
+      logLines = logLines.concat(incoming);
+      if (logLines.length > 150) {
+        logLines = logLines.slice(-150);
+      }
+      changed = true;
+    }
+
+    if (hasCursor) {
+      logCursor = nextCursor;
+    }
+    if (!changed) return;
     const nearBottom = (els.logStream.scrollHeight - els.logStream.scrollTop - els.logStream.clientHeight) < 80;
-    els.logStream.textContent = (logs || []).join("\n");
+    els.logStream.textContent = logLines.join("\n");
     if (nearBottom) els.logStream.scrollTop = els.logStream.scrollHeight;
   }
 
@@ -1683,7 +2283,8 @@
     if (pollInFlight) return;
     pollInFlight = true;
     try {
-      const resp = await fetch("/api/state", { cache: "no-store" });
+      const stateUrl = (logCursor !== null) ? `/api/state?log_cursor=${encodeURIComponent(logCursor)}` : "/api/state";
+      const resp = await fetch(stateUrl, { cache: "no-store" });
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       const data = await resp.json();
       const cfg = data.config || {};
@@ -1720,8 +2321,20 @@
       if (!replyLenDragging && cfg.reply_length) {
         renderReplyLengthUI(cfg.reply_length);
       }
+      if (cfg.idle_farewell) {
+        renderIdleFarewellUI(cfg.idle_farewell);
+      }
       if (!relDragging && !relSaving && cfg.relationship) {
         renderRelationshipUI(cfg.relationship);
+      }
+      if (cfg.obsidian) {
+        if (obsBusy) {
+          obsOnline = Boolean(cfg.obsidian.online);
+          obsPendingState = cfg.obsidian;
+        } else {
+          obsPendingState = null;
+          renderObsidianUI(cfg.obsidian);
+        }
       }
 
       els.dsKeyBadge.textContent = cfg.deepseek_key_ok ? "已就绪" : "未设置";
@@ -1745,7 +2358,11 @@
       }
 
       if (!isRestarting) {
-        if (!dev.server_ready) {
+        const hlth = data.health || {};
+        if (hlth.degraded) {
+          els.statusPill.className = "status-pill restarting";
+          els.statusText.textContent = "补丁契约降级（查看 /api/health）";
+        } else if (!dev.server_ready) {
           els.statusPill.className = "status-pill restarting";
           els.statusText.textContent = "正在加载语音识别模型…";
         } else if (dev.activity === "listening") {
@@ -1761,8 +2378,18 @@
       }
 
       renderMessages(data.messages || []);
-      renderLogs(data.logs || []);
+      applyLogsDelta(
+        data.logs || [],
+        data.log_cursor,
+        Boolean(data.logs_incremental),
+        Boolean(data.logs_reset)
+      );
     } catch (_) {
+      obsOnline = false;
+      if (!obsBusy) {
+        if (els.obsSyncToggle) els.obsSyncToggle.disabled = true;
+        if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = true;
+      }
       if (!isRestarting) {
         els.statusPill.className = "status-pill offline";
         els.statusText.textContent = "本地服务连接中断";

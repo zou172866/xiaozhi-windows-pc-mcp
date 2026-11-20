@@ -404,6 +404,260 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
         self.assertNotIn('log.info("Studio URL: %s", studio_url)', svc_src)
         self.assertIn("#token=***", svc_src)
 
+    def test_longer_reply_upsert_and_turn_meta_preserves_earliest_occurred_at(self):
+        t0 = 1795000000.0
+        r1 = svc.extract_and_commit_turn(
+            self.brain,
+            svc.DEFAULT_CHARACTER_ID,
+            "xz-tool-round-1",
+            "帮我查下明天长沙天气",
+            "我帮你查一下",
+            turn_meta={"occurred_at": t0, "source": "esp32", "device_id": "aa:bb", "used_tools": False},
+        )
+        self.assertTrue(r1["committed"])
+        self.assertFalse(r1.get("replayed", False))
+        turn_id = r1["turn_id"]
+
+        # Fuller post-tool reply arrives with SAME request_id -> must upsert turns, evidence & turn_meta
+        r2 = svc.extract_and_commit_turn(
+            self.brain,
+            svc.DEFAULT_CHARACTER_ID,
+            "xz-tool-round-1",
+            "帮我查下明天长沙天气",
+            "我帮你查一下 明天长沙多云转晴，16到24度。",
+            turn_meta={"occurred_at": t0 + 25.0, "source": "esp32", "device_id": "aa:bb", "used_tools": True},
+        )
+        self.assertTrue(r2["committed"])
+        self.assertTrue(r2.get("updated"))
+        self.assertFalse(r2.get("replayed"))
+
+        eng = self.brain.engine
+        t_row = eng.db.execute("SELECT assistant_reply FROM turns WHERE id=?", (turn_id,)).fetchone()
+        self.assertEqual(t_row["assistant_reply"], "我帮你查一下 明天长沙多云转晴，16到24度。")
+        ev_row = eng.db.execute("SELECT text FROM evidence WHERE id=?", (f"{turn_id}:assistant",)).fetchone()
+        self.assertEqual(ev_row["text"], "我帮你查一下 明天长沙多云转晴，16到24度。")
+        meta_row = eng.db.execute("SELECT * FROM xiaozhi_turn_meta WHERE turn_id=?", (turn_id,)).fetchone()
+        self.assertAlmostEqual(meta_row["occurred_at"], t0, places=2)
+        self.assertEqual(meta_row["used_tools"], 1)
+        self.assertEqual(meta_row["device_id"], "aa:bb")
+
+        # Shorter stale replay must NOT downgrade the fuller reply
+        r3 = svc.extract_and_commit_turn(
+            self.brain,
+            svc.DEFAULT_CHARACTER_ID,
+            "xz-tool-round-1",
+            "帮我查下明天长沙天气",
+            "我帮你查一下",
+            turn_meta={"occurred_at": t0 + 40.0, "used_tools": False},
+        )
+        self.assertTrue(r3["committed"])
+        self.assertTrue(r3["replayed"])
+        self.assertFalse(r3["updated"])
+        t_row2 = eng.db.execute("SELECT assistant_reply FROM turns WHERE id=?", (turn_id,)).fetchone()
+        self.assertEqual(t_row2["assistant_reply"], "我帮你查一下 明天长沙多云转晴，16到24度。")
+
+        # Metadata-only replay shifting occurred_at earlier must mark updated=True and expose prev_occurred_at
+        r4 = svc.extract_and_commit_turn(
+            self.brain,
+            svc.DEFAULT_CHARACTER_ID,
+            "xz-tool-round-1",
+            "帮我查下明天长沙天气",
+            "我帮你查一下 明天长沙多云转晴，16到24度。",
+            turn_meta={"occurred_at": t0 - 3600.0, "used_tools": True},
+        )
+        self.assertTrue(r4["committed"])
+        self.assertTrue(r4["updated"])
+        self.assertAlmostEqual(r4["occurred_at"], t0 - 3600.0, places=2)
+        self.assertAlmostEqual(r4["prev_occurred_at"], t0, places=2)
+
+    def test_ingest_retries_on_another_turn_pending_instead_of_dropping(self):
+        token = "retry-pending-token-" + ("d" * 24)
+        # Hold a pending Studio turn so initial ingest attempt hits another_turn_pending
+        pending_ctx = self.brain.engine.prepare_turn(
+            svc.DEFAULT_CHARACTER_ID, "网页正在聊天", request_id="studio-pending-1"
+        )
+
+        frontend_override = svc.FRONTEND_DIR if (svc.FRONTEND_DIR / "index.html").is_file() else None
+        with (
+            patch.object(svc, "FRONTEND_DIR", frontend_override),
+            patch.object(svc, "INGEST_PENDING_INLINE_WAIT_SECONDS", 0.05),
+            patch.object(svc, "INGEST_PENDING_BACKOFF_BASE", 0.1),
+            patch.object(svc, "INGEST_PENDING_MAX_RETRIES", 8),
+        ):
+            app = svc.create_combined_asgi_app(self.brain, token)
+            with TestClient(app, base_url="http://127.0.0.1:18787") as client:
+                headers = {"Authorization": f"Bearer {token}"}
+                r = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={
+                        "character_id": svc.DEFAULT_CHARACTER_ID,
+                        "request_id": "xz-delayed-by-pending",
+                        "user_message": "哥哥刚刚回来",
+                        "assistant_reply": "欢迎回来哥哥。",
+                        "occurred_at": time.time() - 10,
+                    },
+                )
+                self.assertEqual(r.status_code, 200)
+                time.sleep(0.15)
+                h_mid = client.get("/xiaozhi/health").json()
+                self.assertGreaterEqual(h_mid["ingest"]["retried_total"], 1)
+                self.assertEqual(h_mid["ingest"]["dropped_total"], 0)
+
+                # Clear the pending turn -> delayed retry MUST commit the voice turn!
+                self.brain.engine.commit_turn(
+                    svc.DEFAULT_CHARACTER_ID,
+                    pending_ctx.turn_id,
+                    CommitRequest(assistant_reply="网页回复完毕"),
+                )
+                deadline = time.monotonic() + 3.0
+                found = None
+                while time.monotonic() < deadline:
+                    found = self.brain.engine.db.execute(
+                        "SELECT status, assistant_reply FROM turns WHERE request_id='xz-delayed-by-pending'"
+                    ).fetchone()
+                    if found and found["status"] == "committed":
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(found)
+                self.assertEqual(found["status"], "committed")
+                self.assertEqual(found["assistant_reply"], "欢迎回来哥哥。")
+
+    def test_ingest_queue_full_backpressure_and_health_dropped_metrics(self):
+        import threading
+
+        token = "queue-full-token-" + ("e" * 24)
+        gate = threading.Event()
+        started = threading.Event()
+
+        def _blocked_extract(brain, char_id, req_id, user_msg, reply_msg, **kwargs):
+            started.set()
+            gate.wait(timeout=3.0)
+            return {"committed": True, "turn_id": f"tid-{req_id}"}
+
+        frontend_override = svc.FRONTEND_DIR if (svc.FRONTEND_DIR / "index.html").is_file() else None
+        with (
+            patch.object(svc, "FRONTEND_DIR", frontend_override),
+            patch.object(svc, "extract_and_commit_turn", side_effect=_blocked_extract),
+            patch.object(svc, "INGEST_QUEUE_MAXSIZE", 1),
+            patch.object(svc, "INGEST_OVERFLOW_MAX_TASKS", 0),
+            patch.object(svc, "INGEST_ENQUEUE_WAIT_SECONDS", 0.03),
+            patch.object(svc, "SHUTDOWN_DRAIN_SECONDS", 1.5),
+        ):
+            app = svc.create_combined_asgi_app(self.brain, token)
+            with TestClient(app, base_url="http://127.0.0.1:18787") as client:
+                headers = {"Authorization": f"Bearer {token}"}
+                # 1st item picked up by worker (blocked on gate)
+                r1 = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={"request_id": "qf-1", "user_message": "u1", "assistant_reply": "a1"},
+                )
+                self.assertEqual(r1.status_code, 200)
+                self.assertTrue(started.wait(timeout=2.0))
+                # 2nd item fills queue (maxsize=1)
+                r2 = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={"request_id": "qf-2", "user_message": "u2", "assistant_reply": "a2"},
+                )
+                self.assertEqual(r2.status_code, 200)
+                # 3rd item overflows queue & overflow=0 -> 503 with rejected_ids and health dropped counter
+                r3 = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={"request_id": "qf-3", "user_message": "u3", "assistant_reply": "a3"},
+                )
+                self.assertEqual(r3.status_code, 503)
+                body3 = r3.json()
+                self.assertEqual(body3["queued"], 0)
+                self.assertEqual(body3["rejected_ids"], ["qf-3"])
+
+                h = client.get("/xiaozhi/health").json()
+                self.assertEqual(h["ingest"]["dropped_total"], 1)
+                self.assertEqual(h["ingest"]["dropped_queue_full"], 1)
+                gate.set()
+
+    def test_graceful_shutdown_harvests_sleeping_retry_tasks_instead_of_dropping(self):
+        token = "shutdown-retry-token-" + ("f" * 24)
+        pending_ctx = self.brain.engine.prepare_turn(
+            svc.DEFAULT_CHARACTER_ID, "网页端占用中", request_id="studio-lock-shutdown"
+        )
+        frontend_override = svc.FRONTEND_DIR if (svc.FRONTEND_DIR / "index.html").is_file() else None
+        with (
+            patch.object(svc, "FRONTEND_DIR", frontend_override),
+            patch.object(svc, "INGEST_PENDING_INLINE_WAIT_SECONDS", 0.02),
+            patch.object(svc, "INGEST_PENDING_BACKOFF_BASE", 10.0),
+            patch.object(svc, "SHUTDOWN_DRAIN_SECONDS", 5.0),
+        ):
+            app = svc.create_combined_asgi_app(self.brain, token)
+            with TestClient(app, base_url="http://127.0.0.1:18787") as client:
+                headers = {"Authorization": f"Bearer {token}"}
+                r = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={
+                        "character_id": svc.DEFAULT_CHARACTER_ID,
+                        "request_id": "xz-harvest-on-shutdown",
+                        "user_message": "关停前别丢我",
+                        "assistant_reply": "放心，关停前会稳稳落库。",
+                    },
+                )
+                self.assertEqual(r.status_code, 200)
+                # Wait until turn enters the 10s retry_tasks sleep
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if client.get("/xiaozhi/health").json()["ingest"]["pending_retries"] >= 1:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(client.get("/xiaozhi/health").json()["ingest"]["pending_retries"], 1)
+                # Release pending lock right before lifespan.shutdown fires
+                self.brain.engine.commit_turn(
+                    svc.DEFAULT_CHARACTER_ID,
+                    pending_ctx.turn_id,
+                    CommitRequest(assistant_reply="网页端结束"),
+                )
+            # After TestClient exits (lifespan.shutdown complete), the sleeping retry turn MUST be committed!
+            row = self.brain.engine.db.execute(
+                "SELECT status, assistant_reply FROM turns WHERE request_id='xz-harvest-on-shutdown'"
+            ).fetchone()
+            self.assertIsNotNone(row, "Deferred retry turn was silently dropped on graceful shutdown")
+            self.assertEqual(row["status"], "committed")
+            self.assertEqual(row["assistant_reply"], "放心，关停前会稳稳落库。")
+
+    def test_p223_load_or_create_token_retries_io_and_refuses_silent_overwrite(self):
+        tf = Path(self._tmp.name) / "studio_token.txt"
+        tok1 = svc.load_or_create_token(tf)
+        self.assertGreaterEqual(len(tok1), 32)
+        self.assertEqual(list(Path(self._tmp.name).glob("*.tmp")), [])
+        self.assertEqual(svc.load_or_create_token(tf), tok1)
+
+        # Transient OSError recovers without regenerating
+        orig_read = Path.read_text
+        state = {"n": 0}
+
+        def _flaky_read(self_path, *args, **kwargs):
+            if self_path == tf:
+                state["n"] += 1
+                if state["n"] == 1:
+                    raise PermissionError("transient lock")
+            return orig_read(self_path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", _flaky_read):
+            self.assertEqual(svc.load_or_create_token(tf, retries=3), tok1)
+        self.assertEqual(state["n"], 2)
+
+        # Persistent OSError raises and leaves existing token untouched
+        def _always_fail(self_path, *args, **kwargs):
+            if self_path == tf:
+                raise OSError("persistent io error")
+            return orig_read(self_path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", _always_fail):
+            with self.assertRaises(RuntimeError):
+                svc.load_or_create_token(tf, retries=2)
+        self.assertEqual(tf.read_text(encoding="utf-8").strip(), tok1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

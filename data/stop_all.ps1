@@ -14,11 +14,47 @@ if ($LASTEXITCODE -eq 0 -and $dockerVer) {
     Write-Host "  Docker 引擎未运行，跳过容器停止" -ForegroundColor DarkGray
 }
 
-Write-Host "[2/5] 正在关闭三层电脑操控 MCP 服务 (端口 18900)..." -ForegroundColor Cyan
-$mcpPids = Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
-foreach ($mp in $mcpPids) {
+Write-Host "[2/5] 正在关闭 18900 看门狗、清理 L3 子进程树并停止三层电脑操控 MCP 服务..." -ForegroundColor Cyan
+$watchdogStopFlag = Join-Path $serverDir "pc-mcp\state\watchdog_stop.flag"
+try {
+    New-Item -ItemType File -Path $watchdogStopFlag -Force -ErrorAction SilentlyContinue | Out-Null
+    $wdProcs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -match '^python(w)?(\.exe)?$' -and
+            $_.CommandLine -and
+            $_.CommandLine -like '*pc_mcp_watchdog.py*'
+        }
+    foreach ($wp in $wdProcs) {
+        Stop-Process -Id $wp.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "  已关闭 18900 看门狗进程 PID=$($wp.ProcessId)" -ForegroundColor DarkGray
+    }
+} catch {}
+
+# 仅对已校验 create_time 的运行中 L3 后台任务子进程执行进程树清理（不误杀用户浏览器窗口）
+$mcpPy = Join-Path $serverDir "pc-mcp\.venv\Scripts\python.exe"
+$mcpWatchdogScript = Join-Path $serverDir "pc-mcp\pc_mcp_watchdog.py"
+if ((Test-Path $mcpPy) -and (Test-Path $mcpWatchdogScript)) {
+    try {
+        $l3Out = & $mcpPy -X utf8 $mcpWatchdogScript --cleanup-l3 2>$null
+        if ($l3Out) { Write-Host "  L3 子进程树清理完成: $l3Out" -ForegroundColor DarkGray }
+    } catch {}
+}
+
+$mcpPidSet = @{}
+$mcpListenPids = Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
+foreach ($mp in $mcpListenPids) {
+    if ($mp) { $mcpPidSet[[int]$mp] = $true }
+}
+try {
+    $mcpPyProcs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^python(w)?(\.exe)?$' -and $_.CommandLine -and $_.CommandLine -like '*pc_control_mcp.py*' }
+    foreach ($p in $mcpPyProcs) {
+        if ($p.ProcessId) { $mcpPidSet[[int]$p.ProcessId] = $true }
+    }
+} catch {}
+foreach ($mp in $mcpPidSet.Keys) {
     Stop-Process -Id $mp -Force -ErrorAction SilentlyContinue
-    Write-Host "  已关闭电脑操控进程 PID=$mp" -ForegroundColor DarkGray
+    Write-Host "  已精准关闭电脑操控进程 PID=$mp（已保护用户浏览器窗口）" -ForegroundColor DarkGray
 }
 
 Write-Host "[3/5] 正在关闭本地 19880 语音合成进程并释放显卡显存..." -ForegroundColor Cyan
@@ -38,14 +74,19 @@ try {
             $_.CommandLine -like '*agy_sidecar_worker.py*'
         }
     foreach ($sp in $sidecarProcs) {
+        try {
+            & taskkill.exe /F /T /PID $sp.ProcessId 2>$null | Out-Null
+        } catch {}
         Stop-Process -Id $sp.ProcessId -Force -ErrorAction SilentlyContinue
-        Write-Host "  已清理残留 Sidecar 进程 PID=$($sp.ProcessId)" -ForegroundColor DarkGray
+        Write-Host "  已清理残留 Sidecar 进程及其 L3 子进程树 PID=$($sp.ProcessId)" -ForegroundColor DarkGray
         $sidecarStopped++
     }
 } catch {}
-$hbFile = Join-Path $serverDir "data\agy_tasks\worker_heartbeat.json"
-if ($sidecarStopped -gt 0 -and (Test-Path $hbFile)) {
-    Remove-Item -Path $hbFile -Force -ErrorAction SilentlyContinue
+foreach ($hbRel in @("pc-mcp\state\agy_tasks\worker_heartbeat.json", "data\agy_tasks\worker_heartbeat.json")) {
+    $hbFile = Join-Path $serverDir $hbRel
+    if ($sidecarStopped -gt 0 -and (Test-Path $hbFile)) {
+        Remove-Item -Path $hbFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host "[5/5] 正在检查是否可自动退出 Docker Desktop 并释放 Vmmem 内存..." -ForegroundColor Cyan

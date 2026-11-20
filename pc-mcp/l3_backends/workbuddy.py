@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Tuple
 
 from . import (
     L3Backend,
+    get_process_create_time,
     load_last_active_task,
     resolve_workdir,
     run_subprocess_with_tree_kill,
@@ -18,6 +19,7 @@ from . import (
     split_command,
     start_worker_thread,
     summarize_text_for_voice,
+    validate_task_id,
 )
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -69,11 +71,11 @@ class WorkBuddyBackend(L3Backend):
         if _has_workbuddy_desktop_app():
             return {
                 "ready": False,
-                "detail": "检测到桌面客户端，但未找到 CLI，请安装 CodeBuddy/WorkBuddy CLI 或在下方填写命令路径",
+                "detail": "检测到桌面客户端，但未找到 CLI，请安装 CodeBuddy/WorkBuddy CLI 或在宿主机 .env 中配置 WORKBUDDY_CMD",
             }
         return {
             "ready": False,
-            "detail": "未检测到 workbuddy / codebuddy / cbc 命令，请安装腾讯 WorkBuddy / CodeBuddy CLI 或填写自定义路径",
+            "detail": "未检测到 workbuddy / codebuddy / cbc 命令，请安装腾讯 WorkBuddy / CodeBuddy CLI 或在宿主机 .env 中配置 WORKBUDDY_CMD",
         }
 
     def _build_command(
@@ -90,6 +92,7 @@ class WorkBuddyBackend(L3Backend):
     def dispatch(
         self, task_id: str, instruction: str, follow_up_last: bool, cfg: Dict[str, Any]
     ) -> str:
+        task_id = validate_task_id(task_id)
         instr = (instruction or "").strip()
         if not instr:
             return "任务内容不能为空。"
@@ -98,11 +101,11 @@ class WorkBuddyBackend(L3Backend):
         if not prefix:
             return (
                 "当前未检测到腾讯 WorkBuddy 或 CodeBuddy 命令行工具（workbuddy / codebuddy / cbc）。"
-                "请先安装并登录对应 CLI，或在 18080 控制台的高级设置中填写命令路径。"
+                "请先安装并登录对应 CLI，或在宿主机 .env 中配置 WORKBUDDY_CMD。"
             )
 
         workdir = resolve_workdir(cfg)
-        auto_approve = bool(cfg.get("workbuddy_auto_approve", True))
+        auto_approve = bool(cfg.get("workbuddy_auto_approve", False))
         cmd = self._build_command(prefix, instr, follow_up_last, auto_approve)
         timeout_sec = int(cfg.get("timeout_seconds", 300))
 
@@ -116,7 +119,9 @@ class WorkBuddyBackend(L3Backend):
             "follow_up_last": bool(follow_up_last),
             "status": "running",
             "owner_pid": os.getpid(),
+            "owner_create_time": get_process_create_time(os.getpid()),
             "pid": None,
+            "pid_create_time": None,
             "timeout_seconds": timeout_sec,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "started_ts": time.time(),
@@ -125,6 +130,7 @@ class WorkBuddyBackend(L3Backend):
 
         def _on_spawn(child_pid: int) -> None:
             task_record["pid"] = child_pid
+            task_record["pid_create_time"] = get_process_create_time(child_pid)
             save_active_task(task_id, task_record)
 
         def _worker():

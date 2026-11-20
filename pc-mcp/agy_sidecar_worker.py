@@ -146,16 +146,49 @@ def _kill_process_tree(pid: int) -> None:
         except Exception:
             pass
 
-SERVER_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = SERVER_DIR / "data"
-TASKS_ROOT = DATA_DIR / "agy_tasks"
+MCP_DIR = Path(__file__).resolve().parent
+SERVER_DIR = MCP_DIR.parent
+STATE_DIR = MCP_DIR / "state"
+TASKS_ROOT = STATE_DIR / "agy_tasks"
 PENDING_DIR = TASKS_ROOT / "pending"
 ACTIVE_DIR = TASKS_ROOT / "active"
 HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
-L3_CONFIG_FILE = DATA_DIR / "l3_backend_config.json"
 
-for d in (PENDING_DIR, ACTIVE_DIR):
+for d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR):
     d.mkdir(parents=True, exist_ok=True)
+
+TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_WINDOWS_RESERVED_TASK_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+
+
+def validate_task_id(task_id: object) -> str:
+    """Strictly validate sidecar task ID with fullmatch regex + reserved-name rejection."""
+    if not isinstance(task_id, str):
+        raise ValueError("invalid task_id: must be a string")
+    if not TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(f"invalid task_id: {task_id!r}")
+    if task_id.upper() in _WINDOWS_RESERVED_TASK_NAMES:
+        raise ValueError(f"reserved task_id: {task_id!r}")
+    return task_id
+
+
+def _resolve_task_file(base_dir: Path, task_id: object) -> Path:
+    """Resolve `<base_dir>/<task_id>.json` with regex + `.resolve().is_relative_to()` containment."""
+    safe_id = validate_task_id(task_id)
+    root = Path(base_dir).resolve()
+    candidate = (root / f"{safe_id}.json").resolve()
+    if not candidate.is_relative_to(root) or candidate.parent != root:
+        raise ValueError(f"task path escapes base directory: {task_id!r}")
+    return candidate
 
 
 def _read_dotenv_var(name: str) -> str:
@@ -191,16 +224,31 @@ def _read_dotenv_var(name: str) -> str:
 
 
 def _resolve_default_workdir() -> str:
-    try:
-        if L3_CONFIG_FILE.is_file():
-            wd = str(json.loads(L3_CONFIG_FILE.read_text(encoding="utf-8")).get("workdir") or "").strip()
-            if wd and Path(wd).exists():
-                return wd
-    except Exception:
-        pass
-    env_wd = os.environ.get("XIAOZHI_L3_WORKDIR", "").strip() or _read_dotenv_var("XIAOZHI_L3_WORKDIR")
-    if env_wd and Path(env_wd).exists():
-        return env_wd
+    env_wd = os.environ.get("XIAOZHI_L3_WORKDIR", "").strip()
+    if not env_wd and os.name == "nt":
+        try:
+            import winreg
+
+            for root, subkey in (
+                (winreg.HKEY_CURRENT_USER, r"Environment"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+            ):
+                try:
+                    with winreg.OpenKey(root, subkey) as k:
+                        v, _ = winreg.QueryValueEx(k, "XIAOZHI_L3_WORKDIR")
+                        if v:
+                            env_wd = str(v).strip()
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    if not env_wd:
+        env_wd = _read_dotenv_var("XIAOZHI_L3_WORKDIR")
+    if env_wd:
+        wd_path = Path(env_wd).expanduser()
+        if wd_path.exists() and wd_path.is_dir():
+            return str(wd_path)
     return str(SERVER_DIR.parent)
 
 MY_PID = os.getpid()
@@ -254,17 +302,54 @@ def _write_heartbeat():
         pass
 
 
-def _process_task(task_file: Path):
+def _process_task(task_file: Path) -> bool:
+    pending_root = PENDING_DIR.resolve()
     try:
-        data = json.loads(task_file.read_text(encoding="utf-8"))
+        if task_file.is_symlink():
+            print(f"[xiaozhi-agy-bridge] Rejected symlink task file: {task_file.name}", file=sys.stderr, flush=True)
+            return False
+        resolved_tf = task_file.resolve()
+        if not resolved_tf.is_relative_to(pending_root) or resolved_tf.parent != pending_root:
+            print(f"[xiaozhi-agy-bridge] Rejected out-of-bounds task file: {task_file}", file=sys.stderr, flush=True)
+            return False
     except Exception:
-        task_file.unlink(missing_ok=True)
-        return
+        return False
 
-    task_id = data.get("id", task_file.stem)
+    try:
+        data = json.loads(resolved_tf.read_text(encoding="utf-8"))
+    except Exception:
+        resolved_tf.unlink(missing_ok=True)
+        return False
+
+    if not isinstance(data, dict):
+        print(f"[xiaozhi-agy-bridge] Rejected non-object task payload: {resolved_tf.name}", file=sys.stderr, flush=True)
+        resolved_tf.unlink(missing_ok=True)
+        return False
+
+    raw_task_id = data["id"] if "id" in data else resolved_tf.stem
+    try:
+        task_id = validate_task_id(raw_task_id)
+        out_file = _resolve_task_file(ACTIVE_DIR, task_id)
+    except ValueError as exc:
+        print(f"[xiaozhi-agy-bridge] Rejected invalid task_id in {resolved_tf.name}: {exc}", file=sys.stderr, flush=True)
+        resolved_tf.unlink(missing_ok=True)
+        return False
+
+    data["id"] = task_id
     raw_prompt = str(data.get("prompt") or "").strip()
     title = str(data.get("title") or f"[小智派单] {raw_prompt[:22]}").strip()
     target_conv = str(data.get("conversation_id") or "").strip()
+    if target_conv and not UUID_RE.fullmatch(target_conv):
+        print(
+            f"[xiaozhi-agy-bridge] Rejected invalid conversation_id in {resolved_tf.name}: {target_conv!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        data["status"] = "error"
+        data["stderr"] = "invalid conversation_id format"
+        _atomic_write_json(out_file, data, indent=2)
+        resolved_tf.unlink(missing_ok=True)
+        return False
 
     prefix = _build_agentapi_prefix()
     if target_conv:
@@ -314,9 +399,9 @@ def _process_task(task_file: Path):
         data["status"] = "error"
         data["stderr"] = str(exc)
 
-    out_file = ACTIVE_DIR / f"{task_id}.json"
     _atomic_write_json(out_file, data, indent=2)
-    task_file.unlink(missing_ok=True)
+    resolved_tf.unlink(missing_ok=True)
+    return True
 
 
 def main():
@@ -341,10 +426,15 @@ def main():
             _write_heartbeat()
             last_hb = now
         try:
-            for tf in sorted(PENDING_DIR.glob("*.json")):
-                _process_task(tf)
+            pending_files = sorted(PENDING_DIR.glob("*.json"))
         except Exception as e:
-            print(f"[xiaozhi-agy-bridge] loop error: {e}", file=sys.stderr, flush=True)
+            print(f"[xiaozhi-agy-bridge] scan error: {e}", file=sys.stderr, flush=True)
+            pending_files = []
+        for tf in pending_files:
+            try:
+                _process_task(tf)
+            except Exception as e:
+                print(f"[xiaozhi-agy-bridge] task error ({tf.name}): {e}", file=sys.stderr, flush=True)
         time.sleep(0.8)
 
 
