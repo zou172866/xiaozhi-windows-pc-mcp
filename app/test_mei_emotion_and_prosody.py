@@ -639,10 +639,17 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         from unittest.mock import patch
         import console_server as cs
 
-        # 1. Verify no hardcoded personal MAC / LAN IP / drive path in console_server defaults
+        # 1. Verify no hardcoded personal MAC / LAN IP / drive path across ALL console modules
         import re as _re
+        src_parts = []
         with open(os.path.join(DATA_DIR, "console_server.py"), "r", encoding="utf-8") as _f:
-            src = _f.read()
+            src_parts.append(_f.read())
+        for _dp, _, _fns in os.walk(os.path.join(DATA_DIR, "console")):
+            for _fn in sorted(_fns):
+                if _fn.endswith(".py"):
+                    with open(os.path.join(_dp, _fn), "r", encoding="utf-8") as _f:
+                        src_parts.append(_f.read())
+        src = "\n".join(src_parts)
         self.assertIsNone(_re.search(r"\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b", src))
         self.assertIsNone(_re.search(r"\b192\.168\.\d+\.\d+\b", src))
         self.assertIsNone(_re.search(r"(?i)[a-z]:[\\/]+故事[\\/]+1", src))
@@ -923,15 +930,18 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         self.assertNotIn("sk-1234567890abcdef", red)
         self.assertNotIn("AIzaSyA12345678901234567890", red)
 
-        # 3. Verify console.html sends application/json + X-Console-Token, pauses polling, and renders llmCacheRateBadge
-        with open(os.path.join(APP_DIR, "console.html"), "r", encoding="utf-8") as f:
+        # 3. Verify console static assets send application/json + X-Console-Token, pause polling, and render llmCacheRateBadge
+        with open(cs.HTML_PATH, "r", encoding="utf-8") as f:
             html_src = f.read()
-        self.assertIn("visibilitychange", html_src)
-        self.assertIn("document.hidden", html_src)
+        with open(cs.JS_PATH, "r", encoding="utf-8") as f:
+            js_src = f.read()
+        combined_ui = html_src + "\n" + js_src
+        self.assertIn("visibilitychange", combined_ui)
+        self.assertIn("document.hidden", combined_ui)
         self.assertIn('name="console-token"', html_src)
-        self.assertIn("X-Console-Token", html_src)
-        self.assertIn("llmCacheRateBadge", html_src)
-        self.assertNotIn('fetch("/api/clear-history", { method: "POST" })', html_src)
+        self.assertIn("X-Console-Token", js_src)
+        self.assertIn("llmCacheRateBadge", combined_ui)
+        self.assertNotIn('fetch("/api/clear-history", { method: "POST" })', combined_ui)
 
     def test_pc_audio_router_single_wait_dynamic_poll_queue_lock_and_bearer_auth(self):
         import asyncio
@@ -1346,22 +1356,25 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         import console_server
         from unittest.mock import patch
 
-        with open(os.path.join(DATA_DIR, "console.html"), "r", encoding="utf-8") as f:
+        with open(console_server.HTML_PATH, "r", encoding="utf-8") as f:
             html_src = f.read()
+        with open(console_server.JS_PATH, "r", encoding="utf-8") as f:
+            js_src = f.read()
+        combined_ui = html_src + "\n" + js_src
         for el_id in ("obsStatusBadge", "obsSyncToggle", "obsExportDirText", "obsLastExportText", "obsRebuildBtn"):
-            self.assertIn(f'id="{el_id}"', html_src, f"Missing Obsidian UI element {el_id} in console.html")
-        self.assertIn("/api/obsidian/config", html_src)
-        self.assertIn("/api/obsidian/rebuild", html_src)
+            self.assertIn(f'id="{el_id}"', html_src, f"Missing Obsidian UI element {el_id} in index.html")
+        self.assertIn("/api/obsidian/config", js_src)
+        self.assertIn("/api/obsidian/rebuild", js_src)
         # Ensure finally blocks restore disabled state from last known obsOnline instead of unconditionally enabling,
         # and controls start disabled before initial state load.
         self.assertIn('<input type="checkbox" id="obsSyncToggle" disabled>', html_src)
         self.assertIn('id="obsRebuildBtn"', html_src)
         self.assertIn('disabled>立即全量重建</button>', html_src)
-        self.assertIn("let obsOnline = false;", html_src)
-        self.assertIn("let obsPendingState = null;", html_src)
-        self.assertIn("els.obsRebuildBtn.disabled = !obsOnline;", html_src)
-        self.assertNotIn("if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = false;", html_src)
-        self.assertNotIn("els.obsRebuildBtn.disabled = false;", html_src)
+        self.assertIn("let obsOnline = false;", js_src)
+        self.assertIn("let obsPendingState = null;", js_src)
+        self.assertIn("els.obsRebuildBtn.disabled = !obsOnline;", js_src)
+        self.assertNotIn("if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = false;", combined_ui)
+        self.assertNotIn("els.obsRebuildBtn.disabled = false;", combined_ui)
 
         # Verify tracked setup scripts & .env.example have no hardcoded personal drive path
         personal_dir = "E:" + "\\love"
@@ -1376,10 +1389,14 @@ class TestContainerOfflinePipeline(unittest.TestCase):
             with open(env_ex_path, "r", encoding="utf-8") as f:
                 self.assertNotIn(personal_dir, f.read())
 
-        # Verify console_server pre-exit flush imports and invokes anima_memory_provider.flush_outbox
-        with open(os.path.join(DATA_DIR, "console_server.py"), "r", encoding="utf-8") as f:
-            srv_src = f.read()
-        self.assertIn("anima_memory_provider.flush_outbox", srv_src)
+        # Verify console pre-exit flush imports and invokes anima_memory_provider.flush_outbox
+        srv_parts = []
+        for _dp, _, _fns in os.walk(os.path.join(DATA_DIR, "console")):
+            for _fn in sorted(_fns):
+                if _fn.endswith(".py"):
+                    with open(os.path.join(_dp, _fn), "r", encoding="utf-8") as f:
+                        srv_parts.append(f.read())
+        self.assertIn("anima_memory_provider.flush_outbox", "\n".join(srv_parts))
 
         # Verify proxy helpers handle Anima responses cleanly
         import httpx
@@ -1705,9 +1722,16 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         from unittest.mock import patch
         import console_server
 
-        # 1. console_server never references container-mounted data/l3_backend_config.json or data/agy_tasks
+        # 1. console modules never reference container-mounted data/l3_backend_config.json or data/agy_tasks
+        cs_parts = []
         with open(os.path.join(DATA_DIR, "console_server.py"), "r", encoding="utf-8") as f:
-            cs_src = f.read()
+            cs_parts.append(f.read())
+        for _dp, _, _fns in os.walk(os.path.join(DATA_DIR, "console")):
+            for _fn in sorted(_fns):
+                if _fn.endswith(".py"):
+                    with open(os.path.join(_dp, _fn), "r", encoding="utf-8") as f:
+                        cs_parts.append(f.read())
+        cs_src = "\n".join(cs_parts)
         self.assertNotIn("l3_backend_config.json", cs_src)
         self.assertNotIn("agy_tasks", cs_src)
 
@@ -1774,16 +1798,18 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                 console_server._l3_cache = None
                 console_server._l3_cache_ts = 0.0
 
-        # 5. console.html reflects L3 full-mode gate & read-only host .env fields
-        with open(os.path.join(DATA_DIR, "console.html"), "r", encoding="utf-8") as f:
+        # 5. console static assets reflect L3 full-mode gate & read-only host .env fields
+        with open(console_server.HTML_PATH, "r", encoding="utf-8") as f:
             html_src = f.read()
+        with open(console_server.JS_PATH, "r", encoding="utf-8") as f:
+            js_src = f.read()
         self.assertIn('id="l3ModeGateHint"', html_src)
         self.assertIn('id="l3TimeoutInput"', html_src)
         self.assertIn('id="l3WorkdirInput" readonly', html_src)
         self.assertIn('id="l3DshCmdInput" readonly', html_src)
         self.assertIn('id="l3WbCmdInput" readonly', html_src)
         self.assertIn('id="l3WbAutoApprove" disabled', html_src)
-        self.assertNotIn("l3.workbuddy_auto_approve !== false", html_src)
+        self.assertNotIn("l3.workbuddy_auto_approve !== false", html_src + "\n" + js_src)
 
         # 6. PowerShell setup/start scripts preserve UTF-8 BOM + CRLF and move L3 state to pc-mcp\state
         for ps1_name in ("start_all.ps1", "init_setup.ps1"):
@@ -4095,15 +4121,16 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
-        # 6. Verify console.html degraded guard & banner/save state machine guards
-        html_src = open(cs.HTML_PATH, "r", encoding="utf-8").read()
-        self.assertIn('typeof hlth.degraded === "boolean" && hlth.degraded', html_src)
-        self.assertNotIn("|| Boolean(hlth.degraded)", html_src)
-        self.assertIn("function scheduleHideBanner(", html_src)
-        self.assertNotIn("setTimeout(hideBanner,", html_src)
-        self.assertIn('typeof res.voice_dirty === "boolean"', html_src)
-        self.assertIn("stateEpoch", html_src)
-        self.assertIn("isSaving", html_src)
+        # 6. Verify console static JS degraded guard & banner/save state machine guards
+        with open(cs.JS_PATH, "r", encoding="utf-8") as f:
+            js_src = f.read()
+        self.assertIn('typeof hlth.degraded === "boolean" && hlth.degraded', js_src)
+        self.assertNotIn("|| Boolean(hlth.degraded)", js_src)
+        self.assertIn("function scheduleHideBanner(", js_src)
+        self.assertNotIn("setTimeout(hideBanner,", js_src)
+        self.assertIn('typeof res.voice_dirty === "boolean"', js_src)
+        self.assertIn("stateEpoch", js_src)
+        self.assertIn("isSaving", js_src)
 
     def test_batch2_a1_split_mount_paths_and_env_token_isolation(self):
         """A-1: Env-first token lookup + legacy HOST_DATA_DIR/voices path rewrite compatibility."""
@@ -4232,6 +4259,18 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                 tok = m.group(1)
                 self.assertEqual(tok, cs.get_console_token())
                 self.assertNotIn("__XIAOZHI_CONSOLE_TOKEN__", r_root.text)
+                self.assertIn('href="/static/app.css"', r_root.text)
+                self.assertIn('src="/static/app.js"', r_root.text)
+
+                # H-1: Split static CSS & JS served cleanly with nosniff + no-store
+                r_css = client.get(f"http://127.0.0.1:{port}/static/app.css")
+                self.assertEqual(r_css.status_code, 200)
+                self.assertIn("text/css", r_css.headers.get("content-type", ""))
+                self.assertEqual(r_css.headers.get("x-content-type-options"), "nosniff")
+                r_js = client.get(f"http://127.0.0.1:{port}/static/app.js")
+                self.assertEqual(r_js.status_code, 200)
+                self.assertIn("javascript", r_js.headers.get("content-type", ""))
+                self.assertEqual(r_js.headers.get("x-content-type-options"), "nosniff")
 
                 # Missing or wrong X-Console-Token -> 401
                 r_no = client.post(

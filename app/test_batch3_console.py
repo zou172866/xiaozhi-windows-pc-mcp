@@ -487,14 +487,14 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
                 cs._raw_log_seq = orig_seq
                 cs._log_offset = orig_off
 
-        # 3. HTML tab-visibility polling pause & resume check
-        with open(cs.HTML_PATH, "r", encoding="utf-8") as f:
-            html_src = f.read()
-        self.assertIn('document.visibilityState !== "visible"', html_src)
-        self.assertIn("visibilitychange", html_src)
-        self.assertIn("stopPolling()", html_src)
-        self.assertIn("startPolling()", html_src)
-        self.assertIn("pollState(true)", html_src)
+        # 3. HTML/JS tab-visibility polling pause & resume check (static/index.html + static/app.js)
+        with open(cs.JS_PATH, "r", encoding="utf-8") as f:
+            js_src = f.read()
+        self.assertIn('document.visibilityState !== "visible"', js_src)
+        self.assertIn("visibilitychange", js_src)
+        self.assertIn("stopPolling()", js_src)
+        self.assertIn("startPolling()", js_src)
+        self.assertIn("pollState(true)", js_src)
 
     def test_d5_expanded_secret_redaction_and_unified_send_json_redaction(self):
         """D-5: _redact_secrets covers ?token=, x-goog-api-key, Bearer, sk-, AIza; _send_json auto-redacts all error responses."""
@@ -575,16 +575,21 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
         self.assertIn("[site_b]", out)
         self.assertIn("suppressed 2 similar", out)
 
-        # Static AST check: zero silent `except Exception: pass` blocks in console_server.py
-        cs_path = os.path.join(APP_DIR, "console_server.py")
-        with open(cs_path, "r", encoding="utf-8") as f:
-            tree = ast.parse(f.read())
+        # Static AST check: zero silent `except Exception: pass` blocks across ALL console modules
+        console_py_files = [os.path.join(APP_DIR, "console_server.py")]
+        for dirpath, _, fnames in os.walk(os.path.join(APP_DIR, "console")):
+            for fn in sorted(fnames):
+                if fn.endswith(".py"):
+                    console_py_files.append(os.path.join(dirpath, fn))
         silent_exc_lines = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ExceptHandler) and len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
-                if node.type is None or (isinstance(node.type, ast.Name) and node.type.id == "Exception"):
-                    silent_exc_lines.append(node.lineno)
-        self.assertEqual(silent_exc_lines, [], f"Found silent except Exception: pass at lines {silent_exc_lines}")
+        for cs_path in console_py_files:
+            with open(cs_path, "r", encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=cs_path)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ExceptHandler) and len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
+                    if node.type is None or (isinstance(node.type, ast.Name) and node.type.id == "Exception"):
+                        silent_exc_lines.append((os.path.relpath(cs_path, APP_DIR), node.lineno))
+        self.assertEqual(silent_exc_lines, [], f"Found silent except Exception: pass at {silent_exc_lines}")
 
     def test_d7_explicit_persistent_voice_id_and_legacy_fallback(self):
         """D-7: voice_id persisted in TTS config, prioritized over ref_audio_path across all sites, legacy fallback kept."""
@@ -676,10 +681,16 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
-        # 3. No duplicate "raiden_mei" in ref_p inference across console_server.py (only 1 legacy fallback)
+        # 3. No duplicate "raiden_mei" in ref_p inference across console modules (only 1 legacy fallback)
+        ref_count = 0
+        for dirpath, _, fnames in os.walk(os.path.join(APP_DIR, "console")):
+            for fn in sorted(fnames):
+                if fn.endswith(".py"):
+                    with open(os.path.join(dirpath, fn), "r", encoding="utf-8") as f:
+                        ref_count += f.read().count('"raiden_mei" in ref_p')
         with open(os.path.join(APP_DIR, "console_server.py"), "r", encoding="utf-8") as f:
-            src = f.read()
-        self.assertEqual(src.count('"raiden_mei" in ref_p'), 1)
+            ref_count += f.read().count('"raiden_mei" in ref_p')
+        self.assertEqual(ref_count, 1)
 
         # 4. config/.config.example.yaml includes explicit voice_id
         ex_path = os.path.join(CONFIG_TEMPLATES_DIR, ".config.example.yaml")
@@ -916,9 +927,13 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
-        # 6. Verify console.html DOM IDs, API routes, and consolePost usage (X-Console-Token)
+        # 6. Verify console/static/{index.html,app.js} DOM IDs, API routes, and consolePost usage (X-Console-Token)
         with open(cs.HTML_PATH, "r", encoding="utf-8") as f:
             html_src = f.read()
+        with open(cs.JS_PATH, "r", encoding="utf-8") as f:
+            js_src = f.read()
+        self.assertIn('href="/static/app.css"', html_src)
+        self.assertIn('src="/static/app.js"', html_src)
         for el_id in (
             "animaOutboxBadge",
             "animaReplayDeadBtn",
@@ -937,18 +952,17 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
             "asrCorrInput",
             "asrCorrSaveBtn",
         ):
-            self.assertIn(f'id="{el_id}"', html_src, f"Missing DOM element {el_id} in console.html")
-        self.assertIn('consolePost("/api/anima-outbox/replay-dead"', html_src)
-        self.assertIn('consolePost("/api/vad-speculative"', html_src)
-        self.assertIn('consolePost("/api/asr-corrections"', html_src)
-        self.assertIn('Object.prototype.hasOwnProperty.call(payload, "corrections")', html_src)
-        self.assertIn("if (savedCorrections)", html_src)
+            self.assertIn(f'id="{el_id}"', html_src, f"Missing DOM element {el_id} in index.html")
+        self.assertIn('consolePost("/api/anima-outbox/replay-dead"', js_src)
+        self.assertIn('consolePost("/api/vad-speculative"', js_src)
+        self.assertIn('consolePost("/api/asr-corrections"', js_src)
+        self.assertIn('Object.prototype.hasOwnProperty.call(payload, "corrections")', js_src)
+        self.assertIn("if (savedCorrections)", js_src)
 
-        # Verify every getElementById("...") in inline script exists in HTML
-        m_script = re.search(r"<script>([\s\S]*?)</script>", html_src)
-        self.assertIsNotNone(m_script)
+        # Verify every getElementById("...") in static/app.js exists in static/index.html
         all_ids = set(re.findall(r'\bid="([^"]+)"', html_src))
-        script_refs = re.findall(r'getElementById\("([^"]+)"\)', m_script.group(1))
+        script_refs = re.findall(r'getElementById\("([^"]+)"\)', js_src)
+        self.assertGreater(len(script_refs), 20)
         missing_refs = [r for r in script_refs if r not in all_ids]
         self.assertEqual(missing_refs, [], f"Missing DOM IDs referenced in JS: {missing_refs}")
 

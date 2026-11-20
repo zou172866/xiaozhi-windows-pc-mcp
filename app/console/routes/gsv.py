@@ -1,0 +1,505 @@
+"""GSV/Edge voice profiles, GPU weight switching, TTS preview & PC audio chime routes (H-1, D-3/D-7)."""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+from collections import deque
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
+import json
+import math
+import os
+import re
+import secrets
+import socket
+import struct
+import threading
+import time
+from urllib.parse import parse_qs, quote, urlparse
+import wave
+
+import httpx
+import yaml
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
+
+import asr_corrections
+import mei_emotion_router
+import patch_registry
+import pc_audio_router
+import reply_length_router
+import runtime_events
+import runtime_settings
+import turn_context_router
+import xz_common
+from console import shared
+
+GSV_PROFILES = {
+    "__gsv_raiden_mei__": {
+        "version": "v4",
+        "gpt_weights": f"{shared.HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/芽衣/芽衣-e10.ckpt",
+        "sovits_weights": f"{shared.HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/芽衣/芽衣_e10_s430_l32.pth",
+        "block": {
+            "type": "gpt_sovits_v2",
+            "voice_id": "__gsv_raiden_mei__",
+            "url": f"{shared.GSV_Host}/tts",
+            "output_dir": "tmp/",
+            "text_lang": "zh",
+            "ref_audio_path": "${HOST_VOICES_DIR}/raiden_mei/mei_default_ref.wav",
+            "aux_ref_audio_paths": [],
+            "prompt_text": "今夜月色很美，呵...适合与朋友小聚一番。",
+            "prompt_lang": "zh",
+            "top_k": 12,
+            "top_p": 1,
+            "temperature": 0.98,
+            "text_split_method": "cut0",
+            "batch_size": 1,
+            "return_fragment": False,
+            "speed_factor": 1.0,
+            "streaming_mode": False,
+            "seed": -1,
+            "parallel_infer": True,
+            "repetition_penalty": 1.35,
+            "sample_steps": 16,
+        },
+    },
+    "__gsv_xiaozhi_tw__": {
+        "version": "v2ProPlus",
+        "gpt_weights": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+        "sovits_weights": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
+        "block": {
+            "type": "gpt_sovits_v2",
+            "voice_id": "__gsv_xiaozhi_tw__",
+            "url": f"{shared.GSV_Host}/tts",
+            "output_dir": "tmp/",
+            "text_lang": "zh",
+            "ref_audio_path": "${HOST_VOICES_DIR}/xiaozhi_taiwan_ref.wav",
+            "aux_ref_audio_paths": ["${HOST_VOICES_DIR}/xiaozhi_taiwan_aux.wav"],
+            "prompt_text": "哈啰啊，我是小智啦，声音好听的台湾女孩一枚，超开心认识你耶，最近在忙啥？",
+            "prompt_lang": "zh",
+            "top_k": 12,
+            "top_p": 1,
+            "temperature": 0.98,
+            "text_split_method": "cut0",
+            "batch_size": 1,
+            "return_fragment": False,
+            "speed_factor": 1.04,
+            "streaming_mode": False,
+            "seed": -1,
+            "parallel_infer": True,
+            "repetition_penalty": 1.35,
+        },
+    },
+}
+
+ALLOWED_GSV_VOICES = frozenset(GSV_PROFILES.keys())
+ALLOWED_EDGE_VOICES = frozenset(
+    {
+        "zh-TW-HsiaoChenNeural",
+        "zh-TW-YunJheNeural",
+        "zh-CN-XiaoxiaoNeural",
+        "zh-CN-XiaoyiNeural",
+        "zh-CN-YunxiNeural",
+        "zh-CN-YunjianNeural",
+        "zh-CN-YunxiaNeural",
+        "zh-HK-HiuGaaiNeural",
+        "zh-CN-liaoning-XiaobeiNeural",
+        "zh-CN-shaanxi-XiaoniNeural",
+    }
+)
+ALLOWED_VOICES = ALLOWED_GSV_VOICES | ALLOWED_EDGE_VOICES
+# Share the exact same RLock with live ESP32 GPT-SoVITS synthesis (P1-14)
+_gsv_weights_lock = mei_emotion_router.GSV_GPU_LOCK
+_active_gsv_loaded = None
+_gsv_op_deadline_tls = threading.local()
+_GSV_PREVIEW_LOCK_MAX_SECONDS = 45.0
+EDGE_PREVIEW_TIMEOUT_SECONDS = 15.0
+_voice_dirty_lock = threading.Lock()
+_voice_dirty_target: str | None = None
+_voice_dirty_error: str = ""
+
+
+def _set_voice_dirty(target_voice: str | None, error_msg: str = "") -> None:
+    global _voice_dirty_target, _voice_dirty_error
+    with _voice_dirty_lock:
+        _voice_dirty_target = target_voice
+        _voice_dirty_error = shared._redact_secrets(error_msg) if error_msg else ""
+
+
+def _get_voice_dirty_state() -> tuple[str | None, str]:
+    with _voice_dirty_lock:
+        return _voice_dirty_target, _voice_dirty_error
+
+
+def _gsv_timeout_within_budget(default_timeout: float) -> float:
+    deadline = getattr(_gsv_op_deadline_tls, "deadline", None)
+    if deadline is None:
+        return float(default_timeout)
+    rem = float(deadline) - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError("GPU 锁持有时间已达到上限，中止试听以保护线上语音播报")
+    return min(float(default_timeout), rem)
+
+
+def _detect_boot_gsv_voice() -> str | None:
+    if os.path.exists(shared.GSV_INFER_YAML):
+        try:
+            with open(shared.GSV_INFER_YAML, "r", encoding="utf-8") as rf:
+                boot_cfg = yaml.safe_load(rf) or {}
+            t2s = str((boot_cfg.get("custom") or {}).get("t2s_weights_path") or "")
+            for vid, prof in GSV_PROFILES.items():
+                if prof["gpt_weights"] == t2s:
+                    return vid
+        except Exception as exc:
+            shared._log_rate_limited("detect_boot_gsv_voice", exc)
+    return None
+
+
+def _resolve_gsv_voice_id(tts_cfg: dict | None) -> str:
+    """Resolve GSV voice ID from explicit persistent `voice_id` first, falling back to legacy ref_audio_path (D-7)."""
+    cfg_d = tts_cfg if isinstance(tts_cfg, dict) else {}
+    explicit = str(cfg_d.get("voice_id") or "").strip()
+    if explicit in GSV_PROFILES:
+        return explicit
+    # Legacy fallback ONLY for older configs lacking explicit voice_id
+    ref_p = str(cfg_d.get("ref_audio_path") or "")
+    return "__gsv_raiden_mei__" if "raiden_mei" in ref_p else "__gsv_xiaozhi_tw__"
+
+
+def _get_configured_gsv_voice() -> str | None:
+    try:
+        cfg = shared._read_raw_yaml()
+        selected = cfg.get("selected_module") or {}
+        if selected.get("TTS") != "GPT_SOVITS_V2":
+            return None
+        return _get_current_voice_id(cfg)
+    except Exception as exc:
+        shared._log_rate_limited("get_configured_gsv_voice", exc)
+        return None
+
+
+def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
+    global _active_gsv_loaded
+    prof = GSV_PROFILES.get(voice_id)
+    if not prof:
+        return
+    with _gsv_weights_lock:
+        if _active_gsv_loaded is None:
+            _active_gsv_loaded = _detect_boot_gsv_voice()
+        if _active_gsv_loaded != voice_id:
+            client = shared._get_console_http_client()
+            t_gpt = _gsv_timeout_within_budget(25.0)
+            r1 = client.get(f"{shared.GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=t_gpt)
+            if r1.status_code != 200:
+                raise RuntimeError(f"切换 GPT 权重失败 (HTTP {r1.status_code}): {r1.text[:160]}")
+            # GPT weights are now mutated on GPU: mark state dirty (distinct from None) so a SoVITS
+            # failure forces restoration instead of falling back to _detect_boot_gsv_voice().
+            _active_gsv_loaded = "__dirty__"
+            t_sov = _gsv_timeout_within_budget(30.0)
+            r2 = client.get(f"{shared.GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=t_sov)
+            if r2.status_code != 200:
+                raise RuntimeError(f"切换 SoVITS 权重失败 (HTTP {r2.status_code}): {r2.text[:160]}")
+            _active_gsv_loaded = voice_id
+        if persist_boot_yaml:
+            boot_cfg = {}
+            if os.path.exists(shared.GSV_INFER_YAML):
+                try:
+                    with open(shared.GSV_INFER_YAML, "r", encoding="utf-8") as rf:
+                        boot_cfg = yaml.safe_load(rf) or {}
+                except Exception as exc:
+                    shared._log_rate_limited("read_gsv_infer_yaml", exc)
+                    boot_cfg = {}
+            boot_cfg["custom"] = {
+                "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
+                "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
+                "device": "cuda",
+                "is_half": True,
+                "t2s_weights_path": prof["gpt_weights"],
+                "version": prof["version"],
+                "vits_weights_path": prof["sovits_weights"],
+            }
+            shared._atomic_write_text(shared.GSV_INFER_YAML, yaml.safe_dump(boot_cfg, allow_unicode=True, sort_keys=False))
+
+
+def _get_current_voice_id(cfg: dict) -> str:
+    selected = (cfg or {}).get("selected_module") or {}
+    tts_key = selected.get("TTS", "GPT_SOVITS_V2")
+    tts_cfg = ((cfg or {}).get("TTS") or {}).get(tts_key) or {}
+    if tts_key == "GPT_SOVITS_V2":
+        return _resolve_gsv_voice_id(tts_cfg)
+    return str(tts_cfg.get("voice_id") or tts_cfg.get("voice") or "zh-CN-XiaoxiaoNeural")
+
+
+_GSV_VOICE_IDENTITY_KEYS = (
+    "voice_id",
+    "ref_audio_path",
+    "aux_ref_audio_paths",
+    "prompt_text",
+    "prompt_lang",
+    "speed_factor",
+    "top_k",
+    "top_p",
+    "temperature",
+    "text_split_method",
+)
+
+
+def _generate_test_chime_wav(duration_sec: float = 0.4, sample_rate: int = 48000) -> bytes:
+    """Generate a clean 0.4s 48kHz mono 16-bit sine chime WAV in memory as audio-test fallback."""
+    n_samples = max(1, int(sample_rate * duration_sec))
+    fade_in = max(1, int(sample_rate * 0.02))
+    fade_out = max(1, int(sample_rate * 0.06))
+    half = n_samples // 2
+    amp = 0.28 * 32767.0
+    frames = bytearray()
+    phase = 0.0
+    two_pi_over_sr = 2.0 * math.pi / float(sample_rate)
+    for i in range(n_samples):
+        freq = 587.33 if i < half else 880.0
+        env = 1.0
+        if i < fade_in:
+            env = 0.5 * (1.0 - math.cos(math.pi * i / fade_in))
+        elif i >= n_samples - fade_out:
+            rem = n_samples - 1 - i
+            env = 0.5 * (1.0 - math.cos(math.pi * rem / fade_out))
+        sample = int(max(-32767, min(32767, round(amp * env * math.sin(phase)))))
+        phase += two_pi_over_sr * freq
+        frames.extend(struct.pack("<h", sample))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
+async def _synthesize_mp3(text: str, voice: str) -> bytes:
+    comm = edge_tts.Communicate(text=text, voice=voice)
+    chunks = bytearray()
+    async for item in comm.stream():
+        if item.get("type") == "audio":
+            chunks.extend(item["data"])
+    return bytes(chunks)
+
+
+async def _synthesize_mp3_with_timeout(
+    text: str, voice: str, timeout: float = EDGE_PREVIEW_TIMEOUT_SECONDS
+) -> bytes:
+    return await asyncio.wait_for(_synthesize_mp3(text=text, voice=voice), timeout=float(timeout))
+
+
+
+def handle_post_audio_test(handler) -> None:
+    try:
+        body = handler._read_body_json()
+        vol = body.get("volume", None)
+        ref_wav = os.path.join(shared.VOICES_DIR, "raiden_mei", "mei_gentle_ref.wav")
+        if not os.path.isfile(ref_wav):
+            ref_wav = os.path.join(shared.VOICES_DIR, "wakeup_words_short.wav")
+        if not os.path.isfile(ref_wav):
+            ref_wav = os.path.join(shared.DATA_DIR, "wakeup_words_short.wav")
+        if os.path.isfile(ref_wav):
+            with open(ref_wav, "rb") as f:
+                wav_bytes = f.read()
+        else:
+            wav_bytes = _generate_test_chime_wav(0.4)
+        ok, detail = pc_audio_router.play_wav_on_pc_sync(wav_bytes, volume=vol)
+        if ok:
+            handler._send_json({"ok": True})
+        else:
+            handler._send_json({"ok": False, "error": f"电脑音响桥接不可用: {detail}"}, HTTPStatus.BAD_GATEWAY)
+    except shared._BadRequestError:
+        raise
+    except Exception as e:
+        handler._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+def handle_post_tts_preview(handler) -> None:
+    try:
+        body = handler._read_body_json()
+        raw_voice = body.get("voice", "__gsv_raiden_mei__")
+        if raw_voice is not None and not isinstance(raw_voice, str):
+            handler._send_json({"ok": False, "error": "字段 voice 必须为字符串"}, HTTPStatus.BAD_REQUEST)
+            return
+        voice = (raw_voice or "__gsv_raiden_mei__").strip()
+        if voice not in ALLOWED_VOICES:
+            handler._send_json(
+                {"ok": False, "error": f"无效的试听音色 ID: {voice or '(空)'}"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        raw_text = str(body.get("text") or "嗯，哥哥欢迎回来，今天的工作辛苦了，我已经为你泡好了热茶。").strip()
+        req_emotion = str(body.get("emotion") or "auto").strip().lower()
+        tag_emo, stripped_text = mei_emotion_router.extract_and_strip_emotion(
+            raw_text, flush_incomplete=True
+        )
+        clean_text = mei_emotion_router.clean_segment_for_tts(stripped_text) or "欢迎回来，今天辛苦了。"
+        if voice in GSV_PROFILES:
+            configured_gsv = _get_configured_gsv_voice()
+            needs_weight_swap = bool(configured_gsv and configured_gsv != voice)
+            if needs_weight_swap and shared._is_device_busy():
+                handler._send_json(
+                    {
+                        "ok": False,
+                        "busy": True,
+                        "error": "ESP32 设备正在语音播报或合成中，为避免抢占 GPU 显存权重，已拒绝试听非当前音色，请稍后再试。",
+                    },
+                    HTTPStatus.CONFLICT,
+                )
+                return
+
+            lock_timeout = 0.25 if needs_weight_swap else 10.0
+            acquired = _gsv_weights_lock.acquire(timeout=lock_timeout)
+            if not acquired:
+                handler._send_json(
+                    {
+                        "ok": False,
+                        "busy": True,
+                        "error": "本地 GPU 语音合成引擎正忙，请等待当前播报结束后再试听。",
+                    },
+                    HTTPStatus.CONFLICT,
+                )
+                return
+            rollback_warning = ""
+            total_cap = max(0.01, float(_GSV_PREVIEW_LOCK_MAX_SECONDS))
+            lock_deadline = time.monotonic() + total_cap
+            rollback_reserve = min(12.0, total_cap * 0.30) if needs_weight_swap else 0.0
+            _gsv_op_deadline_tls.deadline = lock_deadline - rollback_reserve
+            try:
+                if needs_weight_swap and shared._is_device_busy():
+                    handler._send_json(
+                        {
+                            "ok": False,
+                            "busy": True,
+                            "error": "ESP32 设备正在语音播报或合成中，已取消非当前音色试听。",
+                        },
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                try:
+                    _ensure_gsv_weights(voice, persist_boot_yaml=False)
+                    req_payload = dict(GSV_PROFILES[voice]["block"])
+                    if isinstance(req_payload.get("ref_audio_path"), str):
+                        req_payload["ref_audio_path"] = req_payload["ref_audio_path"].replace(
+                            "${HOST_VOICES_DIR}", shared.HOST_VOICES_DIR
+                        ).replace("${HOST_DATA_DIR}", shared.HOST_DATA_DIR)
+                    if isinstance(req_payload.get("aux_ref_audio_paths"), list):
+                        req_payload["aux_ref_audio_paths"] = [
+                            str(p).replace("${HOST_VOICES_DIR}", shared.HOST_VOICES_DIR).replace(
+                                "${HOST_DATA_DIR}", shared.HOST_DATA_DIR
+                            )
+                            for p in req_payload["aux_ref_audio_paths"]
+                        ]
+                    req_payload["text"] = clean_text[:120]
+                    req_payload["text_split_method"] = "cut0"
+                    if voice == "__gsv_raiden_mei__":
+                        explicit_emo = None
+                        if req_emotion and req_emotion != "auto":
+                            norm_emo, _ = mei_emotion_router.normalize_emotion_name(req_emotion)
+                            explicit_emo = norm_emo or req_emotion
+                        elif tag_emo:
+                            explicit_emo = tag_emo
+                        emo_key = mei_emotion_router.resolve_mei_emotion(
+                            clean_text,
+                            explicit_segment_emotion=explicit_emo,
+                        )
+                        emo_prof = mei_emotion_router.get_mei_emotion_profile(emo_key)
+                        req_payload["ref_audio_path"] = emo_prof["ref_audio_path"]
+                        req_payload["aux_ref_audio_paths"] = []
+                        req_payload["prompt_text"] = emo_prof["prompt_text"]
+                        req_payload["prompt_lang"] = emo_prof.get("prompt_lang", "zh")
+                        req_payload["speed_factor"] = emo_prof["speed_factor"]
+                        req_payload["temperature"] = emo_prof["temperature"]
+                        req_payload["top_k"] = emo_prof["top_k"]
+                        req_payload["top_p"] = emo_prof["top_p"]
+                    for drop_k in ("type", "url", "output_dir", "voice_id"):
+                        req_payload.pop(drop_k, None)
+                    tts_timeout = _gsv_timeout_within_budget(25.0)
+                    client = shared._get_console_http_client()
+                    r = client.post(f"{shared.GSV_Host}/tts", json=req_payload, timeout=tts_timeout)
+                    if r.status_code != 200:
+                        raise RuntimeError(f"本地 GPT-SoVITS 未就绪或返回异常 ({r.status_code})")
+                    wav_bytes = r.content
+                finally:
+                    global _active_gsv_loaded
+                    should_restore = bool(
+                        configured_gsv
+                        and (configured_gsv != voice or _active_gsv_loaded == "__dirty__")
+                    )
+                    if should_restore:
+                        _gsv_op_deadline_tls.deadline = lock_deadline
+                        try:
+                            if time.monotonic() >= lock_deadline:
+                                raise TimeoutError("GPU 锁持有时间已达上限，跳过同步回滚，由后台自动恢复")
+                            _ensure_gsv_weights(configured_gsv, persist_boot_yaml=False)
+                            cur_dirty, _ = _get_voice_dirty_state()
+                            if cur_dirty == configured_gsv:
+                                _set_voice_dirty(None, "")
+                        except Exception as rb_exc:
+                            _active_gsv_loaded = "__dirty__"
+                            _set_voice_dirty(configured_gsv, str(rb_exc))
+                            redacted_rb = shared._redact_secrets(str(rb_exc))
+                            rollback_warning = (
+                                f"试听后恢复线上音色权重 ({configured_gsv}) 失败，后台将自动重试：{redacted_rb}"
+                            )
+                            warn_log = f"[WebConsole] WARNING: {rollback_warning}"
+                            print(warn_log, flush=True)
+                            with shared._state_lock:
+                                shared._append_raw_log_locked(warn_log)
+            finally:
+                _gsv_op_deadline_tls.deadline = None
+                _gsv_weights_lock.release()
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "audio/wav")
+            handler.send_header("Cache-Control", "no-store")
+            if rollback_warning:
+                handler.send_header("X-Voice-Dirty", "1")
+                handler.send_header("X-Preview-Warning", quote(rollback_warning, safe=""))
+            handler.send_header("Content-Length", str(len(wav_bytes)))
+            handler.end_headers()
+            handler.wfile.write(wav_bytes)
+        else:
+            try:
+                mp3_bytes = asyncio.run(
+                    _synthesize_mp3_with_timeout(
+                        text=clean_text[:120],
+                        voice=voice,
+                        timeout=EDGE_PREVIEW_TIMEOUT_SECONDS,
+                    )
+                )
+            except asyncio.TimeoutError:
+                handler._send_json(
+                    {
+                        "ok": False,
+                        "error": f"Edge 语音试听超时（超过 {int(EDGE_PREVIEW_TIMEOUT_SECONDS)} 秒），请稍后重试。",
+                    },
+                    HTTPStatus.GATEWAY_TIMEOUT,
+                )
+                return
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", "audio/mpeg")
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header("Content-Length", str(len(mp3_bytes)))
+            handler.end_headers()
+            handler.wfile.write(mp3_bytes)
+    except shared._BadRequestError:
+        raise
+    except TimeoutError as e:
+        err_payload = {"ok": False, "error": shared._redact_secrets(str(e))}
+        dirty_v, dirty_e = _get_voice_dirty_state()
+        if dirty_v:
+            err_payload["voice_dirty"] = True
+            err_payload["rollback_warning"] = f"线上音色恢复失败，后台将自动重试：{dirty_e}"
+        handler._send_json(err_payload, HTTPStatus.GATEWAY_TIMEOUT)
+    except Exception as e:
+        err_payload = {"ok": False, "error": shared._redact_secrets(f"音色试听合成失败: {e}")}
+        dirty_v, dirty_e = _get_voice_dirty_state()
+        if dirty_v:
+            err_payload["voice_dirty"] = True
+            err_payload["rollback_warning"] = f"线上音色恢复失败，后台将自动重试：{dirty_e}"
+        handler._send_json(err_payload, HTTPStatus.INTERNAL_SERVER_ERROR)
