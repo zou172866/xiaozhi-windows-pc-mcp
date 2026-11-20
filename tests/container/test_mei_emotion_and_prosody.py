@@ -4689,6 +4689,17 @@ class TestLiveOnlineIntegration(unittest.TestCase):
             self.assertEqual(r_rel.status_code, 200)
             self.assertIn("axes", r_rel.json())
 
+            # H-2/H-3 live check: non-root container healthy, build_version present, Obsidian export writable
+            r_h = client.get("http://anima-brain:18787/health")
+            self.assertEqual(r_h.status_code, 200)
+            h_data = r_h.json()
+            self.assertEqual(h_data.get("status"), "ok")
+            self.assertTrue(h_data.get("build_version"), "Expected non-empty build_version in anima-brain /health")
+            obs = h_data.get("obsidian") or {}
+            if obs.get("enabled"):
+                self.assertTrue(obs.get("writable"), f"Anima Brain Obsidian export dir not writable: {obs}")
+                self.assertEqual(obs.get("last_error") or "", "", f"Obsidian export reported error: {obs}")
+
         mp = anima_memory_provider.MemoryProvider(
             {"service_url": "http://anima-brain:18787", "character_id": "xiaozhi"}
         )

@@ -395,14 +395,14 @@ if (-not $animaImg) {
     }
 }
 
-# H-2 非 root (USER app, uid 1000) 平滑升级：若宿主机旧版 root-0600 遗留文件阻塞 uid 1000 读写，则一次性归属修正
+# H-2 非 root (USER app, uid 1000) 平滑升级：若宿主机旧版 root 遗留文件阻塞 uid 1000 读写 /data/anima 或 /obsidian，则一次性归属修正
 $animaDataHost = Join-Path $serverDir "anima-data"
 $obsidianHost = if ($env:OBSIDIAN_EXPORT_DIR) { $env:OBSIDIAN_EXPORT_DIR } else { Join-Path $serverDir "data\obsidian_export" }
 if (-not (Test-Path $obsidianHost)) { New-Item -ItemType Directory -Path $obsidianHost -Force | Out-Null }
 try {
-    docker run --rm --user 1000:1000 -v "${animaDataHost}:/data/anima" xiaozhi-anima-brain:local python -c "import os, pathlib, sys; p=pathlib.Path('/data/anima/brain.sqlite3'); sys.exit(0 if (not p.exists() or (os.access(p, os.R_OK) and os.access(p, os.W_OK))) else 1)" 2>$null
+    docker run --rm --user 1000:1000 -v "${animaDataHost}:/data/anima" -v "${obsidianHost}:/obsidian" xiaozhi-anima-brain:local python -c "import os, pathlib, sys; db=pathlib.Path('/data/anima/brain.sqlite3'); ok_db=(not db.exists()) or (os.access(db, os.R_OK) and os.access(db, os.W_OK)); obs_dirs=[p for p in [pathlib.Path('/obsidian'), *pathlib.Path('/obsidian').rglob('*')] if p.is_dir()]; ok_obs=all(os.access(d, os.W_OK | os.X_OK) for d in obs_dirs); sys.exit(0 if (ok_db and ok_obs) else 1)" 2>$null
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[迁移] 检测到旧版 root 权限 brain.sqlite3，正在平滑调整 /data/anima 属主为 app (1000:1000)..." -ForegroundColor DarkGray
+        Write-Host "[迁移] 检测到旧版 root 权限文件，正在平滑调整 /data/anima 与 /obsidian 属主为 app (1000:1000)..." -ForegroundColor DarkGray
         docker run --rm --user 0:0 -v "${animaDataHost}:/data/anima" -v "${obsidianHost}:/obsidian" xiaozhi-anima-brain:local chown -R 1000:1000 /data/anima /obsidian 2>$null
     }
 } catch {}
