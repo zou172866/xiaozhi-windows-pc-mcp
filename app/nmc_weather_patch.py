@@ -16,8 +16,12 @@ from plugins_func.register import (
 TAG = "nmc_weather_patch"
 logger = setup_logging()
 
-DATA_DIR = "/opt/xiaozhi-esp32-server/data"
-STATIONS_CACHE_PATH = os.path.join(DATA_DIR, "nmc_stations_cache.json")
+DATA_DIR = xz_common.STATE_DIR
+STATIONS_CACHE_PATH = os.path.join(xz_common.STATE_DIR, "nmc_stations_cache.json")
+_SEED_STATIONS_PATHS = (
+    os.path.join(xz_common.ROOT_DIR, "config_templates", "nmc_stations_cache.json"),
+    os.path.join(xz_common.DATA_DIR, "nmc_stations_cache.json"),
+)
 
 HEADERS = {
     "User-Agent": (
@@ -92,17 +96,22 @@ async def _ensure_stations_loaded() -> list[dict]:
         if _stations_list:
             return _stations_list
         existing_disk: list[dict] = []
-        if os.path.exists(STATIONS_CACHE_PATH):
-            try:
-                with open(STATIONS_CACHE_PATH, "r", encoding="utf-8") as f:
-                    cached = json.load(f)
-                    if isinstance(cached, list):
-                        existing_disk = cached
-                        if len(cached) > _MIN_COMPLETE_STATIONS:
-                            _stations_list = cached
-                            return _stations_list
-            except Exception:
-                pass
+        cache_candidates = [STATIONS_CACHE_PATH]
+        if STATIONS_CACHE_PATH == os.path.join(xz_common.STATE_DIR, "nmc_stations_cache.json"):
+            cache_candidates.extend(_SEED_STATIONS_PATHS)
+        for cand_path in cache_candidates:
+            if os.path.exists(cand_path):
+                try:
+                    with open(cand_path, "r", encoding="utf-8") as f:
+                        cached = json.load(f)
+                        if isinstance(cached, list):
+                            if not existing_disk:
+                                existing_disk = cached
+                            if len(cached) > _MIN_COMPLETE_STATIONS:
+                                _stations_list = cached
+                                return _stations_list
+                except Exception:
+                    pass
 
         # 从中央气象台一次性拉取全国 34 省级行政区全部站点并本地持久化
         sem = asyncio.Semaphore(8)
@@ -334,6 +343,17 @@ def apply_nmc_weather_patch():
     ok_sig, det_sig = patch_registry.verify_signature_contract(
         orig_fn, required_params=("conn",), require_async=None
     )
+    if not ok_sig:
+        patch_registry.record_patch(
+            "nmc_weather",
+            "skipped_contract",
+            target="plugins_func.functions.get_weather",
+            detail=det_sig,
+            contract_ok=False,
+            category="experience",
+        )
+        print(f"[NMCWeather] 跳过挂载天气补丁（签名契约不匹配）: {det_sig}", flush=True)
+        return
 
     orig_mod.GET_WEATHER_FUNCTION_DESC = NMC_WEATHER_FUNCTION_DESC
     orig_mod.get_weather = nmc_get_weather
@@ -346,10 +366,11 @@ def apply_nmc_weather_patch():
     )
     patch_registry.record_patch(
         "nmc_weather",
-        "ok" if ok_sig else "failed",
+        "ok",
         target="plugins_func.functions.get_weather",
         detail=det_sig,
-        contract_ok=ok_sig,
+        contract_ok=True,
+        category="experience",
         rebound=rebound,
     )
     print("[NMCWeather] 已启用中央气象台免Key全国实时+7天天气插件", flush=True)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 from datetime import datetime, timezone
 import json
 import logging
@@ -10,6 +12,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sys
+import threading
 import time
 from typing import Optional
 
@@ -19,7 +23,9 @@ from starlette.datastructures import Headers as _StarletteHeaders
 from starlette.responses import JSONResponse as _StarletteJSONResponse, Response as _StarletteResponse
 
 from . import (
+    CONTAINER_TOKENS_ENV_FILE as _DEFAULT_CONTAINER_TOKENS_ENV_FILE,
     L2_AUDIT_LOG_FILE as _DEFAULT_L2_AUDIT_LOG_FILE,
+    LEGACY_TOKEN_FILE as _LEGACY_TOKEN_FILE,
     LOG_FILE as _DEFAULT_LOG_FILE,
     MODE_FILE as _DEFAULT_MODE_FILE,
     RUNTIME_SETTINGS_FILE as _DEFAULT_RUNTIME_SETTINGS_FILE,
@@ -28,10 +34,31 @@ from . import (
     _get_env_key,
     facade_attr,
 )
-from .winapi import _get_foreground_window_info
+from .winapi import _get_foreground_window_info, _kernel32, _user32
 
 _ACTIVE_BEARER_TOKEN = ""
 _VALID_MODES = frozenset({"off", "safe", "full"})
+
+# A-3: Global emergency stop state (triggered by Ctrl+Alt+Pause/Break or PyAutoGUI FailSafe)
+# Note: On Windows, holding Ctrl while pressing Pause/Break generates VK_CANCEL (0x03), NOT VK_PAUSE (0x13);
+# registering BOTH ensures physical keyboards (VK_CANCEL) and virtual/remapped keyboards (VK_PAUSE) both trigger.
+_emergency_stop_event = threading.Event()
+_emergency_hotkey_lock = threading.Lock()
+_emergency_hotkey_thread: Optional[threading.Thread] = None
+_emergency_hotkey_tid: int = 0
+_EMERGENCY_HOTKEY_ID = 0x585A
+_EMERGENCY_HOTKEY_CANCEL_ID = 0x585B
+_MOD_ALT = 0x0001
+_MOD_CONTROL = 0x0002
+_MOD_NOREPEAT = 0x4000
+_VK_CANCEL = 0x03
+_VK_PAUSE = 0x13
+_EMERGENCY_HOTKEY_SPECS = (
+    (_EMERGENCY_HOTKEY_CANCEL_ID, _VK_CANCEL, "VK_CANCEL(0x03)"),
+    (_EMERGENCY_HOTKEY_ID, _VK_PAUSE, "VK_PAUSE(0x13)"),
+)
+_WM_HOTKEY = 0x0312
+_WM_QUIT = 0x0012
 
 
 def set_active_bearer_token(token: str) -> None:
@@ -44,15 +71,44 @@ def get_active_bearer_token() -> str:
     return facade_attr("_ACTIVE_BEARER_TOKEN", _ACTIVE_BEARER_TOKEN) or _ACTIVE_BEARER_TOKEN
 
 
+def _sync_container_token_env(key: str, value: str, env_file: Optional[Path] = None) -> None:
+    """Keep host-only secrets/pc_mcp_tokens.env in sync for Docker Compose env_file injection (A-1)."""
+    if not key or not value:
+        return
+    target = Path(env_file) if env_file is not None else Path(
+        facade_attr("CONTAINER_TOKENS_ENV_FILE", _DEFAULT_CONTAINER_TOKENS_ENV_FILE)
+    )
+    try:
+        entries: dict[str, str] = {}
+        if target.is_file():
+            for raw in target.read_text(encoding="utf-8", errors="ignore").splitlines():
+                ln = raw.lstrip("\ufeff").strip()
+                if not ln or ln.startswith("#") or "=" not in ln:
+                    continue
+                k, v = ln.split("=", 1)
+                k = k.strip()
+                if k:
+                    entries[k] = v.strip()
+        if entries.get(key) == value:
+            return
+        entries[key] = value
+        lines = [f"{k}={v}" for k, v in entries.items()]
+        l3_mod = facade_attr("l3_backends", l3_backends)
+        l3_mod.atomic_write_text(target, "\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def load_or_create_pc_mcp_token(token_file: Optional[Path] = None, *, retries: int = 3) -> str:
-    """Load local 18900 Bearer token from data/pc_mcp_token.txt or atomically generate one.
+    """Load local 18900 Bearer token from host-private secrets/pc_mcp_token.txt or atomically generate one.
 
     Transient I/O errors when reading an existing token file are retried and NEVER cause silent
-    regeneration/overwrite that would disconnect running clients (P2-23).
+    regeneration/overwrite that would disconnect running clients (P2-23, A-1, A-2).
     """
     global _ACTIVE_BEARER_TOKEN
     default_tf = facade_attr("TOKEN_FILE", _DEFAULT_TOKEN_FILE)
     tf = Path(token_file) if token_file is not None else Path(default_tf)
+    is_default_path = token_file is None
     tmod = facade_attr("time", time)
     last_io_err: Optional[Exception] = None
     max_tries = max(1, int(retries))
@@ -70,6 +126,8 @@ def load_or_create_pc_mcp_token(token_file: Optional[Path] = None, *, retries: i
             continue
         if len(existing) >= 24:
             _ACTIVE_BEARER_TOKEN = existing
+            if is_default_path:
+                _sync_container_token_env("PC_MCP_TOKEN", existing)
             return existing
         if attempt + 1 < max_tries and existing == "":
             tmod.sleep(0.05)
@@ -79,16 +137,33 @@ def load_or_create_pc_mcp_token(token_file: Optional[Path] = None, *, retries: i
 
     if last_io_err is not None:
         cached_tok = get_active_bearer_token()
-        if token_file is None and len(cached_tok) >= 24:
+        if is_default_path and len(cached_tok) >= 24:
             return cached_tok
         raise RuntimeError(
             f"读取令牌文件 {tf} 遇 I/O 异常，拒绝静默覆盖重建以免旧客户端失联: {last_io_err}"
         ) from last_io_err
 
+    # One-time seamless migration from legacy data/pc_mcp_token.txt -> secrets/pc_mcp_token.txt (A-1)
+    if is_default_path and tf == Path(_DEFAULT_TOKEN_FILE):
+        legacy_tf = Path(facade_attr("LEGACY_TOKEN_FILE", _LEGACY_TOKEN_FILE))
+        if legacy_tf != tf and legacy_tf.is_file():
+            try:
+                legacy_tok = legacy_tf.read_text(encoding="utf-8").strip()
+                if len(legacy_tok) >= 24:
+                    l3_mod = facade_attr("l3_backends", l3_backends)
+                    l3_mod.atomic_write_text(tf, legacy_tok + "\n", encoding="utf-8")
+                    _ACTIVE_BEARER_TOKEN = legacy_tok
+                    _sync_container_token_env("PC_MCP_TOKEN", legacy_tok)
+                    return legacy_tok
+            except Exception:
+                pass
+
     token = secrets.token_urlsafe(32)
     l3_mod = facade_attr("l3_backends", l3_backends)
     l3_mod.atomic_write_text(tf, token + "\n", encoding="utf-8")
     _ACTIVE_BEARER_TOKEN = token
+    if is_default_path:
+        _sync_container_token_env("PC_MCP_TOKEN", token)
     return token
 
 
@@ -109,32 +184,237 @@ def _extract_mode_from_json(raw: object) -> Optional[str]:
 
 
 def _get_mode() -> str:
-    """Read PC control mode from unified data/runtime_settings.json with legacy pc_control_mode.json fallback (P2-21)."""
+    """Read authoritative PC control mode EXCLUSIVELY from host-private pc-mcp/state/pc_control_mode.json (A-2).
+
+    Container-writable data/runtime_settings.json is NEVER trusted by the host 18900 service.
+    Missing, corrupt, or unrecognized mode files fail-safe to 'safe'.
+    """
     mode_file = Path(facade_attr("MODE_FILE", _DEFAULT_MODE_FILE))
-    rs_file = Path(facade_attr("RUNTIME_SETTINGS_FILE", _DEFAULT_RUNTIME_SETTINGS_FILE))
-
-    # If a unit test explicitly monkeypatched MODE_FILE (without patching RUNTIME_SETTINGS_FILE), honor MODE_FILE first
-    mode_overridden = mode_file != _DEFAULT_MODE_FILE and rs_file == _DEFAULT_RUNTIME_SETTINGS_FILE
-    candidates = [mode_file] if mode_overridden else [rs_file, mode_file]
-
-    for path in candidates:
-        try:
-            if path.is_file():
-                raw = json.loads(path.read_text(encoding="utf-8"))
-                parsed = _extract_mode_from_json(raw)
-                if parsed is not None:
-                    return parsed
-                # If the primary settings file exists and is valid/corrupt without valid mode,
-                # fall back to next candidate only if file was missing; otherwise fail-safe to 'safe'.
-                if path == rs_file and mode_file.is_file() and isinstance(raw, dict) and "pc_control" not in raw:
-                    continue
-                return "safe"
-        except Exception:
-            if path == rs_file and not mode_overridden:
-                # Corrupt runtime_settings.json must fail-safe to 'safe' rather than trusting stale legacy file
-                return "safe"
-            continue
+    try:
+        if mode_file.is_file():
+            raw = json.loads(mode_file.read_text(encoding="utf-8"))
+            parsed = _extract_mode_from_json(raw)
+            if parsed is not None:
+                return parsed
+            return "safe"
+    except Exception:
+        return "safe"
     return "safe"
+
+
+def _notify_full_mode_escalation(prev_mode: str, source: str) -> None:
+    """Best-effort non-blocking Windows desktop notification when host mode escalates to 'full' (A-2)."""
+    if os.name != "nt":
+        return
+    if os.environ.get("PC_MCP_NOTIFY_ON_FULL", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    if "unittest" in sys.modules:
+        return
+
+    def _worker():
+        try:
+            import subprocess
+
+            ps_cmd = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "Add-Type -AssemblyName System.Drawing; "
+                "$n = New-Object System.Windows.Forms.NotifyIcon; "
+                "$n.Icon = [System.Drawing.SystemIcons]::Warning; "
+                "$n.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning; "
+                "$n.BalloonTipTitle = 'XiaoZhi PC-MCP 安全提醒'; "
+                "$n.BalloonTipText = '电脑操控已切至【全权操控挡】(full)。按 Ctrl+Alt+Pause 可随时急停降回安全挡。'; "
+                "$n.Visible = $true; "
+                "$n.ShowBalloonTip(4000); "
+                "Start-Sleep -Milliseconds 4200; "
+                "$n.Dispose()"
+            )
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                creationflags=0x08000000,
+            )
+        except Exception:
+            pass
+
+    try:
+        threading.Thread(target=_worker, name="pc-mcp-full-notify", daemon=True).start()
+    except Exception:
+        pass
+
+
+def set_host_mode(mode: str, *, source: str = "http_api", reason: str = "") -> dict:
+    """Validate, atomically persist to host-private MODE_FILE, and audit every PC control mode change (A-2)."""
+    if not isinstance(mode, str):
+        raise ValueError("mode 必须为字符串 (off / safe / full)")
+    m = mode.strip().lower()
+    if m not in _VALID_MODES:
+        raise ValueError(f"无效的权限挡位: {mode!r}（仅允许 off / safe / full）")
+
+    mode_file = Path(facade_attr("MODE_FILE", _DEFAULT_MODE_FILE))
+    prev_mode = _get_mode()
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "mode": m,
+        "updated_at": ts,
+        "source": str(source or "http_api"),
+    }
+    l3_mod = facade_attr("l3_backends", l3_backends)
+    l3_mod.atomic_write_json(mode_file, payload)
+
+    if source != "emergency_stop":
+        clear_emergency_stop()
+
+    audit_fn = facade_attr("_write_l2_audit_log", _write_l2_audit_log)
+    audit_reason = "mode_escalated_to_full" if m == "full" else (
+        "emergency_stop_downgrade" if source == "emergency_stop" else "mode_changed"
+    )
+    detail_str = f"{prev_mode}->{m} (source={source}" + (f", reason={reason})" if reason else ")")
+    audit_fn(
+        tool="pc_mode",
+        action="set_mode",
+        outcome="allowed",
+        reason=audit_reason,
+        mode=m,
+        detail=detail_str,
+    )
+    logging.getLogger("xiaozhi.pc_mcp").info("[Mode] Host PC control mode changed: %s", detail_str)
+    if m == "full" and prev_mode != "full":
+        _notify_full_mode_escalation(prev_mode, source)
+    return {
+        "ok": True,
+        "mode": m,
+        "previous_mode": prev_mode,
+        "updated_at": ts,
+        "source": "host_state",
+        "emergency_stopped": is_emergency_stop_active(),
+    }
+
+
+def is_emergency_stop_active() -> bool:
+    return _emergency_stop_event.is_set()
+
+
+def clear_emergency_stop() -> None:
+    _emergency_stop_event.clear()
+
+
+def trigger_emergency_stop(reason: str = "hotkey:ctrl+alt+pause") -> dict:
+    """Immediately cancel active L2 UI operations and downgrade host mode to 'safe' (A-3)."""
+    _emergency_stop_event.set()
+    res = set_host_mode("safe", source="emergency_stop", reason=reason)
+    logging.getLogger("xiaozhi.pc_mcp").warning(
+        "[EMERGENCY STOP] Triggered (%s): L2 cancelled and mode downgraded to safe.", reason
+    )
+    return res
+
+
+def start_emergency_stop_hotkey_listener() -> Optional[threading.Thread]:
+    """Register global Windows Ctrl+Alt+Pause emergency stop hotkey on a background daemon thread (A-3)."""
+    global _emergency_hotkey_thread, _emergency_hotkey_tid
+    if os.name != "nt":
+        return None
+    with _emergency_hotkey_lock:
+        if _emergency_hotkey_thread is not None and _emergency_hotkey_thread.is_alive():
+            return _emergency_hotkey_thread
+
+        ready = threading.Event()
+
+        def _hotkey_loop():
+            global _emergency_hotkey_tid
+            u32 = facade_attr("_user32", _user32)
+            k32 = facade_attr("_kernel32", _kernel32)
+            trigger_fn = facade_attr("trigger_emergency_stop", trigger_emergency_stop)
+            tid = int(k32.GetCurrentThreadId())
+            _emergency_hotkey_tid = tid
+            registered_ids: list[int] = []
+            registered_labels: list[str] = []
+            try:
+                for hk_id, vk_code, label in _EMERGENCY_HOTKEY_SPECS:
+                    try:
+                        ok = bool(
+                            u32.RegisterHotKey(
+                                None,
+                                hk_id,
+                                _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT,
+                                vk_code,
+                            )
+                        )
+                        if ok:
+                            registered_ids.append(hk_id)
+                            registered_labels.append(label)
+                        else:
+                            logging.getLogger("xiaozhi.pc_mcp").warning(
+                                "[Guardrail] Could not register global Ctrl+Alt+Pause hotkey %s (err=%s).",
+                                label,
+                                ctypes.get_last_error(),
+                            )
+                    except Exception as exc:
+                        logging.getLogger("xiaozhi.pc_mcp").warning(
+                            "[Guardrail] Hotkey registration error (%s): %s", label, exc
+                        )
+                if registered_ids:
+                    logging.getLogger("xiaozhi.pc_mcp").info(
+                        "[Guardrail] Global emergency stop hotkey registered: Ctrl+Alt+Pause/Break [%s]",
+                        ", ".join(registered_labels),
+                    )
+                else:
+                    logging.getLogger("xiaozhi.pc_mcp").warning(
+                        "[Guardrail] No Ctrl+Alt+Pause/Break hotkey could be registered; PyAutoGUI FAILSAFE remains active."
+                    )
+            finally:
+                ready.set()
+
+            if not registered_ids:
+                return
+
+            registered_id_set = set(registered_ids)
+            msg = wintypes.MSG()
+            try:
+                while True:
+                    ret = u32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                    if ret <= 0:
+                        break
+                    if msg.message == _WM_HOTKEY and msg.wParam in registered_id_set:
+                        try:
+                            trigger_fn("hotkey:ctrl+alt+pause")
+                        except Exception as exc:
+                            logging.getLogger("xiaozhi.pc_mcp").warning(
+                                "[EMERGENCY STOP] Callback failed: %s", exc
+                            )
+            finally:
+                for hk_id in registered_ids:
+                    try:
+                        u32.UnregisterHotKey(None, hk_id)
+                    except Exception:
+                        pass
+                _emergency_hotkey_tid = 0
+
+        t = threading.Thread(target=_hotkey_loop, name="pc-mcp-emergency-hotkey", daemon=True)
+        _emergency_hotkey_thread = t
+        t.start()
+        ready.wait(timeout=1.0)
+        return t
+
+
+def stop_emergency_stop_hotkey_listener() -> None:
+    global _emergency_hotkey_thread, _emergency_hotkey_tid
+    with _emergency_hotkey_lock:
+        tid = _emergency_hotkey_tid
+        t = _emergency_hotkey_thread
+    if tid and os.name == "nt":
+        try:
+            _user32.PostThreadMessageW(wintypes.DWORD(tid), _WM_QUIT, 0, 0)
+        except Exception:
+            pass
+    if t is not None and t.is_alive():
+        t.join(timeout=1.5)
+    with _emergency_hotkey_lock:
+        if _emergency_hotkey_thread is t:
+            _emergency_hotkey_thread = None
+            _emergency_hotkey_tid = 0
 
 
 def _check_permission(required_level: str) -> Optional[str]:
@@ -183,6 +463,11 @@ _BLOCKED_INPUT_PROCESSES = frozenset({
     "conemuc.exe",
     "conemuc64.exe",
     "taskmgr.exe",
+    "searchhost.exe",
+    "startmenuexperiencehost.exe",
+    "searchapp.exe",
+    "searchui.exe",
+    "shellexperiencehost.exe",
 })
 
 _BLOCKED_INPUT_WINDOW_CLASSES = frozenset({
@@ -192,6 +477,10 @@ _BLOCKED_INPUT_WINDOW_CLASSES = frozenset({
     "virtualconsoleclass",
     "putty",
     "org.wezfurlong.wezterm",
+    "dv2controlhost",
+    "shell_traywnd",
+    "shell_secondarytraywnd",
+    "launchertipwnd",
 })
 
 _RUN_DIALOG_TITLES = frozenset({
@@ -200,9 +489,110 @@ _RUN_DIALOG_TITLES = frozenset({
     "執行",
 })
 
+_CREATE_TASK_DIALOG_TITLES = frozenset({
+    "创建新任务",
+    "运行新任务",
+    "create new task",
+    "run new task",
+    "建立新工作",
+})
+
+_EXPLORER_ADDRESS_BAR_IDS = frozenset({
+    "41477",
+    "1001",
+    "addressbandroot",
+    "searcheditbox",
+    "textbox",
+    "part_editabletextbox",
+    "part_autosuggestbox",
+})
+
+_EXPLORER_ADDRESS_BAR_CLASSES = frozenset({
+    "edit",
+    "richeditd2dpt",
+    "combobox",
+    "comboboxex32",
+    "address band root",
+    "breadcrumb parent",
+    "toolbarwindow32",
+    "msctls_progress32",
+})
+
+_EXPLORER_ADDRESS_BAR_NAME_TOKENS = (
+    "地址",
+    "address",
+    "路径",
+    "path",
+    "位置",
+    "location",
+    "搜索",
+    "search",
+)
+
+_EXPLORER_XAML_BRIDGE_CLASSES = frozenset({
+    "microsoft.ui.content.desktopchildsitebridge",
+    "windows.ui.composition.desktopwindowcontentbridge",
+})
+
+_EXPLORER_ADDRESS_BAR_HOTKEYS = frozenset({
+    frozenset({"alt", "d"}),
+    frozenset({"ctrl", "l"}),
+    frozenset({"f3"}),
+    frozenset({"f4"}),
+    frozenset({"ctrl", "e"}),
+    frozenset({"ctrl", "f"}),
+})
+
+
+def _is_explorer_address_or_search_bar(info: dict) -> bool:
+    """Detect focused or clicked Explorer (CabinetWClass) address bar / search Edit controls (A-3)."""
+    cls = str(info.get("class") or "").strip().lower()
+    if cls != "cabinetwclass":
+        return False
+    for key in ("focused_control", "point_control"):
+        ctrl = info.get(key)
+        if not isinstance(ctrl, dict) or not ctrl:
+            continue
+        ctype = str(ctrl.get("control_type") or "").strip().lower()
+        ccls = str(ctrl.get("class") or "").strip().lower()
+        ucls = str(ctrl.get("uia_class") or "").strip().lower()
+        cname = str(ctrl.get("name") or "").strip().lower()
+        caid = str(ctrl.get("automation_id") or "").strip().lower()
+        canc = str(ctrl.get("ancestor_names") or "").strip().lower()
+
+        is_rename = ("重命名" in cname or "rename" in cname) and caid not in _EXPLORER_ADDRESS_BAR_IDS
+        if is_rename:
+            continue
+
+        # Fail-closed when Win10/11 Explorer XAML chrome bridge cannot be inspected via UIA
+        if ctrl.get("uia_error") and ccls in _EXPLORER_XAML_BRIDGE_CLASSES:
+            return True
+
+        if caid in _EXPLORER_ADDRESS_BAR_IDS:
+            return True
+        if ctype in ("edit", "editcontrol", "combobox", "comboboxcontrol"):
+            return True
+        for cand_cls in (ccls, ucls):
+            if not cand_cls:
+                continue
+            if cand_cls in _EXPLORER_ADDRESS_BAR_CLASSES:
+                if cand_cls in ("toolbarwindow32", "msctls_progress32"):
+                    if any(tok in cname or tok in canc for tok in _EXPLORER_ADDRESS_BAR_NAME_TOKENS):
+                        return True
+                else:
+                    return True
+            if "autosuggest" in cand_cls or "searchedit" in cand_cls or cand_cls == "textbox":
+                return True
+        if any(tok in cname for tok in _EXPLORER_ADDRESS_BAR_NAME_TOKENS) and (
+            "edit" in ctype or "combo" in ctype or "address" in canc or "地址" in canc or "breadcrumb" in ccls or "autosuggest" in canc
+        ):
+            return True
+    return False
+
 
 def _check_foreground_input_guard(fg_info: Optional[dict] = None) -> Optional[str]:
-    """Refuse L2 keyboard/text/hotkey input when foreground window is a terminal or Windows Run dialog."""
+    """Refuse L2 keyboard/text/hotkey input when foreground window is a terminal, Start/Search,
+    Windows Run dialog, Task Manager 'Run new task', or Explorer address bar (A-3)."""
     info = fg_info if fg_info is not None else _get_foreground_window_info()
     proc_raw = str(info.get("process") or "").strip().lower()
     proc = os.path.basename(proc_raw) if proc_raw else ""
@@ -212,13 +602,61 @@ def _check_foreground_input_guard(fg_info: Optional[dict] = None) -> Optional[st
     title_low = title.lower()
 
     if proc in _BLOCKED_INPUT_PROCESSES:
-        return f"安全护栏已拦截：当前前台窗口为终端或系统敏感进程（{proc}），已拒绝 L2 键盘输入。"
+        return f"安全护栏已拦截：当前前台窗口为终端、搜索/开始菜单或系统敏感进程（{proc}），已拒绝 L2 输入。"
     if cls in _BLOCKED_INPUT_WINDOW_CLASSES:
-        return f"安全护栏已拦截：当前前台窗口为终端控制台窗口（{cls_raw}），已拒绝 L2 键盘输入。"
+        return f"安全护栏已拦截：当前前台窗口为终端控制台或系统外壳窗口（{cls_raw}），已拒绝 L2 输入。"
     if (cls == "#32770" and title_low in _RUN_DIALOG_TITLES) or (
         proc == "explorer.exe" and cls != "cabinetwclass" and title_low in _RUN_DIALOG_TITLES
     ):
-        return f"安全护栏已拦截：当前前台窗口为 Windows「{title or '运行'}」对话框，已拒绝 L2 键盘输入。"
+        return f"安全护栏已拦截：当前前台窗口为 Windows「{title or '运行'}」对话框，已拒绝 L2 输入。"
+    if title_low in _CREATE_TASK_DIALOG_TITLES and (
+        cls == "#32770" or proc in ("", "taskmgr.exe", "explorer.exe")
+    ):
+        return f"安全护栏已拦截：当前前台窗口为任务管理器「{title or '创建新任务'}」对话框，已拒绝 L2 输入。"
+    if _is_explorer_address_or_search_bar(info):
+        return "安全护栏已拦截：检测到焦点位于资源管理器（CabinetWClass）地址栏或搜索框，已拒绝 L2 输入以防命令执行绕过。"
+    return None
+
+
+def _check_foreground_hotkey_guard(canon_keys: list[str], fg_info: Optional[dict] = None) -> Optional[str]:
+    """Block hotkeys that focus Explorer's address/search bar while CabinetWClass is in foreground (A-3)."""
+    info = fg_info if fg_info is not None else _get_foreground_window_info()
+    cls = str(info.get("class") or "").strip().lower()
+    if cls == "cabinetwclass":
+        key_set = frozenset(canon_keys)
+        for combo in _EXPLORER_ADDRESS_BAR_HOTKEYS:
+            if combo.issubset(key_set):
+                label = "+".join(sorted(combo))
+                return f"安全护栏已拦截：资源管理器窗口下禁止发送地址栏/搜索聚焦快捷键（{label}）。"
+    return None
+
+
+def _check_click_guard(
+    act: str,
+    fg_info: Optional[dict] = None,
+    target_info: Optional[dict] = None,
+) -> Optional[str]:
+    """Guard L2 click / double_click / right_click against terminal right-click paste & sensitive windows (A-3)."""
+    fg = fg_info if fg_info is not None else _get_foreground_window_info()
+    fg_err = _check_foreground_input_guard(fg)
+    tgt_err = _check_foreground_input_guard(target_info) if target_info else None
+
+    if act == "right_click":
+        if fg_err:
+            return f"安全护栏已拦截：前台为终端或系统敏感窗口，已拒绝右键点击以防触发右键粘贴（{fg_err}）。"
+        if tgt_err:
+            return f"安全护栏已拦截：点击目标位于终端或系统敏感窗口，已拒绝右键点击（{tgt_err}）。"
+        return None
+
+    # For left click / double_click: block clicking onto any sensitive window, or clicking when
+    # foreground is sensitive and target window is unknown or the same sensitive window.
+    if tgt_err:
+        return f"安全护栏已拦截：点击目标位于终端、地址栏或系统敏感窗口，已拒绝 L2 点击（{tgt_err}）。"
+    if fg_err:
+        fg_hwnd = int(fg.get("hwnd") or 0) if isinstance(fg, dict) else 0
+        tgt_hwnd = int(target_info.get("hwnd") or 0) if isinstance(target_info, dict) else 0
+        if not target_info or not tgt_hwnd or (fg_hwnd and tgt_hwnd == fg_hwnd):
+            return f"安全护栏已拦截：当前前台为终端或系统敏感窗口，已拒绝 L2 点击（{fg_err}）。"
     return None
 
 
@@ -482,9 +920,9 @@ class _SecretRedactingFilter(logging.Filter):
 
 
 class _AccessLogNoiseFilter(logging.Filter):
-    """Drop routine 200 OK polling logs for /l3/status and /audio/status; keep all errors & mutations."""
+    """Drop routine 200 OK polling logs for /l3/status, /audio/status, and GET /mode; keep all errors & mutations."""
 
-    _QUIET_PATHS = frozenset({"/l3/status", "/audio/status"})
+    _QUIET_PATHS = frozenset({"/l3/status", "/audio/status", "/mode"})
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
@@ -502,6 +940,8 @@ class _AccessLogNoiseFilter(logging.Filter):
             if '"GET /l3/status' in msg and msg.rstrip().endswith("200"):
                 return False
             if '"GET /audio/status' in msg and msg.rstrip().endswith("200"):
+                return False
+            if '"GET /mode' in msg and msg.rstrip().endswith("200"):
                 return False
         return True
 
@@ -528,37 +968,53 @@ def _build_allowed_hosts_and_origins(port: int = 18900) -> tuple[list[str], list
 class _LocalBearerAndHostMiddleware:
     """ASGI middleware enforcing Host/Origin allowlist and Bearer Token across ALL 18900 endpoints."""
 
-    def __init__(self, app, token: str, allowed_hosts: list[str], allowed_origins: list[str]):
+    def __init__(self, app, token: str | None, allowed_hosts: list[str], allowed_origins: list[str]):
         self.app = app
-        self.expected_token = token
+        norm_token = token.strip() if isinstance(token, str) else ""
+        self.expected_token = norm_token
+        self.expected_token_bytes = norm_token.encode("utf-8") if norm_token else b""
         self.allowed_hosts = {h.lower() for h in allowed_hosts}
         self.allowed_origins = {o.lower() for o in allowed_origins}
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        scope_type = scope.get("type")
+        if scope_type == "lifespan":
             await self.app(scope, receive, send)
+            return
+        if scope_type not in ("http", "websocket"):
             return
 
         headers = _StarletteHeaders(scope=scope)
         host = (headers.get("host") or "").strip().lower()
         if not host or host not in self.allowed_hosts:
+            if scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 1008, "reason": "Invalid Host header"})
+                return
             resp = _StarletteResponse("Invalid Host header", status_code=421)
             await resp(scope, receive, send)
             return
 
         origin = (headers.get("origin") or "").strip().lower()
         if origin and origin not in self.allowed_origins:
+            if scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 1008, "reason": "Invalid Origin header"})
+                return
             resp = _StarletteResponse("Invalid Origin header", status_code=403)
             await resp(scope, receive, send)
             return
 
         auth = (headers.get("authorization") or "").strip()
         scheme, sep, supplied_token = auth.partition(" ")
+        supplied_bytes = supplied_token.strip().encode("utf-8", errors="replace")
         if (
             not sep
             or scheme.lower() != "bearer"
-            or not secrets.compare_digest(supplied_token.strip(), self.expected_token)
+            or not self.expected_token_bytes
+            or not secrets.compare_digest(supplied_bytes, self.expected_token_bytes)
         ):
+            if scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 1008, "reason": "Unauthorized"})
+                return
             resp = _StarletteJSONResponse(
                 {"ok": False, "error": "Unauthorized"},
                 status_code=401,

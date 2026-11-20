@@ -28,12 +28,20 @@ import l3_backends
 
 SERVER_DIR = MCP_DIR.parent
 DATA_DIR = SERVER_DIR / "data"
+SECRETS_DIR = SERVER_DIR / "secrets"
+LOGS_DIR = SERVER_DIR / "logs"
+CONFIG_RUNTIME_DIR = SERVER_DIR / "config" / "runtime"
 STATE_DIR = getattr(l3_backends, "STATE_DIR", MCP_DIR / "state")
+# Deprecated legacy alias kept only for backward-compatible test imports; host NEVER trusts container-writable runtime_settings.json (A-2).
 RUNTIME_SETTINGS_FILE = DATA_DIR / "runtime_settings.json"
-MODE_FILE = DATA_DIR / "pc_control_mode.json"
-TOKEN_FILE = DATA_DIR / "pc_mcp_token.txt"
-LOG_FILE = DATA_DIR / "pc_mcp_18900.log"
-CONFIG_YAML = DATA_DIR / ".config.yaml"
+# Authoritative host-private PC control mode file (A-2): never mounted into Docker containers.
+MODE_FILE = STATE_DIR / "pc_control_mode.json"
+LEGACY_TOKEN_FILE = DATA_DIR / "pc_mcp_token.txt"
+TOKEN_FILE = SECRETS_DIR / "pc_mcp_token.txt"
+CONTAINER_TOKENS_ENV_FILE = SECRETS_DIR / "pc_mcp_tokens.env"
+LOG_FILE = LOGS_DIR / "pc_mcp_18900.log"
+CONFIG_YAML = CONFIG_RUNTIME_DIR / ".config.yaml"
+LEGACY_CONFIG_YAML = DATA_DIR / ".config.yaml"
 L2_AUDIT_LOG_FILE = STATE_DIR / "l2_audit.jsonl"
 LAST_GROUNDING_IMG = STATE_DIR / "last_som_grounding.jpg"
 TASKS_ROOT = STATE_DIR / "agy_tasks"
@@ -41,7 +49,7 @@ PENDING_DIR = TASKS_ROOT / "pending"
 ACTIVE_DIR = TASKS_ROOT / "active"
 HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
 
-for _d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR):
+for _d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR, SECRETS_DIR, LOGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 # Lock hierarchy: _gui_lock (outer) -> _clipboard_lock / _audit_log_lock (inner) (P1-16)

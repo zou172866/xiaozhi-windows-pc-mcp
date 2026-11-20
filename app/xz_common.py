@@ -14,9 +14,65 @@ import time
 from typing import Any, Callable, Dict, Generic, Optional, TypeVar
 
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
-DATA_DIR = os.path.join(ROOT_DIR, "data")
-PC_MCP_TOKEN_PATH = os.path.join(DATA_DIR, "pc_mcp_token.txt")
-ANIMA_TOKEN_PATH = os.path.join(DATA_DIR, "anima", "studio_token.txt")
+APP_DIR = os.environ.get("XIAOZHI_APP_DIR") or os.path.dirname(os.path.abspath(__file__))
+CONFIG_DIR = os.environ.get("XIAOZHI_CONFIG_DIR") or os.path.join(ROOT_DIR, "data")
+STATE_DIR = os.environ.get("XIAOZHI_STATE_DIR") or (
+    os.path.join(ROOT_DIR, "state")
+    if os.path.isdir(os.path.join(ROOT_DIR, "state"))
+    else os.path.join(ROOT_DIR, "data")
+)
+VOICES_DIR = os.environ.get("XIAOZHI_VOICES_DIR") or (
+    os.path.join(ROOT_DIR, "voices")
+    if os.path.isdir(os.path.join(ROOT_DIR, "voices"))
+    else os.path.join(ROOT_DIR, "data", "voices")
+)
+# Backward-compatibility alias pointing to container config mount (/opt/xiaozhi-esp32-server/data)
+DATA_DIR = CONFIG_DIR
+PC_MCP_TOKEN_PATH = os.path.join(CONFIG_DIR, "pc_mcp_token.txt")
+ANIMA_TOKEN_PATH = os.path.join(CONFIG_DIR, "anima", "studio_token.txt")
+
+
+def resolve_host_dirs(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Resolve host project/data/voices/gsv_weights paths with backward-compatible derivation from HOST_DATA_DIR (A-1).
+
+    Ensures plain `docker compose up -d` with a legacy `.env` defining only `HOST_DATA_DIR=.../data`
+    still derives real Windows host paths for `HOST_VOICES_DIR` and `HOST_GSV_WEIGHTS_DIR` instead of
+    sending Linux `/opt/xiaozhi-esp32-server/voices` paths to host 19880 GPT-SoVITS.
+    """
+    src = os.environ if env is None else env
+    raw_proj = (src.get("HOST_PROJECT_DIR") or "").replace("\\", "/").rstrip("/")
+    raw_data = (src.get("HOST_DATA_DIR") or "").replace("\\", "/").rstrip("/")
+    raw_voices = (src.get("HOST_VOICES_DIR") or "").replace("\\", "/").rstrip("/")
+    raw_weights = (src.get("HOST_GSV_WEIGHTS_DIR") or "").replace("\\", "/").rstrip("/")
+
+    default_weights = f"{ROOT_DIR}/models/gsv_weights"
+    if raw_proj and raw_proj != ROOT_DIR:
+        host_project = raw_proj
+    elif raw_data and raw_data != DATA_DIR and raw_data.lower().endswith("/data"):
+        host_project = raw_data[:-5]
+    else:
+        host_project = raw_proj or ROOT_DIR
+
+    has_external_proj = bool(host_project and host_project != ROOT_DIR)
+    host_data = raw_data if (raw_data and raw_data != DATA_DIR) else (
+        f"{host_project}/data" if has_external_proj else (raw_data or DATA_DIR)
+    )
+    host_voices = (
+        raw_voices
+        if (raw_voices and not (raw_voices == VOICES_DIR and has_external_proj))
+        else (f"{host_project}/voices" if has_external_proj else (raw_voices or VOICES_DIR))
+    )
+    host_weights = (
+        raw_weights
+        if (raw_weights and not (raw_weights == default_weights and has_external_proj))
+        else (f"{host_project}/models/gsv_weights" if has_external_proj else (raw_weights or default_weights))
+    )
+    return {
+        "HOST_PROJECT_DIR": host_project,
+        "HOST_DATA_DIR": host_data,
+        "HOST_VOICES_DIR": host_voices,
+        "HOST_GSV_WEIGHTS_DIR": host_weights,
+    }
 
 T = TypeVar("T")
 
@@ -192,14 +248,21 @@ def invalidate_token_cache(path: Optional[str] = None) -> None:
                 c.invalidate()
 
 
-def get_pc_mcp_token(token_path: str = PC_MCP_TOKEN_PATH) -> str:
-    return read_token_file(token_path)
+def get_pc_mcp_token(token_path: Optional[str] = None) -> str:
+    """Read 18900 Bearer token: env PC_MCP_TOKEN first (A-1 zero mounted secret files), legacy file fallback."""
+    use_default = token_path is None or os.path.abspath(str(token_path)) == os.path.abspath(PC_MCP_TOKEN_PATH)
+    if use_default:
+        env_tok = (os.environ.get("PC_MCP_TOKEN") or "").strip()
+        if env_tok:
+            return env_tok
+        return read_token_file(PC_MCP_TOKEN_PATH)
+    return read_token_file(str(token_path))
 
 
 def get_pc_mcp_auth_headers(
     extra: Optional[Dict[str, str]] = None,
     *,
-    token_path: str = PC_MCP_TOKEN_PATH,
+    token_path: Optional[str] = None,
 ) -> Dict[str, str]:
     headers = dict(extra) if extra else {}
     tok = get_pc_mcp_token(token_path)
@@ -208,5 +271,12 @@ def get_pc_mcp_auth_headers(
     return headers
 
 
-def get_anima_token(token_path: str = ANIMA_TOKEN_PATH) -> str:
-    return read_token_file(token_path)
+def get_anima_token(token_path: Optional[str] = None) -> str:
+    """Read Anima Brain Bearer token: env ANIMA_STUDIO_TOKEN first (A-1 zero mounted secret files), legacy file fallback."""
+    use_default = token_path is None or os.path.abspath(str(token_path)) == os.path.abspath(ANIMA_TOKEN_PATH)
+    if use_default:
+        env_tok = (os.environ.get("ANIMA_STUDIO_TOKEN") or "").strip()
+        if env_tok:
+            return env_tok
+        return read_token_file(ANIMA_TOKEN_PATH)
+    return read_token_file(str(token_path))

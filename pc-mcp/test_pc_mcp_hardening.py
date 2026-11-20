@@ -10,14 +10,12 @@ from __future__ import annotations
 import array
 import io
 import logging
-import math
-import struct
 import sys
 import tempfile
 import unittest
 import wave
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 
@@ -269,12 +267,12 @@ class TestPcControlMcpHardening(unittest.TestCase):
                 patch.object(pcm.pyperclip, "copy", side_effect=_fake_copy),
                 patch.object(pcm.pyperclip, "paste", return_value="hello"),
             ):
-                # Case A: clipboard holds non-text (e.g. screenshot image) -> IsClipboardFormatAvailable(13) == 0 -> must NOT overwrite with ""
+                # Case A (A-3): original clipboard had no text -> IsClipboardFormatAvailable(13) == 0 -> MUST clear typed text (never leave residual text in clipboard)
                 with patch.object(pcm._user32, "IsClipboardFormatAvailable", return_value=0):
                     copied_calls.clear()
                     res = pcm.pc_ui_action(action="type_text", text="hello")
                     self.assertIn("已输入文本", res)
-                    self.assertEqual(copied_calls, ["hello"])
+                    self.assertEqual(copied_calls, ["hello", ""])
 
                 # Case B: clipboard holds previous text -> restores previous text after paste
                 with (
@@ -284,6 +282,232 @@ class TestPcControlMcpHardening(unittest.TestCase):
                     copied_calls.clear()
                     pcm.pc_ui_action(action="type_text", text="hello")
                     self.assertEqual(copied_calls, ["hello", "previous-clip"])
+
+    def test_e5_middleware_non_ascii_auth_and_websocket_scope_enforcement(self):
+        import asyncio
+        from pc_mcp_modules.security import _LocalBearerAndHostMiddleware
+
+        tok = "test-e5-token-abcdefghijklmnopqrstuvwxyz-123456"
+        called = []
+
+        async def _inner(scope, receive, send):
+            called.append(scope.get("type"))
+            if scope.get("type") == "http":
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"ok"})
+
+        mw = _LocalBearerAndHostMiddleware(
+            _inner,
+            token=tok,
+            allowed_hosts=["127.0.0.1:18900"],
+            allowed_origins=["http://127.0.0.1:18080"],
+        )
+
+        async def _run():
+            async def _noop_receive():
+                return {"type": "http.request", "body": b""}
+
+            # 1. Non-ASCII Authorization header -> 401 (NEVER TypeError/500!)
+            sent_http = []
+            scope_non_ascii = {
+                "type": "http",
+                "method": "GET",
+                "path": "/audio/status",
+                "headers": [
+                    (b"host", b"127.0.0.1:18900"),
+                    (b"authorization", b"Bearer \xe4\xb8\xad\xe6\x96\x87\xe4\xbb\xa4\xe7\x89\x8c"),
+                ],
+            }
+            await mw(scope_non_ascii, _noop_receive, lambda m: asyncio.sleep(0, result=sent_http.append(m)))
+            self.assertEqual(sent_http[0]["status"], 401)
+            self.assertEqual(called, [])
+
+            # 2. WebSocket without Bearer -> rejected with websocket.close 1008, inner NOT called
+            sent_ws_unauth = []
+            scope_ws_unauth = {
+                "type": "websocket",
+                "path": "/ws",
+                "headers": [(b"host", b"127.0.0.1:18900")],
+            }
+            await mw(scope_ws_unauth, _noop_receive, lambda m: asyncio.sleep(0, result=sent_ws_unauth.append(m)))
+            self.assertEqual(sent_ws_unauth[0]["type"], "websocket.close")
+            self.assertEqual(sent_ws_unauth[0]["code"], 1008)
+            self.assertEqual(called, [])
+
+            # 3. WebSocket with untrusted Host -> rejected
+            sent_ws_host = []
+            scope_ws_host = {
+                "type": "websocket",
+                "path": "/ws",
+                "headers": [
+                    (b"host", b"evil.example:18900"),
+                    (b"authorization", f"Bearer {tok}".encode("utf-8")),
+                ],
+            }
+            await mw(scope_ws_host, _noop_receive, lambda m: asyncio.sleep(0, result=sent_ws_host.append(m)))
+            self.assertEqual(sent_ws_host[0]["type"], "websocket.close")
+            self.assertEqual(called, [])
+
+            # 4. WebSocket with untrusted Origin -> rejected
+            sent_ws_origin = []
+            scope_ws_origin = {
+                "type": "websocket",
+                "path": "/ws",
+                "headers": [
+                    (b"host", b"127.0.0.1:18900"),
+                    (b"origin", b"https://evil.example"),
+                    (b"authorization", f"Bearer {tok}".encode("utf-8")),
+                ],
+            }
+            await mw(scope_ws_origin, _noop_receive, lambda m: asyncio.sleep(0, result=sent_ws_origin.append(m)))
+            self.assertEqual(sent_ws_origin[0]["type"], "websocket.close")
+            self.assertEqual(called, [])
+
+            # 5. WebSocket with valid Host + Bearer -> allowed through
+            scope_ws_ok = {
+                "type": "websocket",
+                "path": "/ws",
+                "headers": [
+                    (b"host", b"127.0.0.1:18900"),
+                    (b"authorization", f"Bearer {tok}".encode("utf-8")),
+                ],
+            }
+            await mw(scope_ws_ok, _noop_receive, lambda m: asyncio.sleep(0))
+            self.assertEqual(called, ["websocket"])
+
+            # 6. Lifespan scope -> allowed through
+            await mw({"type": "lifespan"}, _noop_receive, lambda m: asyncio.sleep(0))
+            self.assertEqual(called, ["websocket", "lifespan"])
+
+            # 7. Unknown ASGI scope type -> rejected (fail-closed)
+            await mw({"type": "unknown_proto"}, _noop_receive, lambda m: asyncio.sleep(0))
+            self.assertEqual(called, ["websocket", "lifespan"])
+
+            # 8. Non-ASCII Host & Origin headers -> cleanly rejected (421 / 403, never 500)
+            sent_na_host = []
+            await mw(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/audio/status",
+                    "headers": [(b"host", b"\xe4\xb8\xad\xe6\x96\x87:18900")],
+                },
+                _noop_receive,
+                lambda m: asyncio.sleep(0, result=sent_na_host.append(m)),
+            )
+            self.assertEqual(sent_na_host[0]["status"], 421)
+
+            # 9. Empty expected token must fail-closed even with Bearer header
+            mw_empty = _LocalBearerAndHostMiddleware(
+                _inner,
+                token="",
+                allowed_hosts=["127.0.0.1:18900"],
+                allowed_origins=["http://127.0.0.1:18080"],
+            )
+            sent_empty_tok = []
+            await mw_empty(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/audio/status",
+                    "headers": [
+                        (b"host", b"127.0.0.1:18900"),
+                        (b"authorization", b"Bearer "),
+                    ],
+                },
+                _noop_receive,
+                lambda m: asyncio.sleep(0, result=sent_empty_tok.append(m)),
+            )
+            self.assertEqual(sent_empty_tok[0]["status"], 401)
+
+        asyncio.run(_run())
+
+    def test_e5_middleware_none_and_whitespace_token_fail_closed(self):
+        import asyncio
+        from pc_mcp_modules.security import _LocalBearerAndHostMiddleware
+
+        called = []
+
+        async def _inner(scope, receive, send):
+            called.append(scope.get("type"))
+            if scope.get("type") == "http":
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"ok"})
+
+        async def _run():
+            async def _noop_receive():
+                return {"type": "http.request", "body": b""}
+
+            # None expected token MUST fail-closed (never encode None -> b"None"!)
+            mw_none = _LocalBearerAndHostMiddleware(
+                _inner,
+                token=None,
+                allowed_hosts=["127.0.0.1:18900"],
+                allowed_origins=["http://127.0.0.1:18080"],
+            )
+            self.assertEqual(mw_none.expected_token, "")
+            self.assertEqual(mw_none.expected_token_bytes, b"")
+
+            sent_none_http = []
+            await mw_none(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/audio/status",
+                    "headers": [
+                        (b"host", b"127.0.0.1:18900"),
+                        (b"authorization", b"Bearer None"),
+                    ],
+                },
+                _noop_receive,
+                lambda m: asyncio.sleep(0, result=sent_none_http.append(m)),
+            )
+            self.assertEqual(sent_none_http[0]["status"], 401)
+
+            sent_none_ws = []
+            await mw_none(
+                {
+                    "type": "websocket",
+                    "path": "/ws",
+                    "headers": [
+                        (b"host", b"127.0.0.1:18900"),
+                        (b"authorization", b"Bearer None"),
+                    ],
+                },
+                _noop_receive,
+                lambda m: asyncio.sleep(0, result=sent_none_ws.append(m)),
+            )
+            self.assertEqual(sent_none_ws[0]["type"], "websocket.close")
+            self.assertEqual(sent_none_ws[0]["code"], 1008)
+
+            # Whitespace-only & non-str tokens MUST also fail-closed
+            for bad_tok, hdr_val in (("   ", b"Bearer    "), (12345, b"Bearer 12345")):
+                mw_bad = _LocalBearerAndHostMiddleware(
+                    _inner,
+                    token=bad_tok,
+                    allowed_hosts=["127.0.0.1:18900"],
+                    allowed_origins=["http://127.0.0.1:18080"],
+                )
+                self.assertEqual(mw_bad.expected_token_bytes, b"")
+                sent_bad = []
+                await mw_bad(
+                    {
+                        "type": "http",
+                        "method": "GET",
+                        "path": "/audio/status",
+                        "headers": [
+                            (b"host", b"127.0.0.1:18900"),
+                            (b"authorization", hdr_val),
+                        ],
+                    },
+                    _noop_receive,
+                    lambda m: asyncio.sleep(0, result=sent_bad.append(m)),
+                )
+                self.assertEqual(sent_bad[0]["status"], 401)
+
+            self.assertEqual(called, [])
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

@@ -17,9 +17,9 @@ import patch_registry
 import runtime_settings
 import xz_common
 
-ROOT_DIR = "/opt/xiaozhi-esp32-server"
-DATA_DIR = os.path.join(ROOT_DIR, "data")
-_DEFAULT_REPLY_LEN_PATH = os.path.join(DATA_DIR, "reply_length_config.json")
+ROOT_DIR = xz_common.ROOT_DIR
+DATA_DIR = xz_common.STATE_DIR
+_DEFAULT_REPLY_LEN_PATH = os.path.join(xz_common.STATE_DIR, "reply_length_config.json")
 REPLY_LEN_PATH = _DEFAULT_REPLY_LEN_PATH
 
 PRESETS: Dict[str, Dict[str, int]] = {
@@ -183,6 +183,17 @@ def apply_reply_length_llm_patch() -> None:
     ok2, d2 = patch_registry.verify_signature_contract(
         _orig_response_with_functions, required_params=("self", "session_id", "dialogue"), require_async=False
     )
+    if not (ok1 and ok2):
+        patch_registry.record_patch(
+            "reply_length_llm",
+            "skipped_contract",
+            target="OpenAI.LLMProvider.response/response_with_functions",
+            detail=f"{d1}; {d2}",
+            contract_ok=False,
+            category="experience",
+        )
+        print(f"[ReplyLengthRouter] 跳过挂载回复字数补丁（签名契约不匹配）: {d1}; {d2}", flush=True)
+        return
 
     def _sync_max_tokens(self):
         try:
@@ -215,9 +226,10 @@ def apply_reply_length_llm_patch() -> None:
     LLMProvider._reply_len_patched = True
     patch_registry.record_patch(
         "reply_length_llm",
-        "ok" if (ok1 and ok2) else "failed",
+        "ok",
         target="OpenAI.LLMProvider.response/response_with_functions",
         detail=f"{d1}; {d2}",
-        contract_ok=(ok1 and ok2),
+        contract_ok=True,
+        category="experience",
     )
     print("[ReplyLengthRouter] 已挂载回复字数与讲故事篇幅实时热调补丁 (免重启生效)", flush=True)

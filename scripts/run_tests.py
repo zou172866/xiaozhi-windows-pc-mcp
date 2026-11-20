@@ -97,6 +97,10 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
                     f"{ANIMA_DIR / 'obsidian_exporter.py'}:/app/obsidian_exporter.py:ro",
                     "-v",
                     f"{ANIMA_DIR / 'xiaozhi_anima_service.py'}:/app/xiaozhi_anima_service.py:ro",
+                    "-v",
+                    f"{ANIMA_DIR / 'src' / 'companion_engine' / 'automation.py'}:/app/src/companion_engine/automation.py:ro",
+                    "-v",
+                    f"{ANIMA_DIR / 'src' / 'companion_engine' / 'http_server.py'}:/app/src/companion_engine/http_server.py:ro",
                     "xiaozhi-anima-brain:local",
                     "-m",
                     "unittest",
@@ -115,7 +119,7 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
                     "exec",
                     "xiaozhi-esp32-server",
                     "python3",
-                    "/opt/xiaozhi-esp32-server/data/test_mei_emotion_and_prosody.py",
+                    "/opt/xiaozhi-esp32-server/app/test_mei_emotion_and_prosody.py",
                 ],
             )
         )
@@ -124,13 +128,13 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
         plan.append(
             (
                 "contract",
-                "Upstream image contracts (SERVER_VERSION, 18 patches, anchors, rebind)",
+                "Upstream image contracts (SERVER_VERSION, 19 patches, anchors, rebind)",
                 [
                     "docker",
                     "exec",
                     "xiaozhi-esp32-server",
                     "python3",
-                    "/opt/xiaozhi-esp32-server/data/test_upstream_contracts.py",
+                    "/opt/xiaozhi-esp32-server/app/test_upstream_contracts.py",
                 ],
             )
         )
@@ -149,11 +153,33 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
                     (
                         "import os, sys, unittest; "
                         "os.environ['XIAOZHI_RUN_LIVE_TESTS'] = '1'; "
-                        "sys.path.insert(0, '/opt/xiaozhi-esp32-server/data'); "
+                        "sys.path.insert(0, '/opt/xiaozhi-esp32-server/app'); "
                         "import test_mei_emotion_and_prosody as m; "
                         "suite = unittest.defaultTestLoader.loadTestsFromTestCase(m.TestLiveOnlineIntegration); "
                         "res = unittest.TextTestRunner(verbosity=2).run(suite); "
                         "sys.exit(0 if res.wasSuccessful() else 1)"
+                    ),
+                ],
+            )
+        )
+        plan.append(
+            (
+                "live",
+                "Live A-1 least-privilege env isolation (anima-brain has zero PC_MCP_TOKEN)",
+                [
+                    "docker",
+                    "exec",
+                    "xiaozhi-anima-brain",
+                    "python",
+                    "-c",
+                    (
+                        "import os, unittest\n"
+                        "class _T(unittest.TestCase):\n"
+                        "    def test_anima_container_has_no_pc_mcp_token(self):\n"
+                        "        self.assertNotIn('PC_MCP_TOKEN', os.environ, 'anima-brain MUST NOT receive PC_MCP_TOKEN')\n"
+                        "        self.assertTrue(len((os.environ.get('ANIMA_STUDIO_TOKEN') or '').strip()) >= 24, 'anima-brain missing ANIMA_STUDIO_TOKEN')\n"
+                        "res = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(_T))\n"
+                        "raise SystemExit(0 if res.wasSuccessful() else 1)\n"
                     ),
                 ],
             )

@@ -10,12 +10,17 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import os
 import re
 import secrets
+import shutil
+import sqlite3
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +31,6 @@ from starlette.responses import JSONResponse
 from companion_engine import BrainConfig, CompanionBrain, Settings
 from companion_engine import emotion
 from companion_engine.automation import MemoryAutomation
-from companion_engine.engine import Conflict
 from companion_engine.http_server import create_app
 from companion_engine.knowledge import eligible
 from companion_engine.models import (
@@ -105,6 +109,342 @@ OBSIDIAN_EXPORT_DIR = Path(os.environ.get("OBSIDIAN_EXPORT_DIR", "/obsidian"))
 OBSIDIAN_HOST_DIR = (os.environ.get("OBSIDIAN_HOST_DIR") or "").strip() or str(OBSIDIAN_EXPORT_DIR)
 OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS = _env_int("OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS", 600, 15, 86400)
 OBSIDIAN_DEBOUNCE_SECONDS = _env_float("OBSIDIAN_DEBOUNCE_SECONDS", 5.0, 0.1, 60.0)
+
+# Online SQLite backup & WAL governance settings (B-2, B-3, B-6)
+BACKUP_ENABLED = _env_bool("ANIMA_BACKUP_ENABLED", True)
+BACKUP_DIR_ENV = (os.environ.get("ANIMA_BACKUP_DIR") or "").strip()
+BACKUP_KEEP_DAILY = _env_int("ANIMA_BACKUP_KEEP_DAILY", 7, 1, 90)
+BACKUP_KEEP_WEEKLY = _env_int("ANIMA_BACKUP_KEEP_WEEKLY", 4, 1, 52)
+WAL_JOURNAL_SIZE_LIMIT = _env_int("ANIMA_WAL_JOURNAL_SIZE_LIMIT", 8 * 1024 * 1024, 65536)
+HEALTH_BACKLOG_THRESHOLD = _env_int("ANIMA_HEALTH_BACKLOG_THRESHOLD", 0, 0)
+
+_DAILY_BACKUP_RE = re.compile(r"^brain-(\d{8})\.sqlite3$")
+_WEEKLY_BACKUP_RE = re.compile(r"^brain-weekly-(\d{4}-W\d{2})\.sqlite3$")
+_BACKUP_STATE_LOCK = threading.Lock()
+_BACKUP_STATE_BY_DIR: dict[str, dict[str, Any]] = {}
+
+
+def _default_backup_state() -> dict[str, Any]:
+    return {
+        "enabled": bool(BACKUP_ENABLED),
+        "last_backup_at": "",
+        "last_backup_ts": 0.0,
+        "last_backup_file": "",
+        "integrity_ok": None,
+        "daily_count": 0,
+        "weekly_count": 0,
+        "last_error": "",
+    }
+
+
+def _backup_dir_key(bdir: Path) -> str:
+    try:
+        return str(bdir.resolve())
+    except Exception:
+        return str(bdir)
+
+
+def _new_request_id() -> str:
+    return f"xz-{uuid.uuid4().hex}"
+
+
+def _resolve_backup_dir(brain: CompanionBrain | None = None, backup_dir: Path | str | None = None) -> Path:
+    if backup_dir is not None:
+        return Path(backup_dir)
+    if BACKUP_DIR_ENV:
+        return Path(BACKUP_DIR_ENV)
+    if brain is not None:
+        eng = getattr(brain, "engine", None)
+        db_p = getattr(eng, "database", None) or getattr(eng, "path", None)
+        if db_p and str(db_p) != ":memory:":
+            try:
+                return Path(str(db_p)).resolve().parent / "backups"
+            except Exception:
+                pass
+    return DATA_DIR / "backups"
+
+
+def configure_sqlite_wal(engine, journal_size_limit: int = WAL_JOURNAL_SIZE_LIMIT) -> None:
+    """Apply bounded WAL size limit on SQLite connection (B-3)."""
+    limit = max(65536, int(journal_size_limit))
+    try:
+        with engine._lock:
+            if not engine.db.in_transaction:
+                engine.db.execute(f"PRAGMA journal_size_limit = {limit}")
+    except Exception as exc:
+        log.warning("Failed to set PRAGMA journal_size_limit=%d: %s", limit, exc)
+
+
+def checkpoint_wal_if_idle(brain: CompanionBrain, *, is_idle: bool = True) -> dict[str, Any]:
+    """Run PRAGMA wal_checkpoint(TRUNCATE) when ingest is idle to keep WAL bounded (B-3)."""
+    if not is_idle:
+        return {"skipped": "busy"}
+    engine = brain.engine
+    try:
+        with engine._lock:
+            if engine.db.in_transaction:
+                return {"skipped": "in_transaction"}
+            row = engine.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if row is not None:
+                return {"ok": True, "busy": int(row[0]), "log": int(row[1]), "checkpointed": int(row[2])}
+            return {"ok": True}
+    except Exception as exc:
+        log.warning("WAL checkpoint skipped: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
+def _scan_backup_dir(bdir: Path) -> tuple[list[Path], list[Path]]:
+    if not bdir.is_dir():
+        return [], []
+    dailies: list[Path] = []
+    weeklies: list[Path] = []
+    for p in bdir.iterdir():
+        if not p.is_file():
+            continue
+        if _DAILY_BACKUP_RE.match(p.name):
+            dailies.append(p)
+        elif _WEEKLY_BACKUP_RE.match(p.name):
+            weeklies.append(p)
+    dailies.sort(key=lambda x: x.name, reverse=True)
+    weeklies.sort(key=lambda x: x.name, reverse=True)
+    return dailies, weeklies
+
+
+def get_backup_status(
+    brain: CompanionBrain | None = None,
+    backup_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Return safe backup status summary (never exposes host filesystem paths)."""
+    bdir = _resolve_backup_dir(brain, backup_dir)
+    dir_key = _backup_dir_key(bdir)
+    dailies, weeklies = _scan_backup_dir(bdir)
+    with _BACKUP_STATE_LOCK:
+        st = dict(_BACKUP_STATE_BY_DIR.get(dir_key) or _default_backup_state())
+    st["enabled"] = bool(BACKUP_ENABLED)
+    st["daily_count"] = len(dailies)
+    st["weekly_count"] = len(weeklies)
+    if not dailies:
+        st["last_backup_at"] = ""
+        st["last_backup_ts"] = 0.0
+        st["last_backup_file"] = ""
+    else:
+        newest = dailies[0]
+        if st.get("last_backup_file") != newest.name or not st.get("last_backup_ts"):
+            try:
+                mtime = newest.stat().st_mtime
+                st["last_backup_ts"] = float(mtime)
+                st["last_backup_at"] = datetime.datetime.fromtimestamp(mtime).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                st["last_backup_file"] = newest.name
+            except OSError:
+                pass
+    return st
+
+
+def _verify_sqlite_integrity(db_file: Path) -> tuple[bool, str]:
+    conn = sqlite3.connect(str(db_file), timeout=10.0)
+    try:
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+        ok = len(rows) == 1 and str(rows[0][0]).strip().lower() == "ok"
+        detail = "ok" if ok else "; ".join(str(r[0]) for r in rows[:5])
+        return ok, detail
+    finally:
+        conn.close()
+
+
+def _prune_backup_dir(bdir: Path, keep_daily: int, keep_weekly: int) -> tuple[list[Path], list[Path]]:
+    dailies, weeklies = _scan_backup_dir(bdir)
+    for old_d in dailies[keep_daily:]:
+        try:
+            old_d.unlink()
+        except OSError:
+            pass
+    for old_w in weeklies[keep_weekly:]:
+        try:
+            old_w.unlink()
+        except OSError:
+            pass
+    return _scan_backup_dir(bdir)
+
+
+def run_online_backup(
+    brain: CompanionBrain,
+    backup_dir: Path | str | None = None,
+    *,
+    now: float | None = None,
+    force: bool = False,
+    keep_daily: int | None = None,
+    keep_weekly: int | None = None,
+) -> dict[str, Any]:
+    """Create a consistent daily/weekly SQLite backup via VACUUM INTO (or backup() fallback),
+    verify with PRAGMA integrity_check, and prune old backups (B-2)."""
+    if not BACKUP_ENABLED and not force:
+        return {"ok": True, "skipped": "disabled", **get_backup_status(brain, backup_dir)}
+
+    bdir = _resolve_backup_dir(brain, backup_dir)
+    dir_key = _backup_dir_key(bdir)
+    ts = float(now) if now is not None else time.time()
+    dt = datetime.datetime.fromtimestamp(ts).astimezone()
+    daily_name = f"brain-{dt.strftime('%Y%m%d')}.sqlite3"
+    weekly_name = f"brain-weekly-{dt.strftime('%G-W%V')}.sqlite3"
+    daily_path = bdir / daily_name
+    weekly_path = bdir / weekly_name
+
+    keep_d = max(1, int(keep_daily if keep_daily is not None else BACKUP_KEEP_DAILY))
+    keep_w = max(1, int(keep_weekly if keep_weekly is not None else BACKUP_KEEP_WEEKLY))
+
+    tmp_path = bdir / f".{daily_name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    weekly_tmp = bdir / f".{weekly_name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+
+    if not force and daily_path.is_file():
+        existing_size = 0
+        try:
+            existing_size = daily_path.stat().st_size
+        except OSError:
+            existing_size = 0
+        if existing_size > 0:
+            with _BACKUP_STATE_LOCK:
+                prev_st = dict(_BACKUP_STATE_BY_DIR.get(dir_key) or _default_backup_state())
+            already_verified = (
+                prev_st.get("integrity_ok") is True
+                and prev_st.get("last_backup_file") == daily_name
+                and weekly_path.is_file()
+            )
+            if already_verified:
+                st = get_backup_status(brain, bdir)
+                return {"ok": True, "skipped": "already_exists", **st}
+            try:
+                ok_exist, det_exist = _verify_sqlite_integrity(daily_path)
+            except Exception as exc:
+                ok_exist, det_exist = False, str(exc)
+            if ok_exist:
+                if not weekly_path.is_file():
+                    try:
+                        shutil.copy2(daily_path, weekly_tmp)
+                        os.replace(weekly_tmp, weekly_path)
+                    except OSError as w_exc:
+                        try:
+                            weekly_tmp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        log.warning("Failed to backfill weekly backup %s: %s", weekly_name, w_exc)
+                dailies, weeklies = _prune_backup_dir(bdir, keep_d, keep_w)
+                newest = dailies[0] if dailies else daily_path
+                try:
+                    mtime = newest.stat().st_mtime
+                except OSError:
+                    mtime = time.time()
+                formatted = datetime.datetime.fromtimestamp(mtime).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                with _BACKUP_STATE_LOCK:
+                    cur = dict(_BACKUP_STATE_BY_DIR.get(dir_key) or _default_backup_state())
+                    cur.update(
+                        {
+                            "enabled": bool(BACKUP_ENABLED),
+                            "last_backup_at": formatted,
+                            "last_backup_ts": float(mtime),
+                            "last_backup_file": newest.name,
+                            "integrity_ok": True,
+                            "daily_count": len(dailies),
+                            "weekly_count": len(weeklies),
+                            "last_error": "",
+                        }
+                    )
+                    _BACKUP_STATE_BY_DIR[dir_key] = cur
+                    snap = dict(cur)
+                return {"ok": True, "skipped": "already_exists", **snap}
+            log.warning(
+                "Existing daily backup %s failed integrity check (%s); recreating fresh backup",
+                daily_name,
+                det_exist,
+            )
+
+    engine = brain.engine
+    try:
+        bdir.mkdir(parents=True, exist_ok=True)
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+        with engine._lock:
+            used_vacuum = False
+            if not engine.db.in_transaction:
+                try:
+                    engine.db.execute("VACUUM INTO ?", (str(tmp_path),))
+                    used_vacuum = True
+                except sqlite3.OperationalError:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+            if not used_vacuum:
+                dst = sqlite3.connect(str(tmp_path), timeout=15.0)
+                try:
+                    engine.db.backup(dst)
+                finally:
+                    dst.close()
+
+        integrity_ok, integrity_detail = _verify_sqlite_integrity(tmp_path)
+        if not integrity_ok:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            err_msg = f"backup integrity_check failed: {integrity_detail}"
+            with _BACKUP_STATE_LOCK:
+                cur = dict(_BACKUP_STATE_BY_DIR.get(dir_key) or _default_backup_state())
+                cur["integrity_ok"] = False
+                cur["last_error"] = err_msg
+                _BACKUP_STATE_BY_DIR[dir_key] = cur
+            log.error("Anima SQLite backup failed integrity check: %s", integrity_detail)
+            return {"ok": False, "error": err_msg, **get_backup_status(brain, bdir)}
+
+        os.replace(tmp_path, daily_path)
+
+        if force or not weekly_path.is_file():
+            shutil.copy2(daily_path, weekly_tmp)
+            os.replace(weekly_tmp, weekly_path)
+
+        dailies, weeklies = _prune_backup_dir(bdir, keep_d, keep_w)
+        newest_name = dailies[0].name if dailies else daily_name
+        now_done = time.time()
+        formatted = datetime.datetime.fromtimestamp(now_done).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        with _BACKUP_STATE_LOCK:
+            cur = dict(_BACKUP_STATE_BY_DIR.get(dir_key) or _default_backup_state())
+            cur.update(
+                {
+                    "enabled": bool(BACKUP_ENABLED),
+                    "last_backup_at": formatted,
+                    "last_backup_ts": now_done,
+                    "last_backup_file": newest_name,
+                    "integrity_ok": True,
+                    "daily_count": len(dailies),
+                    "weekly_count": len(weeklies),
+                    "last_error": "",
+                }
+            )
+            _BACKUP_STATE_BY_DIR[dir_key] = cur
+            snap = dict(cur)
+        log.info(
+            "Online SQLite backup verified OK: %s (daily=%d/%d weekly=%d/%d)",
+            daily_name,
+            len(dailies),
+            keep_d,
+            len(weeklies),
+            keep_w,
+        )
+        return {"ok": True, "created": True, **snap}
+    except Exception as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            weekly_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        err_msg = str(exc)
+        with _BACKUP_STATE_LOCK:
+            cur = dict(_BACKUP_STATE_BY_DIR.get(dir_key) or _default_backup_state())
+            cur["last_error"] = err_msg
+            _BACKUP_STATE_BY_DIR[dir_key] = cur
+        log.warning("Online SQLite backup failed: %s", exc)
+        return {"ok": False, "error": err_msg, **get_backup_status(brain, bdir)}
 
 DEFAULT_PERSONA = (
     "你是小智，住在桌面小屏幕音箱里的贴心 AI 伙伴。说话自然、真诚、简短有温度，"
@@ -192,9 +532,22 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def load_or_create_token(token_path: Path | None = None, *, retries: int = 3) -> str:
-    """Load studio_token.txt or atomically generate one; never clobber on transient I/O errors (P2-23)."""
+    """Load studio_token.txt (or honor ANIMA_STUDIO_TOKEN env on default startup) without clobbering on I/O errors (P2-23, A-1)."""
     tf = Path(token_path) if token_path is not None else TOKEN_PATH
     tf.parent.mkdir(parents=True, exist_ok=True)
+    if token_path is None:
+        env_tok = (os.environ.get("ANIMA_STUDIO_TOKEN") or "").strip()
+        if len(env_tok) >= 24:
+            try:
+                cur_disk = tf.read_text(encoding="utf-8").strip() if tf.is_file() else ""
+            except OSError:
+                cur_disk = ""
+            if cur_disk != env_tok:
+                try:
+                    _atomic_write_text(tf, env_tok)
+                except OSError:
+                    pass
+            return env_tok
     last_io_err: Exception | None = None
     max_tries = max(1, int(retries))
 
@@ -1135,7 +1488,7 @@ def extract_and_commit_turn(
     if not user_message or not assistant_reply:
         return {"skipped": "empty_message"}
 
-    request_id = re.sub(r"[^a-zA-Z0-9_\-:.]", "_", request_id)[:110] or f"xz-{int(time.time()*1000)}"
+    request_id = re.sub(r"[^a-zA-Z0-9_\-:.]", "_", request_id)[:110] or _new_request_id()
     ensure_xiaozhi_turn_meta_table(engine)
 
     with engine._lock:
@@ -1147,33 +1500,67 @@ def extract_and_commit_turn(
             row = engine._character(character_id)
 
         existing_turn = engine.db.execute(
-            "SELECT id, status, assistant_reply, created_at FROM turns "
+            "SELECT id, status, user_message, assistant_reply, created_at FROM turns "
             "WHERE owner=? AND character_id=? AND request_id=?",
             (engine.owner, character_id, request_id),
         ).fetchone()
         if existing_turn and existing_turn["status"] == "committed":
+            old_user = (existing_turn["user_message"] or "").strip()
             old_reply = (existing_turn["assistant_reply"] or "").strip()
             turn_id = existing_turn["id"]
             created_at = float(existing_turn["created_at"] or time.time())
-            if len(assistant_reply) > len(old_reply) and assistant_reply != old_reply:
-                with engine._transaction():
-                    eff_occ, prev_occ = _upsert_longer_reply_tx(
-                        engine, character_id, turn_id, assistant_reply, turn_meta, created_at
-                    )
-                log.info(
-                    "Upserted fuller reply for committed turn %s (%d -> %d chars)",
+            if user_message != old_user:
+                log.warning(
+                    "request_id collision detected for %s (turn %s): user_message differs; refusing to overwrite",
+                    request_id,
                     turn_id[:8],
-                    len(old_reply),
-                    len(assistant_reply),
                 )
                 return {
                     "committed": True,
-                    "updated": True,
-                    "replayed": False,
+                    "replayed": True,
+                    "updated": False,
+                    "conflict": True,
                     "turn_id": turn_id,
-                    "occurred_at": eff_occ,
-                    "prev_occurred_at": prev_occ,
+                    "occurred_at": created_at,
+                    "prev_occurred_at": None,
                 }
+            if assistant_reply != old_reply:
+                if len(assistant_reply) > len(old_reply) and assistant_reply.startswith(old_reply):
+                    with engine._transaction():
+                        eff_occ, prev_occ = _upsert_longer_reply_tx(
+                            engine, character_id, turn_id, assistant_reply, turn_meta, created_at
+                        )
+                    log.info(
+                        "Upserted fuller post-tool continuation for committed turn %s (%d -> %d chars)",
+                        turn_id[:8],
+                        len(old_reply),
+                        len(assistant_reply),
+                    )
+                    return {
+                        "committed": True,
+                        "updated": True,
+                        "replayed": False,
+                        "turn_id": turn_id,
+                        "occurred_at": eff_occ,
+                        "prev_occurred_at": prev_occ,
+                    }
+                if not old_reply.startswith(assistant_reply):
+                    log.warning(
+                        "request_id content conflict for %s (turn %s): divergent assistant_reply (%d vs %d chars); refusing to overwrite",
+                        request_id,
+                        turn_id[:8],
+                        len(old_reply),
+                        len(assistant_reply),
+                    )
+                    return {
+                        "committed": True,
+                        "replayed": True,
+                        "updated": False,
+                        "conflict": True,
+                        "turn_id": turn_id,
+                        "occurred_at": created_at,
+                        "prev_occurred_at": None,
+                    }
             meta_changed = False
             prev_occ = None
             if turn_meta:
@@ -1437,6 +1824,8 @@ def create_combined_asgi_app(
     from obsidian_exporter import ObsidianExporter, ObsidianSyncRunner
 
     ensure_xiaozhi_turn_meta_table(brain.engine)
+    configure_sqlite_wal(brain.engine)
+    backup_dir = _resolve_backup_dir(brain)
 
     studio_app = create_app(
         brain.runtime,
@@ -1619,23 +2008,72 @@ def create_combined_asgi_app(
                 await asyncio.to_thread(clear_stale_review_jobs, brain)
                 if tick % 5 == 0:
                     await asyncio.to_thread(prune_database_bloat, brain, allow_vacuum=False)
+                is_idle = (
+                    ingest_queue.empty()
+                    and int(getattr(ingest_queue, "_unfinished_tasks", 0) or 0) == 0
+                    and not retry_tasks
+                )
+                if is_idle:
+                    await asyncio.to_thread(checkpoint_wal_if_idle, brain, is_idle=True)
+                await asyncio.to_thread(run_online_backup, brain, backup_dir)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.warning("review_healer iteration failed: %s", exc)
 
-    def _health_payload() -> dict[str, Any]:
-        return {
-            "status": "ok",
+    def _check_db_and_backup_blocking() -> tuple[bool, str, dict[str, Any], dict[str, Any]]:
+        try:
+            with brain.engine._lock:
+                row = brain.engine.db.execute("SELECT 1").fetchone()
+            db_ok, db_err = bool(row and row[0] == 1), ""
+        except Exception as exc:
+            db_ok, db_err = False, str(exc)
+        obs_public = dict(obsidian_exporter.status())
+        obs_public.pop("host_export_dir", None)
+        backup_snap = get_backup_status(brain, backup_dir)
+        return db_ok, db_err, backup_snap, obs_public
+
+    async def _build_health_response() -> tuple[dict[str, Any], int]:
+        # Snapshot event-loop-owned asyncio state on the loop thread before offloading blocking DB/FS checks
+        worker_alive = (worker_task is not None) and (not worker_task.done()) and (not shutting_down)
+        qsize = ingest_queue.qsize()
+        pending_r = len(retry_tasks)
+        stats_snap = dict(ingest_stats)
+        db_ok, db_err, backup_snap, obs_public = await asyncio.to_thread(_check_db_and_backup_blocking)
+
+        backlog_limit = (
+            HEALTH_BACKLOG_THRESHOLD
+            if HEALTH_BACKLOG_THRESHOLD > 0
+            else max(1, int(INGEST_QUEUE_MAXSIZE * 0.8))
+        )
+        backlog_ok = (qsize + pending_r) < backlog_limit
+
+        reasons: list[str] = []
+        if not db_ok:
+            reasons.append(f"db_check_failed: {db_err or 'SELECT 1 failed'}")
+        if not worker_alive:
+            reasons.append("ingest_worker_not_running")
+        if not backlog_ok:
+            reasons.append(f"ingest_backlog_high: {qsize + pending_r} >= {backlog_limit}")
+
+        healthy = len(reasons) == 0
+        payload = {
+            "status": "ok" if healthy else "unhealthy",
+            "db_ok": db_ok,
+            "worker_alive": worker_alive,
+            "backlog_ok": backlog_ok,
+            "unhealthy_reasons": reasons,
             "character": DEFAULT_CHARACTER_ID,
             "ingest": {
-                "queue_size": ingest_queue.qsize(),
+                "queue_size": qsize,
                 "queue_maxsize": INGEST_QUEUE_MAXSIZE,
-                "pending_retries": len(retry_tasks),
-                **ingest_stats,
+                "pending_retries": pending_r,
+                **stats_snap,
             },
-            "obsidian": obsidian_exporter.status(),
+            "backup": backup_snap,
+            "obsidian": obs_public,
         }
+        return payload, (200 if healthy else 503)
 
     async def combined_app(scope, receive, send):
         nonlocal worker_task, heal_task, shutting_down
@@ -1712,6 +2150,22 @@ def create_combined_asgi_app(
             await studio_app(scope, wrapped_receive, send)
             return
 
+        orig_send = send
+
+        async def _send_with_clickjacking_headers(message):
+            if scope["type"] == "http" and message.get("type") == "http.response.start":
+                raw_hdrs = list(message.get("headers") or [])
+                keys = {k.lower() for k, _ in raw_hdrs}
+                if b"x-frame-options" not in keys:
+                    raw_hdrs.append((b"x-frame-options", b"DENY"))
+                if b"content-security-policy" not in keys:
+                    raw_hdrs.append((b"content-security-policy", b"frame-ancestors 'none'"))
+                message = dict(message, headers=raw_hdrs)
+            await orig_send(message)
+
+        if scope["type"] == "http":
+            send = _send_with_clickjacking_headers
+
         if scope["type"] in ("http", "websocket"):
             path = scope.get("path", "")
             headers_list = list(scope.get("headers", []))
@@ -1721,12 +2175,16 @@ def create_combined_asgi_app(
             if scope["type"] == "http" and path.startswith("/xiaozhi/"):
                 req = Request(scope, receive=receive)
                 if path == "/xiaozhi/health":
-                    resp = JSONResponse(_health_payload())
+                    health_body, health_code = await _build_health_response()
+                    resp = JSONResponse(health_body, status_code=health_code)
                     await resp(scope, receive, send)
                     return
 
                 auth = headers_dict.get("authorization", "")
-                if not secrets.compare_digest(auth, f"Bearer {token}"):
+                if not secrets.compare_digest(
+                    auth.encode("utf-8", errors="replace"),
+                    f"Bearer {token}".encode("utf-8"),
+                ):
                     resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
                     await resp(scope, receive, send)
                     return
@@ -1819,7 +2277,7 @@ def create_combined_asgi_app(
                         turns = [body]
                     if shutting_down:
                         rej_ids = [
-                            str(item.get("request_id") or f"xz-{int(time.time()*1000)}").strip()
+                            str(item.get("request_id") or "").strip() or _new_request_id()
                             for item in turns
                             if isinstance(item, dict)
                             and str(item.get("user_message") or "").strip()
@@ -1844,7 +2302,7 @@ def create_combined_asgi_app(
                             continue
                         u_msg = str(item.get("user_message") or "").strip()
                         a_msg = str(item.get("assistant_reply") or "").strip()
-                        r_id = str(item.get("request_id") or f"xz-{int(time.time()*1000)}").strip()
+                        r_id = str(item.get("request_id") or "").strip() or _new_request_id()
                         if not (u_msg and a_msg):
                             continue
                         item_meta: dict[str, Any] = {}
@@ -1916,16 +2374,25 @@ def create_combined_asgi_app(
                 await resp(scope, receive, send)
                 return
 
-            # Normalize trusted LAN/Docker Host & Origin headers for Companion Studio UI
+            # Normalize trusted LAN/Docker Host & Origin headers for Companion Studio UI,
+            # and sanitize non-ASCII Authorization bytes so http_server.py's compare_digest never 500s.
             host_val = headers_dict.get("host", "")
-            if host_val in allowed_hosts and host_val not in (f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
+            needs_host_norm = host_val in allowed_hosts and host_val not in (
+                f"127.0.0.1:{PORT}",
+                f"localhost:{PORT}",
+            )
+            raw_auth = headers_dict.get("authorization", "")
+            has_non_ascii_auth = any(ord(ch) >= 128 for ch in raw_auth)
+            if needs_host_norm or has_non_ascii_auth:
                 new_headers = []
                 for k, v in headers_list:
                     kl = k.lower()
-                    if kl == b"host":
+                    if needs_host_norm and kl == b"host":
                         new_headers.append((b"host", f"localhost:{PORT}".encode("latin1")))
-                    elif kl == b"origin" and v.decode("latin1") == f"http://{host_val}":
+                    elif needs_host_norm and kl == b"origin" and v.decode("latin1") == f"http://{host_val}":
                         new_headers.append((b"origin", f"http://localhost:{PORT}".encode("latin1")))
+                    elif has_non_ascii_auth and kl == b"authorization":
+                        new_headers.append((b"authorization", b"Bearer invalid-non-ascii"))
                     else:
                         new_headers.append((k, v))
                 scope = dict(scope, headers=new_headers)
@@ -1935,6 +2402,7 @@ def create_combined_asgi_app(
             and scope.get("method") == "POST"
             and scope.get("path", "") in _STUDIO_WRITE_ACTIONS
         )
+
         await studio_app(scope, receive, send)
         if is_studio_write:
             obsidian_runner.notify_db_change()
@@ -1983,9 +2451,11 @@ def main():
     ) as brain:
         ensure_default_character(brain)
         ensure_xiaozhi_turn_meta_table(brain.engine)
+        configure_sqlite_wal(brain.engine)
         tighten_legacy_summary_batch_size(brain)
         prune_database_bloat(brain, allow_vacuum=True)
         clear_stale_review_jobs(brain, is_startup=True)
+        run_online_backup(brain)
         app = create_combined_asgi_app(brain, token)
         log.info("==========================================================")
         log.info("Anima Brain + Companion Studio is READY on port %d", PORT)

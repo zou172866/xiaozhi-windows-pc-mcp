@@ -24,13 +24,15 @@ from typing import Any, Dict, Optional
 
 import xz_common
 
-DATA_DIR = xz_common.DATA_DIR
-RUNTIME_SETTINGS_PATH = os.path.join(DATA_DIR, "runtime_settings.json")
+STATE_DIR = xz_common.STATE_DIR
+DATA_DIR = STATE_DIR
+RUNTIME_SETTINGS_PATH = os.path.join(STATE_DIR, "runtime_settings.json")
 SCHEMA_VERSION = 1
 
 VALID_PC_MODES = frozenset({"off", "safe", "full"})
 VALID_AUDIO_TARGETS = frozenset({"esp32", "pc"})
 VALID_IDLE_FAREWELL_MODES = frozenset({"fixed", "llm_summary"})
+VALID_TURN_CONTEXT_MODES = frozenset({"split", "legacy"})
 
 REPLY_LEN_PRESETS: Dict[str, Dict[str, int]] = {
     "concise": {"chat_chars": 60, "story_chars": 200},
@@ -64,6 +66,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "summary_prompt": DEFAULT_IDLE_FAREWELL_SUMMARY_PROMPT,
         "messages": list(DEFAULT_IDLE_FAREWELL_MESSAGES),
     },
+    "turn_context": {"mode": "split"},
 }
 
 _settings_lock = threading.RLock()
@@ -171,6 +174,14 @@ def normalize_idle_farewell(raw: Any) -> Dict[str, Any]:
     }
 
 
+def normalize_turn_context(raw: Any) -> Dict[str, str]:
+    d = raw if isinstance(raw, dict) else {}
+    mode = str(d.get("mode") or "split").strip().lower()
+    if mode not in VALID_TURN_CONTEXT_MODES:
+        mode = "split"
+    return {"mode": mode}
+
+
 def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
     d = raw if isinstance(raw, dict) else {}
     return {
@@ -179,6 +190,7 @@ def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
         "audio_output": normalize_audio_output(d.get("audio_output")),
         "reply_length": normalize_reply_length(d.get("reply_length")),
         "idle_farewell": normalize_idle_farewell(d.get("idle_farewell")),
+        "turn_context": normalize_turn_context(d.get("turn_context")),
     }
 
 
@@ -424,3 +436,15 @@ def set_idle_farewell(
         "summary_prompt": str(sec["summary_prompt"]),
         "messages": list(sec["messages"]),
     }
+
+
+def get_turn_context_mode(settings_path: Optional[str] = None) -> str:
+    return read_runtime_settings(settings_path)["turn_context"]["mode"]
+
+
+def set_turn_context_mode(mode: str, settings_path: Optional[str] = None) -> str:
+    m = str(mode or "split").strip().lower()
+    if m not in VALID_TURN_CONTEXT_MODES:
+        raise ValueError(f"Unsupported turn_context mode: {mode}")
+    saved = update_runtime_section("turn_context", lambda _: {"mode": m}, settings_path=settings_path)
+    return saved["turn_context"]["mode"]

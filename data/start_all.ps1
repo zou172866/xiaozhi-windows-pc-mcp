@@ -8,16 +8,54 @@ Write-Host "=========================================================" -Foregrou
 Write-Host "  小智 ESP32 · 三层电脑操控与长期记忆系统 一键启动" -ForegroundColor Cyan
 Write-Host "=========================================================" -ForegroundColor Cyan
 
-# 0. 确保模型与宿主机私有状态目录存在，加载本地 .env，并自动推导宿主机路径与局域网 IP
-foreach ($relDir in @("models\sherpa-onnx-sense-voice", "models\SenseVoiceSmall", "data\anima", "data\obsidian_export", "pc-mcp\state", "pc-mcp\state\agy_tasks\pending", "pc-mcp\state\agy_tasks\active")) {
+# 0. 确保拆分后的目录结构与宿主机私有状态目录存在（A-1 / A-2），并自动兼容迁移旧 data/ 路径
+foreach ($relDir in @(
+    "models\sherpa-onnx-sense-voice",
+    "models\SenseVoiceSmall",
+    "models\gsv_weights",
+    "config\runtime",
+    "config\runtime\bin",
+    "state",
+    "secrets",
+    "backups",
+    "voices",
+    "voices\raiden_mei",
+    "logs",
+    "anima-data",
+    "data\obsidian_export",
+    "pc-mcp\state",
+    "pc-mcp\state\agy_tasks\pending",
+    "pc-mcp\state\agy_tasks\active"
+)) {
     $fullD = Join-Path $serverDir $relDir
     if (-not (Test-Path $fullD)) { New-Item -ItemType Directory -Path $fullD -Force | Out-Null }
 }
 
+# 自动无损兼容迁移旧 data/ 文件至新职责目录（仅当目标不存在时迁移，便于灰度回滚）
+$legacyFileMoves = @(
+    @{ Src = "data\.config.yaml";              Dst = "config\runtime\.config.yaml" },
+    @{ Src = "data\tts_infer_xiaozhi.yaml";    Dst = "config\runtime\tts_infer_xiaozhi.yaml" },
+    @{ Src = "data\.wakeup_words.yaml";        Dst = "config\runtime\.wakeup_words.yaml" },
+    @{ Src = "data\runtime_settings.json";     Dst = "state\runtime_settings.json" },
+    @{ Src = "data\chat_history.json";         Dst = "state\chat_history.json" },
+    @{ Src = "data\.console_log_cursor.json";  Dst = "state\.console_log_cursor.json" },
+    @{ Src = "data\pc_mcp_token.txt";          Dst = "secrets\pc_mcp_token.txt" }
+)
+foreach ($mv in $legacyFileMoves) {
+    $srcP = Join-Path $serverDir $mv.Src
+    $dstP = Join-Path $serverDir $mv.Dst
+    if ((Test-Path $srcP) -and -not (Test-Path $dstP)) {
+        try {
+            Copy-Item -Path $srcP -Destination $dstP -Force
+            Write-Host "[迁移] 已兼容迁移 $($mv.Src) -> $($mv.Dst)" -ForegroundColor DarkCyan
+        } catch {}
+    }
+}
+
 $runtimeTemplates = @(
-    @{ Tpl = "data\.config.example.yaml";             Dst = "data\.config.yaml" },
-    @{ Tpl = "data\tts_infer_xiaozhi.example.yaml";   Dst = "data\tts_infer_xiaozhi.yaml" },
-    @{ Tpl = "data\.wakeup_words.example.yaml";       Dst = "data\.wakeup_words.yaml" }
+    @{ Tpl = "config\.config.example.yaml";             Dst = "config\runtime\.config.yaml" },
+    @{ Tpl = "config\tts_infer_xiaozhi.example.yaml";   Dst = "config\runtime\tts_infer_xiaozhi.yaml" },
+    @{ Tpl = "config\.wakeup_words.example.yaml";       Dst = "config\runtime\.wakeup_words.yaml" }
 )
 foreach ($rt in $runtimeTemplates) {
     $tplP = Join-Path $serverDir $rt.Tpl
@@ -27,14 +65,20 @@ foreach ($rt in $runtimeTemplates) {
         Write-Host "[初始化] 已从 $($rt.Tpl) 生成默认运行文件 $($rt.Dst)" -ForegroundColor Yellow
     }
 }
-$rsDst = Join-Path $serverDir "data\runtime_settings.json"
-$rsTpl = Join-Path $serverDir "data\runtime_settings.example.json"
-$hasLegacyRs = (Test-Path (Join-Path $serverDir "data\pc_control_mode.json")) -or
-               (Test-Path (Join-Path $serverDir "data\audio_output_mode.json")) -or
-               (Test-Path (Join-Path $serverDir "data\reply_length_config.json"))
+$rsDst = Join-Path $serverDir "state\runtime_settings.json"
+$rsTpl = Join-Path $serverDir "config\runtime_settings.example.json"
+$hasLegacyRs = (Test-Path (Join-Path $serverDir "state\pc_control_mode.json")) -or
+               (Test-Path (Join-Path $serverDir "state\audio_output_mode.json")) -or
+               (Test-Path (Join-Path $serverDir "state\reply_length_config.json"))
 if (-not (Test-Path $rsDst) -and -not $hasLegacyRs -and (Test-Path $rsTpl)) {
     Copy-Item $rsTpl $rsDst
-    Write-Host "[初始化] 已从 data\runtime_settings.example.json 生成默认统一运行配置 data\runtime_settings.json" -ForegroundColor Yellow
+    Write-Host "[初始化] 已从 config\runtime_settings.example.json 生成默认统一运行配置 state\runtime_settings.json" -ForegroundColor Yellow
+}
+# A-2: 宿主机私有挡位文件默认初始化为 safe（绝不信任容器可写目录的挡位）
+$hostModeFile = Join-Path $serverDir "pc-mcp\state\pc_control_mode.json"
+if (-not (Test-Path $hostModeFile)) {
+    [System.IO.File]::WriteAllText($hostModeFile, '{"mode": "safe"}' + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    Write-Host "[安全] 已初始化宿主机私有操控挡位 pc-mcp\state\pc_control_mode.json (mode=safe)" -ForegroundColor Green
 }
 
 $dotEnvPath = Join-Path $serverDir ".env"
@@ -67,7 +111,10 @@ foreach ($envName in @("DEEPSEEK_API_KEY", "GEMINI_API_KEY", "ANIMA_LLM_API_KEY"
     }
 }
 
+$env:HOST_PROJECT_DIR = $serverDir.Replace("\", "/")
 $env:HOST_DATA_DIR = (Join-Path $serverDir "data").Replace("\", "/")
+$env:HOST_VOICES_DIR = (Join-Path $serverDir "voices").Replace("\", "/")
+$env:HOST_GSV_WEIGHTS_DIR = (Join-Path $serverDir "models\gsv_weights").Replace("\", "/")
 if (-not $env:ESP32_AUTH_KEY) {
     try {
         $randBytes = New-Object byte[] 32
@@ -141,9 +188,9 @@ $mcpPy = Join-Path $serverDir "pc-mcp\.venv\Scripts\python.exe"
 if (-not (Test-Path $mcpPy)) { $mcpPy = "python" }
 $mcpScript = Join-Path $serverDir "pc-mcp\pc_control_mcp.py"
 $mcpWatchdogScript = Join-Path $serverDir "pc-mcp\pc_mcp_watchdog.py"
-$mcpBootLog = Join-Path $serverDir "data\pc_mcp_18900_boot.log"
-$mcpRuntimeLog = Join-Path $serverDir "data\pc_mcp_18900.log"
-$mcpTokenFile = Join-Path $serverDir "data\pc_mcp_token.txt"
+$mcpBootLog = Join-Path $serverDir "logs\pc_mcp_18900_boot.log"
+$mcpRuntimeLog = Join-Path $serverDir "logs\pc_mcp_18900.log"
+$mcpTokenFile = Join-Path $serverDir "secrets\pc_mcp_token.txt"
 $watchdogStopFlag = Join-Path $serverDir "pc-mcp\state\watchdog_stop.flag"
 
 function Test-PcMcpAlive {
@@ -254,9 +301,10 @@ if ($hasLocalGsv) {
     $gsvListening = Get-NetTCPConnection -LocalPort 19880 -State Listen -ErrorAction SilentlyContinue
     if (-not $gsvListening) {
         Write-Host "[3/4] 正在后台启动本机 GPU GPT-SoVITS 语音引擎 (127.0.0.1:19880)..." -ForegroundColor Cyan
-        $cfgPath = Join-Path $serverDir "data\tts_infer_xiaozhi.yaml"
-        $logOut = Join-Path $serverDir "data\gsv_19880.log"
-        $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set PYTHONUTF8=1&& set GSV_IDLE_TRIM_SECONDS=60&& `"$gsvPy`" -X utf8 api_v2.py -a 127.0.0.1 -p 19880 -c `"$cfgPath`" > `"$logOut`" 2>&1`""
+        $cfgPath = Join-Path $serverDir "config\runtime\tts_infer_xiaozhi.yaml"
+        $logOut = Join-Path $serverDir "logs\gsv_19880.log"
+        # F-3: 空闲回收放宽至 300s 且按系统内存压力 (>=75%) 触发，避免聊天停顿缺页劣化
+        $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set PYTHONUTF8=1&& set GSV_IDLE_TRIM_SECONDS=300&& set GSV_IDLE_TRIM_MEM_THRESHOLD=75&& `"$gsvPy`" -X utf8 api_v2.py -a 127.0.0.1 -p 19880 -c `"$cfgPath`" > `"$logOut`" 2>&1`""
         $hideGsv = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
         Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine; ProcessStartupInformation = $hideGsv } | Out-Null
     } else {
@@ -264,6 +312,47 @@ if ($hasLocalGsv) {
     }
 } else {
     Write-Host "[3/4] 未启用本地 GPU GPT-SoVITS（无独显/免显存模式，将使用内置 EdgeTTS）" -ForegroundColor DarkGreen
+}
+
+# A-1: 按最小权限拆分宿主机私有令牌至 secrets\anima_tokens.env 与 secrets\pc_mcp_tokens.env
+#      anima-brain 仅接收 anima_tokens.env（严禁暴露 PC_MCP_TOKEN），主容器按需接收两个 env_file
+try {
+    $animaTokFile = Join-Path $serverDir "secrets\anima_token.txt"
+    $animaDataTok = Join-Path $serverDir "anima-data\studio_token.txt"
+    $animaTok = ""
+    if (Test-Path $animaDataTok) {
+        $animaTok = (Get-Content -Path $animaDataTok -Raw -Encoding UTF8 -ErrorAction SilentlyContinue).Trim()
+    }
+    if (-not $animaTok -and (Test-Path $animaTokFile)) {
+        $animaTok = (Get-Content -Path $animaTokFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue).Trim()
+    }
+    if (-not $animaTok -or $animaTok.Length -lt 24) {
+        $randB = New-Object byte[] 32
+        $rngA = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        $rngA.GetBytes($randB)
+        $rngA.Dispose()
+        $animaTok = [Convert]::ToBase64String($randB).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+    }
+    [System.IO.File]::WriteAllText($animaTokFile, $animaTok + "`n", [System.Text.UTF8Encoding]::new($false))
+
+    $pcTok = ""
+    if (Test-Path $mcpTokenFile) {
+        $pcTok = (Get-Content -Path $mcpTokenFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue).Trim()
+    }
+    $animaEnvFile = Join-Path $serverDir "secrets\anima_tokens.env"
+    $pcMcpEnvFile = Join-Path $serverDir "secrets\pc_mcp_tokens.env"
+    if ($animaTok) {
+        [System.IO.File]::WriteAllText($animaEnvFile, "ANIMA_STUDIO_TOKEN=$animaTok`n", [System.Text.UTF8Encoding]::new($false))
+    }
+    if ($pcTok) {
+        [System.IO.File]::WriteAllText($pcMcpEnvFile, "PC_MCP_TOKEN=$pcTok`n", [System.Text.UTF8Encoding]::new($false))
+    }
+    $legacyCombinedEnv = Join-Path $serverDir "secrets\container_tokens.env"
+    if (Test-Path $legacyCombinedEnv) {
+        Remove-Item -Path $legacyCombinedEnv -Force -ErrorAction SilentlyContinue
+    }
+} catch {
+    Write-Host "[警告] 写入 secrets\*_tokens.env 失败: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
 # 4. 启动小智与 Anima Brain 双容器
@@ -293,36 +382,117 @@ for ($j = 0; $j -lt 22; $j++) {
     Start-Sleep -Seconds 1
 }
 
-# 5. 若启用了本地 GPU 语音引擎，则预热一句并裁剪冷内存页
+# 5. 若启用了本地 GPU 语音引擎，则通过 /prime 预热全部 7 种情绪参考缓存，再短句预热一次 CUDA 算子 (F-3)
 if ($hasLocalGsv) {
-    $warmRef = Join-Path $serverDir "data\voices\raiden_mei\mei_default_ref.wav"
+    $voicesMeiDir = Join-Path $serverDir "voices\raiden_mei"
+    $warmRef = Join-Path $voicesMeiDir "mei_default_ref.wav"
+    if (-not (Test-Path $warmRef)) {
+        $warmRef = Join-Path $serverDir "data\voices\raiden_mei\mei_default_ref.wav"
+        $voicesMeiDir = Split-Path -Parent $warmRef
+    }
     if (Test-Path $warmRef) {
         try {
             for ($w = 0; $w -lt 90; $w++) {
                 if (Get-NetTCPConnection -LocalPort 19880 -State Listen -ErrorAction SilentlyContinue) { break }
                 Start-Sleep -Seconds 1
             }
+
+            $primeItems = @()
+            $shortShapeItems = @()
+            $emoManifest = Join-Path $voicesMeiDir "mei_emotions.json"
+            if (Test-Path $emoManifest) {
+                try {
+                    $mObj = (Get-Content -Path $emoManifest -Raw -Encoding UTF8) | ConvertFrom-Json
+                    if ($mObj -and $mObj.emotions) {
+                        foreach ($prop in $mObj.emotions.PSObject.Properties) {
+                            $ep = $prop.Value
+                            $wavName = Split-Path -Leaf ([string]$ep.ref_audio_path)
+                            $localWav = Join-Path $voicesMeiDir $wavName
+                            if (Test-Path $localWav) {
+                                $pItem = @{
+                                    ref_audio_path = $localWav.Replace("\", "/")
+                                    prompt_text    = [string]$ep.prompt_text
+                                    prompt_lang    = if ($ep.prompt_lang) { [string]$ep.prompt_lang } else { "zh" }
+                                }
+                                $primeItems += $pItem
+                                # v4 T_ref=500 (5.0s @ 48kHz/480): 参考音频短于 5.0s 时 T_min 卷积张量形状独立，需一次极短 sample_steps=4 暖机消除首次切换 cuDNN 编译开销
+                                $dur = 0.0
+                                if ($ep.PSObject.Properties["duration_sec"]) {
+                                    try { $dur = [double]$ep.duration_sec } catch { $dur = 0.0 }
+                                }
+                                if ($dur -gt 0.0 -and $dur -lt 5.05) {
+                                    $shortShapeItems += $pItem
+                                }
+                            }
+                        }
+                    }
+                } catch {}
+            }
+            if ($primeItems.Count -eq 0) {
+                $primeItems += @{
+                    ref_audio_path = $warmRef.Replace("\", "/")
+                    prompt_text    = "今夜月色很美，呵...适合与朋友小聚一番。"
+                    prompt_lang    = "zh"
+                }
+            }
+
+            $primeBody = @{ items = $primeItems; skip_if_busy = $false; reason = "startup_7_emotions" } | ConvertTo-Json -Depth 4 -Compress
+            $primeResp = Invoke-RestMethod -Uri "http://127.0.0.1:19880/prime" -Method Post -TimeoutSec 60 `
+                -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($primeBody))
+            if ($primeResp -and $primeResp.ok) {
+                Write-Host "[预热] 语音引擎 7 情绪参考特征缓存已就绪 (slots=$($primeResp.cache_slots), $($primeResp.elapsed_ms)ms)" -ForegroundColor DarkGreen
+            }
+
             $warm = @{
-                text = "预热测试，银行行长今天很开心。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"; sample_steps = 16
+                text = "预热测试，银行行长今天很开心。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"; sample_steps = 8
                 ref_audio_path = $warmRef.Replace("\", "/")
                 prompt_text = "今夜月色很美，呵...适合与朋友小聚一番。"; prompt_lang = "zh"
             } | ConvertTo-Json -Compress
             Invoke-WebRequest -Uri "http://127.0.0.1:19880/tts" -Method Post -UseBasicParsing -TimeoutSec 60 `
                 -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($warm)) | Out-Null
+
+            foreach ($si in $shortShapeItems) {
+                $shortWarm = @{
+                    text = "嗯。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"; sample_steps = 4
+                    ref_audio_path = $si.ref_audio_path
+                    prompt_text = $si.prompt_text
+                    prompt_lang = $si.prompt_lang
+                } | ConvertTo-Json -Compress
+                Invoke-WebRequest -Uri "http://127.0.0.1:19880/tts" -Method Post -UseBasicParsing -TimeoutSec 30 `
+                    -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($shortWarm)) | Out-Null
+            }
+            if ($shortShapeItems.Count -gt 0) {
+                Write-Host "[预热] 已完成 $($shortShapeItems.Count) 种短参考情绪 cuDNN 形状暖机（首次切换即达缓存速度）" -ForegroundColor DarkGreen
+            }
         } catch {
             Write-Host "[提示] 语音引擎预热失败（不影响使用）: $($_.Exception.Message)" -ForegroundColor DarkYellow
         }
     }
 }
 
+# G-3: 改用 %UserProfile%\.wslconfig 的 [experimental] autoMemoryReclaim=gradual 持续回收内存，不再一次性执行 drop_caches
 try {
-    Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class MemTrim { [DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr hProcess); }' -ErrorAction SilentlyContinue
-    $trimPids = Get-NetTCPConnection -LocalPort 19880, 18900 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
-    foreach ($gp in $trimPids) {
-        $proc = Get-Process -Id $gp -ErrorAction SilentlyContinue
-        if ($proc) { [void][MemTrim]::EmptyWorkingSet($proc.Handle) }
+    $wslCfgPath = Join-Path $env:USERPROFILE ".wslconfig"
+    $hasAutoReclaim = $false
+    if (Test-Path $wslCfgPath) {
+        $wslCfgText = [System.IO.File]::ReadAllText($wslCfgPath, [System.Text.Encoding]::UTF8)
+        $curSection = ""
+        foreach ($rawLn in ($wslCfgText -split "\r?\n")) {
+            $ln = $rawLn.Trim()
+            if (-not $ln -or $ln.StartsWith("#") -or $ln.StartsWith(";")) { continue }
+            if ($ln -match '^\[([^\]]+)\]') {
+                $curSection = $Matches[1].Trim().ToLowerInvariant()
+                continue
+            }
+            if ($curSection -eq "experimental" -and $ln -match '^autoMemoryReclaim\s*=\s*(gradual|dropcache)\b') {
+                $hasAutoReclaim = $true
+                break
+            }
+        }
     }
-    wsl -d docker-desktop -u root sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" 2>$null
+    if (-not $hasAutoReclaim) {
+        Write-Host "[提示] 未在 $wslCfgPath 的 [experimental] 段检测到 autoMemoryReclaim=gradual；建议添加以持续平滑回收 Vmmem 内存（需 WSL >= 2.0）。" -ForegroundColor Yellow
+    }
 } catch {}
 
 Write-Host "`n[启动成功] 全部服务已就绪！" -ForegroundColor Green

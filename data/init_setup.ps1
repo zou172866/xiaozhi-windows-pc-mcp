@@ -252,6 +252,10 @@ $wbAutoApprove = if ($existingEnv.ContainsKey("WORKBUDDY_AUTO_APPROVE") -and $ex
 
 $envUpdates = [ordered]@{
     "HOST_LAN_IP" = $hostLanIp
+    "HOST_PROJECT_DIR" = $serverDir.Replace("\", "/")
+    "HOST_DATA_DIR" = (Join-Path $serverDir "data").Replace("\", "/")
+    "HOST_VOICES_DIR" = (Join-Path $serverDir "voices").Replace("\", "/")
+    "HOST_GSV_WEIGHTS_DIR" = (Join-Path $serverDir "models\gsv_weights").Replace("\", "/")
     "ESP32_AUTH_KEY" = $esp32AuthKey
     "ESP32_ALLOWED_DEVICES" = $esp32AllowedDevices
     "L3_BACKEND" = $l3Backend
@@ -318,11 +322,15 @@ $l3Json = $l3Obj | ConvertTo-Json -Depth 4
 [System.IO.File]::WriteAllText($l3CfgPath, $l3Json, [System.Text.UTF8Encoding]::new($false))
 Write-Host "[已更新] 宿主机私有 L3 引擎配置:  $l3CfgPath" -ForegroundColor Green
 
-# 按需从 .example 模板生成缺失的运行态配置文件（绝不覆盖已有个人设定）
+# 按需从 config\*.example 模板生成缺失的运行态配置文件（绝不覆盖已有个人设定，A-1）
+foreach ($dRel in @("config\runtime", "config\runtime\bin", "state", "secrets", "backups", "voices", "logs", "anima-data")) {
+    $dFull = Join-Path $serverDir $dRel
+    if (-not (Test-Path $dFull)) { New-Item -ItemType Directory -Path $dFull -Force | Out-Null }
+}
 $runtimeTemplates = @(
-    @{ Tpl = "data\.config.example.yaml";             Dst = "data\.config.yaml";             Label = "默认小智主配置" },
-    @{ Tpl = "data\tts_infer_xiaozhi.example.yaml";   Dst = "data\tts_infer_xiaozhi.yaml";   Label = "GPT-SoVITS 推理配置" },
-    @{ Tpl = "data\.wakeup_words.example.yaml";       Dst = "data\.wakeup_words.yaml";       Label = "唤醒词缓存索引" }
+    @{ Tpl = "config\.config.example.yaml";             Dst = "config\runtime\.config.yaml";             Label = "默认小智主配置" },
+    @{ Tpl = "config\tts_infer_xiaozhi.example.yaml";   Dst = "config\runtime\tts_infer_xiaozhi.yaml";   Label = "GPT-SoVITS 推理配置" },
+    @{ Tpl = "config\.wakeup_words.example.yaml";       Dst = "config\runtime\.wakeup_words.yaml";       Label = "唤醒词缓存索引" }
 )
 foreach ($item in $runtimeTemplates) {
     $tplFull = Join-Path $serverDir $item.Tpl
@@ -332,26 +340,33 @@ foreach ($item in $runtimeTemplates) {
         Write-Host "[已生成] $($item.Label): $($item.Dst)" -ForegroundColor Green
     }
 }
-# 统一运行态配置 data\runtime_settings.json：仅当不存在且无旧版三件套待无损迁移时才从模板生成
-$rsDst = Join-Path $serverDir "data\runtime_settings.json"
-$rsTpl = Join-Path $serverDir "data\runtime_settings.example.json"
-$hasLegacyRs = (Test-Path (Join-Path $serverDir "data\pc_control_mode.json")) -or
+# 统一运行态配置 state\runtime_settings.json：仅当不存在且无旧版三件套待无损迁移时才从模板生成
+$rsDst = Join-Path $serverDir "state\runtime_settings.json"
+$rsTpl = Join-Path $serverDir "config\runtime_settings.example.json"
+$hasLegacyRs = (Test-Path (Join-Path $serverDir "data\runtime_settings.json")) -or
+               (Test-Path (Join-Path $serverDir "data\pc_control_mode.json")) -or
                (Test-Path (Join-Path $serverDir "data\audio_output_mode.json")) -or
                (Test-Path (Join-Path $serverDir "data\reply_length_config.json"))
 if (-not (Test-Path $rsDst) -and -not $hasLegacyRs -and (Test-Path $rsTpl)) {
     Copy-Item $rsTpl $rsDst
-    Write-Host "[已生成] 统一运行态配置（挡位/播报端/回复字数）: data\runtime_settings.json" -ForegroundColor Green
+    Write-Host "[已生成] 统一运行态配置（播报端/回复字数/空闲告别）: state\runtime_settings.json" -ForegroundColor Green
+}
+# 宿主机私有挡位文件 pc-mcp\state\pc_control_mode.json（默认 safe，A-2）
+$hostModePath = Join-Path $l3StateDir "pc_control_mode.json"
+if (-not (Test-Path $hostModePath)) {
+    [System.IO.File]::WriteAllText($hostModePath, '{"mode": "safe"}' + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    Write-Host "[已生成] 宿主机私有操控挡位配置（默认安全挡）: $hostModePath" -ForegroundColor Green
 }
 
-# 若用户选择免显卡 EdgeTTS，同步确保 data\.config.yaml 的 selected_module.TTS 为 EdgeTTS（不改动其余个人设定）
-$cfgPath = Join-Path $serverDir "data\.config.yaml"
+# 若用户选择免显卡 EdgeTTS，同步确保 config\runtime\.config.yaml 的 selected_module.TTS 为 EdgeTTS（不改动其余个人设定）
+$cfgPath = Join-Path $serverDir "config\runtime\.config.yaml"
 if ($enableGsv -eq "false" -and (Test-Path $cfgPath)) {
     $cfgRaw = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8)
     $ttsPat = '(?m)^(\s*TTS:\s*)["'']?GPT_SOVITS_V2["'']?(\s*(?:#.*)?\r?)$'
     if ($cfgRaw -match $ttsPat) {
         $cfgUpdated = [regex]::Replace($cfgRaw, $ttsPat, '${1}EdgeTTS${2}')
         [System.IO.File]::WriteAllText($cfgPath, $cfgUpdated, [System.Text.UTF8Encoding]::new($false))
-        Write-Host "[已同步] data\.config.yaml 中 TTS 已设为 EdgeTTS（免显卡模式）" -ForegroundColor Green
+        Write-Host "[已同步] config\runtime\.config.yaml 中 TTS 已设为 EdgeTTS（免显卡模式）" -ForegroundColor Green
     }
 }
 

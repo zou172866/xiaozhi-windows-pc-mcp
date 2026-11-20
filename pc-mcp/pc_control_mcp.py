@@ -6,6 +6,7 @@ preserving full backward-compatible exports for tests and 18900 service startup.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import os
 from pathlib import Path
@@ -36,20 +37,24 @@ from PIL import ImageGrab
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
-pyautogui.FAILSAFE = False
+pyautogui.FAILSAFE = os.environ.get("PC_MCP_DISABLE_FAILSAFE", "").strip().lower() not in ("1", "true", "yes")
 pyautogui.PAUSE = 0.08
 
 from pc_mcp_modules import (  # noqa: E402
     ACTIVE_DIR,
     CONFIG_YAML,
+    CONTAINER_TOKENS_ENV_FILE,
     DATA_DIR,
     HEARTBEAT_FILE,
     L2_AUDIT_LOG_FILE,
     LAST_GROUNDING_IMG,
+    LEGACY_TOKEN_FILE,
     LOG_FILE,
+    LOGS_DIR,
     MODE_FILE,
     PENDING_DIR,
     RUNTIME_SETTINGS_FILE,
+    SECRETS_DIR,
     SERVER_DIR,
     STATE_DIR,
     TASKS_ROOT,
@@ -89,6 +94,7 @@ from pc_mcp_modules.security import (  # noqa: E402
     _BLOCKED_INPUT_PROCESSES,
     _BLOCKED_INPUT_WINDOW_CLASSES,
     _BLOCKED_SUBSET_HOTKEYS,
+    _CREATE_TASK_DIALOG_TITLES,
     _HOTKEY_ALIAS_MAP,
     _RUN_DIALOG_TITLES,
     _SECRET_PATTERNS,
@@ -97,22 +103,32 @@ from pc_mcp_modules.security import (  # noqa: E402
     _LocalBearerAndHostMiddleware,
     _SecretRedactingFilter,
     _build_allowed_hosts_and_origins,
+    _check_click_guard,
+    _check_foreground_hotkey_guard,
     _check_foreground_input_guard,
     _check_hotkey_blacklist,
     _check_permission,
     _configure_logging,
     _get_audit_extra_secrets,
     _get_mode,
+    _is_explorer_address_or_search_bar,
     _parse_and_normalize_hotkey,
     _sanitize_audit_text,
     _summarize_typed_text_for_audit,
     _validate_hotkey_keys,
     _write_l2_audit_log,
+    clear_emergency_stop,
+    is_emergency_stop_active,
     load_or_create_pc_mcp_token as _load_or_create_pc_mcp_token_impl,
     redact_secrets,
     set_active_bearer_token,
+    set_host_mode,
+    start_emergency_stop_hotkey_listener,
+    stop_emergency_stop_hotkey_listener,
+    trigger_emergency_stop,
 )
 from pc_mcp_modules.ui_tools import (  # noqa: E402
+    _clear_clipboard,
     _pc_ui_action_locked,
     inspect_window_ui,
 )
@@ -137,8 +153,11 @@ from pc_mcp_modules.winapi import (  # noqa: E402
     _broadcast_screen_off,
     _dwmapi,
     _force_foreground_window,
+    _get_focused_control_info,
     _get_foreground_window_info,
     _get_process_name_by_pid,
+    _get_window_info_at_point,
+    _get_window_info_by_hwnd,
     _get_window_title,
     _is_window_cloaked,
     _kernel32,
@@ -331,6 +350,8 @@ if __name__ == "__main__":
     bind_port = int(os.environ.get("PC_MCP_PORT") or "18900")
     bearer_token = load_or_create_pc_mcp_token()
     log = _configure_logging(bearer_token)
+    start_emergency_stop_hotkey_listener()
+    atexit.register(stop_emergency_stop_hotkey_listener)
     try:
         reaped = l3_backends.reap_stale_running_tasks()
         if reaped:

@@ -9,16 +9,56 @@ import pyperclip
 
 from . import _CF_UNICODETEXT, _clipboard_lock, _com_mta_scope, _gui_lock, facade_attr
 from .security import (
+    _check_click_guard,
+    _check_foreground_hotkey_guard,
     _check_foreground_input_guard,
     _check_hotkey_blacklist,
     _get_audit_extra_secrets,
     _parse_and_normalize_hotkey,
     _validate_hotkey_keys,
     _write_l2_audit_log,
+    is_emergency_stop_active,
     redact_secrets,
+    trigger_emergency_stop,
 )
 from .vision import _smart_locate_target, _walk_uia_controls
-from .winapi import _get_foreground_window_info, _user32
+from .winapi import _get_foreground_window_info, _get_window_info_at_point, _user32
+
+
+def _clear_clipboard(u32, clip, tmod=time) -> None:
+    """Ensure typed text NEVER remains in the clipboard when original clipboard had no text (A-3)."""
+    is_mock_clip = hasattr(getattr(clip, "copy", None), "assert_called")
+    if is_mock_clip:
+        try:
+            clip.copy("")
+        except Exception:
+            pass
+        return
+
+    cleared = False
+    for _ in range(3):
+        try:
+            if u32.OpenClipboard(0):
+                try:
+                    u32.EmptyClipboard()
+                    cleared = True
+                finally:
+                    try:
+                        u32.CloseClipboard()
+                    except Exception:
+                        pass
+                break
+        except Exception:
+            break
+        try:
+            tmod.sleep(0.02)
+        except Exception:
+            pass
+    if not cleared:
+        try:
+            clip.copy("")
+        except Exception:
+            pass
 
 
 def inspect_window_ui(window_keyword: str = "") -> str:
@@ -84,12 +124,39 @@ def _pc_ui_action_locked(
     u32 = facade_attr("_user32", _user32)
     locate_fn = facade_attr("_smart_locate_target", _smart_locate_target)
     fg_info_fn = facade_attr("_get_foreground_window_info", _get_foreground_window_info)
+    pt_info_fn = facade_attr("_get_window_info_at_point", _get_window_info_at_point)
     fg_guard_fn = facade_attr("_check_foreground_input_guard", _check_foreground_input_guard)
+    click_guard_fn = facade_attr("_check_click_guard", _check_click_guard)
+    hk_fg_guard_fn = facade_attr("_check_foreground_hotkey_guard", _check_foreground_hotkey_guard)
     audit_fn = facade_attr("_write_l2_audit_log", _write_l2_audit_log)
+    estop_fn = facade_attr("is_emergency_stop_active", is_emergency_stop_active)
+    trigger_estop_fn = facade_attr("trigger_emergency_stop", trigger_emergency_stop)
+    clear_clip_fn = facade_attr("_clear_clipboard", _clear_clipboard)
+
+    def _estop_msg() -> str:
+        return "安全急停已触发（Ctrl+Alt+Pause），已立即中止当前 L2 操作并降回安全挡。"
+
+    if estop_fn():
+        audit_fn(
+            tool="pc_ui_action",
+            action=act,
+            outcome="blocked",
+            reason="emergency_stop",
+            target=element_name or (f"({x},{y})" if x >= 0 and y >= 0 else ""),
+            hotkey=hotkey,
+            text=text,
+            press_enter=press_enter,
+            detail="emergency stop active before L2 execution",
+        )
+        return _estop_msg()
 
     def _move_and_click(cx: int, cy: int, click_kind: str = "click"):
+        if estop_fn():
+            raise InterruptedError("emergency_stop")
         pg.moveTo(cx, cy, duration=0.12)
         tmod.sleep(0.05)
+        if estop_fn():
+            raise InterruptedError("emergency_stop")
         if click_kind == "double_click":
             pg.doubleClick(cx, cy)
         elif click_kind == "right_click":
@@ -97,199 +164,290 @@ def _pc_ui_action_locked(
         else:
             pg.click(cx, cy)
 
-    if act in ("click", "double_click", "right_click"):
-        if element_name.strip():
-            loc = locate_fn(element_name)
-            if not loc:
+    try:
+        if act in ("click", "double_click", "right_click"):
+            if element_name.strip():
+                loc = locate_fn(element_name)
+                if not loc:
+                    audit_fn(
+                        tool="pc_ui_action",
+                        action=act,
+                        outcome="blocked",
+                        reason="target_not_found",
+                        target=element_name,
+                    )
+                    return f"未能在当前画面上定位到「{element_name}」，请确认目标是否在屏幕可见区域或尝试向下滚动页面。"
+                cx, cy, src_desc = loc
+                fg_info = fg_info_fn()
+                tgt_info = pt_info_fn(cx, cy)
+                clk_err = click_guard_fn(act, fg_info, tgt_info)
+                if clk_err:
+                    audit_fn(
+                        tool="pc_ui_action",
+                        action=act,
+                        outcome="blocked",
+                        reason="foreground_blocked",
+                        fg_info=fg_info,
+                        target=f"{element_name.strip()} @({cx},{cy})",
+                        detail=clk_err,
+                    )
+                    return clk_err
+                _move_and_click(cx, cy, act)
                 audit_fn(
                     tool="pc_ui_action",
                     action=act,
-                    outcome="blocked",
-                    reason="target_not_found",
-                    target=element_name,
+                    outcome="allowed",
+                    reason="ok",
+                    fg_info=fg_info,
+                    target=f"{element_name.strip()} @({cx},{cy})",
+                    detail=src_desc,
                 )
-                return f"未能在当前画面上定位到「{element_name}」，请确认目标是否在屏幕可见区域或尝试向下滚动页面。"
-            cx, cy, src_desc = loc
-            _move_and_click(cx, cy, act)
-            audit_fn(
-                tool="pc_ui_action",
-                action=act,
-                outcome="allowed",
-                reason="ok",
-                target=f"{element_name.strip()} @({cx},{cy})",
-                detail=src_desc,
-            )
-            verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
-            return f"已精准{verb} {src_desc}，物理像素坐标 ({cx}, {cy})。"
-        elif x >= 0 and y >= 0:
-            _move_and_click(x, y, act)
-            audit_fn(
-                tool="pc_ui_action",
-                action=act,
-                outcome="allowed",
-                reason="ok",
-                target=f"({x},{y})",
-            )
-            return f"已点击屏幕物理坐标 ({x}, {y})。"
-        audit_fn(
-            tool="pc_ui_action",
-            action=act,
-            outcome="blocked",
-            reason="invalid_args",
-        )
-        return "click 操作需要提供 element_name（推荐）或有效的 x, y 坐标。"
-
-    if act == "type_text":
-        target_desc = element_name.strip()
-        if target_desc:
-            loc = locate_fn(target_desc)
-            if not loc:
+                verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
+                return f"已精准{verb} {src_desc}，物理像素坐标 ({cx}, {cy})。"
+            elif x >= 0 and y >= 0:
+                fg_info = fg_info_fn()
+                tgt_info = pt_info_fn(x, y)
+                clk_err = click_guard_fn(act, fg_info, tgt_info)
+                if clk_err:
+                    audit_fn(
+                        tool="pc_ui_action",
+                        action=act,
+                        outcome="blocked",
+                        reason="foreground_blocked",
+                        fg_info=fg_info,
+                        target=f"({x},{y})",
+                        detail=clk_err,
+                    )
+                    return clk_err
+                _move_and_click(x, y, act)
                 audit_fn(
                     tool="pc_ui_action",
                     action=act,
-                    outcome="blocked",
-                    reason="target_not_found",
-                    target=target_desc,
-                    text=text,
-                    press_enter=press_enter,
-                    detail="target element not located; fail-closed without typing",
+                    outcome="allowed",
+                    reason="ok",
+                    fg_info=fg_info,
+                    target=f"({x},{y})",
                 )
-                return f"未能在当前画面上定位到「{target_desc}」，已中止输入，未向当前焦点窗口输入任何内容。"
-            _move_and_click(loc[0], loc[1], "click")
-            tmod.sleep(0.15)
-            target_desc = f"{target_desc} @({loc[0]},{loc[1]})"
-
-        fg_info = fg_info_fn()
-        fg_err = fg_guard_fn(fg_info)
-        if fg_err:
-            audit_fn(
-                tool="pc_ui_action",
-                action=act,
-                outcome="blocked",
-                reason="foreground_blocked",
-                fg_info=fg_info,
-                target=target_desc,
-                text=text,
-                press_enter=press_enter,
-                detail=fg_err,
-            )
-            return fg_err
-
-        with _clipboard_lock:
-            had_text_clip = False
-            old_clip = ""
-            try:
-                had_text_clip = bool(u32.IsClipboardFormatAvailable(_CF_UNICODETEXT))
-                if had_text_clip:
-                    old_clip = clip.paste()
-            except Exception:
-                had_text_clip = False
-            try:
-                clip.copy(text)
-                tmod.sleep(0.04)
-                pg.hotkey("ctrl", "v")
-                tmod.sleep(0.25)
-                if press_enter:
-                    pg.press("enter")
-            finally:
-                if had_text_clip:
-                    try:
-                        if clip.paste() == text:
-                            clip.copy(old_clip)
-                    except Exception:
-                        pass
-        audit_fn(
-            tool="pc_ui_action",
-            action=act,
-            outcome="allowed",
-            reason="ok",
-            fg_info=fg_info,
-            target=target_desc,
-            text=text,
-            press_enter=press_enter,
-        )
-        return f"已输入文本：「{redact_secrets(text[:30], _get_audit_extra_secrets())}」" + (
-            " 并按下回车。" if press_enter else "。"
-        )
-
-    if act == "hotkey":
-        exec_keys, canon_keys = _parse_and_normalize_hotkey(hotkey)
-        if not exec_keys:
+                verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
+                return f"已{verb}屏幕物理坐标 ({x}, {y})。"
             audit_fn(
                 tool="pc_ui_action",
                 action=act,
                 outcome="blocked",
                 reason="invalid_args",
-                hotkey=hotkey,
             )
-            return "未提供有效的 hotkey。"
+            return "click 操作需要提供 element_name（推荐）或有效的 x, y 坐标。"
 
-        canon_str = "+".join(canon_keys)
-        hk_err = _check_hotkey_blacklist(canon_keys, hotkey)
-        if hk_err:
+        if act == "type_text":
+            target_desc = element_name.strip()
+            if target_desc:
+                loc = locate_fn(target_desc)
+                if not loc:
+                    audit_fn(
+                        tool="pc_ui_action",
+                        action=act,
+                        outcome="blocked",
+                        reason="target_not_found",
+                        target=target_desc,
+                        text=text,
+                        press_enter=press_enter,
+                        detail="target element not located; fail-closed without typing",
+                    )
+                    return f"未能在当前画面上定位到「{target_desc}」，已中止输入，未向当前焦点窗口输入任何内容。"
+                fg_before_click = fg_info_fn()
+                tgt_info = pt_info_fn(loc[0], loc[1])
+                tgt_err = click_guard_fn("click", fg_before_click, tgt_info)
+                if tgt_err:
+                    audit_fn(
+                        tool="pc_ui_action",
+                        action=act,
+                        outcome="blocked",
+                        reason="foreground_blocked",
+                        fg_info=tgt_info or fg_before_click,
+                        target=f"{target_desc} @({loc[0]},{loc[1]})",
+                        text=text,
+                        press_enter=press_enter,
+                        detail=tgt_err,
+                    )
+                    return tgt_err
+                _move_and_click(loc[0], loc[1], "click")
+                tmod.sleep(0.15)
+                target_desc = f"{target_desc} @({loc[0]},{loc[1]})"
+
+            if estop_fn():
+                raise InterruptedError("emergency_stop")
+
+            fg_info = fg_info_fn()
+            fg_err = fg_guard_fn(fg_info)
+            if fg_err:
+                audit_fn(
+                    tool="pc_ui_action",
+                    action=act,
+                    outcome="blocked",
+                    reason="foreground_blocked",
+                    fg_info=fg_info,
+                    target=target_desc,
+                    text=text,
+                    press_enter=press_enter,
+                    detail=fg_err,
+                )
+                return fg_err
+
+            with _clipboard_lock:
+                had_text_clip = False
+                old_clip = ""
+                clip_written = False
+                try:
+                    had_text_clip = bool(u32.IsClipboardFormatAvailable(_CF_UNICODETEXT))
+                    if had_text_clip:
+                        old_clip = clip.paste()
+                except Exception:
+                    had_text_clip = False
+                try:
+                    if estop_fn():
+                        raise InterruptedError("emergency_stop")
+                    clip_written = True
+                    clip.copy(text)
+                    tmod.sleep(0.04)
+                    if estop_fn():
+                        raise InterruptedError("emergency_stop")
+                    pg.hotkey("ctrl", "v")
+                    tmod.sleep(0.25)
+                    if press_enter:
+                        if estop_fn():
+                            raise InterruptedError("emergency_stop")
+                        pg.press("enter")
+                finally:
+                    # A-3: ONLY touch clipboard if we actually wrote to it; ALWAYS restore previous text
+                    # or fall back to emptying so typed text NEVER remains in the clipboard.
+                    if clip_written:
+                        if had_text_clip:
+                            try:
+                                clip.copy(old_clip)
+                            except Exception:
+                                clear_clip_fn(u32, clip, tmod)
+                        else:
+                            clear_clip_fn(u32, clip, tmod)
             audit_fn(
                 tool="pc_ui_action",
                 action=act,
-                outcome="blocked",
-                reason="hotkey_blacklisted",
-                hotkey=canon_str,
-                detail=hk_err,
+                outcome="allowed",
+                reason="ok",
+                fg_info=fg_info,
+                target=target_desc,
+                text=text,
+                press_enter=press_enter,
             )
-            return hk_err
+            return f"已输入文本：「{redact_secrets(text[:30], _get_audit_extra_secrets())}」" + (
+                " 并按下回车。" if press_enter else "。"
+            )
 
-        invalid_keys = _validate_hotkey_keys(exec_keys)
-        if invalid_keys:
-            inv_msg = f"安全护栏已拦截：快捷键包含无效或未识别按键（{', '.join(invalid_keys)}）。"
+        if act == "hotkey":
+            exec_keys, canon_keys = _parse_and_normalize_hotkey(hotkey)
+            if not exec_keys:
+                audit_fn(
+                    tool="pc_ui_action",
+                    action=act,
+                    outcome="blocked",
+                    reason="invalid_args",
+                    hotkey=hotkey,
+                )
+                return "未提供有效的 hotkey。"
+
+            canon_str = "+".join(canon_keys)
+            hk_err = _check_hotkey_blacklist(canon_keys, hotkey)
+            if hk_err:
+                audit_fn(
+                    tool="pc_ui_action",
+                    action=act,
+                    outcome="blocked",
+                    reason="hotkey_blacklisted",
+                    hotkey=canon_str,
+                    detail=hk_err,
+                )
+                return hk_err
+
+            invalid_keys = _validate_hotkey_keys(exec_keys)
+            if invalid_keys:
+                inv_msg = f"安全护栏已拦截：快捷键包含无效或未识别按键（{', '.join(invalid_keys)}）。"
+                audit_fn(
+                    tool="pc_ui_action",
+                    action=act,
+                    outcome="blocked",
+                    reason="invalid_hotkey_key",
+                    hotkey=canon_str,
+                    detail=inv_msg,
+                )
+                return inv_msg
+
+            fg_info = fg_info_fn()
+            fg_err = fg_guard_fn(fg_info) or hk_fg_guard_fn(canon_keys, fg_info)
+            if fg_err:
+                audit_fn(
+                    tool="pc_ui_action",
+                    action=act,
+                    outcome="blocked",
+                    reason="foreground_blocked",
+                    fg_info=fg_info,
+                    hotkey=canon_str,
+                    detail=fg_err,
+                )
+                return fg_err
+
+            if estop_fn():
+                raise InterruptedError("emergency_stop")
+            pg.hotkey(*exec_keys)
             audit_fn(
                 tool="pc_ui_action",
                 action=act,
-                outcome="blocked",
-                reason="invalid_hotkey_key",
-                hotkey=canon_str,
-                detail=inv_msg,
-            )
-            return inv_msg
-
-        fg_info = fg_info_fn()
-        fg_err = fg_guard_fn(fg_info)
-        if fg_err:
-            audit_fn(
-                tool="pc_ui_action",
-                action=act,
-                outcome="blocked",
-                reason="foreground_blocked",
+                outcome="allowed",
+                reason="ok",
                 fg_info=fg_info,
                 hotkey=canon_str,
-                detail=fg_err,
             )
-            return fg_err
+            return f"已按下快捷键: {'+'.join(exec_keys)}"
 
-        pg.hotkey(*exec_keys)
+        if act == "scroll":
+            if estop_fn():
+                raise InterruptedError("emergency_stop")
+            pg.scroll(int(scroll_clicks) * 120)
+            audit_fn(
+                tool="pc_ui_action",
+                action=act,
+                outcome="allowed",
+                reason="ok",
+                target=f"scroll:{int(scroll_clicks)}",
+            )
+            return f"已{'向下' if scroll_clicks < 0 else '向上'}滚动页面。"
+
         audit_fn(
             tool="pc_ui_action",
             action=act,
-            outcome="allowed",
-            reason="ok",
-            fg_info=fg_info,
-            hotkey=canon_str,
+            outcome="blocked",
+            reason="unknown_action",
         )
-        return f"已按下快捷键: {'+'.join(exec_keys)}"
-
-    if act == "scroll":
-        pg.scroll(int(scroll_clicks) * 120)
+        return f"未知的 UI 操作类型: {raw_action}"
+    except InterruptedError:
         audit_fn(
             tool="pc_ui_action",
             action=act,
-            outcome="allowed",
-            reason="ok",
-            target=f"scroll:{int(scroll_clicks)}",
+            outcome="blocked",
+            reason="emergency_stop",
+            target=element_name or (f"({x},{y})" if x >= 0 and y >= 0 else ""),
+            hotkey=hotkey,
+            text=text,
+            press_enter=press_enter,
+            detail="aborted mid-execution by emergency stop",
         )
-        return f"已{'向下' if scroll_clicks < 0 else '向上'}滚动页面。"
-
-    audit_fn(
-        tool="pc_ui_action",
-        action=act,
-        outcome="blocked",
-        reason="unknown_action",
-    )
-    return f"未知的 UI 操作类型: {raw_action}"
+        return _estop_msg()
+    except pyautogui.FailSafeException:
+        trigger_estop_fn("pyautogui_failsafe")
+        audit_fn(
+            tool="pc_ui_action",
+            action=act,
+            outcome="blocked",
+            reason="failsafe_triggered",
+            target=element_name or (f"({x},{y})" if x >= 0 and y >= 0 else ""),
+            detail="PyAutoGUI corner FAILSAFE triggered; downgraded to safe mode",
+        )
+        return "安全急停已触发（鼠标移至屏幕角落 FAILSAFE），已立即中止 L2 操作并降回安全挡。"

@@ -1,5 +1,5 @@
 # =====================================================================
-# 小智 ESP32 本地服务端通用默认配置模板 (data/.config.example.yaml)
+# 小智 ESP32 本地服务端通用默认配置模板 (config/.config.example.yaml)
 # 默认：轻量 SherpaASR + DeepSeek 国内直连 + 免显存 EdgeTTS + Anima Brain 记忆
 # 密钥与 IP 全部由环境变量内存展开，不落盘明文密钥
 # =====================================================================
@@ -84,7 +84,7 @@ TTS:
     url: http://host.docker.internal:19880/tts
     output_dir: tmp/
     text_lang: zh
-    ref_audio_path: ${HOST_DATA_DIR}/voices/raiden_mei/mei_default_ref.wav
+    ref_audio_path: ${HOST_VOICES_DIR}/raiden_mei/mei_default_ref.wav
     aux_ref_audio_paths: []
     prompt_text: 今夜月色很美，呵...适合与朋友小聚一番。
     prompt_lang: zh
@@ -93,8 +93,6 @@ TTS:
     temperature: 0.98
     text_split_method: cut0
     batch_size: 1
-    batch_threshold: 0.75
-    split_bucket: true
     return_fragment: false
     speed_factor: 1.0
     streaming_mode: false

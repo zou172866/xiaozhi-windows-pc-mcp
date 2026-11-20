@@ -36,11 +36,14 @@ import l3_backends  # noqa: E402
 
 SERVER_DIR = MCP_DIR.parent
 DATA_DIR = SERVER_DIR / "data"
+SECRETS_DIR = SERVER_DIR / "secrets"
+LOGS_DIR = SERVER_DIR / "logs"
 STATE_DIR = l3_backends.STATE_DIR
-TOKEN_FILE = DATA_DIR / "pc_mcp_token.txt"
-BOOT_LOG_FILE = DATA_DIR / "pc_mcp_18900_boot.log"
-MCP_LOG_FILE = DATA_DIR / "pc_mcp_18900.log"
-WATCHDOG_LOG_FILE = DATA_DIR / "pc_mcp_watchdog.log"
+TOKEN_FILE = SECRETS_DIR / "pc_mcp_token.txt"
+LEGACY_TOKEN_FILE = DATA_DIR / "pc_mcp_token.txt"
+BOOT_LOG_FILE = LOGS_DIR / "pc_mcp_18900_boot.log"
+MCP_LOG_FILE = LOGS_DIR / "pc_mcp_18900.log"
+WATCHDOG_LOG_FILE = LOGS_DIR / "pc_mcp_watchdog.log"
 PID_FILE = STATE_DIR / "pc_mcp_watchdog.pid"
 STATE_FILE = STATE_DIR / "watchdog_state.json"
 STOP_FLAG_FILE = STATE_DIR / "watchdog_stop.flag"
@@ -51,11 +54,17 @@ DEFAULT_BACKOFF_SECONDS = (1.0, 2.0, 5.0, 15.0, 30.0)
 
 
 def read_bearer_token(token_file: Path = TOKEN_FILE) -> str:
-    try:
-        if token_file.is_file():
-            return token_file.read_text(encoding="utf-8", errors="ignore").strip()
-    except Exception:
-        pass
+    candidates = [token_file]
+    if token_file == TOKEN_FILE and LEGACY_TOKEN_FILE not in candidates:
+        candidates.append(LEGACY_TOKEN_FILE)
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                tok = cand.read_text(encoding="utf-8", errors="ignore").strip()
+                if tok:
+                    return tok
+        except Exception:
+            pass
     return ""
 
 

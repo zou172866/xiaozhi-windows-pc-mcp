@@ -9,6 +9,13 @@ env/
 # Secrets, ESP32 Wi-Fi NVS backups, personal memory DB & chat history (NEVER COMMIT)
 .env
 *.bin
+secrets/
+backups/
+anima-data/
+state/
+config/runtime/
+voices/
+logs/
 data/nvs*
 data/chat_history.json
 data/.console_log_cursor.json
@@ -33,7 +40,7 @@ data/*.log
 data/*.log.*
 data/last_som_grounding.jpg
 
-# Host-private L3 state, Antigravity sidecar tasks & L2 audit log (never mounted in Docker)
+# Host-private L3 state, mode authority, Antigravity sidecar tasks & L2 audit log (never mounted in Docker)
 pc-mcp/state/
 
 # Large local model weights & voice reference audio
@@ -45,4 +52,6 @@ data/*.ckpt
 data/*.pth
 data/*.onnx
 data/*.pt
+*.ckpt
+*.pth
 tmp/

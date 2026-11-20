@@ -111,31 +111,36 @@ class TestP2ModularSplitAndFixes(unittest.TestCase):
             # Token on disk MUST remain completely untouched
             self.assertEqual(tf.read_text(encoding="utf-8").strip(), original)
 
-    def test_p221_host_reads_runtime_settings_with_legacy_fallback_and_corrupt_failsafe(self):
+    def test_a2_host_ignores_container_runtime_settings_and_trusts_only_host_mode_file(self):
+        """A-2: Host 18900 reads mode EXCLUSIVELY from host-private MODE_FILE; container runtime_settings.json is ignored."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             rs_file = root / "runtime_settings.json"
-            legacy_mode = root / "pc_control_mode.json"
+            host_mode = root / "pc_control_mode.json"
 
-            # 1. Primary runtime_settings.json wins over legacy file
+            # 1. Container-tampered runtime_settings.json='full' MUST be ignored when host MODE_FILE is 'off' or missing
             rs_file.write_text(
                 json.dumps({"schema_version": 1, "pc_control": {"mode": "full"}}),
                 encoding="utf-8",
             )
-            legacy_mode.write_text(json.dumps({"mode": "off"}), encoding="utf-8")
             with (
                 patch.object(pcm, "RUNTIME_SETTINGS_FILE", rs_file),
-                patch.object(pcm, "MODE_FILE", legacy_mode),
+                patch.object(pcm, "MODE_FILE", host_mode),
             ):
-                self.assertEqual(pcm._get_mode(), "full")
-
-                # 2. Corrupt runtime_settings.json fails safe to 'safe' (does not read stale legacy file)
-                rs_file.write_text("{corrupt json", encoding="utf-8")
+                # Missing host mode file -> fail-safe 'safe' (ignores tampered runtime_settings.json='full')
                 self.assertEqual(pcm._get_mode(), "safe")
 
-                # 3. Missing runtime_settings.json falls back cleanly to legacy pc_control_mode.json
-                rs_file.unlink()
+                # Valid host mode file wins
+                host_mode.write_text(json.dumps({"mode": "off"}), encoding="utf-8")
                 self.assertEqual(pcm._get_mode(), "off")
+
+                # Corrupt host mode file -> fail-safe 'safe'
+                host_mode.write_text("{corrupt json", encoding="utf-8")
+                self.assertEqual(pcm._get_mode(), "safe")
+
+                # Host mode set to 'full' -> reads 'full'
+                host_mode.write_text(json.dumps({"mode": "full"}), encoding="utf-8")
+                self.assertEqual(pcm._get_mode(), "full")
 
     def test_p221_unified_l3_backend_default_is_dsh_everywhere(self):
         with tempfile.TemporaryDirectory() as td:

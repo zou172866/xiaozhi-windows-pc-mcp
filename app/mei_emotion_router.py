@@ -26,14 +26,20 @@ from typing import Any, Dict, Optional, Tuple
 import patch_registry
 import runtime_events
 import runtime_settings
+import xz_common
 
 _LEGACY_HOST_DATA_PREFIX = "e:/故事/1/xiaozhi-server/data"
-CONTAINER_DATA_PREFIX = "/opt/xiaozhi-esp32-server/data"
-HOST_DATA_PREFIX = (
-    (os.environ.get("HOST_DATA_DIR") or "").replace("\\", "/").rstrip("/")
-    or CONTAINER_DATA_PREFIX
-)
-MEI_DIR_HOST = f"{HOST_DATA_PREFIX}/voices/raiden_mei"
+_LEGACY_HOST_VOICES_PREFIX = "e:/故事/1/xiaozhi-server/voices"
+CONTAINER_DATA_PREFIX = xz_common.DATA_DIR
+CONTAINER_VOICES_PREFIX = xz_common.VOICES_DIR
+_HOST_DIRS = xz_common.resolve_host_dirs()
+HOST_DATA_PREFIX = _HOST_DIRS["HOST_DATA_DIR"]
+_HOST_PROJECT_PREFIX = _HOST_DIRS["HOST_PROJECT_DIR"]
+HOST_VOICES_PREFIX = _HOST_DIRS["HOST_VOICES_DIR"]
+MEI_DIR_HOST = f"{HOST_VOICES_PREFIX}/raiden_mei"
+GSV_PRIME_URL = os.environ.get("GSV_PRIME_URL", "http://host.docker.internal:19880/prime").strip()
+_gsv_prime_lock = threading.Lock()
+_gsv_last_prime_ts: float = 0.0
 
 DEFAULT_MEI_EMOTIONS: Dict[str, Dict[str, Any]] = {
     "calm": {
@@ -517,27 +523,100 @@ def _resolve_gsv_sample_steps(
     return base_steps
 
 
+def _resolve_gsv_prime_url(tts=None) -> str:
+    raw_url = str(getattr(tts, "url", "") or "").strip() if tts is not None else ""
+    if raw_url:
+        if raw_url.endswith("/tts"):
+            return raw_url[:-4] + "/prime"
+        if "/tts?" in raw_url:
+            return raw_url.split("/tts?", 1)[0] + "/prime"
+    return GSV_PRIME_URL
+
+
+def prime_gsv_async(tts=None, *, reason: str = "wakeup", min_interval_sec: float = 12.0) -> bool:
+    """Fire-and-forget async /prime ping to host 19880 on ESP32 wakeup/hello to page in warm memory (F-3)."""
+    global _gsv_last_prime_ts
+    if tts is not None:
+        cls_mod = str(getattr(type(tts), "__module__", "") or "").lower()
+        if cls_mod and "gpt_sovits" not in cls_mod and not is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
+            return False
+
+    now = time.monotonic()
+    with _gsv_prime_lock:
+        if min_interval_sec > 0 and (now - _gsv_last_prime_ts) < float(min_interval_sec):
+            return False
+        _gsv_last_prime_ts = now
+
+    prime_url = _resolve_gsv_prime_url(tts)
+
+    def _worker():
+        try:
+            sess = _get_gsv_http_session()
+            sess.post(
+                prime_url,
+                json={"skip_if_busy": True, "reason": str(reason or "wakeup")},
+                timeout=2.0,
+            )
+        except Exception:
+            pass
+
+    try:
+        threading.Thread(target=_worker, name=f"gsv-prime-{reason}", daemon=True).start()
+        return True
+    except Exception:
+        return False
+
+
 def _rewrite_host_data_path(raw_path: str) -> str:
+    """Rewrite legacy data/voices or ${HOST_DATA_DIR} / ${HOST_VOICES_DIR} paths to active host paths (A-1)."""
     p = (raw_path or "").replace("\\", "/").strip()
     if not p:
         return p
+    if "${HOST_VOICES_DIR}" in p:
+        p = p.replace("${HOST_VOICES_DIR}", HOST_VOICES_PREFIX)
     if "${HOST_DATA_DIR}" in p:
         p = p.replace("${HOST_DATA_DIR}", HOST_DATA_PREFIX)
-    if p.lower().startswith(_LEGACY_HOST_DATA_PREFIX.lower()):
+
+    p_low = p.lower()
+    # Map legacy .../data/voices/<rest> -> HOST_VOICES_PREFIX/<rest>
+    for pfx in (
+        f"{HOST_DATA_PREFIX}/voices/".lower(),
+        f"{_LEGACY_HOST_DATA_PREFIX}/voices/".lower(),
+        f"{_LEGACY_HOST_VOICES_PREFIX}/".lower(),
+        "data/voices/",
+        "voices/",
+    ):
+        if p_low.startswith(pfx):
+            return f"{HOST_VOICES_PREFIX}/{p[len(pfx):]}"
+
+    # Map legacy taiwan ref audio under data/ -> HOST_VOICES_PREFIX/
+    for fname in ("xiaozhi_taiwan_ref.wav", "xiaozhi_taiwan_aux.wav", "wakeup_words_short.wav"):
+        for pfx in (f"{HOST_DATA_PREFIX}/", f"{_LEGACY_HOST_DATA_PREFIX}/", "data/"):
+            if p_low == f"{pfx.lower()}{fname}":
+                return f"{HOST_VOICES_PREFIX}/{fname}"
+
+    if p_low.startswith(_LEGACY_HOST_DATA_PREFIX.lower()):
         p = HOST_DATA_PREFIX + p[len(_LEGACY_HOST_DATA_PREFIX) :]
     elif p.startswith("data/"):
         p = HOST_DATA_PREFIX + "/" + p[len("data/") :]
-    elif p.startswith("voices/"):
-        p = HOST_DATA_PREFIX + "/" + p
     return p
 
 
 def _to_local_fs_path(host_or_local_path: str) -> str:
     p = _rewrite_host_data_path(host_or_local_path)
     if os.name != "nt":
-        for pfx in (HOST_DATA_PREFIX, _LEGACY_HOST_DATA_PREFIX):
-            if p.lower().startswith(pfx.lower()):
-                return CONTAINER_DATA_PREFIX + p[len(pfx) :]
+        p_low = p.lower()
+        for v_pfx in (
+            HOST_VOICES_PREFIX,
+            f"{HOST_DATA_PREFIX}/voices",
+            f"{_LEGACY_HOST_DATA_PREFIX}/voices",
+            _LEGACY_HOST_VOICES_PREFIX,
+        ):
+            if v_pfx and p_low.startswith(v_pfx.lower()):
+                return CONTAINER_VOICES_PREFIX + p[len(v_pfx) :]
+        for d_pfx in (HOST_DATA_PREFIX, _LEGACY_HOST_DATA_PREFIX):
+            if d_pfx and p_low.startswith(d_pfx.lower()):
+                return CONTAINER_DATA_PREFIX + p[len(d_pfx) :]
     return p
 
 
@@ -556,6 +635,7 @@ def load_mei_emotions(force_reload: bool = False) -> Dict[str, Dict[str, Any]]:
     }
     manifest_candidates = [
         _to_local_fs_path(f"{MEI_DIR_HOST}/mei_emotions.json"),
+        os.path.join(CONTAINER_VOICES_PREFIX, "raiden_mei", "mei_emotions.json"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices", "raiden_mei", "mei_emotions.json"),
     ]
     for mp in manifest_candidates:
@@ -1009,6 +1089,16 @@ _PROMPT_REPLACEMENTS: Tuple[Tuple[str, str, str], ...] = (
 )
 
 
+_WARNED_MISSING_PROMPT_ANCHORS: set[str] = set()
+_WARNED_ANCHORS_LOCK = threading.Lock()
+
+
+def reset_prompt_anchor_warnings() -> None:
+    """Clear one-shot missing-anchor warning cache (for isolated unit tests)."""
+    with _WARNED_ANCHORS_LOCK:
+        _WARNED_MISSING_PROMPT_ANCHORS.clear()
+
+
 def verify_prompt_base_anchors(
     prompt_path: str = "/opt/xiaozhi-esp32-server/agent-base-prompt.txt",
 ) -> Tuple[bool, str]:
@@ -1026,22 +1116,78 @@ def verify_prompt_base_anchors(
     return True, f"verified {len(_PROMPT_REPLACEMENTS)} anchors"
 
 
-def apply_prompt_harmony_replacements(rendered: str) -> str:
-    """Apply prompt harmonization replacements after asserting every upstream anchor is present (P1-8)."""
+def _apply_prompt_harmony_detailed(
+    rendered: str, *, warn_once: bool = True
+) -> Tuple[str, List[str], List[str]]:
+    """Soft-apply prompt harmonization replacements, skipping missing anchors without raising (C-2)."""
     out = rendered
+    applied: List[str] = []
+    missing: List[str] = []
     for anchor_name, old_anchor, new_text in _PROMPT_REPLACEMENTS:
-        try:
-            assert old_anchor in out, f"Upstream prompt anchor missing: {anchor_name}"
-        except AssertionError:
-            patch_registry.record_patch(
-                "mei_prompt_anchors",
-                "failed",
-                target="agent-base-prompt.txt",
-                detail=f"runtime anchor assertion failed: {anchor_name}",
-                contract_ok=False,
-            )
-            raise
-        out = out.replace(old_anchor, new_text)
+        if old_anchor in out:
+            out = out.replace(old_anchor, new_text)
+            applied.append(anchor_name)
+        else:
+            missing.append(anchor_name)
+            if warn_once:
+                should_warn = False
+                with _WARNED_ANCHORS_LOCK:
+                    if anchor_name not in _WARNED_MISSING_PROMPT_ANCHORS:
+                        _WARNED_MISSING_PROMPT_ANCHORS.add(anchor_name)
+                        should_warn = True
+                if should_warn:
+                    print(
+                        f"[MeiEmotionRouter] WARNING: 上游提示词锚点缺失，已跳过该项替换 (C-2 软失败): {anchor_name}",
+                        flush=True,
+                    )
+    return out, applied, missing
+
+
+def dry_run_prompt_harmony(
+    prompt_path: str = "/opt/xiaozhi-esp32-server/agent-base-prompt.txt",
+) -> Tuple[str, str, List[str], List[str]]:
+    """Run prompt harmony replacements against the real upstream template at startup (C-2)."""
+    all_names = [name for name, _, _ in _PROMPT_REPLACEMENTS]
+    if not os.path.isfile(prompt_path):
+        return "failed", f"base prompt file missing: {prompt_path}", [], all_names
+    try:
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except Exception as exc:
+        return "failed", f"failed to read base prompt: {exc}", [], all_names
+
+    _, applied, missing = _apply_prompt_harmony_detailed(raw, warn_once=True)
+    total = len(_PROMPT_REPLACEMENTS)
+    if not missing:
+        return "ok", f"verified {len(applied)}/{total} anchors", applied, []
+    if applied:
+        return (
+            "partial",
+            f"applied {len(applied)}/{total} anchors; missing: {', '.join(missing)}",
+            applied,
+            missing,
+        )
+    return (
+        "partial",
+        f"0/{total} anchors matched; missing: {', '.join(missing)}",
+        [],
+        missing,
+    )
+
+
+def apply_prompt_harmony_replacements(rendered: str, *, record_registry: bool = True) -> str:
+    """Soft-apply prompt harmonization replacements without ever crashing live turns on anchor drift (C-2)."""
+    out, applied, missing = _apply_prompt_harmony_detailed(rendered, warn_once=True)
+    if record_registry and missing:
+        total = len(_PROMPT_REPLACEMENTS)
+        patch_registry.record_patch(
+            "mei_prompt_anchors",
+            "partial",
+            target="agent-base-prompt.txt",
+            detail=f"runtime applied {len(applied)}/{total}; missing: {', '.join(missing)}",
+            contract_ok=False,
+            category="experience",
+        )
     return out
 
 
@@ -1057,8 +1203,18 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     from core.utils.prompt_manager import PromptManager
 
     if getattr(TTSProviderBase, "_mei_prosody_patched", False):
+        if patch_registry.get_patch_status("mei_prompt_anchors") is None:
+            anchors_status, anchors_detail, _applied_a, _missing_a = dry_run_prompt_harmony()
+            patch_registry.record_patch(
+                "mei_prompt_anchors",
+                anchors_status,
+                target="agent-base-prompt.txt",
+                detail=anchors_detail,
+                contract_ok=(anchors_status == "ok"),
+                category="experience",
+            )
         if patch_registry.get_patch_status("mei_emotion_and_prosody") is None:
-            patch_registry.record_patch("mei_emotion_and_prosody", "ok", target="TTSProviderBase/GSV", detail="already applied")
+            patch_registry.record_patch("mei_emotion_and_prosody", "ok", target="TTSProviderBase/GSV", detail="already applied", category="experience")
         return
 
     # P1-8: Startup contract verification for upstream targets + prompt anchors
@@ -1084,14 +1240,30 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         if not ok_sig:
             contract_failures.append(f"{cname}: {sig_detail}")
 
-    anchors_ok, anchors_detail = verify_prompt_base_anchors()
+    anchors_status, anchors_detail, _applied_a, _missing_a = dry_run_prompt_harmony()
     patch_registry.record_patch(
         "mei_prompt_anchors",
-        "ok" if anchors_ok else "failed",
+        anchors_status,
         target="agent-base-prompt.txt",
         detail=anchors_detail,
-        contract_ok=anchors_ok,
+        contract_ok=(anchors_status == "ok"),
+        category="experience",
     )
+
+    if contract_failures:
+        patch_registry.record_patch(
+            "mei_emotion_and_prosody",
+            "skipped_contract",
+            target="TTSProviderBase/GSV/send_tts_message/PromptManager",
+            detail="; ".join(contract_failures),
+            contract_ok=False,
+            category="experience",
+        )
+        print(
+            f"[MeiEmotionRouter] 跳过挂载情绪与韵律补丁（签名契约不匹配）: {'; '.join(contract_failures)}",
+            flush=True,
+        )
+        return
 
     # 0. Fix upstream direct_answer delta cleaner eating closing `]` on [gentle] / [playful] / [安全挡]
     ConnectionHandler._clean_response_garbage = staticmethod(safe_clean_response_garbage)
@@ -1521,10 +1693,11 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     TTSProviderBase._mei_prosody_patched = True
     patch_registry.record_patch(
         "mei_emotion_and_prosody",
-        "ok" if not contract_failures else "failed",
+        "ok",
         target="TTSProviderBase/GSV/send_tts_message/PromptManager",
-        detail="; ".join(contract_failures) if contract_failures else "ok",
-        contract_ok=not contract_failures,
+        detail="ok",
+        contract_ok=True,
+        category="experience",
         rebound=rebound_tts + rebound_emo,
     )
     print("[MeiEmotionRouter] 已挂载芽衣7情绪动态参考音频路由 + 防碎句韵律切分补丁 (cut0)", flush=True)
@@ -1539,7 +1712,7 @@ MEI_WAKEUP_RESPONSES = [
     "我一直在呢，随时告诉我吧。",
 ]
 MEI_WAKEUP_FALLBACK_TEXT = "我在呢，哥哥请说吧。"
-MEI_WAKEUP_FALLBACK_WAV = "data/voices/raiden_mei/wakeup_mei_default.wav"
+MEI_WAKEUP_FALLBACK_WAV = os.path.join(CONTAINER_VOICES_PREFIX, "raiden_mei", "wakeup_mei_default.wav")
 
 
 def _trim_wav_leading_breath(wav_bytes: bytes) -> bytes:
@@ -1605,6 +1778,7 @@ def apply_mei_wakeup_responses_patch() -> None:
     _orig_check_wakeup = hello_mod.checkWakeupWords
     _orig_wakeup_response = hello_mod.wakeupWordsResponse
     _orig_preheat = hello_mod.preheat_wakeup_audio_cache
+    _orig_handle_hello = getattr(hello_mod, "handleHelloMessage", None)
     _last_mei_reply = {"text": ""}
 
     wk_checks = [
@@ -1612,6 +1786,8 @@ def apply_mei_wakeup_responses_patch() -> None:
         ("helloHandle.wakeupWordsResponse", _orig_wakeup_response, ("conn",), True),
         ("helloHandle.preheat_wakeup_audio_cache", _orig_preheat, (), True),
     ]
+    if _orig_handle_hello is not None:
+        wk_checks.append(("helloHandle.handleHelloMessage", _orig_handle_hello, ("conn", "msg_json"), True))
     wk_failures = []
     for cname, cfn, req_p, req_a in wk_checks:
         ok_s, det = patch_registry.verify_signature_contract(cfn, required_params=req_p, require_async=req_a)
@@ -1676,7 +1852,10 @@ def apply_mei_wakeup_responses_patch() -> None:
                 await asyncio.sleep(0.1)
 
         if tts is None or not is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
-            return await _orig_check_wakeup(conn, text, *args, **kwargs)
+            matched = await _orig_check_wakeup(conn, text, *args, **kwargs)
+            if matched and tts is not None:
+                prime_gsv_async(tts, reason="wakeup")
+            return matched
 
         if not conn.config.get("enable_wakeup_words_response_cache"):
             return False
@@ -1685,6 +1864,8 @@ def apply_mei_wakeup_responses_patch() -> None:
         if filtered_text not in (conn.config.get("wakeup_words") or []):
             return False
 
+        # F-3: Trigger non-blocking GSV /prime on wakeup so memory pages warm up while user speaks
+        prime_gsv_async(tts, reason="wakeup")
         conn.just_woken_up = True
         await hello_mod.send_tts_message(conn, "start")
 
@@ -1743,25 +1924,52 @@ def apply_mei_wakeup_responses_patch() -> None:
         except Exception:
             pass
 
-    hello_mod.wakeupWordsResponse = _mei_aware_wakeup_words_response
-    hello_mod.checkWakeupWords = _mei_aware_check_wakeup_words
-    hello_mod.preheat_wakeup_audio_cache = _mei_aware_preheat
-    hello_mod._mei_wakeup_patched = True
+    wk_mounted = not wk_failures
+    lh_mounted = False
+    if wk_failures:
+        patch_registry.record_patch(
+            "mei_wakeup_responses",
+            "skipped_contract",
+            target="helloHandle",
+            detail="; ".join(wk_failures),
+            contract_ok=False,
+            category="experience",
+        )
+        print(
+            f"[MeiEmotionRouter] 跳过挂载唤醒回复补丁（签名契约不匹配）: {'; '.join(wk_failures)}",
+            flush=True,
+        )
+    else:
+        hello_mod.wakeupWordsResponse = _mei_aware_wakeup_words_response
+        hello_mod.checkWakeupWords = _mei_aware_check_wakeup_words
+        hello_mod.preheat_wakeup_audio_cache = _mei_aware_preheat
+        rebound_hello: list[str] = []
+        if _orig_handle_hello is not None:
+            @functools.wraps(_orig_handle_hello)
+            async def _prime_aware_handle_hello(conn, msg_json, *args, **kwargs):
+                prime_gsv_async(getattr(conn, "tts", None), reason="hello")
+                return await _orig_handle_hello(conn, msg_json, *args, **kwargs)
 
-    # P1-12: Rebind ALL already-imported module references across sys.modules
-    rebound_wk = (
-        patch_registry.rebind(_orig_check_wakeup, _mei_aware_check_wakeup_words)
-        + patch_registry.rebind(_orig_wakeup_response, _mei_aware_wakeup_words_response)
-        + patch_registry.rebind(_orig_preheat, _mei_aware_preheat)
-    )
-    patch_registry.record_patch(
-        "mei_wakeup_responses",
-        "ok" if not wk_failures else "failed",
-        target="helloHandle",
-        detail="; ".join(wk_failures) if wk_failures else "ok",
-        contract_ok=not wk_failures,
-        rebound=rebound_wk,
-    )
+            hello_mod.handleHelloMessage = _prime_aware_handle_hello
+            rebound_hello = patch_registry.rebind(_orig_handle_hello, _prime_aware_handle_hello)
+        hello_mod._mei_wakeup_patched = True
+
+        # P1-12: Rebind ALL already-imported module references across sys.modules
+        rebound_wk = (
+            patch_registry.rebind(_orig_check_wakeup, _mei_aware_check_wakeup_words)
+            + patch_registry.rebind(_orig_wakeup_response, _mei_aware_wakeup_words_response)
+            + patch_registry.rebind(_orig_preheat, _mei_aware_preheat)
+            + rebound_hello
+        )
+        patch_registry.record_patch(
+            "mei_wakeup_responses",
+            "ok",
+            target="helloHandle",
+            detail="ok",
+            contract_ok=True,
+            category="experience",
+            rebound=rebound_wk,
+        )
 
     # Patch ListenTextMessageHandler so offline interrupt words (e.g. "听我说") switch straight to
     # listening with ZERO greeting TTS and ZERO 2s just_woken_up VAD suppression (even from IDLE),
@@ -1799,6 +2007,7 @@ def apply_mei_wakeup_responses_patch() -> None:
                         if str(w).strip()
                     }
                     if filtered_text and filtered_text in norm_words:
+                        prime_gsv_async(getattr(conn, "tts", None), reason="interrupt")
                         conn.client_have_voice = False
                         conn.reset_audio_states()
                         conn.last_activity_time = time.time() * 1000
@@ -1822,15 +2031,31 @@ def apply_mei_wakeup_responses_patch() -> None:
                         return
                 return await _orig_listen_handle(self, conn, msg_json, *args, **kwargs)
 
-            cls.handle = _interrupt_aware_listen_handle
-            cls._interrupt_word_patched = True
-            patch_registry.record_patch(
-                "listen_interrupt_handler",
-                "ok" if ok_lh else "failed",
-                target="ListenTextMessageHandler.handle",
-                detail=det_lh,
-                contract_ok=ok_lh,
-            )
+            if not ok_lh:
+                patch_registry.record_patch(
+                    "listen_interrupt_handler",
+                    "skipped_contract",
+                    target="ListenTextMessageHandler.handle",
+                    detail=det_lh,
+                    contract_ok=False,
+                    category="experience",
+                )
+                print(
+                    f"[MeiEmotionRouter] 跳过挂载打断词补丁（签名契约不匹配）: {det_lh}",
+                    flush=True,
+                )
+            else:
+                cls.handle = _interrupt_aware_listen_handle
+                cls._interrupt_word_patched = True
+                lh_mounted = True
+                patch_registry.record_patch(
+                    "listen_interrupt_handler",
+                    "ok",
+                    target="ListenTextMessageHandler.handle",
+                    detail=det_lh,
+                    contract_ok=True,
+                    category="experience",
+                )
     except Exception as exc:
         patch_registry.record_patch(
             "listen_interrupt_handler",
@@ -1838,10 +2063,17 @@ def apply_mei_wakeup_responses_patch() -> None:
             target="ListenTextMessageHandler.handle",
             detail=str(exc),
             contract_ok=False,
+            category="experience",
         )
         print(f"[MeiEmotionRouter] 挂载打断词直通聆听补丁跳过: {exc}", flush=True)
 
-    print("[MeiEmotionRouter] 已挂载芽衣专属唤醒词秒回语 + 打断词直通聆听补丁 (raiden_mei 独立缓存 + gentle 温柔音色)", flush=True)
+    if wk_mounted or lh_mounted:
+        mounted_parts = []
+        if wk_mounted:
+            mounted_parts.append("芽衣专属唤醒词秒回语 (raiden_mei 独立缓存 + gentle 温柔音色)")
+        if lh_mounted:
+            mounted_parts.append("打断词直通聆听补丁")
+        print(f"[MeiEmotionRouter] 已挂载{' + '.join(mounted_parts)}", flush=True)
 
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -2021,6 +2253,17 @@ def apply_idle_farewell_patch() -> None:
         required_params=("conn", "have_voice"),
         require_async=True,
     )
+    if not ok_sig:
+        patch_registry.record_patch(
+            "idle_farewell",
+            "skipped_contract",
+            target="receiveAudioHandle.no_voice_close_connect",
+            detail=det_sig,
+            contract_ok=False,
+            category="experience",
+        )
+        print(f"[MeiEmotionRouter] 跳过挂载空闲告别补丁（签名契约不匹配）: {det_sig}", flush=True)
+        return
     _last_farewell = {"text": ""}
 
     async def _speak_or_close(conn: Any, chosen: str, *, timeout_sec: int, default_emotion: str, reason: str) -> None:
@@ -2217,10 +2460,11 @@ def apply_idle_farewell_patch() -> None:
     rebound = patch_registry.rebind(_orig_no_voice_close, _custom_no_voice_close_connect)
     patch_registry.record_patch(
         "idle_farewell",
-        "ok" if ok_sig else "failed",
+        "ok",
         target="receiveAudioHandle.no_voice_close_connect",
         detail=det_sig,
-        contract_ok=ok_sig,
+        contract_ok=True,
+        category="experience",
         rebound=rebound,
     )
     print("[MeiEmotionRouter] 已挂载自定义空闲超时告别语补丁（固定随机 / AI总结依恋双模式 · 零记忆污染 · 18080 免重启热改）", flush=True)

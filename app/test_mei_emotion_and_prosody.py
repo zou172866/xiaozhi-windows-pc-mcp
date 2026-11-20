@@ -5,11 +5,31 @@ import sys
 import unittest
 import wave
 
-DATA_DIR = os.path.dirname(os.path.abspath(__file__))
-if DATA_DIR not in sys.path:
-    sys.path.insert(0, DATA_DIR)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = APP_DIR  # code modules moved from data/ -> app/ (A-1)
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
 
+import xz_common
 import mei_emotion_router as router
+
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+CONFIG_DIR = (
+    xz_common.CONFIG_DIR
+    if os.path.isdir(xz_common.CONFIG_DIR)
+    else os.path.join(PROJECT_ROOT, "config", "runtime")
+)
+CONFIG_TEMPLATES_DIR = (
+    os.path.join(xz_common.ROOT_DIR, "config_templates")
+    if os.path.isdir(os.path.join(xz_common.ROOT_DIR, "config_templates"))
+    else os.path.join(PROJECT_ROOT, "config")
+)
+VOICES_DIR = (
+    xz_common.VOICES_DIR
+    if os.path.isdir(xz_common.VOICES_DIR)
+    else os.path.join(PROJECT_ROOT, "voices")
+)
+HOST_SCRIPTS_DIR = os.path.join(PROJECT_ROOT, "data")
 
 
 def _simple_quote_safe_cut(text: str, pos: int, punctuations) -> int:
@@ -375,7 +395,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
     def test_playback_synced_esp32_emotion_and_prompt_harmony(self):
         import asyncio
         import json
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
         from core.providers.tts.gpt_sovits_v2 import TTSProvider
         import core.handle.sendAudioHandle as send_audio_mod
         from core.connection import ConnectionHandler
@@ -489,13 +509,13 @@ class TestContainerOfflinePipeline(unittest.TestCase):
     def test_mei_wakeup_word_config_and_fallback_wav(self):
         import yaml
 
-        cfg_path = os.path.join(DATA_DIR, ".config.yaml")
+        cfg_path = os.path.join(CONFIG_DIR, ".config.yaml")
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         ww = cfg.get("wakeup_words") or []
-        self.assertIn("你好芽衣", ww, "data/.config.yaml wakeup_words must include 你好芽衣")
+        self.assertIn("你好芽衣", ww, "config/runtime/.config.yaml wakeup_words must include 你好芽衣")
 
-        wav_path = os.path.join(DATA_DIR, "voices", "raiden_mei", "wakeup_mei_default.wav")
+        wav_path = os.path.join(VOICES_DIR, "raiden_mei", "wakeup_mei_default.wav")
         self.assertTrue(os.path.isfile(wav_path), f"Missing Mei default wakeup WAV: {wav_path}")
         with wave.open(wav_path, "rb") as wf:
             dur = wf.getnframes() / float(wf.getframerate())
@@ -524,11 +544,11 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         import core.handle.textHandler.listenMessageHandler as listen_mod
         import core.handle.helloHandle as hello_mod
 
-        cfg_path = os.path.join(DATA_DIR, ".config.yaml")
+        cfg_path = os.path.join(CONFIG_DIR, ".config.yaml")
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         iw = cfg.get("interrupt_words") or []
-        self.assertIn("听我说", iw, "data/.config.yaml interrupt_words must include 听我说")
+        self.assertIn("听我说", iw, "config/runtime/.config.yaml interrupt_words must include 听我说")
 
         router.apply_mei_wakeup_responses_patch()
         self.assertTrue(getattr(listen_mod.ListenTextMessageHandler, "_interrupt_word_patched", False))
@@ -615,7 +635,6 @@ class TestContainerOfflinePipeline(unittest.TestCase):
 
     def test_console_log_cursor_dedup_audio_fallback_and_portable_defaults(self):
         import io
-        import json
         import tempfile
         from unittest.mock import patch
         import console_server as cs
@@ -830,8 +849,8 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         self.assertFalse(ok_sfs)
         self.assertEqual(st_sfs, 403)
 
-        # Same-origin JSON POST passes
-        ok_good, st_good, _ = cs.validate_console_request(
+        # Same-origin JSON POST without X-Console-Token -> 401; wrong token -> 401 (A-4)
+        ok_no_tok, st_no_tok, _ = cs.validate_console_request(
             "POST",
             {
                 "Host": "localhost:18080",
@@ -839,9 +858,61 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                 "Sec-Fetch-Site": "same-origin",
                 "Content-Type": "application/json; charset=utf-8",
             },
+            path="/api/pc-mode",
+        )
+        self.assertFalse(ok_no_tok)
+        self.assertEqual(st_no_tok, 401)
+
+        ok_bad_tok, st_bad_tok, _ = cs.validate_console_request(
+            "POST",
+            {
+                "Host": "localhost:18080",
+                "Origin": "http://localhost:18080",
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "application/json; charset=utf-8",
+                "X-Console-Token": "wrong-token",
+            },
+            path="/api/pc-mode",
+        )
+        self.assertFalse(ok_bad_tok)
+        self.assertEqual(st_bad_tok, 401)
+
+        # Same-origin JSON POST with valid per-boot X-Console-Token passes
+        ok_good, st_good, _ = cs.validate_console_request(
+            "POST",
+            {
+                "Host": "localhost:18080",
+                "Origin": "http://localhost:18080",
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "application/json; charset=utf-8",
+                "X-Console-Token": cs.get_console_token(),
+            },
+            path="/api/pc-mode",
         )
         self.assertTrue(ok_good)
         self.assertEqual(st_good, 200)
+
+        # Host: xiaozhi-esp32-server restricted strictly to read-only /api/health & /api/state (A-4)
+        ok_ih, st_ih, _ = cs.validate_console_request("GET", {"Host": "xiaozhi-esp32-server:18080"}, path="/api/health")
+        self.assertTrue(ok_ih)
+        self.assertEqual(st_ih, 200)
+        ok_is, st_is, _ = cs.validate_console_request("GET", {"Host": "xiaozhi-esp32-server:18080"}, path="/api/state")
+        self.assertTrue(ok_is)
+        self.assertEqual(st_is, 200)
+        ok_iroot, st_iroot, _ = cs.validate_console_request("GET", {"Host": "xiaozhi-esp32-server:18080"}, path="/")
+        self.assertFalse(ok_iroot)
+        self.assertEqual(st_iroot, 403)
+        ok_ipost, st_ipost, _ = cs.validate_console_request(
+            "POST",
+            {
+                "Host": "xiaozhi-esp32-server:18080",
+                "Content-Type": "application/json",
+                "X-Console-Token": cs.get_console_token(),
+            },
+            path="/api/pc-mode",
+        )
+        self.assertFalse(ok_ipost)
+        self.assertEqual(st_ipost, 403)
 
         # 2. Log secret redaction
         red = cs._redact_secrets(
@@ -852,17 +923,20 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         self.assertNotIn("sk-1234567890abcdef", red)
         self.assertNotIn("AIzaSyA12345678901234567890", red)
 
-        # 3. Verify console.html sends application/json on clear-history and pauses polling on visibilitychange
-        with open(os.path.join(DATA_DIR, "console.html"), "r", encoding="utf-8") as f:
+        # 3. Verify console.html sends application/json + X-Console-Token, pauses polling, and renders llmCacheRateBadge
+        with open(os.path.join(APP_DIR, "console.html"), "r", encoding="utf-8") as f:
             html_src = f.read()
         self.assertIn("visibilitychange", html_src)
         self.assertIn("document.hidden", html_src)
+        self.assertIn('name="console-token"', html_src)
+        self.assertIn("X-Console-Token", html_src)
+        self.assertIn("llmCacheRateBadge", html_src)
         self.assertNotIn('fetch("/api/clear-history", { method: "POST" })', html_src)
 
     def test_pc_audio_router_single_wait_dynamic_poll_queue_lock_and_bearer_auth(self):
         import asyncio
         import tempfile
-        from unittest.mock import AsyncMock, MagicMock, patch
+        from unittest.mock import AsyncMock, patch
         import core.handle.sendAudioHandle as send_audio_mod
         import pc_audio_router as par
 
@@ -980,7 +1054,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         import start_with_env
 
         # 1. Verify env expansion on example template (never requires private prod keys)
-        cfg_path = os.path.join(DATA_DIR, ".config.example.yaml")
+        cfg_path = os.path.join(CONFIG_TEMPLATES_DIR, ".config.example.yaml")
         with open(cfg_path, "r", encoding="utf-8") as f:
             raw_cfg = yaml.safe_load(f) or {}
         expanded = start_with_env._expand_env(raw_cfg)
@@ -1288,13 +1362,13 @@ class TestContainerOfflinePipeline(unittest.TestCase):
 
         # Verify tracked setup scripts & .env.example have no hardcoded personal drive path
         personal_dir = "E:" + "\\love"
-        init_ps1_path = os.path.join(DATA_DIR, "init_setup.ps1")
+        init_ps1_path = os.path.join(HOST_SCRIPTS_DIR, "init_setup.ps1")
         if os.path.isfile(init_ps1_path):
             with open(init_ps1_path, "r", encoding="utf-8-sig") as f:
                 ps1_src = f.read()
             self.assertNotIn(personal_dir, ps1_src)
             self.assertIn('Join-Path $serverDir "data\\obsidian_export"', ps1_src)
-        env_ex_path = os.path.join(os.path.dirname(DATA_DIR), ".env.example")
+        env_ex_path = os.path.join(PROJECT_ROOT, ".env.example")
         if os.path.isfile(env_ex_path):
             with open(env_ex_path, "r", encoding="utf-8") as f:
                 self.assertNotIn(personal_dir, f.read())
@@ -1425,13 +1499,13 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         import start_with_env
 
         # 1. Example configs default to safe mode + auth enabled with zero plaintext secrets
-        with open(os.path.join(DATA_DIR, "runtime_settings.example.json"), "r", encoding="utf-8") as f:
+        with open(os.path.join(CONFIG_TEMPLATES_DIR, "runtime_settings.example.json"), "r", encoding="utf-8") as f:
             rs_ex = json.load(f)
         self.assertEqual(rs_ex.get("schema_version"), 1)
         self.assertEqual((rs_ex.get("pc_control") or {}).get("mode"), "safe")
         self.assertEqual((rs_ex.get("audio_output") or {}).get("target"), "esp32")
 
-        with open(os.path.join(DATA_DIR, ".config.example.yaml"), "r", encoding="utf-8") as f:
+        with open(os.path.join(CONFIG_TEMPLATES_DIR, ".config.example.yaml"), "r", encoding="utf-8") as f:
             cfg_ex = yaml.safe_load(f)
         srv_ex = cfg_ex.get("server") or {}
         self.assertEqual(srv_ex.get("auth_key"), "${ESP32_AUTH_KEY}")
@@ -1710,7 +1784,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
 
         # 6. PowerShell setup/start scripts preserve UTF-8 BOM + CRLF and move L3 state to pc-mcp\state
         for ps1_name in ("start_all.ps1", "init_setup.ps1"):
-            ps1_path = os.path.join(DATA_DIR, ps1_name)
+            ps1_path = os.path.join(HOST_SCRIPTS_DIR, ps1_name)
             if os.path.isfile(ps1_path):
                 with open(ps1_path, "rb") as bf:
                     raw = bf.read()
@@ -1722,7 +1796,6 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                 self.assertIn("pc-mcp\\state", txt)
 
     def test_p108_patch_registry_contracts_version_check_passthrough_and_prompt_anchors(self):
-        import json
         import threading
         from http.server import ThreadingHTTPServer
         import httpx
@@ -1753,6 +1826,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
             "mei_wakeup_responses",
             "listen_interrupt_handler",
             "reply_length_llm",
+            "llm_prefix_cache",
             "sherpa_async_asr",
         ):
             st = patch_registry.get_patch_status(required_patch)
@@ -1776,9 +1850,16 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         ok4, _ = patch_registry.verify_signature_contract(_async_fn, required_params=("conn", "state"), require_async=True)
         self.assertTrue(ok4)
 
-        # 3. Prompt anchor assertion must fail loudly with AssertionError when an anchor drifts
-        with self.assertRaises(AssertionError):
-            router.apply_prompt_harmony_replacements("mutated upstream prompt without anchors")
+        # 3. C-2: Missing prompt anchor soft-fails (skips missing anchor, applies remaining, warns once, records partial)
+        router.reset_prompt_anchor_warnings()
+        _, anchor1_old, anchor1_new = router._PROMPT_REPLACEMENTS[1]
+        partial_prompt = f"header {anchor1_old} footer"
+        out_soft = router.apply_prompt_harmony_replacements(partial_prompt)
+        self.assertIn(anchor1_new, out_soft)
+        self.assertNotIn(anchor1_old, out_soft)
+        st_pa = patch_registry.get_patch_status("mei_prompt_anchors")
+        self.assertEqual(st_pa["status"], "partial")
+        self.assertFalse(st_pa["contract_ok"])
         # Restore mei_prompt_anchors back to ok and verify /api/health degradation lifecycle
         anchors_ok, anchors_det = router.verify_prompt_base_anchors()
         self.assertTrue(anchors_ok)
@@ -1826,20 +1907,35 @@ class TestContainerOfflinePipeline(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
-        # 5. Patched wrappers forward extra *args/**kwargs cleanly without TypeError
+        # 5. Patched wrappers invoke their `_orig` parameter & forward extra *args/**kwargs cleanly without TypeError
         import config.config_loader as cfg_loader
-        from unittest.mock import patch
 
-        with patch.object(start_with_env, "_orig_read_config", side_effect=lambda p, *a, **kw: {"extra": (a, kw)}):
-            res = cfg_loader.read_config("/tmp/fake.yaml", "extra_pos", custom_flag=True)
-            self.assertEqual(res["extra"], (("extra_pos",), {"custom_flag": True}))
+        self.assertFalse(
+            hasattr(start_with_env, "_orig_read_config"),
+            "Redundant module-global _orig_read_config should be removed",
+        )
+        self.assertFalse(
+            hasattr(start_with_env, "_orig_create_memory"),
+            "Redundant module-global _orig_create_memory should be removed",
+        )
+        wrapped_rc = start_with_env._make_patched_read_config(
+            lambda config_path, *a, **kw: {"path": config_path, "extra": (a, kw)}
+        )
+        res = wrapped_rc("/tmp/fake.yaml", "extra_pos", custom_flag=True)
+        self.assertEqual(res["path"], "/tmp/fake.yaml")
+        self.assertEqual(res["extra"], (("extra_pos",), {"custom_flag": True}))
+        self.assertIs(cfg_loader.read_config, start_with_env._patched_read_config)
+        self.assertTrue(hasattr(cfg_loader.read_config, "__wrapped__"))
+
+        wrapped_mem = start_with_env._wrap_create_memory(
+            lambda class_name, *a, **kw: (class_name, a, kw)
+        )
+        self.assertEqual(wrapped_mem("other_mem", 1, flag=True), ("other_mem", (1,), {"flag": True}))
 
     def test_p109_anima_recall_budget_circuit_breaker_and_stale_while_revalidate(self):
         import asyncio
         import tempfile
         import time
-        from unittest.mock import patch
-        import httpx
         import anima_memory_provider as amp
 
         async def _run():
@@ -2403,6 +2499,11 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                     patch("core.utils.modules_initialize.initialize_modules", return_value={"llm": "new-hot-llm"}),
                 ):
                     with httpx.Client(timeout=4.0, trust_env=False) as client:
+                        post_hdrs = {
+                            "Content-Type": "application/json",
+                            "Origin": f"http://127.0.0.1:{port}",
+                            "X-Console-Token": cs.get_console_token(),
+                        }
                         # 1. Edit ONLY prompt -> LLM & TTS blocks remain untouched, ZERO os._exit, live prompt updated
                         r1 = client.post(
                             f"http://127.0.0.1:{port}/api/config",
@@ -2413,7 +2514,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                                 "voice": "__gsv_raiden_mei__",
                                 "restart": True,
                             },
-                            headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                            headers=post_hdrs,
                         )
                         self.assertEqual(r1.status_code, 200)
                         d1 = r1.json()
@@ -2441,7 +2542,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                                 "voice": "__gsv_xiaozhi_tw__",
                                 "restart": True,
                             },
-                            headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                            headers=post_hdrs,
                         )
                         self.assertEqual(r2.status_code, 200)
                         d2 = r2.json()
@@ -2468,7 +2569,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                                 "model_name": "deepseek-chat",
                                 "voice": "__gsv_xiaozhi_tw__",
                             },
-                            headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                            headers=post_hdrs,
                         )
                         self.assertEqual(r3.json()["changed_fields"], [])
 
@@ -2483,7 +2584,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                                 "voice": "zh-CN-XiaoxiaoNeural",
                                 "restart": False,
                             },
-                            headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                            headers=post_hdrs,
                         )
                         d4 = r4.json()
                         self.assertTrue(d4["ok"])
@@ -2501,7 +2602,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                                 "voice": "__gsv_raiden_mei__",
                                 "restart": True,
                             },
-                            headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                            headers=post_hdrs,
                         )
                         d5 = r5.json()
                         self.assertTrue(d5["ok"])
@@ -2520,7 +2621,6 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         from http.server import ThreadingHTTPServer
         from unittest.mock import patch
         import httpx
-        import runtime_events
         import console_server as cs
 
         # 1. Live ESP32 TTS and Console preview MUST share the exact same RLock instance
@@ -2551,13 +2651,18 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                 patch.object(cs, "_get_console_http_client", return_value=_FakeHttpClient()),
             ):
                 with httpx.Client(timeout=4.0, trust_env=False) as client:
+                    post_hdrs = {
+                        "Content-Type": "application/json",
+                        "Origin": f"http://127.0.0.1:{port}",
+                        "X-Console-Token": cs.get_console_token(),
+                    }
                     # 2. Device busy (speaking) + previewing DIFFERENT GSV voice -> 409 Conflict, ZERO weight swap!
                     with cs._state_lock:
                         cs._device_info["activity"] = "speaking"
                     r_busy = client.post(
                         f"http://127.0.0.1:{port}/api/tts-preview",
                         json={"voice": "__gsv_xiaozhi_tw__", "text": "测试"},
-                        headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                        headers=post_hdrs,
                     )
                     self.assertEqual(r_busy.status_code, 409)
                     self.assertTrue(r_busy.json().get("busy"))
@@ -2567,7 +2672,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                     r_same = client.post(
                         f"http://127.0.0.1:{port}/api/tts-preview",
                         json={"voice": "__gsv_raiden_mei__", "text": "测试当前音色"},
-                        headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                        headers=post_hdrs,
                     )
                     self.assertEqual(r_same.status_code, 200)
                     self.assertTrue(r_same.content.startswith(b"RIFF"))
@@ -2590,7 +2695,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                         r_lock = client.post(
                             f"http://127.0.0.1:{port}/api/tts-preview",
                             json={"voice": "__gsv_xiaozhi_tw__", "text": "锁冲突测试"},
-                            headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                            headers=post_hdrs,
                         )
                         self.assertEqual(r_lock.status_code, 409)
                         self.assertTrue(r_lock.json().get("busy"))
@@ -2603,7 +2708,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                     r_idle = client.post(
                         f"http://127.0.0.1:{port}/api/tts-preview",
                         json={"voice": "__gsv_xiaozhi_tw__", "text": "空闲试听"},
-                        headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                        headers=post_hdrs,
                     )
                     self.assertEqual(r_idle.status_code, 200)
                     self.assertEqual(swap_calls, ["__gsv_xiaozhi_tw__", "__gsv_raiden_mei__"])
@@ -2639,7 +2744,11 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                         r_part = client.post(
                             f"http://127.0.0.1:{port}/api/tts-preview",
                             json={"voice": "__gsv_xiaozhi_tw__", "text": "半失败恢复测试"},
-                            headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+                            headers={
+                                "Content-Type": "application/json",
+                                "Origin": f"http://127.0.0.1:{port}",
+                                "X-Console-Token": cs.get_console_token(),
+                            },
                         )
                         self.assertEqual(r_part.status_code, 500)
                         # Expect: set_gpt(tw) -> set_sovits(tw FAIL) -> restore set_gpt(mei) -> restore set_sovits(mei)
@@ -3231,6 +3340,1200 @@ class TestContainerOfflinePipeline(unittest.TestCase):
 
             asyncio.run(_run_scenarios())
 
+    def test_batch1_hardening_c1_c2_c3_b3_b4_b6_a5_d3(self):
+        import asyncio
+        import io
+        import json
+        import subprocess
+        import tempfile
+        import threading
+        import time
+        from contextlib import redirect_stdout
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        from urllib.parse import unquote
+        import httpx
+        import anima_memory_provider as amp
+        import console_server as cs
+        import patch_registry
+        import start_with_env
+
+        # --- C-1: Security category + fail-closed boot gate + XIAOZHI_ALLOW_INSECURE_BOOT=1 ---
+        for sec_name in ("esp32_auth_ota", "esp32_auth_ws", "esp32_auth_vision", "mcp_token_injection"):
+            st = patch_registry.get_patch_status(sec_name)
+            self.assertIsNotNone(st)
+            self.assertEqual(st.get("category"), "security", f"{sec_name} must be category=security")
+
+        orig_ota_entry = patch_registry.get_patch_status("esp32_auth_ota")
+        try:
+            patch_registry.record_patch(
+                "esp32_auth_ota",
+                "skipped_contract",
+                target="OTAHandler.handle_post",
+                detail="simulated drift",
+                contract_ok=False,
+                category="security",
+            )
+            with patch.dict(os.environ, {"XIAOZHI_ALLOW_INSECURE_BOOT": ""}, clear=False):
+                with self.assertRaises(SystemExit) as cm_exit:
+                    patch_registry.enforce_security_patches_or_exit(exit_code=2)
+                self.assertEqual(cm_exit.exception.code, 2)
+
+            with patch.dict(os.environ, {"XIAOZHI_ALLOW_INSECURE_BOOT": "1"}, clear=False):
+                failed_list = patch_registry.enforce_security_patches_or_exit(exit_code=2)
+                self.assertEqual([e["name"] for e in failed_list], ["esp32_auth_ota"])
+                summ = patch_registry.get_health_summary()
+                self.assertFalse(summ["security_ok"])
+                self.assertTrue(summ["insecure_boot"])
+                self.assertEqual(summ["status"], "unhealthy")
+                self.assertIn("esp32_auth_ota", summ["security_failures"])
+        finally:
+            with patch_registry._lock:
+                patch_registry._patches["esp32_auth_ota"] = orig_ota_entry
+
+        # Real subprocess exit-code-2 test when security patch fails contract at __main__ boot
+        sub_code = "\n".join(
+            [
+                "import os, sys, runpy",
+                "os.environ.pop('XIAOZHI_ALLOW_INSECURE_BOOT', None)",
+                "sys.path.insert(0, '/opt/xiaozhi-esp32-server')",
+                "sys.path.insert(0, '/opt/xiaozhi-esp32-server/app')",
+                "from core.api import ota_handler",
+                "def _broken_sync(self):",
+                "    return None",
+                "ota_handler.OTAHandler.handle_post = _broken_sync",
+                "runpy.run_path('/opt/xiaozhi-esp32-server/app/start_with_env.py', run_name='__main__')",
+            ]
+        )
+        proc = subprocess.run([sys.executable, "-c", sub_code], capture_output=True, text=True, timeout=20)
+        self.assertEqual(
+            proc.returncode,
+            2,
+            f"Expected exit code 2 on failed security patch, got {proc.returncode}; stderr={proc.stderr}",
+        )
+        self.assertIn("esp32_auth_ota", proc.stderr)
+
+        # --- C-2: One-shot missing-anchor warning + dry_run partial status ---
+        router.reset_prompt_anchor_warnings()
+        orig_pa_entry = patch_registry.get_patch_status("mei_prompt_anchors")
+        try:
+            with open("/opt/xiaozhi-esp32-server/agent-base-prompt.txt", "r", encoding="utf-8") as f:
+                real_tpl = f.read()
+            broken_anchor_name, broken_anchor_old, _ = router._PROMPT_REPLACEMENTS[0]
+            mutated_tpl = real_tpl.replace(broken_anchor_old, "MUTATED_UPSTREAM_TEXT")
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as tf:
+                tf.write(mutated_tpl)
+                tf_path = tf.name
+            try:
+                st_dr, _det_dr, applied_dr, missing_dr = router.dry_run_prompt_harmony(tf_path)
+                self.assertEqual(st_dr, "partial")
+                self.assertEqual(missing_dr, [broken_anchor_name])
+                self.assertEqual(len(applied_dr), len(router._PROMPT_REPLACEMENTS) - 1)
+            finally:
+                os.unlink(tf_path)
+
+            router.reset_prompt_anchor_warnings()
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                r1 = router.apply_prompt_harmony_replacements(mutated_tpl)
+                r2 = router.apply_prompt_harmony_replacements(mutated_tpl)
+                r3 = router.apply_prompt_harmony_replacements(mutated_tpl)
+            self.assertEqual(r1, r2)
+            self.assertEqual(r2, r3)
+            # Warning for the broken anchor must appear ONLY ONCE across 3 turns
+            self.assertEqual(buf.getvalue().count(broken_anchor_name), 1)
+            # Remaining anchors must still be applied cleanly
+            self.assertIn(router._PROMPT_REPLACEMENTS[1][2], r1)
+        finally:
+            with patch_registry._lock:
+                patch_registry._patches["mei_prompt_anchors"] = orig_pa_entry
+            router.reset_prompt_anchor_warnings()
+
+        # --- C-3: install_patch MUST NOT replace target when signature contract fails ---
+        class _DummyTarget:
+            def drifted_fn(self, only_one):
+                return ("orig", only_one)
+
+        orig_method = _DummyTarget.drifted_fn
+        ok_inst, rec_inst = patch_registry.install_patch(
+            "synthetic_c3_drift",
+            _DummyTarget,
+            "drifted_fn",
+            lambda fn: (lambda self, *a, **kw: ("wrapped",)),
+            category="experience",
+            required_params=("self", "missing_required_param"),
+            require_async=False,
+        )
+        try:
+            self.assertFalse(ok_inst)
+            self.assertEqual(rec_inst["status"], "skipped_contract")
+            self.assertFalse(rec_inst["contract_ok"])
+            self.assertIs(_DummyTarget.drifted_fn, orig_method)
+            self.assertEqual(_DummyTarget().drifted_fn(42), ("orig", 42))
+        finally:
+            with patch_registry._lock:
+                patch_registry._patches.pop("synthetic_c3_drift", None)
+
+        # --- B-3 & B-4 (Outbox): journal_size_limit=8MB, WAL truncate, uuid4 fallback ---
+        with tempfile.TemporaryDirectory() as td:
+            ob = amp.AnimaOutbox(os.path.join(td, "ob.sqlite"), auto_start=False)
+            try:
+                db = ob._ensure_db()
+                self.assertEqual(db.execute("PRAGMA journal_size_limit").fetchone()[0], 8 * 1024 * 1024)
+                ob.enqueue([{"user_message": "hello", "assistant_reply": "world"}])
+                cp = ob.checkpoint_wal()
+                self.assertIsNotNone(cp)
+            finally:
+                ob.close()
+
+        gen_ids = {
+            amp._canonical_turn_payload({"user_message": "u", "assistant_reply": "a"})["request_id"]
+            for _ in range(40)
+        }
+        self.assertEqual(len(gen_ids), 40)
+        for gid in gen_ids:
+            self.assertRegex(gid, r"^xz-[0-9a-f]{32}$")
+
+        # --- A-5, B-6, D-3 via real ConsoleHandler HTTP server ---
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), cs.ConsoleHandler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        orig_port = cs.CONSOLE_PORT
+        orig_act = cs._device_info.get("activity")
+        orig_loaded = cs._active_gsv_loaded
+        cs.CONSOLE_PORT = port
+        try:
+            with cs._state_lock:
+                cs._device_info["activity"] = "idle"
+            cs._set_voice_dirty(None, "")
+
+            with httpx.Client(timeout=5.0, trust_env=False) as client:
+                # A-5: Clickjacking headers on HTML console
+                r_html = client.get(f"http://127.0.0.1:{port}/")
+                self.assertEqual(r_html.status_code, 200)
+                self.assertEqual(r_html.headers.get("x-frame-options"), "DENY")
+                self.assertIn("frame-ancestors 'none'", r_html.headers.get("content-security-policy", ""))
+                self.assertIn("securityBanner", r_html.text)
+                self.assertIn("animaBackupText", r_html.text)
+
+                # B-6: /api/health returns 503 when a security patch fails, 200 + degraded list when experience patch fails
+                orig_sec = patch_registry.get_patch_status("mcp_token_injection")
+                try:
+                    patch_registry.record_patch(
+                        "mcp_token_injection",
+                        "failed",
+                        target="ServerMCPManager.load_config",
+                        detail="boom",
+                        contract_ok=False,
+                        category="security",
+                    )
+                    r_503 = client.get(f"http://127.0.0.1:{port}/api/health")
+                    self.assertEqual(r_503.status_code, 503)
+                    self.assertFalse(r_503.json()["security_ok"])
+                    self.assertIn("mcp_token_injection", r_503.json()["security_failures"])
+                finally:
+                    with patch_registry._lock:
+                        patch_registry._patches["mcp_token_injection"] = orig_sec
+
+                patch_registry.record_patch(
+                    "synthetic_exp_partial",
+                    "partial",
+                    target="demo",
+                    detail="partial drift",
+                    contract_ok=False,
+                    category="experience",
+                )
+                try:
+                    r_200_deg = client.get(f"http://127.0.0.1:{port}/api/health")
+                    self.assertEqual(r_200_deg.status_code, 200)
+                    j_deg = r_200_deg.json()
+                    self.assertEqual(j_deg["status"], "degraded")
+                    self.assertIsInstance(j_deg["degraded"], list)
+                    self.assertIn("synthetic_exp_partial", j_deg["degraded"])
+                    self.assertTrue(j_deg["security_ok"])
+                finally:
+                    with patch_registry._lock:
+                        patch_registry._patches.pop("synthetic_exp_partial", None)
+
+                # D-3a: Edge preview timeout -> HTTP 504
+                async def _slow_edge(text, voice):
+                    await asyncio.sleep(1.5)
+                    return b"ID3"
+
+                with (
+                    patch.object(cs, "EDGE_PREVIEW_TIMEOUT_SECONDS", 0.12),
+                    patch.object(cs, "_synthesize_mp3", side_effect=_slow_edge),
+                ):
+                    r_edge_to = client.post(
+                        f"http://127.0.0.1:{port}/api/tts-preview",
+                        json={"voice": "zh-CN-XiaoxiaoNeural", "text": "超时测试"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "Origin": f"http://127.0.0.1:{port}",
+                            "X-Console-Token": cs.get_console_token(),
+                        },
+                    )
+                    self.assertEqual(r_edge_to.status_code, 504)
+                    self.assertIn("超时", r_edge_to.json().get("error", ""))
+
+                # D-3b: Preview rollback failure -> logs, marks voice_dirty, returns warning header, probe retries & clears
+                class _FakeResp200:
+                    status_code = 200
+                    content = b"RIFF\x24\x00\x00\x00WAVEfmt "
+                    text = "ok"
+
+                class _FakeHttp:
+                    def post(self, *a, **kw):
+                        return _FakeResp200()
+
+                    def get(self, *a, **kw):
+                        return _FakeResp200()
+
+                call_seq = []
+
+                def _swap_fail_rollback(v, persist_boot_yaml=False):
+                    call_seq.append(v)
+                    if len(call_seq) == 2:
+                        raise RuntimeError("GSV rollback OOM")
+
+                with (
+                    patch.object(cs, "_get_configured_gsv_voice", return_value="__gsv_raiden_mei__"),
+                    patch.object(cs, "_ensure_gsv_weights", side_effect=_swap_fail_rollback),
+                    patch.object(cs, "_get_console_http_client", return_value=_FakeHttp()),
+                ):
+                    r_rb = client.post(
+                        f"http://127.0.0.1:{port}/api/tts-preview",
+                        json={"voice": "__gsv_xiaozhi_tw__", "text": "回滚失败测试"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "Origin": f"http://127.0.0.1:{port}",
+                            "X-Console-Token": cs.get_console_token(),
+                        },
+                    )
+                    self.assertEqual(r_rb.status_code, 200)
+                    self.assertEqual(r_rb.headers.get("x-voice-dirty"), "1")
+                    warn_txt = unquote(r_rb.headers.get("x-preview-warning", ""))
+                    self.assertIn("恢复线上音色权重", warn_txt)
+                    dirty_v, dirty_e = cs._get_voice_dirty_state()
+                    self.assertEqual(dirty_v, "__gsv_raiden_mei__")
+                    self.assertIn("GSV rollback OOM", dirty_e)
+                    self.assertEqual(cs._active_gsv_loaded, "__dirty__")
+
+                # Now background probe retries & recovers voice_dirty!
+                recovered = []
+                with (
+                    patch.object(cs, "_probe_gsv_tcp_once", return_value=True),
+                    patch.object(cs, "_get_configured_gsv_voice", return_value="__gsv_raiden_mei__"),
+                    patch.object(cs, "_ensure_gsv_weights", side_effect=lambda v, persist_boot_yaml=False: recovered.append(v)),
+                    patch.object(cs, "_get_console_http_client", return_value=_FakeHttp()),
+                    patch.object(cs.pc_audio_router, "is_pc_audio_bridge_online", return_value=False),
+                ):
+                    cs._probe_background_services_once()
+                self.assertEqual(recovered, ["__gsv_raiden_mei__"])
+                self.assertEqual(cs._get_voice_dirty_state(), (None, ""))
+
+                # D-3b2: Stale voice_dirty MUST reconcile with newly saved voice (never revert to obsolete voice!)
+                cs._set_voice_dirty("__gsv_raiden_mei__", "old rollback error")
+                recovered_edge = []
+                with (
+                    patch.object(cs, "_probe_gsv_tcp_once", return_value=True),
+                    patch.object(cs, "_get_configured_gsv_voice", return_value=None),
+                    patch.object(cs, "_ensure_gsv_weights", side_effect=lambda v, persist_boot_yaml=False: recovered_edge.append(v)),
+                    patch.object(cs, "_get_console_http_client", return_value=_FakeHttp()),
+                    patch.object(cs.pc_audio_router, "is_pc_audio_bridge_online", return_value=False),
+                ):
+                    cs._probe_background_services_once()
+                self.assertEqual(recovered_edge, [])
+                self.assertEqual(cs._get_voice_dirty_state(), (None, ""))
+
+                cs._set_voice_dirty("__gsv_raiden_mei__", "old rollback error")
+                recovered_new = []
+                with (
+                    patch.object(cs, "_probe_gsv_tcp_once", return_value=True),
+                    patch.object(cs, "_get_configured_gsv_voice", return_value="__gsv_xiaozhi_tw__"),
+                    patch.object(cs, "_ensure_gsv_weights", side_effect=lambda v, persist_boot_yaml=False: recovered_new.append(v)),
+                    patch.object(cs, "_get_console_http_client", return_value=_FakeHttp()),
+                    patch.object(cs.pc_audio_router, "is_pc_audio_bridge_online", return_value=False),
+                ):
+                    cs._probe_background_services_once()
+                self.assertEqual(recovered_new, ["__gsv_xiaozhi_tw__"])
+                self.assertEqual(cs._get_voice_dirty_state(), (None, ""))
+
+                # D-3c: GPU lock total duration cap -> returns 504, NEVER extends deadline during rollback, releases lock
+                cap_calls = []
+
+                def _slow_swap_other(v, persist_boot_yaml=False):
+                    cap_calls.append(v)
+                    time.sleep(0.08)
+
+                with (
+                    patch.object(cs, "_GSV_PREVIEW_LOCK_MAX_SECONDS", 0.03),
+                    patch.object(cs, "_get_configured_gsv_voice", return_value="__gsv_raiden_mei__"),
+                    patch.object(cs, "_ensure_gsv_weights", side_effect=_slow_swap_other),
+                    patch.object(cs, "_get_console_http_client", return_value=_FakeHttp()),
+                ):
+                    r_cap = client.post(
+                        f"http://127.0.0.1:{port}/api/tts-preview",
+                        json={"voice": "__gsv_xiaozhi_tw__", "text": "锁超时测试"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "Origin": f"http://127.0.0.1:{port}",
+                            "X-Console-Token": cs.get_console_token(),
+                        },
+                    )
+                    self.assertEqual(r_cap.status_code, 504)
+                    cap_body = r_cap.json()
+                    self.assertTrue(cap_body.get("voice_dirty"))
+                    self.assertIn("后台将自动重试", cap_body.get("rollback_warning", ""))
+                # Rollback must have been skipped fast once cap expired (not called a second time extending lock!)
+                self.assertEqual(cap_calls, ["__gsv_xiaozhi_tw__"])
+                self.assertEqual(cs._get_voice_dirty_state()[0], "__gsv_raiden_mei__")
+                cs._set_voice_dirty(None, "")
+                # Lock must have been released cleanly
+                self.assertTrue(cs._gsv_weights_lock.acquire(blocking=False))
+                cs._gsv_weights_lock.release()
+
+                # A-5b: HTML error pages from BaseHTTPRequestHandler.send_error (e.g. 501 PUT) also carry clickjacking headers
+                r_501 = client.put(f"http://127.0.0.1:{port}/")
+                self.assertEqual(r_501.status_code, 501)
+                self.assertEqual(r_501.headers.get("x-frame-options"), "DENY")
+                self.assertIn("frame-ancestors 'none'", r_501.headers.get("content-security-policy", ""))
+                self.assertEqual(r_501.headers.get("x-content-type-options"), "nosniff")
+        finally:
+            cs._set_voice_dirty(None, "")
+            cs._active_gsv_loaded = orig_loaded
+            cs.CONSOLE_PORT = orig_port
+            with cs._state_lock:
+                cs._device_info["activity"] = orig_act
+            httpd.shutdown()
+            httpd.server_close()
+
+        # --- C-1 extra: Boot gate MUST fail-closed when a required security patch is MISSING from registry ---
+        orig_sec_ota = patch_registry.get_patch_status("esp32_auth_ota")
+        try:
+            with patch_registry._lock:
+                patch_registry._patches.pop("esp32_auth_ota", None)
+            with patch.dict(os.environ, {"XIAOZHI_ALLOW_INSECURE_BOOT": ""}, clear=False):
+                with self.assertRaises(SystemExit) as cm_miss:
+                    start_with_env.enforce_security_boot_gate(exit_code=2)
+                self.assertEqual(cm_miss.exception.code, 2)
+            with patch.dict(os.environ, {"XIAOZHI_ALLOW_INSECURE_BOOT": "1"}, clear=False):
+                missing_fail = start_with_env.enforce_security_boot_gate(exit_code=2)
+                self.assertEqual([e["name"] for e in missing_fail], ["esp32_auth_ota"])
+                # Must also have recorded the missing patch so /api/health returns 503
+                self.assertFalse(patch_registry.get_health_summary()["security_ok"])
+        finally:
+            with patch_registry._lock:
+                patch_registry._patches["esp32_auth_ota"] = orig_sec_ota
+
+        # C-1 extra: insecure_boot_env flag is exposed even when security_ok is True
+        with patch.dict(os.environ, {"XIAOZHI_ALLOW_INSECURE_BOOT": "1"}, clear=False):
+            summ_arm = patch_registry.get_health_summary()
+            self.assertTrue(summ_arm["security_ok"])
+            self.assertTrue(summ_arm["insecure_boot_env"])
+
+        # --- C-3 extra: verify_signature_contract & install_patch handle @classmethod and @staticmethod cleanly ---
+        class _DescDemo:
+            @classmethod
+            def cm(cls, a, b):
+                return (cls.__name__, a, b)
+
+            @staticmethod
+            def sm(x, y):
+                return (x, y)
+
+        ok_cm, _ = patch_registry.verify_signature_contract(_DescDemo.__dict__["cm"], required_params=("cls", "a", "b"))
+        self.assertTrue(ok_cm)
+        ok_sm, _ = patch_registry.install_patch(
+            "synthetic_sm",
+            _DescDemo,
+            "sm",
+            lambda orig: (lambda x, y: ("sm_wrapped", orig(x, y))),
+            required_params=("x", "y"),
+        )
+        ok_cm_i, _ = patch_registry.install_patch(
+            "synthetic_cm",
+            _DescDemo,
+            "cm",
+            lambda orig: (lambda cls, a, b: ("cm_wrapped", orig(cls, a, b))),
+            required_params=("cls", "a", "b"),
+        )
+        try:
+            self.assertTrue(ok_sm)
+            self.assertTrue(ok_cm_i)
+            self.assertEqual(_DescDemo().sm(1, 2), ("sm_wrapped", (1, 2)))
+            self.assertEqual(_DescDemo.cm(3, 4), ("cm_wrapped", ("_DescDemo", 3, 4)))
+        finally:
+            with patch_registry._lock:
+                patch_registry._patches.pop("synthetic_sm", None)
+                patch_registry._patches.pop("synthetic_cm", None)
+
+        # --- B-4 extra: AnimaOutbox collision guard + stable uuid4 fallback in extract_clean_pairs ---
+        with tempfile.TemporaryDirectory() as td_col:
+            ob_col = amp.AnimaOutbox(os.path.join(td_col, "col.sqlite"), auto_start=False)
+            try:
+                ob_col.enqueue(
+                    [{"request_id": "xz-col-1", "user_message": "第一句", "assistant_reply": "原始短答"}]
+                )
+                # Different user_message with SAME request_id -> refused (must NOT overwrite pending row!)
+                added_u = ob_col.enqueue(
+                    [{"request_id": "xz-col-1", "user_message": "冲突问题", "assistant_reply": "很长很长的冲突回复"}]
+                )
+                self.assertEqual(added_u, 0)
+                # Same user_message but divergent non-prefix longer reply -> refused!
+                added_a = ob_col.enqueue(
+                    [{"request_id": "xz-col-1", "user_message": "第一句", "assistant_reply": "完全不相关的更长回复内容"}]
+                )
+                self.assertEqual(added_a, 0)
+                row_col = ob_col._ensure_db().execute(
+                    "SELECT payload_json FROM outbox_turns WHERE request_id='xz-col-1'"
+                ).fetchone()
+                saved_col = json.loads(row_col["payload_json"])
+                self.assertEqual(saved_col["user_message"], "第一句")
+                self.assertEqual(saved_col["assistant_reply"], "原始短答")
+            finally:
+                ob_col.close()
+
+        class _NoUidMsg:
+            def __init__(self, role, content):
+                self.role = role
+                self.content = content
+
+        u_m1, a_m1 = _NoUidMsg("user", "问题一"), _NoUidMsg("assistant", "回答一")
+        u_m2, a_m2 = _NoUidMsg("user", "问题二"), _NoUidMsg("assistant", "回答二")
+        p_first = amp.extract_clean_pairs([u_m1, a_m1])
+        p_second = amp.extract_clean_pairs([u_m1, a_m1, u_m2, a_m2])
+        self.assertEqual(p_first[0]["request_id"], p_second[0]["request_id"])
+        self.assertNotEqual(p_second[0]["request_id"], p_second[1]["request_id"])
+        self.assertRegex(p_second[0]["request_id"], r"^xz-[0-9a-f]{32}$")
+
+    def test_batch1_same_gsv_voice_dirty_save_recovery_and_console_degraded_guard(self):
+        import tempfile
+        import threading
+        import time
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        import httpx
+        import yaml
+        import console_server as cs
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = os.path.join(td, ".config.yaml")
+            infer_yaml_path = os.path.join(td, "tts_infer_xiaozhi.yaml")
+            initial_cfg = {
+                "prompt": "初始芽衣人设。\n",
+                "selected_module": {
+                    "LLM": "DeepSeekLLM",
+                    "TTS": "GPT_SOVITS_V2",
+                },
+                "LLM": {
+                    "DeepSeekLLM": {
+                        "type": "openai",
+                        "model_name": "deepseek-flash",
+                    }
+                },
+                "TTS": {
+                    "GPT_SOVITS_V2": {
+                        "type": "gpt_sovits_v2",
+                        "url": "http://host.docker.internal:19880/tts",
+                        "ref_audio_path": "${HOST_DATA_DIR}/voices/raiden_mei/mei_default_ref.wav",
+                        "prompt_text": "今夜月色很美",
+                    }
+                },
+            }
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(initial_cfg, f, allow_unicode=True, sort_keys=False)
+
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), cs.ConsoleHandler)
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            orig_port = cs.CONSOLE_PORT
+            orig_loaded = cs._active_gsv_loaded
+            cs.CONSOLE_PORT = port
+            try:
+                http_gets = []
+
+                class _FakeResp200:
+                    status_code = 200
+                    text = "ok"
+
+                class _FakeHttp:
+                    def get(self, url, params=None, timeout=None):
+                        http_gets.append((url, dict(params or {})))
+                        return _FakeResp200()
+
+                with (
+                    patch.object(cs, "CONFIG_PATH", cfg_path),
+                    patch.object(cs, "GSV_INFER_YAML", infer_yaml_path),
+                    patch.object(cs, "_get_console_http_client", return_value=_FakeHttp()),
+                    patch.object(cs, "_sync_persona_to_anima"),
+                ):
+                    with httpx.Client(timeout=4.0, trust_env=False) as client:
+                        post_hdrs = {
+                            "Content-Type": "application/json",
+                            "Origin": f"http://127.0.0.1:{port}",
+                            "X-Console-Token": cs.get_console_token(),
+                        }
+                        # 1. Saving the SAME GSV voice while voice_dirty is set (even if _active_gsv_loaded
+                        #    happens to match) MUST force real /set_gpt_weights + /set_sovits_weights,
+                        #    clear voice_dirty, and return HTTP 200 voice_recovered=True without restarting.
+                        cs._active_gsv_loaded = "__gsv_raiden_mei__"
+                        cs._set_voice_dirty("__gsv_raiden_mei__", "preview rollback failed")
+                        r_rec = client.post(
+                            f"http://127.0.0.1:{port}/api/config",
+                            json={"voice": "__gsv_raiden_mei__", "restart": False},
+                            headers=post_hdrs,
+                        )
+                        self.assertEqual(r_rec.status_code, 200)
+                        body_rec = r_rec.json()
+                        self.assertTrue(body_rec["ok"])
+                        self.assertTrue(body_rec["voice_recovered"])
+                        self.assertFalse(body_rec["voice_dirty"])
+                        self.assertEqual(body_rec["changed_fields"], [])
+                        self.assertEqual(body_rec["detail"], "voice_weights_recovered")
+                        self.assertEqual(cs._get_voice_dirty_state(), (None, ""))
+                        self.assertEqual(cs._active_gsv_loaded, "__gsv_raiden_mei__")
+                        self.assertEqual(len(http_gets), 2)
+                        self.assertTrue(http_gets[0][0].endswith("/set_gpt_weights"))
+                        self.assertTrue(http_gets[1][0].endswith("/set_sovits_weights"))
+                        self.assertTrue(os.path.isfile(infer_yaml_path))
+
+                        # 2. Saving the SAME GSV voice when CLEAN must NOT re-trigger weight HTTP calls.
+                        http_gets.clear()
+                        r_clean = client.post(
+                            f"http://127.0.0.1:{port}/api/config",
+                            json={"voice": "__gsv_raiden_mei__", "restart": False},
+                            headers=post_hdrs,
+                        )
+                        self.assertEqual(r_clean.status_code, 200)
+                        self.assertFalse(r_clean.json()["voice_recovered"])
+                        self.assertFalse(r_clean.json()["voice_dirty"])
+                        self.assertEqual(http_gets, [])
+
+                        # 3. Saving the SAME GSV voice while dirty when _ensure_gsv_weights FAILS must keep
+                        #    voice_dirty populated (with latest error) and return HTTP 500.
+                        cs._active_gsv_loaded = "__dirty__"
+                        cs._set_voice_dirty("__gsv_raiden_mei__", "old err")
+                        with patch.object(cs, "_ensure_gsv_weights", side_effect=RuntimeError("19880 unreachable")):
+                            r_fail = client.post(
+                                f"http://127.0.0.1:{port}/api/config",
+                                json={"voice": "__gsv_raiden_mei__", "restart": False},
+                                headers=post_hdrs,
+                            )
+                        self.assertEqual(r_fail.status_code, 500)
+                        self.assertFalse(r_fail.json()["ok"])
+                        dv, de = cs._get_voice_dirty_state()
+                        self.assertEqual(dv, "__gsv_raiden_mei__")
+                        self.assertIn("19880 unreachable", de)
+                        self.assertEqual(cs._active_gsv_loaded, "__dirty__")
+
+                        # 4. Saving the SAME GSV voice while dirty AND editing prompt simultaneously
+                        #    recovers weights, clears voice_dirty, AND writes updated prompt to YAML.
+                        http_gets.clear()
+                        res_both = cs._write_updated_yaml(prompt="新的芽衣人设", voice="__gsv_raiden_mei__")
+                        self.assertTrue(res_both["written"])
+                        self.assertTrue(res_both["voice_recovered"])
+                        self.assertEqual(res_both["changed_fields"], ["prompt"])
+                        self.assertEqual(cs._get_voice_dirty_state(), (None, ""))
+                        self.assertEqual(len(http_gets), 2)
+
+                        # 5. Stale voice_dirty cleared cleanly when saving an already-selected EdgeTTS voice.
+                        edge_cfg = {
+                            "prompt": "Edge人设。\n",
+                            "selected_module": {"LLM": "DeepSeekLLM", "TTS": "EdgeTTS"},
+                            "TTS": {"EdgeTTS": {"type": "edge", "voice": "zh-CN-XiaoxiaoNeural"}},
+                        }
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            yaml.safe_dump(edge_cfg, f, allow_unicode=True, sort_keys=False)
+                        cs._set_voice_dirty("__gsv_raiden_mei__", "stale")
+                        http_gets.clear()
+                        res_edge = cs._write_updated_yaml(voice="zh-CN-XiaoxiaoNeural")
+                        self.assertFalse(res_edge["written"])
+                        self.assertFalse(res_edge["voice_recovered"])
+                        self.assertEqual(cs._get_voice_dirty_state(), (None, ""))
+                        self.assertEqual(http_gets, [])
+
+                        # 5b. Concurrent cross-voice switch vs _probe_background_services_once MUST NOT revert GPU weights
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            yaml.safe_dump(initial_cfg, f, allow_unicode=True, sort_keys=False)
+                        race_calls = []
+                        save_in_ensure = threading.Event()
+                        probe_past_read = threading.Event()
+
+                        def _ensure_race(voice_id, persist_boot_yaml=False):
+                            with cs._gsv_weights_lock:
+                                race_calls.append((threading.current_thread().name, voice_id))
+                                if threading.current_thread().name == "save-race":
+                                    save_in_ensure.set()
+                                    probe_past_read.wait(timeout=2.0)
+                                    time.sleep(0.03)
+                                cs._active_gsv_loaded = voice_id
+
+                        orig_get_dirty = cs._get_voice_dirty_state
+
+                        def _traced_dirty():
+                            res = orig_get_dirty()
+                            if threading.current_thread().name == "probe-race":
+                                probe_past_read.set()
+                            return res
+
+                        class _ProbeResp:
+                            status_code = 200
+                            text = "ok"
+
+                            def json(self):
+                                return {}
+
+                        class _ProbeHttp:
+                            def get(self, url, params=None, timeout=None):
+                                http_gets.append((url, dict(params or {})))
+                                return _ProbeResp()
+
+                        cs._active_gsv_loaded = "__dirty__"
+                        cs._set_voice_dirty("__gsv_raiden_mei__", "old err")
+                        with (
+                            patch.object(cs, "_ensure_gsv_weights", side_effect=_ensure_race),
+                            patch.object(cs, "_get_voice_dirty_state", side_effect=_traced_dirty),
+                            patch.object(cs, "_is_device_busy", return_value=False),
+                            patch.object(cs, "_fetch_l3_backend_status", return_value={"online": True}),
+                            patch.object(cs, "_fetch_anima_relationship", return_value={"online": True}),
+                            patch.object(cs, "_fetch_obsidian_status", return_value={"online": True}),
+                            patch.object(cs.pc_audio_router, "is_pc_audio_bridge_online", return_value=True),
+                            patch.object(cs, "_get_console_http_client", return_value=_ProbeHttp()),
+                        ):
+                            t_sv = threading.Thread(
+                                target=lambda: cs._write_updated_yaml(voice="__gsv_xiaozhi_tw__"),
+                                name="save-race",
+                            )
+                            t_sv.start()
+                            self.assertTrue(save_in_ensure.wait(timeout=2.0))
+                            t_pr = threading.Thread(
+                                target=cs._probe_background_services_once,
+                                name="probe-race",
+                            )
+                            t_pr.start()
+                            t_sv.join(timeout=3.0)
+                            t_pr.join(timeout=3.0)
+                        self.assertEqual(race_calls, [("save-race", "__gsv_xiaozhi_tw__")])
+                        self.assertEqual(cs._active_gsv_loaded, "__gsv_xiaozhi_tw__")
+                        self.assertEqual(cs._get_voice_dirty_state(), (None, ""))
+
+                        # 5c. Concurrent same-voice dirty save while probe is already recovering MUST NOT double-reload GPU
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            yaml.safe_dump(initial_cfg, f, allow_unicode=True, sort_keys=False)
+                        race_calls.clear()
+                        probe_in_ensure = threading.Event()
+
+                        def _ensure_probe_first(voice_id, persist_boot_yaml=False):
+                            race_calls.append((threading.current_thread().name, voice_id))
+                            if threading.current_thread().name == "probe-first":
+                                probe_in_ensure.set()
+                                time.sleep(0.06)
+                            cs._active_gsv_loaded = voice_id
+
+                        cs._active_gsv_loaded = "__dirty__"
+                        cs._set_voice_dirty("__gsv_raiden_mei__", "old err")
+                        with (
+                            patch.object(cs, "_ensure_gsv_weights", side_effect=_ensure_probe_first),
+                            patch.object(cs, "_is_device_busy", return_value=False),
+                            patch.object(cs, "_fetch_l3_backend_status", return_value={"online": True}),
+                            patch.object(cs, "_fetch_anima_relationship", return_value={"online": True}),
+                            patch.object(cs, "_fetch_obsidian_status", return_value={"online": True}),
+                            patch.object(cs.pc_audio_router, "is_pc_audio_bridge_online", return_value=True),
+                            patch.object(cs, "_get_console_http_client", return_value=_ProbeHttp()),
+                        ):
+                            t_pf = threading.Thread(
+                                target=cs._probe_background_services_once,
+                                name="probe-first",
+                            )
+                            t_pf.start()
+                            self.assertTrue(probe_in_ensure.wait(timeout=2.0))
+                            res_dedup = cs._write_updated_yaml(voice="__gsv_raiden_mei__")
+                            t_pf.join(timeout=3.0)
+                        self.assertEqual(len(race_calls), 1)
+                        self.assertEqual(race_calls[0], ("probe-first", "__gsv_raiden_mei__"))
+                        self.assertFalse(res_dedup["voice_recovered"])
+                        self.assertEqual(cs._get_voice_dirty_state(), (None, ""))
+
+                        # 5d. _probe_background_services_once MUST force real GPU weight HTTP calls even if _active_gsv_loaded matches dirty_target
+                        http_gets.clear()
+                        cs._active_gsv_loaded = "__gsv_raiden_mei__"
+                        cs._set_voice_dirty("__gsv_raiden_mei__", "stale gpu weights")
+                        with (
+                            patch.object(cs, "_is_device_busy", return_value=False),
+                            patch.object(cs, "_fetch_l3_backend_status", return_value={"online": True}),
+                            patch.object(cs, "_fetch_anima_relationship", return_value={"online": True}),
+                            patch.object(cs, "_fetch_obsidian_status", return_value={"online": True}),
+                            patch.object(cs.pc_audio_router, "is_pc_audio_bridge_online", return_value=True),
+                            patch.object(cs, "_get_console_http_client", return_value=_ProbeHttp()),
+                        ):
+                            cs._probe_background_services_once()
+                        weight_urls = [u for u, _ in http_gets if u.endswith(("/set_gpt_weights", "/set_sovits_weights"))]
+                        self.assertEqual(len(weight_urls), 2)
+                        self.assertEqual(cs._get_voice_dirty_state(), (None, ""))
+            finally:
+                cs._set_voice_dirty(None, "")
+                cs._active_gsv_loaded = orig_loaded
+                cs.CONSOLE_PORT = orig_port
+                httpd.shutdown()
+                httpd.server_close()
+
+        # 6. Verify console.html degraded guard & banner/save state machine guards
+        html_src = open(cs.HTML_PATH, "r", encoding="utf-8").read()
+        self.assertIn('typeof hlth.degraded === "boolean" && hlth.degraded', html_src)
+        self.assertNotIn("|| Boolean(hlth.degraded)", html_src)
+        self.assertIn("function scheduleHideBanner(", html_src)
+        self.assertNotIn("setTimeout(hideBanner,", html_src)
+        self.assertIn('typeof res.voice_dirty === "boolean"', html_src)
+        self.assertIn("stateEpoch", html_src)
+        self.assertIn("isSaving", html_src)
+
+    def test_batch2_a1_split_mount_paths_and_env_token_isolation(self):
+        """A-1: Env-first token lookup + legacy HOST_DATA_DIR/voices path rewrite compatibility."""
+        from unittest.mock import patch
+
+        with patch.dict(
+            os.environ,
+            {"PC_MCP_TOKEN": "env-pc-mcp-tok-xyz", "ANIMA_STUDIO_TOKEN": "env-anima-tok-abc"},
+            clear=False,
+        ):
+            self.assertEqual(xz_common.get_pc_mcp_token(), "env-pc-mcp-tok-xyz")
+            self.assertEqual(xz_common.get_anima_token(), "env-anima-tok-abc")
+            self.assertEqual(
+                xz_common.get_pc_mcp_auth_headers()["Authorization"],
+                "Bearer env-pc-mcp-tok-xyz",
+            )
+
+        rewritten_legacy = router._rewrite_host_data_path(
+            "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav"
+        )
+        self.assertEqual(rewritten_legacy, f"{router.HOST_VOICES_PREFIX}/raiden_mei/mei_default_ref.wav")
+        rewritten_placeholder = router._rewrite_host_data_path(
+            "${HOST_DATA_DIR}/voices/raiden_mei/mei_happy_ref.wav"
+        )
+        self.assertEqual(rewritten_placeholder, f"{router.HOST_VOICES_PREFIX}/raiden_mei/mei_happy_ref.wav")
+        rewritten_tw = router._rewrite_host_data_path("${HOST_DATA_DIR}/xiaozhi_taiwan_ref.wav")
+        self.assertEqual(rewritten_tw, f"{router.HOST_VOICES_PREFIX}/xiaozhi_taiwan_ref.wav")
+        if os.name != "nt":
+            self.assertEqual(
+                router._to_local_fs_path(rewritten_legacy),
+                f"{router.CONTAINER_VOICES_PREFIX}/raiden_mei/mei_default_ref.wav",
+            )
+
+        # Legacy .env containing ONLY HOST_DATA_DIR (plain `docker compose up -d` without start_all.ps1)
+        # MUST still derive host voices/weights paths instead of falling back to /opt/xiaozhi-esp32-server/voices!
+        derived = xz_common.resolve_host_dirs(
+            {
+                "HOST_DATA_DIR": "D:/myproj/xiaozhi-server/data",
+                "HOST_PROJECT_DIR": "",
+                "HOST_VOICES_DIR": "",
+                "HOST_GSV_WEIGHTS_DIR": "",
+            }
+        )
+        self.assertEqual(derived["HOST_PROJECT_DIR"], "D:/myproj/xiaozhi-server")
+        self.assertEqual(derived["HOST_VOICES_DIR"], "D:/myproj/xiaozhi-server/voices")
+        self.assertEqual(derived["HOST_GSV_WEIGHTS_DIR"], "D:/myproj/xiaozhi-server/models/gsv_weights")
+
+    def test_batch2_a2_console_pc_mode_proxies_to_host_18900_and_fails_closed(self):
+        """A-2: Console _write_pc_mode forwards to authenticated host 18900 POST /mode and fails closed."""
+        import json
+        import httpx
+        from unittest.mock import patch
+        import console_server as cs
+
+        seen: list[tuple[str, str, dict]] = []
+
+        def _ok_transport(request: httpx.Request) -> httpx.Response:
+            seen.append(
+                (
+                    request.method,
+                    request.url.path,
+                    {
+                        "auth": request.headers.get("authorization", ""),
+                        "body": json.loads(request.content.decode("utf-8")),
+                    },
+                )
+            )
+            return httpx.Response(200, json={"ok": True, "mode": "full", "source": "host_state"})
+
+        def _fail_transport(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"error": "unauthorized"})
+
+        ok_cli = httpx.Client(transport=httpx.MockTransport(_ok_transport), trust_env=False)
+        fail_cli = httpx.Client(transport=httpx.MockTransport(_fail_transport), trust_env=False)
+        try:
+            with (
+                patch.object(cs, "_get_console_http_client", return_value=ok_cli),
+                patch.object(
+                    cs.pc_audio_router,
+                    "get_pc_mcp_auth_headers",
+                    return_value={"Authorization": "Bearer test-a2-token"},
+                ),
+            ):
+                res = cs._write_pc_mode("full")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["mode"], "full")
+            self.assertEqual(res["source"], "host_18900")
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0][0], "POST")
+            self.assertEqual(seen[0][1], "/mode")
+            self.assertEqual(seen[0][2]["auth"], "Bearer test-a2-token")
+            self.assertEqual(seen[0][2]["body"], {"mode": "full"})
+            self.assertEqual(cs._read_pc_mode(), "full")
+
+            # Fail-closed when 18900 rejects or is offline
+            with patch.object(cs, "_get_console_http_client", return_value=fail_cli):
+                with self.assertRaises(RuntimeError):
+                    cs._write_pc_mode("safe")
+            self.assertEqual(cs._read_pc_mode(), "full")
+        finally:
+            ok_cli.close()
+            fail_cli.close()
+            cs._set_cached_pc_mode("safe", online=False)
+
+    def test_batch2_a4_console_token_injection_and_internal_host_restriction(self):
+        """A-4: GET / injects per-boot token with no-store; POST enforces token; internal host is read-only."""
+        import re
+        import threading
+        from http.server import ThreadingHTTPServer
+        import httpx
+        import console_server as cs
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), cs.ConsoleHandler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        orig_port = cs.CONSOLE_PORT
+        cs.CONSOLE_PORT = port
+        try:
+            with httpx.Client(timeout=4.0, trust_env=False) as client:
+                r_root = client.get(f"http://127.0.0.1:{port}/")
+                self.assertEqual(r_root.status_code, 200)
+                self.assertIn("no-store", r_root.headers.get("cache-control", "").lower())
+                m = re.search(r'<meta\s+name="console-token"\s+content="([^"]+)"', r_root.text)
+                self.assertIsNotNone(m, "GET / must inject <meta name='console-token'>")
+                tok = m.group(1)
+                self.assertEqual(tok, cs.get_console_token())
+                self.assertNotIn("__XIAOZHI_CONSOLE_TOKEN__", r_root.text)
+
+                # Missing or wrong X-Console-Token -> 401
+                r_no = client.post(
+                    f"http://127.0.0.1:{port}/api/idle-farewell",
+                    json={"enabled": True},
+                    headers={"Origin": f"http://127.0.0.1:{port}"},
+                )
+                self.assertEqual(r_no.status_code, 401)
+                r_bad = client.post(
+                    f"http://127.0.0.1:{port}/api/idle-farewell",
+                    json={"enabled": True},
+                    headers={"Origin": f"http://127.0.0.1:{port}", "X-Console-Token": "invalid-tok"},
+                )
+                self.assertEqual(r_bad.status_code, 401)
+
+                # Host: xiaozhi-esp32-server allows GET /api/health & /api/state ONLY
+                r_int_h = client.get(
+                    f"http://127.0.0.1:{port}/api/health",
+                    headers={"Host": f"xiaozhi-esp32-server:{port}"},
+                )
+                self.assertEqual(r_int_h.status_code, 200)
+                r_int_s = client.get(
+                    f"http://127.0.0.1:{port}/api/state",
+                    headers={"Host": f"xiaozhi-esp32-server:{port}"},
+                )
+                self.assertEqual(r_int_s.status_code, 200)
+                r_int_root = client.get(
+                    f"http://127.0.0.1:{port}/",
+                    headers={"Host": f"xiaozhi-esp32-server:{port}"},
+                )
+                self.assertEqual(r_int_root.status_code, 403)
+                r_int_post = client.post(
+                    f"http://127.0.0.1:{port}/api/pc-mode",
+                    json={"mode": "full"},
+                    headers={"Host": f"xiaozhi-esp32-server:{port}", "X-Console-Token": tok},
+                )
+                self.assertEqual(r_int_post.status_code, 403)
+        finally:
+            cs.CONSOLE_PORT = orig_port
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_batch2_f2_turn_context_split_legacy_rollback_and_usage_telemetry(self):
+        """F-2: System prefix stays byte-identical across turns; legacy rollback works; usage telemetry tracks hits."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import turn_context_router as tcr
+
+        base_sys_t1 = (
+            "你是雷电芽衣。\n"
+            "<context>\n- Current time: 14:01\n- Weather: 晴 22C\n</context>\n"
+            "<speakers_info>\n主用户\n</speakers_info>\n"
+            "请以情绪标签开头。"
+        )
+        base_sys_t2 = (
+            "你是雷电芽衣。\n"
+            "<context>\n- Current time: 14:05\n- Weather: 多云 21C\n</context>\n"
+            "<speakers_info>\n主用户\n</speakers_info>\n"
+            "请以情绪标签开头。"
+        )
+        msgs_t1 = [
+            {"role": "system", "content": base_sys_t1},
+            {"role": "user", "content": "芽衣，今天好累"},
+        ]
+        out_t1 = tcr.apply_turn_context_to_messages(msgs_t1, memory_str="记忆A", mode="split")
+        self.assertNotIn("<context>", out_t1[0]["content"])
+        self.assertNotIn("<memory>", out_t1[0]["content"])
+        self.assertNotIn("<reply_length_control>", out_t1[0]["content"])
+        self.assertIn("<turn_context>", out_t1[1]["content"])
+        self.assertIn("14:01", out_t1[1]["content"])
+        self.assertIn("记忆A", out_t1[1]["content"])
+        self.assertIn("芽衣，今天好累", out_t1[1]["content"])
+
+        # Turn 2: time/weather/memory change, AND stale <turn_context> in history is stripped!
+        msgs_t2 = [
+            {"role": "system", "content": base_sys_t2},
+            {"role": "user", "content": out_t1[1]["content"]},
+            {"role": "assistant", "content": "[gentle] 辛苦啦，先歇一会儿吧。"},
+            {"role": "user", "content": "晚饭吃什么好？"},
+        ]
+        out_t2 = tcr.apply_turn_context_to_messages(msgs_t2, memory_str="记忆B", mode="split")
+        # System prompt prefix MUST be 100% byte-identical between Turn 1 and Turn 2!
+        self.assertEqual(out_t1[0]["content"], out_t2[0]["content"])
+        # Historical user turn MUST NOT retain stale <turn_context>
+        self.assertNotIn("<turn_context>", out_t2[1]["content"])
+        self.assertEqual(out_t2[1]["content"], "芽衣，今天好累")
+        # Latest user turn gets fresh <turn_context>
+        self.assertIn("<turn_context>", out_t2[3]["content"])
+        self.assertIn("14:05", out_t2[3]["content"])
+        self.assertIn("记忆B", out_t2[3]["content"])
+
+        # Legacy rollback mode preserves <context>/<memory>/<reply_length_control> inside msgs[0]
+        msgs_leg = [
+            {"role": "system", "content": base_sys_t1},
+            {"role": "user", "content": "你好"},
+        ]
+        out_leg = tcr.apply_turn_context_to_messages(msgs_leg, memory_str="记忆L", mode="legacy")
+        self.assertIn("<context>", out_leg[0]["content"])
+        self.assertIn("记忆L", out_leg[0]["content"])
+        self.assertNotIn("<turn_context>", out_leg[1]["content"])
+
+        # Inline prose mentioning '<memory>' (e.g. persona instructions) MUST NOT swallow <core_rules>
+        from core.utils.dialogue import Dialogue, Message
+
+        prose_sys = (
+            "<identity>\n请结合 <memory> 中同步过来的长期记忆来回应哥哥。\n</identity>\n\n"
+            "<core_rules>\nCRITICAL_KEEP_ME_INTACT\n</core_rules>\n\n"
+            "<context>\n- Current time: 14:10\n</context>\n\n"
+            "<memory>\n</memory>"
+        )
+        dlg_prose = Dialogue()
+        dlg_prose.update_system_message(prose_sys)
+        dlg_prose.put(Message(role="user", content="测试一下"))
+        with patch.dict(os.environ, {"XIAOZHI_TURN_CONTEXT_MODE": "split"}, clear=False):
+            m_split_p = dlg_prose.get_llm_dialogue_with_memory(memory_str="实时召回记忆")
+        self.assertIn("CRITICAL_KEEP_ME_INTACT", m_split_p[0]["content"])
+        self.assertIn("请结合 <memory> 中同步过来的长期记忆", m_split_p[0]["content"])
+        self.assertNotIn("<context>", m_split_p[0]["content"])
+        self.assertIn("实时召回记忆", m_split_p[1]["content"])
+
+        with patch.dict(os.environ, {"XIAOZHI_TURN_CONTEXT_MODE": "legacy"}, clear=False):
+            m_leg_p = dlg_prose.get_llm_dialogue_with_memory(memory_str="实时召回记忆")
+        self.assertIn("CRITICAL_KEEP_ME_INTACT", m_leg_p[0]["content"])
+        self.assertIn("实时召回记忆", m_leg_p[0]["content"])
+
+        # Usage extraction supports DeepSeek (prompt_cache_hit_tokens) & OpenAI (prompt_tokens_details.cached_tokens)
+        ds_m = tcr.extract_usage_metrics(
+            {"prompt_tokens": 1000, "completion_tokens": 50, "prompt_cache_hit_tokens": 800, "prompt_cache_miss_tokens": 200}
+        )
+        self.assertEqual(ds_m["prompt_cache_hit_tokens"], 800)
+        self.assertEqual(ds_m["prompt_cache_miss_tokens"], 200)
+        oa_m = tcr.extract_usage_metrics(
+            {"prompt_tokens": 1000, "completion_tokens": 40, "prompt_tokens_details": {"cached_tokens": 750}}
+        )
+        self.assertEqual(oa_m["prompt_cache_hit_tokens"], 750)
+        self.assertEqual(oa_m["prompt_cache_miss_tokens"], 250)
+
+        # Streaming wrapper captures cache metrics AND gracefully retries if upstream rejects stream_options
+        tcr.reset_llm_cache_stats()
+        create_calls = []
+
+        def _fake_stream_create(*args, **kwargs):
+            create_calls.append(dict(kwargs))
+            if "stream_options" in kwargs and len(create_calls) == 1:
+                raise RuntimeError("Invalid argument: stream_options not supported")
+
+            def _gen():
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="[gentle] 你好"))],
+                    usage=None,
+                )
+                yield SimpleNamespace(
+                    choices=[],
+                    usage={
+                        "prompt_tokens": 1200,
+                        "completion_tokens": 30,
+                        "prompt_cache_hit_tokens": 960,
+                        "prompt_cache_miss_tokens": 240,
+                    },
+                )
+
+            return _gen()
+
+        fake_llm = SimpleNamespace(
+            model_name="deepseek-flash",
+            client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=_fake_stream_create))),
+        )
+        self.assertTrue(tcr.wrap_llm_client_for_usage(fake_llm))
+        chunks = list(fake_llm.client.chat.completions.create(model="deepseek-flash", stream=True, messages=[]))
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(create_calls), 2)
+        self.assertIn("stream_options", create_calls[0])
+        self.assertNotIn("stream_options", create_calls[1])
+        st = tcr.get_llm_cache_stats()
+        self.assertEqual(st["turns"], 1)
+        self.assertEqual(st["cache_hit_tokens_total"], 960)
+        self.assertAlmostEqual(st["overall_hit_rate_pct"], 80.0, places=1)
+        self.assertAlmostEqual(st["recent_hit_rate_pct"], 80.0, places=1)
+        self.assertAlmostEqual(st["last_hit_rate_pct"], 80.0, places=1)
+        tcr.reset_llm_cache_stats()
+
+    def test_batch2_f3_wakeup_and_hello_async_gsv_prime(self):
+        """F-3: prime_gsv_async fires non-blocking POST /prime with debounce and never raises on failure."""
+        import asyncio
+        import threading
+        from unittest.mock import patch
+        import core.handle.helloHandle as hello_mod
+
+        called = []
+        done_ev = threading.Event()
+
+        class _FakeSess:
+            def post(self, url, json=None, timeout=None):
+                called.append((url, json, timeout))
+                done_ev.set()
+
+        orig_ts = router._gsv_last_prime_ts
+        try:
+            router._gsv_last_prime_ts = 0.0
+            with patch.object(router, "_get_gsv_http_session", return_value=_FakeSess()):
+                ok1 = router.prime_gsv_async(None, reason="wakeup_test", min_interval_sec=30.0)
+                self.assertTrue(ok1)
+                self.assertTrue(done_ev.wait(timeout=2.0), "Async prime worker did not execute")
+                # Immediate second call within debounce window is skipped
+                ok2 = router.prime_gsv_async(None, reason="wakeup_dup", min_interval_sec=30.0)
+                self.assertFalse(ok2)
+            self.assertEqual(len(called), 1)
+            self.assertTrue(called[0][0].endswith("/prime"))
+            self.assertEqual(called[0][1], {"skip_if_busy": True, "reason": "wakeup_test"})
+
+            # Verify handleHelloMessage patch triggers prime_gsv_async without blocking
+            router.apply_mei_wakeup_responses_patch()
+            self.assertTrue(callable(hello_mod.handleHelloMessage))
+
+            # Verify non-Mei GSV voice (e.g. xiaozhi_tw) ALSO triggers wakeup prime when wakeup matches
+            router._gsv_last_prime_ts = 0.0
+            called.clear()
+            done_ev.clear()
+            fake_tw_tts = type(
+                "FakeGsvTts",
+                (),
+                {
+                    "__module__": "core.providers.tts.gpt_sovits_v2",
+                    "url": "http://host.docker.internal:19880/tts",
+                    "ref_audio_path": "${HOST_VOICES_DIR}/xiaozhi_taiwan_ref.wav",
+                },
+            )()
+            fake_conn = type(
+                "FakeConn",
+                (),
+                {"tts": fake_tw_tts, "config": {"enable_wakeup_words_response_cache": True, "wakeup_words": ["你好小智"]}},
+            )()
+            orig_inner_wakeup = hello_mod.checkWakeupWords.__wrapped__
+            with (
+                patch.object(router, "_get_gsv_http_session", return_value=_FakeSess()),
+                patch.object(hello_mod.checkWakeupWords, "__wrapped__", orig_inner_wakeup),
+            ):
+                # Directly test prime_gsv_async accepts non-Mei GSV provider
+                ok_tw = router.prime_gsv_async(fake_tw_tts, reason="wakeup_tw", min_interval_sec=30.0)
+                self.assertTrue(ok_tw)
+                self.assertTrue(done_ev.wait(timeout=2.0))
+            self.assertEqual(len(called), 1)
+            self.assertEqual(called[0][1]["reason"], "wakeup_tw")
+        finally:
+            router._gsv_last_prime_ts = orig_ts
+
+    def test_batch2_f2_edge_cases_stats_legacy_multimodal_and_tool_round(self):
+        """F-2 edge cases: non-cached stats isolation, non-mutating legacy mode, multimodal & tool-call turns."""
+        import turn_context_router as tcr
+
+        # 1. overall_hit_rate_pct must ignore non-cached turns (None when 0 measured, 80.0 when mixed)
+        tcr.reset_llm_cache_stats()
+        try:
+            tcr.record_llm_usage(prompt_tokens=2000, completion_tokens=50, cache_hit_tokens=None, cache_miss_tokens=None)
+            st1 = tcr.get_llm_cache_stats()
+            self.assertIsNone(st1["overall_hit_rate_pct"])
+            self.assertIsNone(st1["recent_hit_rate_pct"])
+            tcr.record_llm_usage(prompt_tokens=1000, completion_tokens=50, cache_hit_tokens=800, cache_miss_tokens=200)
+            st2 = tcr.get_llm_cache_stats()
+            self.assertAlmostEqual(st2["overall_hit_rate_pct"], 80.0, places=1)
+            self.assertAlmostEqual(st2["recent_hit_rate_pct"], 80.0, places=1)
+        finally:
+            tcr.reset_llm_cache_stats()
+
+        # 2. Legacy mode must NOT mutate caller msgs in place and must resolve {{current_time}}
+        raw_sys = "Base\n<context>\n- Current time: {{current_time}}\n</context>\n<memory>\n</memory>"
+        msgs_in = [{"role": "system", "content": raw_sys}, {"role": "user", "content": "hi"}]
+        out_leg = tcr.apply_turn_context_to_messages(
+            msgs_in, memory_str=None, current_time_str="21:30", mode="legacy"
+        )
+        self.assertEqual(msgs_in[0]["content"], raw_sys, "legacy mode must not mutate caller msgs[0] in place")
+        self.assertNotIn("{{current_time}}", out_leg[0]["content"])
+        self.assertIn("21:30", out_leg[0]["content"])
+
+        # 3. Multimodal content list: preserves image_url and strips stale <turn_context> on next turn
+        mm_t1 = [
+            {"role": "system", "content": "Persona\n<context>\n- Current time: 09:00\n</context>"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "帮我看看这张图"},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
+                ],
+            },
+        ]
+        out_mm1 = tcr.apply_turn_context_to_messages(mm_t1, memory_str="M1", mode="split")
+        self.assertIsInstance(out_mm1[1]["content"], list)
+        self.assertTrue(any(p.get("type") == "image_url" for p in out_mm1[1]["content"]))
+        self.assertIn("<turn_context>", out_mm1[1]["content"][0]["text"])
+
+        mm_t2 = [
+            {"role": "system", "content": "Persona\n<context>\n- Current time: 09:05\n</context>"},
+            out_mm1[1],
+            {"role": "assistant", "content": "[gentle] 这是一张测试图片。"},
+            {"role": "user", "content": "那接下来呢？"},
+        ]
+        out_mm2 = tcr.apply_turn_context_to_messages(mm_t2, memory_str="M2", mode="split")
+        self.assertEqual(out_mm1[0]["content"], out_mm2[0]["content"])
+        # Historical multimodal turn stripped of <turn_context> while retaining text & image_url
+        self.assertEqual(len(out_mm2[1]["content"]), 2)
+        self.assertEqual(out_mm2[1]["content"][0]["text"], "帮我看看这张图")
+        self.assertEqual(out_mm2[1]["content"][1]["type"], "image_url")
+        self.assertIn("M2", out_mm2[3]["content"])
+
+        # 4. Tool-call follow-up round keeps assistant tool_calls and tool result intact
+        tool_msgs = [
+            {"role": "system", "content": "Persona\n<context>\n- Current time: 09:10\n</context>"},
+            {"role": "user", "content": "帮我看下屏幕"},
+            {"role": "assistant", "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "pc_look_at_screen", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "tc1", "content": "屏幕上是一个浏览器窗口"},
+        ]
+        out_tool = tcr.apply_turn_context_to_messages(tool_msgs, memory_str="M3", mode="split")
+        self.assertNotIn("<context>", out_tool[0]["content"])
+        self.assertIn("M3", out_tool[1]["content"])
+        self.assertEqual(out_tool[2]["tool_calls"][0]["id"], "tc1")
+        self.assertEqual(out_tool[3]["role"], "tool")
+
 
 @unittest.skipUnless(
     _HAS_XIAOZHI_CORE and _RUN_LIVE_TESTS,
@@ -3337,6 +4640,17 @@ class TestLiveOnlineIntegration(unittest.TestCase):
             self.assertEqual(r_ok.status_code, 200)
             self.assertTrue(r_ok.json().get("ok"))
 
+            # A-2: Host 18900 /mode endpoint is authenticated and backed by host_state
+            self.assertEqual(client.get("http://host.docker.internal:18900/mode").status_code, 401)
+            r_mode = client.get(
+                "http://host.docker.internal:18900/mode",
+                headers={"Authorization": f"Bearer {tok}"},
+            )
+            self.assertEqual(r_mode.status_code, 200)
+            mode_body = r_mode.json()
+            self.assertEqual(mode_body.get("source"), "host_state")
+            self.assertIn(mode_body.get("mode"), ("off", "safe", "full"))
+
         class _DummyConn:
             pass
 
@@ -3353,12 +4667,21 @@ class TestLiveOnlineIntegration(unittest.TestCase):
         asyncio.run(_verify_mcp())
 
     def test_live_18080_state_and_csrf_protection(self):
+        import re
         import httpx
 
         with httpx.Client(timeout=4.0, trust_env=False) as client:
             r_hlth = client.get("http://127.0.0.1:18080/api/health")
             self.assertEqual(r_hlth.status_code, 200)
             self.assertTrue(r_hlth.json().get("ok"))
+
+            # A-4: GET / injects per-boot X-Console-Token and disables caching
+            r_root = client.get("http://127.0.0.1:18080/")
+            self.assertEqual(r_root.status_code, 200)
+            self.assertIn("no-store", r_root.headers.get("cache-control", "").lower())
+            m_tok = re.search(r'<meta\s+name="console-token"\s+content="([^"]+)"', r_root.text)
+            self.assertIsNotNone(m_tok, "Live 18080 HTML missing console-token meta tag")
+            console_tok = m_tok.group(1)
 
             r_st = client.get("http://127.0.0.1:18080/api/state")
             self.assertEqual(r_st.status_code, 200)
@@ -3368,6 +4691,7 @@ class TestLiveOnlineIntegration(unittest.TestCase):
             self.assertTrue((cfg.get("l3_backend") or {}).get("mcp_online"))
             self.assertNotIn("latency", st_body)
             self.assertIn("idle_farewell", cfg)
+            self.assertIn("llm_cache", cfg)
             self.assertIn("log_cursor", st_body)
 
             cur_seq = int(st_body["log_cursor"])
@@ -3382,46 +4706,140 @@ class TestLiveOnlineIntegration(unittest.TestCase):
             r_lat = client.get("http://127.0.0.1:18080/api/latency")
             self.assertEqual(r_lat.status_code, 404)
 
+            # A-4: Host: xiaozhi-esp32-server restricted to read-only health/state
+            self.assertEqual(
+                client.get("http://127.0.0.1:18080/api/health", headers={"Host": "xiaozhi-esp32-server:18080"}).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.get("http://127.0.0.1:18080/", headers={"Host": "xiaozhi-esp32-server:18080"}).status_code,
+                403,
+            )
+            self.assertEqual(
+                client.post(
+                    "http://127.0.0.1:18080/api/pc-mode",
+                    json={"mode": "full"},
+                    headers={"Host": "xiaozhi-esp32-server:18080", "X-Console-Token": console_tok},
+                ).status_code,
+                403,
+            )
+
+            # A-4: POST without / with wrong X-Console-Token rejected with 401
+            self.assertEqual(
+                client.post(
+                    "http://127.0.0.1:18080/api/pc-mode",
+                    json={"mode": "safe"},
+                ).status_code,
+                401,
+            )
+            self.assertEqual(
+                client.post(
+                    "http://127.0.0.1:18080/api/pc-mode",
+                    json={"mode": "safe"},
+                    headers={"X-Console-Token": "wrong-live-token"},
+                ).status_code,
+                401,
+            )
+
             r_ct = client.post(
                 "http://127.0.0.1:18080/api/pc-mode",
                 content="mode=full",
-                headers={"Content-Type": "text/plain"},
+                headers={"Content-Type": "text/plain", "X-Console-Token": console_tok},
             )
             self.assertEqual(r_ct.status_code, 415)
 
             r_ct_spoof = client.post(
                 "http://127.0.0.1:18080/api/pc-mode",
                 content='{"mode":"full"}',
-                headers={"Content-Type": "application/json-evil"},
+                headers={"Content-Type": "application/json-evil", "X-Console-Token": console_tok},
             )
             self.assertEqual(r_ct_spoof.status_code, 415)
 
             r_bad_arr = client.post(
                 "http://127.0.0.1:18080/api/pc-mode",
                 content="[]",
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "X-Console-Token": console_tok},
             )
             self.assertEqual(r_bad_arr.status_code, 400)
 
             r_bad_json = client.post(
                 "http://127.0.0.1:18080/api/pc-mode",
                 content="{bad",
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "X-Console-Token": console_tok},
             )
             self.assertEqual(r_bad_json.status_code, 400)
 
             r_orig = client.post(
                 "http://127.0.0.1:18080/api/pc-mode",
                 json={"mode": "full"},
-                headers={"Origin": "https://evil.example"},
+                headers={"Origin": "https://evil.example", "X-Console-Token": console_tok},
             )
             self.assertEqual(r_orig.status_code, 403)
 
             r_l3_evil = client.post(
                 "http://127.0.0.1:18080/api/l3-backend",
                 json={"backend": "dsh", "dsh_cmd": "calc.exe"},
+                headers={"X-Console-Token": console_tok},
             )
             self.assertEqual(r_l3_evil.status_code, 400)
+
+    def test_live_a1_container_mount_isolation(self):
+        """A-1: Main container sees zero *.bin, token files, anima-data, or .ckpt/.pth, and ro mounts reject writes."""
+        scan_roots = [
+            "/opt/xiaozhi-esp32-server/app",
+            "/opt/xiaozhi-esp32-server/config_templates",
+            "/opt/xiaozhi-esp32-server/data",
+            "/opt/xiaozhi-esp32-server/state",
+            "/opt/xiaozhi-esp32-server/voices",
+        ]
+        forbidden_hits: list[str] = []
+        for root in scan_roots:
+            if not os.path.isdir(root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(root):
+                for dn in dirnames:
+                    if dn.lower() in ("anima", "anima-data", "secrets", "backups"):
+                        forbidden_hits.append(os.path.join(dirpath, dn))
+                for fn in filenames:
+                    low = fn.lower()
+                    if (
+                        low.endswith((".bin", ".ckpt", ".pth"))
+                        or "token.txt" in low
+                        or low.startswith("brain.sqlite3")
+                    ):
+                        forbidden_hits.append(os.path.join(dirpath, fn))
+        self.assertEqual(forbidden_hits, [], f"Forbidden sensitive/host files visible in container: {forbidden_hits}")
+
+        # Verify read-only mounts actually reject writes
+        for ro_probe in (
+            "/opt/xiaozhi-esp32-server/app/.ro_write_probe",
+            "/opt/xiaozhi-esp32-server/config_templates/.ro_write_probe",
+            "/opt/xiaozhi-esp32-server/voices/.ro_write_probe",
+        ):
+            with self.assertRaises(OSError, msg=f"Expected read-only mount at {ro_probe}"):
+                with open(ro_probe, "w", encoding="utf-8") as f:
+                    f.write("should-fail")
+        with self.assertRaises(OSError, msg="Expected .mcp_server_settings.json to be read-only"):
+            with open("/opt/xiaozhi-esp32-server/data/.mcp_server_settings.json", "a", encoding="utf-8") as f:
+                f.write(" ")
+
+    def test_live_f3_gsv_prime_endpoint(self):
+        """F-3: Live 19880 POST /prime works and startup warmup populated >=7 emotion cache slots."""
+        import httpx
+
+        with httpx.Client(timeout=5.0, trust_env=False) as client:
+            r = client.post(
+                "http://host.docker.internal:19880/prime",
+                json={"skip_if_busy": True, "reason": "live_integration_test"},
+            )
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            self.assertTrue(body.get("ok"), f"Unexpected /prime response: {body}")
+            self.assertGreaterEqual(
+                int(body.get("cache_slots") or 0),
+                7,
+                f"Expected >=7 primed emotion cache slots after startup warmup, got: {body}",
+            )
 
     def test_live_18000_18003_esp32_auth_enforcement(self):
         import asyncio

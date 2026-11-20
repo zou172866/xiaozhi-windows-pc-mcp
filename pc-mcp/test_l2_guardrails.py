@@ -23,6 +23,8 @@ import l3_backends
 import pc_control_mcp as pcm
 
 _ORIG_L2_AUDIT_LOG_FILE = pcm.L2_AUDIT_LOG_FILE
+_ORIG_MODE_FILE = pcm.MODE_FILE
+_ORIG_TOKEN_FILE = pcm.TOKEN_FILE
 
 
 _BENIGN_FG = {
@@ -48,8 +50,10 @@ class TestL2GuardrailsAndL3Gate(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
+        pcm.clear_emergency_stop()
 
     def tearDown(self):
+        pcm.clear_emergency_stop()
         for p in reversed(self._patches):
             p.stop()
         self._tmp.cleanup()
@@ -73,6 +77,12 @@ class TestL2GuardrailsAndL3Gate(unittest.TestCase):
             p = getattr(pcm, attr).resolve()
             self.assertTrue(p.is_relative_to(expected_state), f"{attr}={p} must live under {expected_state}")
             self.assertFalse(p.is_relative_to(data_dir), f"{attr}={p} must NOT live under container-mounted data/")
+        # A-2 / A-1: authoritative MODE_FILE under pc-mcp/state/, TOKEN_FILE under secrets/, FAILSAFE enabled
+        self.assertEqual(_ORIG_MODE_FILE.resolve(), expected_state / "pc_control_mode.json")
+        self.assertFalse(_ORIG_MODE_FILE.resolve().is_relative_to(data_dir))
+        self.assertTrue(_ORIG_TOKEN_FILE.resolve().is_relative_to((MCP_DIR.parent / "secrets").resolve()))
+        self.assertFalse(_ORIG_TOKEN_FILE.resolve().is_relative_to(data_dir))
+        self.assertTrue(pcm.pyautogui.FAILSAFE, "PyAutoGUI FAILSAFE must remain enabled by default (A-3)")
 
     def test_default_mode_fallback_when_missing_or_corrupt(self):
         # 1. Missing mode file -> safe
@@ -500,6 +510,501 @@ class TestL2GuardrailsAndL3Gate(unittest.TestCase):
                     self.assertTrue(j_ok2["l3_mode_allowed"])
 
         asyncio.run(_exercise())
+
+    def test_a3_explorer_address_bar_start_search_and_taskmgr_new_task_blocked(self):
+        """A-3: Block Explorer CabinetWClass address bar, SearchHost, StartMenuExperienceHost & TaskMgr Run New Task."""
+        self._set_mode("full")
+        bypass_windows = [
+            # Explorer CabinetWClass address bar (Win10 Edit + Win11 AutoSuggestBox EditControl)
+            {
+                "hwnd": 201,
+                "pid": 601,
+                "process": "explorer.exe",
+                "class": "CabinetWClass",
+                "title": "本地磁盘 (C:)",
+                "focused_control": {
+                    "control_type": "EditControl",
+                    "class": "Edit",
+                    "automation_id": "41477",
+                    "name": "地址",
+                    "ancestor_names": "Address Band Root | ToolbarWindow32",
+                },
+            },
+            {
+                "hwnd": 202,
+                "pid": 601,
+                "process": "explorer.exe",
+                "class": "CabinetWClass",
+                "title": "文档",
+                "focused_control": {
+                    "control_type": "Edit",
+                    "class": "RichEditD2DPT",
+                    "automation_id": "1001",
+                    "name": "Address: C:\\Users",
+                },
+            },
+            {
+                "hwnd": 203,
+                "pid": 601,
+                "process": "explorer.exe",
+                "class": "CabinetWClass",
+                "title": "下载",
+                "focused_control": {
+                    "control_type": "EditControl",
+                    "name": "搜索 下载",
+                    "automation_id": "SearchEditBox",
+                },
+            },
+            # Start menu & Windows Search
+            {
+                "hwnd": 204,
+                "pid": 602,
+                "process": "SearchHost.exe",
+                "class": "Windows.UI.Core.CoreWindow",
+                "title": "搜索",
+            },
+            {
+                "hwnd": 205,
+                "pid": 603,
+                "process": "StartMenuExperienceHost.exe",
+                "class": "Windows.UI.Core.CoreWindow",
+                "title": "开始",
+            },
+            # Task Manager "Run new task" / "创建新任务" (including elevated empty process name)
+            {
+                "hwnd": 206,
+                "pid": 604,
+                "process": "",
+                "class": "#32770",
+                "title": "创建新任务",
+            },
+            {
+                "hwnd": 207,
+                "pid": 605,
+                "process": "",
+                "class": "#32770",
+                "title": "Create new task",
+            },
+            {
+                "hwnd": 208,
+                "pid": 606,
+                "process": "taskmgr.exe",
+                "class": "#32770",
+                "title": "运行新任务",
+            },
+        ]
+
+        with (
+            patch.object(pcm.pyautogui, "hotkey") as m_hk,
+            patch.object(pcm.pyautogui, "press") as m_press,
+            patch.object(pcm.pyperclip, "copy") as m_copy,
+            patch.object(pcm.time, "sleep"),
+        ):
+            for fg in bypass_windows:
+                with patch.object(pcm, "_get_foreground_window_info", return_value=fg):
+                    m_hk.reset_mock()
+                    m_press.reset_mock()
+                    m_copy.reset_mock()
+                    res = pcm.pc_ui_action(
+                        action="type_text",
+                        text="powershell -c calc.exe",
+                        press_enter=True,
+                    )
+                    self.assertIn("安全护栏已拦截", res, f"Expected bypass block for {fg}, got: {res}")
+                    m_copy.assert_not_called()
+                    m_hk.assert_not_called()
+                    m_press.assert_not_called()
+
+        # Also block Explorer address-bar focus hotkeys (Alt+D, Ctrl+L, F4) when CabinetWClass is foreground
+        explorer_fg = {
+            "hwnd": 209,
+            "pid": 601,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "文件资源管理器",
+        }
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=explorer_fg),
+            patch.object(pcm.pyautogui, "hotkey") as m_hk,
+        ):
+            for combo in ("alt+d", "ctrl+l", "f4"):
+                m_hk.reset_mock()
+                res = pcm.pc_ui_action(action="hotkey", hotkey=combo)
+                self.assertIn("安全护栏已拦截", res, f"Expected Explorer hotkey {combo} blocked, got: {res}")
+                m_hk.assert_not_called()
+
+    def test_a3_click_and_right_click_foreground_and_target_terminal_guard(self):
+        """A-3: Refuse right_click (and terminal-targeted clicks) on conhost/WindowsTerminal/Run/AddressBar."""
+        self._set_mode("full")
+        wt_fg = {
+            "hwnd": 301,
+            "pid": 701,
+            "process": "WindowsTerminal.exe",
+            "class": "CASCADIA_HOSTING_WINDOW_CLASS",
+            "title": "Windows PowerShell",
+        }
+        conhost_fg = {
+            "hwnd": 302,
+            "pid": 702,
+            "process": "conhost.exe",
+            "class": "ConsoleWindowClass",
+            "title": "命令提示符",
+        }
+        explorer_addr_pt = {
+            "hwnd": 303,
+            "pid": 703,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "此电脑",
+            "point_control": {"hwnd": 304, "class": "Edit", "name": "地址"},
+        }
+
+        with (
+            patch.object(pcm.pyautogui, "moveTo") as m_move,
+            patch.object(pcm.pyautogui, "click") as m_click,
+            patch.object(pcm.pyautogui, "rightClick") as m_rclick,
+            patch.object(pcm.time, "sleep"),
+        ):
+            # 1. Foreground is Windows Terminal or conhost -> right_click MUST be rejected even with coords
+            for term_fg in (wt_fg, conhost_fg):
+                with (
+                    patch.object(pcm, "_get_foreground_window_info", return_value=term_fg),
+                    patch.object(pcm, "_get_window_info_at_point", return_value=term_fg),
+                ):
+                    res = pcm.pc_ui_action(action="right_click", x=500, y=500)
+                    self.assertIn("安全护栏已拦截", res)
+                    m_rclick.assert_not_called()
+                    m_move.assert_not_called()
+
+            # 2. Foreground is benign Notepad, but right_click target point is over Windows Terminal -> rejected!
+            with (
+                patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+                patch.object(pcm, "_get_window_info_at_point", return_value=wt_fg),
+            ):
+                res = pcm.pc_ui_action(action="right_click", x=900, y=500)
+                self.assertIn("安全护栏已拦截", res)
+                m_rclick.assert_not_called()
+
+            # 3. Left click directly targeting Explorer address bar Edit control -> rejected!
+            with (
+                patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+                patch.object(pcm, "_get_window_info_at_point", return_value=explorer_addr_pt),
+            ):
+                res = pcm.pc_ui_action(action="click", x=400, y=60)
+                self.assertIn("安全护栏已拦截", res)
+                m_click.assert_not_called()
+
+            # 4. Right click on benign window -> allowed
+            with (
+                patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+                patch.object(pcm, "_get_window_info_at_point", return_value=_BENIGN_FG),
+            ):
+                res = pcm.pc_ui_action(action="right_click", x=300, y=300)
+                self.assertIn("右键点击", res)
+                m_rclick.assert_called_once_with(300, 300)
+
+    def test_a3_clipboard_always_cleared_when_empty_and_restored_when_nonempty(self):
+        """A-3: Clipboard must be emptied if originally empty, and restored if originally containing text."""
+        self._set_mode("full")
+
+        # Case 1: Originally empty clipboard -> typed text MUST be cleared (never left behind in clipboard)
+        clip_state = {"val": ""}
+
+        def _fake_copy(val):
+            clip_state["val"] = val
+
+        def _fake_paste():
+            return clip_state["val"]
+
+        fake_clip = MagicMock()
+        fake_clip.copy.side_effect = _fake_copy
+        fake_clip.paste.side_effect = _fake_paste
+
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+            patch.object(pcm._user32, "IsClipboardFormatAvailable", return_value=0),
+            patch.object(pcm, "pyperclip", fake_clip),
+            patch.object(pcm.pyautogui, "hotkey"),
+            patch.object(pcm.time, "sleep"),
+        ):
+            res = pcm.pc_ui_action(action="type_text", text="secret-command-never-linger")
+            self.assertIn("已输入文本", res)
+        self.assertEqual(clip_state["val"], "", "Typed text leaked in clipboard when original clipboard was empty")
+
+        # Case 2: Originally non-empty clipboard -> old text MUST be restored even if paste raises
+        clip_state["val"] = "user-original-clip"
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+            patch.object(pcm._user32, "IsClipboardFormatAvailable", return_value=1),
+            patch.object(pcm, "pyperclip", fake_clip),
+            patch.object(pcm.pyautogui, "hotkey", side_effect=RuntimeError("simulated paste fail")),
+            patch.object(pcm.time, "sleep"),
+        ):
+            with self.assertRaises(RuntimeError):
+                pcm.pc_ui_action(action="type_text", text="temporary-input")
+        self.assertEqual(clip_state["val"], "user-original-clip")
+
+        # Case 3: Direct Win32 _clear_clipboard uses OpenClipboard + EmptyClipboard + CloseClipboard
+        fake_u32 = MagicMock()
+        fake_u32.OpenClipboard.return_value = 1
+        real_like_clip = type("ClipObj", (), {"copy": staticmethod(lambda s: None)})()
+        pcm._clear_clipboard(fake_u32, real_like_clip)
+        fake_u32.OpenClipboard.assert_called_once_with(0)
+        fake_u32.EmptyClipboard.assert_called_once()
+        fake_u32.CloseClipboard.assert_called_once()
+
+    def test_a3_emergency_stop_and_failsafe_downgrade_to_safe(self):
+        """A-3: Global emergency stop (Ctrl+Alt+Pause) and PyAutoGUI FailSafe immediately abort L2 and downgrade to safe."""
+        self._set_mode("full")
+        self.assertEqual(pcm._get_mode(), "full")
+
+        # 1. Trigger emergency stop -> downgrades host MODE_FILE to safe & sets stop flag
+        res = pcm.trigger_emergency_stop("hotkey:ctrl+alt+pause")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["mode"], "safe")
+        self.assertEqual(pcm._get_mode(), "safe")
+        self.assertTrue(pcm.is_emergency_stop_active())
+
+        # Subsequent L2 call is blocked by mode=safe (and if mode forced full without clearing estop, blocked by estop)
+        self._set_mode("full")
+        with patch.object(pcm.pyautogui, "click") as m_clk:
+            blocked_res = pcm.pc_ui_action(action="click", x=100, y=100)
+            self.assertIn("急停", blocked_res)
+            m_clk.assert_not_called()
+
+        # 2. Switching mode via set_host_mode clears emergency stop cleanly
+        pcm.set_host_mode("full", source="http_api")
+        self.assertFalse(pcm.is_emergency_stop_active())
+
+        # 3. PyAutoGUI FailSafeException during action triggers emergency stop & downgrades to safe
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+            patch.object(pcm, "_get_window_info_at_point", return_value=_BENIGN_FG),
+            patch.object(pcm.pyautogui, "moveTo", side_effect=pcm.pyautogui.FailSafeException("corner")),
+        ):
+            fs_res = pcm.pc_ui_action(action="click", x=10, y=10)
+            self.assertIn("FAILSAFE", fs_res)
+        self.assertEqual(pcm._get_mode(), "safe")
+        self.assertTrue(pcm.is_emergency_stop_active())
+
+    def test_a2_http_mode_endpoint_auth_persistence_and_full_audit(self):
+        """A-2: GET/POST /mode enforces Bearer auth, writes host-private MODE_FILE, and audits switching to full."""
+        tok = "test-a2-mode-token-abcdefghijklmnopqrstuvwxyz"
+        app = pcm.create_secured_asgi_app(tok, port=18900, bind_host="127.0.0.1")
+        headers = {
+            "Host": "127.0.0.1:18900",
+            "Authorization": f"Bearer {tok}",
+        }
+
+        async def _exercise():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18900") as client:
+                # 1. Missing Bearer token -> 401
+                r_unauth = await client.post("/mode", headers={"Host": "127.0.0.1:18900"}, json={"mode": "full"})
+                self.assertEqual(r_unauth.status_code, 401)
+
+                # 2. Initial GET /mode defaults to safe
+                r_get0 = await client.get("/mode", headers=headers)
+                self.assertEqual(r_get0.status_code, 200)
+                self.assertEqual(r_get0.json()["mode"], "safe")
+
+                # 3. Invalid mode or extra field -> 400
+                r_bad1 = await client.post("/mode", headers=headers, json={"mode": "root"})
+                self.assertEqual(r_bad1.status_code, 400)
+                r_bad2 = await client.post("/mode", headers=headers, json={"mode": "full", "extra": 1})
+                self.assertEqual(r_bad2.status_code, 400)
+
+                # 4. Valid switch to full -> 200, persists host MODE_FILE, and logs audit record
+                r_full = await client.post("/mode", headers=headers, json={"mode": "full"})
+                self.assertEqual(r_full.status_code, 200, r_full.text)
+                self.assertEqual(r_full.json()["mode"], "full")
+                self.assertEqual(pcm._get_mode(), "full")
+
+                # 5. Switch back to off -> 200
+                r_off = await client.post("/mode", headers=headers, json={"mode": "off"})
+                self.assertEqual(r_off.status_code, 200)
+                self.assertEqual(pcm._get_mode(), "off")
+
+        asyncio.run(_exercise())
+
+        recs = self._read_audit_records()
+        full_audits = [r for r in recs if r["tool"] == "pc_mode" and r["reason"] == "mode_escalated_to_full"]
+        self.assertEqual(len(full_audits), 1)
+        self.assertEqual(full_audits[0]["mode"], "full")
+        self.assertIn("safe->full", full_audits[0]["detail"])
+
+    def test_a3_emergency_stop_hotkey_registers_vk_cancel_and_vk_pause_and_dispatches(self):
+        """A-3: Hotkey listener registers BOTH VK_CANCEL (0x03, physical Ctrl+Alt+Pause) and VK_PAUSE (0x13)."""
+        import ctypes
+        import pc_mcp_modules.security as sec_mod
+
+        self._set_mode("full")
+        registered_calls: list[tuple[int, int, int]] = []
+        unregistered_ids: list[int] = []
+        msg_step = {"n": 0}
+
+        def _fake_register(hwnd, hk_id, mods, vk):
+            registered_calls.append((hk_id, mods, vk))
+            return 1
+
+        def _fake_get_msg(msg_ptr, hwnd, fmin, fmax):
+            msg_step["n"] += 1
+            if msg_step["n"] == 1:
+                m = ctypes.cast(msg_ptr, ctypes.POINTER(ctypes.wintypes.MSG)).contents
+                m.message = sec_mod._WM_HOTKEY
+                m.wParam = sec_mod._EMERGENCY_HOTKEY_CANCEL_ID
+                return 1
+            return 0  # WM_QUIT
+
+        def _fake_unregister(hwnd, hk_id):
+            unregistered_ids.append(hk_id)
+            return 1
+
+        fake_u32 = MagicMock()
+        fake_u32.RegisterHotKey.side_effect = _fake_register
+        fake_u32.GetMessageW.side_effect = _fake_get_msg
+        fake_u32.UnregisterHotKey.side_effect = _fake_unregister
+        fake_u32.PostThreadMessageW.return_value = 1
+
+        fake_k32 = MagicMock()
+        fake_k32.GetCurrentThreadId.return_value = 424242
+
+        sec_mod.stop_emergency_stop_hotkey_listener()
+        try:
+            with (
+                patch.object(pcm, "_user32", fake_u32),
+                patch.object(pcm, "_kernel32", fake_k32),
+            ):
+                t = sec_mod.start_emergency_stop_hotkey_listener()
+                self.assertIsNotNone(t)
+                t.join(timeout=2.0)
+                self.assertFalse(t.is_alive())
+        finally:
+            sec_mod.stop_emergency_stop_hotkey_listener()
+
+        vks = {vk for _, _, vk in registered_calls}
+        self.assertIn(sec_mod._VK_CANCEL, vks, "Must register VK_CANCEL (0x03) for physical Ctrl+Alt+Pause/Break")
+        self.assertIn(sec_mod._VK_PAUSE, vks, "Must also register VK_PAUSE (0x13) for virtual keyboards")
+        self.assertEqual(set(unregistered_ids), {sec_mod._EMERGENCY_HOTKEY_CANCEL_ID, sec_mod._EMERGENCY_HOTKEY_ID})
+        self.assertTrue(pcm.is_emergency_stop_active())
+        self.assertEqual(pcm._get_mode(), "safe")
+
+    def test_a3_explorer_xaml_f3_type_text_click_guard_and_clipboard_edge_cases(self):
+        """A-3: Win10/11 XAML Explorer address bar click, F3 hotkey, type_text click guard, and clipboard fail-safety."""
+        self._set_mode("full")
+
+        # 1. Win11 XAML Islands address bar click (single DesktopChildSiteBridge HWND enriched via UIA)
+        xaml_addr_pt = {
+            "hwnd": 401,
+            "pid": 801,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "文件资源管理器",
+            "point_control": {
+                "hwnd": 402,
+                "class": "Microsoft.UI.Content.DesktopChildSiteBridge",
+                "uia_class": "AutoSuggestBox",
+                "control_type": "EditControl",
+                "name": "地址栏",
+            },
+        }
+        # 2. Win11 XAML bridge when UIA fails -> fail-closed
+        xaml_uia_err_pt = {
+            "hwnd": 401,
+            "pid": 801,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "文件资源管理器",
+            "point_control": {
+                "hwnd": 402,
+                "class": "Microsoft.UI.Content.DesktopChildSiteBridge",
+                "uia_error": True,
+            },
+        }
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+            patch.object(pcm.pyautogui, "click") as m_clk,
+            patch.object(pcm.pyautogui, "moveTo") as m_mv,
+        ):
+            for pt in (xaml_addr_pt, xaml_uia_err_pt):
+                with patch.object(pcm, "_get_window_info_at_point", return_value=pt):
+                    res = pcm.pc_ui_action(action="click", x=300, y=55)
+                    self.assertIn("安全护栏已拦截", res)
+                    m_clk.assert_not_called()
+                    m_mv.assert_not_called()
+
+        # 3. Explorer F3 hotkey blocked
+        explorer_fg = {"hwnd": 401, "pid": 801, "process": "explorer.exe", "class": "CabinetWClass", "title": "此电脑"}
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=explorer_fg),
+            patch.object(pcm.pyautogui, "hotkey") as m_hk,
+        ):
+            res_f3 = pcm.pc_ui_action(action="hotkey", hotkey="f3")
+            self.assertIn("安全护栏已拦截", res_f3)
+            m_hk.assert_not_called()
+
+        # 4. type_text with element_name when foreground is terminal and WindowFromPoint returns None -> NO blind click!
+        wt_fg = {
+            "hwnd": 405,
+            "pid": 805,
+            "process": "WindowsTerminal.exe",
+            "class": "CASCADIA_HOSTING_WINDOW_CLASS",
+            "title": "PowerShell",
+        }
+        with (
+            patch.object(pcm, "_smart_locate_target", return_value=(500, 500, "输入框")),
+            patch.object(pcm, "_get_foreground_window_info", return_value=wt_fg),
+            patch.object(pcm, "_get_window_info_at_point", return_value=None),
+            patch.object(pcm.pyautogui, "moveTo") as m_mv,
+            patch.object(pcm.pyautogui, "click") as m_clk,
+        ):
+            res_tt = pcm.pc_ui_action(action="type_text", element_name="输入框", text="whoami")
+            self.assertIn("安全护栏已拦截", res_tt)
+            m_mv.assert_not_called()
+            m_clk.assert_not_called()
+
+        # 5. Clipboard: if restore clip.copy(old_clip) fails in finally, fallback MUST call _clear_clipboard
+        copy_calls: list[str] = []
+
+        def _flaky_copy(val):
+            copy_calls.append(val)
+            if val == "orig-clip":
+                raise RuntimeError("clipboard locked during restore")
+
+        fake_clip = MagicMock()
+        fake_clip.copy.side_effect = _flaky_copy
+        fake_clip.paste.return_value = "orig-clip"
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+            patch.object(pcm._user32, "IsClipboardFormatAvailable", return_value=1),
+            patch.object(pcm, "pyperclip", fake_clip),
+            patch.object(pcm, "_clear_clipboard") as m_clear,
+            patch.object(pcm.pyautogui, "hotkey"),
+            patch.object(pcm.time, "sleep"),
+        ):
+            res_cb = pcm.pc_ui_action(action="type_text", text="secret-typed-text")
+            self.assertIn("已输入文本", res_cb)
+            m_clear.assert_called_once()
+
+        # 6. Clipboard: if estop fires right before clip.copy(text), non-text clipboard MUST NOT be wiped
+        estop_calls = {"n": 0}
+
+        def _estop_before_copy():
+            estop_calls["n"] += 1
+            return estop_calls["n"] >= 3  # allow entry + post-target check, trigger right before clip.copy
+
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+            patch.object(pcm._user32, "IsClipboardFormatAvailable", return_value=0),
+            patch.object(pcm, "is_emergency_stop_active", side_effect=_estop_before_copy),
+            patch.object(pcm, "_clear_clipboard") as m_clear2,
+            patch.object(pcm.pyperclip, "copy") as m_copy2,
+            patch.object(pcm.time, "sleep"),
+        ):
+            res_es = pcm.pc_ui_action(action="type_text", text="should-abort")
+            self.assertIn("急停", res_es)
+            m_copy2.assert_not_called()
+            m_clear2.assert_not_called()
 
 
 if __name__ == "__main__":

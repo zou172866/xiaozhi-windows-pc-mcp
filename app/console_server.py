@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import secrets
 import socket
 import struct
 import threading
@@ -12,7 +13,7 @@ import wave
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import edge_tts
 import httpx
@@ -24,41 +25,57 @@ import pc_audio_router
 import reply_length_router
 import runtime_events
 import runtime_settings
+import turn_context_router
 import xz_common
 
-ROOT_DIR = "/opt/xiaozhi-esp32-server"
-DATA_DIR = os.path.join(ROOT_DIR, "data")
-CONFIG_PATH = os.path.join(DATA_DIR, ".config.yaml")
-HTML_PATH = os.path.join(DATA_DIR, "console.html")
-HISTORY_PATH = os.path.join(DATA_DIR, "chat_history.json")
-LOG_CURSOR_PATH = os.path.join(DATA_DIR, ".console_log_cursor.json")
-_DEFAULT_MODE_PATH = os.path.join(DATA_DIR, "pc_control_mode.json")
+ROOT_DIR = xz_common.ROOT_DIR
+APP_DIR = xz_common.APP_DIR
+CONFIG_DIR = xz_common.CONFIG_DIR
+STATE_DIR = xz_common.STATE_DIR
+VOICES_DIR = xz_common.VOICES_DIR
+DATA_DIR = CONFIG_DIR
+CONFIG_PATH = os.path.join(CONFIG_DIR, ".config.yaml")
+HTML_PATH = os.path.join(APP_DIR, "console.html")
+HISTORY_PATH = os.path.join(STATE_DIR, "chat_history.json")
+LOG_CURSOR_PATH = os.path.join(STATE_DIR, ".console_log_cursor.json")
+_DEFAULT_MODE_PATH = os.path.join(STATE_DIR, "pc_control_mode.json")
 MODE_PATH = _DEFAULT_MODE_PATH
 LOG_PATH = os.path.join(ROOT_DIR, "tmp", "server.log")
 
 CONSOLE_PORT = int(os.environ.get("CONSOLE_PORT", "18080"))
 GSV_Host = "http://host.docker.internal:19880"
 PC_MCP_HOST = os.environ.get("PC_AUDIO_BRIDGE_URL", "http://host.docker.internal:18900").rstrip("/")
-GSV_INFER_YAML = os.path.join(DATA_DIR, "tts_infer_xiaozhi.yaml")
+GSV_INFER_YAML = os.path.join(CONFIG_DIR, "tts_infer_xiaozhi.yaml")
 ALLOWED_L3_UPDATE_KEYS = frozenset({"backend", "timeout_seconds", "timeout"})
 VALID_L3_BACKENDS = ("antigravity", "dsh", "workbuddy", "none")
-HOST_DATA_DIR = (
-    (os.environ.get("HOST_DATA_DIR") or "").replace("\\", "/").rstrip("/")
-    or DATA_DIR
-)
+_HOST_DIRS = xz_common.resolve_host_dirs()
+HOST_DATA_DIR = _HOST_DIRS["HOST_DATA_DIR"]
+HOST_PROJECT_DIR = _HOST_DIRS["HOST_PROJECT_DIR"]
+HOST_VOICES_DIR = _HOST_DIRS["HOST_VOICES_DIR"]
+HOST_GSV_WEIGHTS_DIR = _HOST_DIRS["HOST_GSV_WEIGHTS_DIR"]
 HOST_LAN_IP = (os.environ.get("HOST_LAN_IP") or "").strip() or "127.0.0.1"
+
+# A-4: Per-boot random write token injected into console.html and required via X-Console-Token on ALL POSTs
+_CONSOLE_WRITE_TOKEN = secrets.token_urlsafe(32)
+_CONSOLE_TOKEN_PLACEHOLDER = "__XIAOZHI_CONSOLE_TOKEN__"
+_INTERNAL_READONLY_PATHS = frozenset({"/api/health", "/api/state"})
+
+
+def get_console_token() -> str:
+    return _CONSOLE_WRITE_TOKEN
+
 
 GSV_PROFILES = {
     "__gsv_raiden_mei__": {
         "version": "v4",
-        "gpt_weights": f"{HOST_DATA_DIR}/voices/raiden_mei/v4/芽衣/芽衣-e10.ckpt",
-        "sovits_weights": f"{HOST_DATA_DIR}/voices/raiden_mei/v4/芽衣/芽衣_e10_s430_l32.pth",
+        "gpt_weights": f"{HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/芽衣/芽衣-e10.ckpt",
+        "sovits_weights": f"{HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/芽衣/芽衣_e10_s430_l32.pth",
         "block": {
             "type": "gpt_sovits_v2",
             "url": f"{GSV_Host}/tts",
             "output_dir": "tmp/",
             "text_lang": "zh",
-            "ref_audio_path": "${HOST_DATA_DIR}/voices/raiden_mei/mei_default_ref.wav",
+            "ref_audio_path": "${HOST_VOICES_DIR}/raiden_mei/mei_default_ref.wav",
             "aux_ref_audio_paths": [],
             "prompt_text": "今夜月色很美，呵...适合与朋友小聚一番。",
             "prompt_lang": "zh",
@@ -67,8 +84,6 @@ GSV_PROFILES = {
             "temperature": 0.98,
             "text_split_method": "cut0",
             "batch_size": 1,
-            "batch_threshold": 0.75,
-            "split_bucket": True,
             "return_fragment": False,
             "speed_factor": 1.0,
             "streaming_mode": False,
@@ -87,8 +102,8 @@ GSV_PROFILES = {
             "url": f"{GSV_Host}/tts",
             "output_dir": "tmp/",
             "text_lang": "zh",
-            "ref_audio_path": "${HOST_DATA_DIR}/xiaozhi_taiwan_ref.wav",
-            "aux_ref_audio_paths": ["${HOST_DATA_DIR}/xiaozhi_taiwan_aux.wav"],
+            "ref_audio_path": "${HOST_VOICES_DIR}/xiaozhi_taiwan_ref.wav",
+            "aux_ref_audio_paths": ["${HOST_VOICES_DIR}/xiaozhi_taiwan_aux.wav"],
             "prompt_text": "哈啰啊，我是小智啦，声音好听的台湾女孩一枚，超开心认识你耶，最近在忙啥？",
             "prompt_lang": "zh",
             "top_k": 12,
@@ -96,8 +111,6 @@ GSV_PROFILES = {
             "temperature": 0.98,
             "text_split_method": "cut0",
             "batch_size": 1,
-            "batch_threshold": 0.75,
-            "split_bucket": True,
             "return_fragment": False,
             "speed_factor": 1.04,
             "streaming_mode": False,
@@ -110,6 +123,34 @@ GSV_PROFILES = {
 # Share the exact same RLock with live ESP32 GPT-SoVITS synthesis (P1-14)
 _gsv_weights_lock = mei_emotion_router.GSV_GPU_LOCK
 _active_gsv_loaded = None
+_gsv_op_deadline_tls = threading.local()
+_GSV_PREVIEW_LOCK_MAX_SECONDS = 45.0
+EDGE_PREVIEW_TIMEOUT_SECONDS = 15.0
+_voice_dirty_lock = threading.Lock()
+_voice_dirty_target: str | None = None
+_voice_dirty_error: str = ""
+
+
+def _set_voice_dirty(target_voice: str | None, error_msg: str = "") -> None:
+    global _voice_dirty_target, _voice_dirty_error
+    with _voice_dirty_lock:
+        _voice_dirty_target = target_voice
+        _voice_dirty_error = _redact_secrets(error_msg) if error_msg else ""
+
+
+def _get_voice_dirty_state() -> tuple[str | None, str]:
+    with _voice_dirty_lock:
+        return _voice_dirty_target, _voice_dirty_error
+
+
+def _gsv_timeout_within_budget(default_timeout: float) -> float:
+    deadline = getattr(_gsv_op_deadline_tls, "deadline", None)
+    if deadline is None:
+        return float(default_timeout)
+    rem = float(deadline) - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError("GPU 锁持有时间已达到上限，中止试听以保护线上语音播报")
+    return min(float(default_timeout), rem)
 
 
 def _detect_boot_gsv_voice() -> str | None:
@@ -157,17 +198,25 @@ def _atomic_write_text(path: str, content: str) -> None:
     xz_common.atomic_write_text(path, content)
 
 
-def validate_console_request(method: str, headers: dict, port: int = CONSOLE_PORT) -> tuple[bool, int, str]:
-    """Validate Host and browser CSRF guards (Origin / Referer / Sec-Fetch-Site / Content-Type) on 18080."""
+def validate_console_request(
+    method: str,
+    headers: dict,
+    port: int = CONSOLE_PORT,
+    path: str = "",
+    expected_token: str | None = None,
+) -> tuple[bool, int, str]:
+    """Validate Host, internal-host read-only scope, browser CSRF guards, and per-boot X-Console-Token (A-4)."""
     norm_headers = {str(k).lower(): str(v).strip() for k, v in (headers or {}).items()}
-    allowed_hosts = {
+    local_hosts = {
         f"localhost:{port}",
         f"127.0.0.1:{port}",
         f"[::1]:{port}",
-        f"xiaozhi-esp32-server:{port}",
         "localhost",
         "127.0.0.1",
         "[::1]",
+    }
+    internal_hosts = {
+        f"xiaozhi-esp32-server:{port}",
         "xiaozhi-esp32-server",
     }
     allowed_origins = {
@@ -177,10 +226,25 @@ def validate_console_request(method: str, headers: dict, port: int = CONSOLE_POR
     }
 
     host = norm_headers.get("host", "").lower()
-    if not host or host not in allowed_hosts:
+    is_internal = host in internal_hosts
+    if not host or (host not in local_hosts and not is_internal):
         return False, int(HTTPStatus.MISDIRECTED_REQUEST), "Invalid Host header"
 
-    if str(method).upper() == "POST":
+    meth = str(method).upper()
+    req_path = urlparse(str(path or "")).path
+
+    # A-4: Internal container hostname `xiaozhi-esp32-server` may ONLY access necessary read-only APIs
+    # (never GET / HTML containing write token, and never any POST write endpoint).
+    if is_internal:
+        if meth != "GET" or req_path not in _INTERNAL_READONLY_PATHS:
+            return (
+                False,
+                int(HTTPStatus.FORBIDDEN),
+                "Host xiaozhi-esp32-server is restricted to read-only health/state endpoints",
+            )
+        return True, int(HTTPStatus.OK), ""
+
+    if meth == "POST":
         origin = norm_headers.get("origin", "").lower()
         if origin:
             if origin not in allowed_origins:
@@ -198,6 +262,15 @@ def validate_console_request(method: str, headers: dict, port: int = CONSOLE_POR
         media_type = content_type.split(";", 1)[0].strip()
         if media_type != "application/json":
             return False, int(HTTPStatus.UNSUPPORTED_MEDIA_TYPE), "POST Content-Type must be application/json"
+
+        # A-4: Require per-boot X-Console-Token on ALL POST endpoints
+        tok = _CONSOLE_WRITE_TOKEN if expected_token is None else str(expected_token)
+        supplied = norm_headers.get("x-console-token", "")
+        if not tok or not supplied or not secrets.compare_digest(
+            supplied.encode("utf-8", errors="replace"),
+            tok.encode("utf-8"),
+        ):
+            return False, int(HTTPStatus.UNAUTHORIZED), "Missing or invalid X-Console-Token"
 
     return True, int(HTTPStatus.OK), ""
 
@@ -232,13 +305,15 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
             _active_gsv_loaded = _detect_boot_gsv_voice()
         if _active_gsv_loaded != voice_id:
             client = _get_console_http_client()
-            r1 = client.get(f"{GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=25.0)
+            t_gpt = _gsv_timeout_within_budget(25.0)
+            r1 = client.get(f"{GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=t_gpt)
             if r1.status_code != 200:
                 raise RuntimeError(f"切换 GPT 权重失败 (HTTP {r1.status_code}): {r1.text[:160]}")
             # GPT weights are now mutated on GPU: mark state dirty (distinct from None) so a SoVITS
             # failure forces restoration instead of falling back to _detect_boot_gsv_voice().
             _active_gsv_loaded = "__dirty__"
-            r2 = client.get(f"{GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=30.0)
+            t_sov = _gsv_timeout_within_budget(30.0)
+            r2 = client.get(f"{GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=t_sov)
             if r2.status_code != 200:
                 raise RuntimeError(f"切换 SoVITS 权重失败 (HTTP {r2.status_code}): {r2.text[:160]}")
             _active_gsv_loaded = voice_id
@@ -500,9 +575,31 @@ def _save_history():
         pass
 
 
+_pc_mode_lock = threading.Lock()
+_pc_mode_cache: str = "safe"
+_pc_mode_online_cache: bool = False
+
+
+def _set_cached_pc_mode(mode: str, online: bool = True) -> None:
+    global _pc_mode_cache, _pc_mode_online_cache
+    m = str(mode or "safe").strip().lower()
+    if m not in ("off", "safe", "full"):
+        m = "safe"
+    with _pc_mode_lock:
+        _pc_mode_cache = m
+        _pc_mode_online_cache = bool(online)
+
+
+def _get_cached_pc_mode_online() -> bool:
+    with _pc_mode_lock:
+        return bool(_pc_mode_online_cache)
+
+
 def _read_pc_mode() -> str:
+    """Read PC control mode: cached host-18900 authority by default (A-2), or explicit test MODE_PATH."""
     if MODE_PATH == _DEFAULT_MODE_PATH:
-        return runtime_settings.get_pc_mode()
+        with _pc_mode_lock:
+            return _pc_mode_cache
     try:
         if os.path.exists(MODE_PATH):
             with open(MODE_PATH, "r", encoding="utf-8") as f:
@@ -514,11 +611,32 @@ def _read_pc_mode() -> str:
     return "safe"
 
 
-def _write_pc_mode(mode: str):
-    if MODE_PATH == _DEFAULT_MODE_PATH:
-        runtime_settings.set_pc_mode(mode)
-        return
-    xz_common.atomic_write_json(MODE_PATH, {"mode": mode})
+def _write_pc_mode(mode: str) -> dict:
+    """Switch PC control mode via authenticated host 18900 POST /mode (A-2; fail-closed if 18900 unreachable)."""
+    m = str(mode or "safe").strip().lower()
+    if m not in ("off", "safe", "full"):
+        raise ValueError("无效的权限挡位")
+    if MODE_PATH != _DEFAULT_MODE_PATH:
+        xz_common.atomic_write_json(MODE_PATH, {"mode": m})
+        return {"ok": True, "mode": m, "source": "local_test"}
+
+    client = _get_console_http_client()
+    resp = client.post(
+        f"{PC_MCP_HOST}/mode",
+        headers=pc_audio_router.get_pc_mcp_auth_headers(),
+        json={"mode": m},
+        timeout=3.0,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"宿主机 18900 MCP 拒绝切换挡位 (HTTP {resp.status_code}): {_redact_secrets(resp.text[:160])}"
+        )
+    data = resp.json() if resp.content else {}
+    confirmed = str(data.get("mode") or m).strip().lower()
+    if confirmed not in ("off", "safe", "full"):
+        confirmed = m
+    _set_cached_pc_mode(confirmed, online=True)
+    return {"ok": True, "mode": confirmed, "source": "host_18900"}
 
 
 def _update_idle_farewell_config(payload: dict) -> tuple[bool, dict | str]:
@@ -1087,7 +1205,7 @@ def _read_raw_yaml() -> dict:
 
 
 ANIMA_HOST = "http://anima-brain:18787"
-ANIMA_TOKEN_PATH = os.path.join(DATA_DIR, "anima", "studio_token.txt")
+ANIMA_TOKEN_PATH = xz_common.ANIMA_TOKEN_PATH
 _anima_rel_lock = threading.Lock()
 _anima_rel_cache: dict | None = None
 _anima_rel_ts = 0.0
@@ -1095,7 +1213,7 @@ _ANIMA_REL_TTL = 3.0
 
 
 def _read_anima_token() -> str:
-    return xz_common.read_token_file(ANIMA_TOKEN_PATH)
+    return xz_common.get_anima_token(ANIMA_TOKEN_PATH)
 
 
 def _get_anima_character_id(cfg: dict | None = None) -> str:
@@ -1356,6 +1474,8 @@ def _trigger_obsidian_rebuild() -> tuple[bool, dict | str]:
 _probe_lock = threading.Lock()
 _pc_audio_online_cache: bool = False
 _gsv_online_cache: bool = False
+_anima_backup_lock = threading.Lock()
+_anima_backup_cache: dict | None = None
 _probe_fail_counts: dict[str, int] = {
     "pc_audio": 0,
     "l3": 0,
@@ -1363,6 +1483,25 @@ _probe_fail_counts: dict[str, int] = {
     "obsidian": 0,
     "gsv": 0,
 }
+
+
+def _get_cached_anima_backup_snapshot() -> dict:
+    with _anima_backup_lock:
+        if _anima_backup_cache is not None:
+            snap = dict(_anima_backup_cache)
+            snap["probed"] = True
+            return snap
+    return {
+        "probed": False,
+        "enabled": True,
+        "last_backup_at": "",
+        "last_backup_ts": 0.0,
+        "last_backup_file": "",
+        "integrity_ok": None,
+        "daily_count": 0,
+        "weekly_count": 0,
+        "last_error": "",
+    }
 _PROBE_OFFLINE_THRESHOLD = 2
 _PROBE_INTERVAL_SECONDS = 3.0
 
@@ -1442,6 +1581,9 @@ def _probe_background_services_once() -> dict[str, bool]:
         if resp.status_code == 200:
             data = resp.json()
             data["mcp_online"] = True
+            host_mode = str(data.get("pc_mode") or "").strip().lower()
+            if host_mode in ("off", "safe", "full"):
+                _set_cached_pc_mode(host_mode, online=True)
             with _l3_cache_lock:
                 _l3_cache = dict(data)
                 _l3_cache_ts = time.monotonic()
@@ -1458,6 +1600,7 @@ def _probe_background_services_once() -> dict[str, bool]:
         with _l3_cache_lock:
             was_never_set = _l3_cache is None
         if was_never_set or should_flip_l3:
+            _set_cached_pc_mode("safe", online=False)
             fb = _read_local_l3_fallback()
             with _l3_cache_lock:
                 _l3_cache = dict(fb)
@@ -1549,6 +1692,68 @@ def _probe_background_services_once() -> dict[str, bool]:
             _probe_fail_counts["gsv"] += 1
             if _probe_fail_counts["gsv"] >= _PROBE_OFFLINE_THRESHOLD:
                 _gsv_online_cache = False
+
+    # 6. 18787 Anima Health & Online Backup Status (B-2)
+    try:
+        client = _get_console_http_client()
+        resp = client.get(f"{ANIMA_HOST}/xiaozhi/health", timeout=1.5)
+        if resp.status_code in (200, 503):
+            h_data = resp.json()
+            if isinstance(h_data, dict) and isinstance(h_data.get("backup"), dict):
+                with _anima_backup_lock:
+                    global _anima_backup_cache
+                    _anima_backup_cache = dict(h_data["backup"])
+    except Exception:
+        pass
+
+    # 7. Auto-retry dirty GSV voice weight rollback when GSV is online and ESP32 is idle (D-3)
+    dirty_target, _dirty_err = _get_voice_dirty_state()
+    if dirty_target:
+        # Always reconcile against current saved active GSV voice so stale dirty state never reverts a newly saved voice
+        current_cfg_gsv = _get_configured_gsv_voice()
+        if current_cfg_gsv is None:
+            _set_voice_dirty(None, "")
+            dirty_target = None
+        elif current_cfg_gsv != dirty_target:
+            dirty_target = current_cfg_gsv
+    if gsv_ok and dirty_target and not _is_device_busy():
+        acquired = _gsv_weights_lock.acquire(timeout=0.1)
+        if acquired:
+            try:
+                # Re-check dirty state, configured voice, and device busy status AFTER acquiring
+                # _gsv_weights_lock so concurrent POST /api/config voice switches or recoveries are never reverted.
+                cur_dirty, _ = _get_voice_dirty_state()
+                if cur_dirty and not _is_device_busy():
+                    cur_cfg_gsv = _get_configured_gsv_voice()
+                    if cur_cfg_gsv is None:
+                        _set_voice_dirty(None, "")
+                    else:
+                        target_voice = cur_cfg_gsv
+                        global _active_gsv_loaded
+                        _active_gsv_loaded = "__dirty__"
+                        _gsv_op_deadline_tls.deadline = time.monotonic() + 20.0
+                        _ensure_gsv_weights(target_voice, persist_boot_yaml=False)
+                        if _active_gsv_loaded == "__dirty__":
+                            _active_gsv_loaded = target_voice
+                        _set_voice_dirty(None, "")
+                        msg = f"[WebConsole] 后台探测已自动恢复线上 GPT-SoVITS 音色权重: {target_voice}"
+                        print(msg, flush=True)
+                        with _state_lock:
+                            _append_raw_log_locked(msg)
+            except Exception as rb_exc:
+                _active_gsv_loaded = "__dirty__"
+                cur_cfg_on_err = _get_configured_gsv_voice()
+                if cur_cfg_on_err is not None:
+                    _set_voice_dirty(cur_cfg_on_err, str(rb_exc))
+                else:
+                    _set_voice_dirty(None, "")
+                print(
+                    f"[WebConsole] WARNING: 后台重试恢复线上音色权重 ({cur_cfg_on_err or dirty_target}) 仍失败: {rb_exc}",
+                    flush=True,
+                )
+            finally:
+                _gsv_op_deadline_tls.deadline = None
+                _gsv_weights_lock.release()
 
     return {
         "pc_audio": _get_cached_pc_audio_online(),
@@ -1672,6 +1877,7 @@ def _write_updated_yaml(
     voice: str | None = None,
 ) -> dict:
     """Deep-merge ONLY user-modified keys into data/.config.yaml without clobbering LLM/TTS blocks (P1-13)."""
+    global _active_gsv_loaded
     cfg = _read_raw_yaml()
     selected = cfg.get("selected_module") or {}
     cur_prompt = str(cfg.get("prompt") or "").strip()
@@ -1717,12 +1923,27 @@ def _write_updated_yaml(
                 prov_patch.setdefault(dk, dv)
         prov_patch["model_name"] = target_model
 
+    voice_recovered = False
     if voice is not None and voice.strip():
         v_id = voice.strip()
         if v_id != cur_voice:
             changed_fields.append("voice")
             if v_id in GSV_PROFILES:
-                _ensure_gsv_weights(v_id, persist_boot_yaml=True)
+                with _gsv_weights_lock:
+                    dirty_before, _ = _get_voice_dirty_state()
+                    if dirty_before is not None:
+                        _active_gsv_loaded = "__dirty__"
+                    try:
+                        _ensure_gsv_weights(v_id, persist_boot_yaml=True)
+                    except Exception as exc:
+                        if (
+                            _active_gsv_loaded == "__dirty__" or dirty_before is not None
+                        ) and cur_voice in GSV_PROFILES:
+                            _set_voice_dirty(cur_voice, str(exc))
+                        raise
+                    if _active_gsv_loaded == "__dirty__":
+                        _active_gsv_loaded = v_id
+                    _set_voice_dirty(None, "")
                 patch.setdefault("selected_module", {})["TTS"] = "GPT_SOVITS_V2"
                 existing_gsv = ((cfg.get("TTS") or {}).get("GPT_SOVITS_V2")) or {}
                 prof_blk = GSV_PROFILES[v_id]["block"]
@@ -1739,6 +1960,8 @@ def _write_updated_yaml(
                     gsv_patch["sample_steps"] = prof_blk["sample_steps"]
                 patch.setdefault("TTS", {})["GPT_SOVITS_V2"] = gsv_patch
             else:
+                with _gsv_weights_lock:
+                    _set_voice_dirty(None, "")
                 patch.setdefault("selected_module", {})["TTS"] = "EdgeTTS"
                 existing_edge = ((cfg.get("TTS") or {}).get("EdgeTTS")) or {}
                 edge_patch = {"voice": v_id}
@@ -1747,9 +1970,29 @@ def _write_updated_yaml(
                 if "output_dir" not in existing_edge:
                     edge_patch["output_dir"] = "tmp/"
                 patch.setdefault("TTS", {})["EdgeTTS"] = edge_patch
+        else:
+            if v_id in GSV_PROFILES:
+                with _gsv_weights_lock:
+                    dirty_target, _ = _get_voice_dirty_state()
+                    is_dirty = (dirty_target is not None) or (_active_gsv_loaded == "__dirty__")
+                    if is_dirty:
+                        _active_gsv_loaded = "__dirty__"
+                        try:
+                            _ensure_gsv_weights(v_id, persist_boot_yaml=True)
+                        except Exception as exc:
+                            _set_voice_dirty(v_id, str(exc))
+                            raise
+                        if _active_gsv_loaded == "__dirty__":
+                            _active_gsv_loaded = v_id
+                        _set_voice_dirty(None, "")
+                        voice_recovered = True
+            else:
+                dirty_target, _ = _get_voice_dirty_state()
+                if dirty_target is not None:
+                    _set_voice_dirty(None, "")
 
     if not changed_fields:
-        return {"changed_fields": [], "written": False}
+        return {"changed_fields": [], "written": False, "voice_recovered": voice_recovered}
 
     merged_cfg = _deep_merge_dict(cfg, patch)
     header = (
@@ -1762,7 +2005,7 @@ def _write_updated_yaml(
     _atomic_write_text(CONFIG_PATH, header + body)
     if "prompt" in changed_fields and prompt is not None:
         threading.Thread(target=_sync_persona_to_anima, args=(prompt,), daemon=True).start()
-    return {"changed_fields": changed_fields, "written": True}
+    return {"changed_fields": changed_fields, "written": True, "voice_recovered": voice_recovered}
 
 
 def _apply_tts_attrs_in_place(tts_obj, tts_module_name: str, tts_cfg: dict) -> bool:
@@ -1957,9 +2200,29 @@ async def _synthesize_mp3(text: str, voice: str) -> bytes:
     return bytes(chunks)
 
 
+async def _synthesize_mp3_with_timeout(
+    text: str, voice: str, timeout: float = EDGE_PREVIEW_TIMEOUT_SECONDS
+) -> bytes:
+    return await asyncio.wait_for(_synthesize_mp3(text=text, voice=voice), timeout=float(timeout))
+
+
 class ConsoleHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def end_headers(self):
+        # A-5: Guarantee clickjacking & MIME-sniffing protection on EVERY response (including HTML error pages)
+        existing = set()
+        for raw in getattr(self, "_headers_buffer", ()):
+            if isinstance(raw, (bytes, bytearray)) and b":" in raw:
+                existing.add(raw.split(b":", 1)[0].strip().lower())
+        if b"x-frame-options" not in existing:
+            self.send_header("X-Frame-Options", "DENY")
+        if b"content-security-policy" not in existing:
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        if b"x-content-type-options" not in existing:
+            self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
 
     def _send_json(self, payload: dict, status=HTTPStatus.OK):
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1990,7 +2253,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def _enforce_security(self, method: str) -> bool:
         hdrs = {k: v for k, v in self.headers.items()}
-        ok, status_code, err_msg = validate_console_request(method, hdrs, port=CONSOLE_PORT)
+        ok, status_code, err_msg = validate_console_request(
+            method, hdrs, port=CONSOLE_PORT, path=self.path
+        )
         if not ok:
             self._send_json({"ok": False, "error": err_msg}, HTTPStatus(status_code))
             return False
@@ -2005,12 +2270,18 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             with _state_lock:
                 ready = bool(_device_info.get("server_ready"))
             health = patch_registry.get_health_summary()
-            degraded = bool(health.get("degraded"))
+            degraded_list = list(health.get("degraded") or [])
+            security_ok = bool(health.get("security_ok", True))
+            http_status = HTTPStatus.OK if security_ok else HTTPStatus.SERVICE_UNAVAILABLE
             self._send_json(
                 {
-                    "ok": not degraded,
+                    "ok": security_ok and not degraded_list,
                     "status": health.get("status", "ok"),
-                    "degraded": degraded,
+                    "degraded": degraded_list,
+                    "security_ok": security_ok,
+                    "security_failures": list(health.get("security_failures") or []),
+                    "insecure_boot": bool(health.get("insecure_boot", False)),
+                    "insecure_boot_env": bool(health.get("insecure_boot_env", False)),
                     "server_ready": ready,
                     "server_version": health.get("server_version", ""),
                     "expected_server_version": health.get("expected_server_version", ""),
@@ -2018,18 +2289,24 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     "patch_counts": health.get("counts", {}),
                     "patches": health.get("patches", {}),
                     "degraded_reasons": health.get("degraded_reasons", []),
-                }
+                },
+                status=http_status,
             )
             return
         if parsed.path in ("/", "/index.html"):
             if not os.path.exists(HTML_PATH):
                 self._send_json({"error": "console.html not found"}, HTTPStatus.NOT_FOUND)
                 return
-            with open(HTML_PATH, "rb") as f:
-                html_bytes = f.read()
+            with open(HTML_PATH, "r", encoding="utf-8") as f:
+                html_text = f.read()
+            html_text = html_text.replace(_CONSOLE_TOKEN_PLACEHOLDER, _CONSOLE_WRITE_TOKEN)
+            html_bytes = html_text.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(len(html_bytes)))
             self.end_headers()
             self.wfile.write(html_bytes)
@@ -2081,6 +2358,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             rel_cfg = _get_cached_anima_relationship_snapshot(cfg=cfg)
             l3_cfg = _get_cached_l3_backend_snapshot()
             obs_cfg = _get_cached_obsidian_snapshot()
+            backup_cfg = _get_cached_anima_backup_snapshot()
+            dirty_voice, dirty_voice_err = _get_voice_dirty_state()
 
             self._send_json(
                 {
@@ -2092,11 +2371,16 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                             "deepseek-flash" if llm_key == "DeepSeekLLM" else "gemini-3.5-flash-lite",
                         ),
                         "voice": active_voice,
+                        "voice_dirty": bool(dirty_voice),
+                        "voice_dirty_target": dirty_voice or "",
+                        "voice_dirty_error": dirty_voice_err,
                         "websocket": ws_url,
                         "ota_url": ota_url,
                         "deepseek_key_ok": ds_ok,
                         "gemini_key_ok": gem_ok,
+                        "llm_cache": turn_context_router.get_llm_cache_stats(),
                         "pc_mode": _read_pc_mode(),
+                        "pc_mode_online": _get_cached_pc_mode_online(),
                         "audio_output": audio_cfg["target"],
                         "pc_audio_volume": audio_cfg["volume"],
                         "pc_audio_online": _get_cached_pc_audio_online(),
@@ -2104,6 +2388,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         "reply_length": reply_len_cfg,
                         "idle_farewell": idle_farewell_cfg,
                         "relationship": rel_cfg,
+                        "anima_backup": backup_cfg,
                         "obsidian": obs_cfg,
                         "l3_backend": l3_cfg,
                         "agy_bridge_online": _check_agy_bridge_online(l3_cfg),
@@ -2116,6 +2401,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     "health": {
                         "status": health_summary.get("status", "ok"),
                         "degraded": bool(health_summary.get("degraded")),
+                        "degraded_list": list(health_summary.get("degraded") or []),
+                        "security_ok": bool(health_summary.get("security_ok", True)),
+                        "security_failures": list(health_summary.get("security_failures") or []),
+                        "insecure_boot": bool(health_summary.get("insecure_boot", False)),
+                        "insecure_boot_env": bool(health_summary.get("insecure_boot_env", False)),
                         "server_version": health_summary.get("server_version", ""),
                         "degraded_reasons": health_summary.get("degraded_reasons", []),
                     },
@@ -2163,16 +2453,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/pc-mode":
             try:
                 body = self._read_body_json()
-                mode = str(body.get("mode") or "safe").strip()
+                mode = str(body.get("mode") or "safe").strip().lower()
                 if mode not in ("off", "safe", "full"):
                     self._send_json({"ok": False, "error": "无效的权限挡位"}, HTTPStatus.BAD_REQUEST)
                     return
-                _write_pc_mode(mode)
-                self._send_json({"ok": True, "mode": mode})
+                res = _write_pc_mode(mode)
+                self._send_json(res)
             except _BadRequestError:
                 raise
+            except ValueError as e:
+                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
             except Exception as e:
-                self._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                self._send_json(
+                    {"ok": False, "error": f"宿主机 18900 MCP 不可用，未能切换挡位: {_redact_secrets(str(e))}"},
+                    HTTPStatus.BAD_GATEWAY,
+                )
             return
 
         if parsed.path == "/api/audio-output":
@@ -2304,7 +2599,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_body_json()
                 vol = body.get("volume", None)
-                ref_wav = os.path.join(DATA_DIR, "voices", "raiden_mei", "mei_gentle_ref.wav")
+                ref_wav = os.path.join(VOICES_DIR, "raiden_mei", "mei_gentle_ref.wav")
+                if not os.path.isfile(ref_wav):
+                    ref_wav = os.path.join(VOICES_DIR, "wakeup_words_short.wav")
                 if not os.path.isfile(ref_wav):
                     ref_wav = os.path.join(DATA_DIR, "wakeup_words_short.wav")
                 if os.path.isfile(ref_wav):
@@ -2345,15 +2642,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     voice=voice,
                 )
                 changed_fields = list(write_res.get("changed_fields") or [])
+                voice_recovered = bool(write_res.get("voice_recovered", False))
                 hot_ok, hot_detail = _hot_reload_runtime_config(changed_fields)
+                if voice_recovered and hot_detail == "no_changes":
+                    hot_detail = "voice_weights_recovered"
                 will_restart = bool(force_restart or (allow_restart and not hot_ok))
 
+                dirty_after, _ = _get_voice_dirty_state()
                 self._send_json(
                     {
                         "ok": True,
                         "restarting": will_restart,
                         "hot_reloaded": bool(hot_ok and not will_restart),
                         "changed_fields": changed_fields,
+                        "voice_recovered": voice_recovered,
+                        "voice_dirty": bool(dirty_after),
                         "detail": hot_detail,
                     }
                 )
@@ -2421,6 +2724,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                             HTTPStatus.CONFLICT,
                         )
                         return
+                    rollback_warning = ""
+                    total_cap = max(0.01, float(_GSV_PREVIEW_LOCK_MAX_SECONDS))
+                    lock_deadline = time.monotonic() + total_cap
+                    # Reserve rollback budget INSIDE total_cap when swapping voices so GPU lock hold time NEVER exceeds total_cap (D-3)
+                    rollback_reserve = min(12.0, total_cap * 0.30) if needs_weight_swap else 0.0
+                    _gsv_op_deadline_tls.deadline = lock_deadline - rollback_reserve
                     try:
                         # Re-check busy status after acquiring shared GPU lock
                         if needs_weight_swap and _is_device_busy():
@@ -2438,11 +2747,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                             req_payload = dict(GSV_PROFILES[voice]["block"])
                             if isinstance(req_payload.get("ref_audio_path"), str):
                                 req_payload["ref_audio_path"] = req_payload["ref_audio_path"].replace(
-                                    "${HOST_DATA_DIR}", HOST_DATA_DIR
-                                )
+                                    "${HOST_VOICES_DIR}", HOST_VOICES_DIR
+                                ).replace("${HOST_DATA_DIR}", HOST_DATA_DIR)
                             if isinstance(req_payload.get("aux_ref_audio_paths"), list):
                                 req_payload["aux_ref_audio_paths"] = [
-                                    str(p).replace("${HOST_DATA_DIR}", HOST_DATA_DIR)
+                                    str(p).replace("${HOST_VOICES_DIR}", HOST_VOICES_DIR).replace(
+                                        "${HOST_DATA_DIR}", HOST_DATA_DIR
+                                    )
                                     for p in req_payload["aux_ref_audio_paths"]
                                 ]
                             req_payload["text"] = clean_text[:120]
@@ -2469,28 +2780,70 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                                 req_payload["top_p"] = emo_prof["top_p"]
                             for drop_k in ("type", "url", "output_dir"):
                                 req_payload.pop(drop_k, None)
+                            tts_timeout = _gsv_timeout_within_budget(25.0)
                             client = _get_console_http_client()
-                            r = client.post(f"{GSV_Host}/tts", json=req_payload, timeout=25.0)
+                            r = client.post(f"{GSV_Host}/tts", json=req_payload, timeout=tts_timeout)
                             if r.status_code != 200:
                                 raise RuntimeError(f"本地 GPT-SoVITS 未就绪或返回异常 ({r.status_code})")
                             wav_bytes = r.content
                         finally:
-                            # Restore live configured ESP32 GSV weights if user only previewed another GSV voice
-                            if configured_gsv and configured_gsv != voice:
+                            # Restore live configured ESP32 GSV weights if another voice was previewed OR weights became dirty (D-3)
+                            global _active_gsv_loaded
+                            should_restore = bool(
+                                configured_gsv
+                                and (configured_gsv != voice or _active_gsv_loaded == "__dirty__")
+                            )
+                            if should_restore:
+                                # Strictly respect original lock_deadline — NEVER extend beyond _GSV_PREVIEW_LOCK_MAX_SECONDS
+                                _gsv_op_deadline_tls.deadline = lock_deadline
                                 try:
+                                    if time.monotonic() >= lock_deadline:
+                                        raise TimeoutError("GPU 锁持有时间已达上限，跳过同步回滚，由后台自动恢复")
                                     _ensure_gsv_weights(configured_gsv, persist_boot_yaml=False)
-                                except Exception:
-                                    pass
+                                    cur_dirty, _ = _get_voice_dirty_state()
+                                    if cur_dirty == configured_gsv:
+                                        _set_voice_dirty(None, "")
+                                except Exception as rb_exc:
+                                    _active_gsv_loaded = "__dirty__"
+                                    _set_voice_dirty(configured_gsv, str(rb_exc))
+                                    redacted_rb = _redact_secrets(str(rb_exc))
+                                    rollback_warning = (
+                                        f"试听后恢复线上音色权重 ({configured_gsv}) 失败，后台将自动重试：{redacted_rb}"
+                                    )
+                                    warn_log = f"[WebConsole] WARNING: {rollback_warning}"
+                                    print(warn_log, flush=True)
+                                    with _state_lock:
+                                        _append_raw_log_locked(warn_log)
                     finally:
+                        _gsv_op_deadline_tls.deadline = None
                         _gsv_weights_lock.release()
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "audio/wav")
                     self.send_header("Cache-Control", "no-store")
+                    if rollback_warning:
+                        self.send_header("X-Voice-Dirty", "1")
+                        self.send_header("X-Preview-Warning", quote(rollback_warning, safe=""))
                     self.send_header("Content-Length", str(len(wav_bytes)))
                     self.end_headers()
                     self.wfile.write(wav_bytes)
                 else:
-                    mp3_bytes = asyncio.run(_synthesize_mp3(text=clean_text[:120], voice=voice))
+                    try:
+                        mp3_bytes = asyncio.run(
+                            _synthesize_mp3_with_timeout(
+                                text=clean_text[:120],
+                                voice=voice,
+                                timeout=EDGE_PREVIEW_TIMEOUT_SECONDS,
+                            )
+                        )
+                    except asyncio.TimeoutError:
+                        self._send_json(
+                            {
+                                "ok": False,
+                                "error": f"Edge 语音试听超时（超过 {int(EDGE_PREVIEW_TIMEOUT_SECONDS)} 秒），请稍后重试。",
+                            },
+                            HTTPStatus.GATEWAY_TIMEOUT,
+                        )
+                        return
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "audio/mpeg")
                     self.send_header("Cache-Control", "no-store")
@@ -2499,8 +2852,20 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     self.wfile.write(mp3_bytes)
             except _BadRequestError:
                 raise
+            except TimeoutError as e:
+                err_payload = {"ok": False, "error": _redact_secrets(str(e))}
+                dirty_v, dirty_e = _get_voice_dirty_state()
+                if dirty_v:
+                    err_payload["voice_dirty"] = True
+                    err_payload["rollback_warning"] = f"线上音色恢复失败，后台将自动重试：{dirty_e}"
+                self._send_json(err_payload, HTTPStatus.GATEWAY_TIMEOUT)
             except Exception as e:
-                self._send_json({"ok": False, "error": f"音色试听合成失败: {e}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                err_payload = {"ok": False, "error": _redact_secrets(f"音色试听合成失败: {e}")}
+                dirty_v, dirty_e = _get_voice_dirty_state()
+                if dirty_v:
+                    err_payload["voice_dirty"] = True
+                    err_payload["rollback_warning"] = f"线上音色恢复失败，后台将自动重试：{dirty_e}"
+                self._send_json(err_payload, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)

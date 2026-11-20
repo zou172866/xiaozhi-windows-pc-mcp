@@ -16,6 +16,7 @@ import pyautogui
 
 from . import (
     CONFIG_YAML as _DEFAULT_CONFIG_YAML,
+    LEGACY_CONFIG_YAML as _LEGACY_CONFIG_YAML,
     LAST_GROUNDING_IMG as _DEFAULT_LAST_GROUNDING_IMG,
     _com_mta_scope,
     _get_env_key,
@@ -31,13 +32,18 @@ _POSITIONAL_HINTS = (
 
 def _prefer_gemini_vision() -> bool:
     cfg_yaml = Path(facade_attr("CONFIG_YAML", _DEFAULT_CONFIG_YAML))
-    try:
-        if cfg_yaml.exists():
-            txt = cfg_yaml.read_text(encoding="utf-8", errors="ignore")
-            if re.search(r"^\s*LLM:\s*GeminiOpenAI\b", txt, re.MULTILINE):
-                return True
-    except Exception:
-        pass
+    candidates = [cfg_yaml]
+    if cfg_yaml == _DEFAULT_CONFIG_YAML:
+        candidates.append(_LEGACY_CONFIG_YAML)
+    for cand in candidates:
+        try:
+            if cand.exists():
+                txt = cand.read_text(encoding="utf-8", errors="ignore")
+                if re.search(r"^\s*LLM:\s*GeminiOpenAI\b", txt, re.MULTILINE):
+                    return True
+                return False
+        except Exception:
+            pass
     return False
 
 

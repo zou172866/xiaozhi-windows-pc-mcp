@@ -16,8 +16,8 @@ import sys
 import unittest
 
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
-DATA_DIR = os.path.join(ROOT_DIR, "data")
-for _p in (ROOT_DIR, DATA_DIR):
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+for _p in (ROOT_DIR, APP_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -25,7 +25,7 @@ for _p in (ROOT_DIR, DATA_DIR):
 class TestUpstreamImageContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        # Import start_with_env once to trigger all 18 monkeypatches & contract verifications
+        # Import start_with_env once to trigger all 19 monkeypatches & contract verifications
         import start_with_env  # noqa: F401
         import patch_registry
 
@@ -38,7 +38,7 @@ class TestUpstreamImageContracts(unittest.TestCase):
             f"Upstream SERVER_VERSION mismatch: got {info.get('actual')!r}, expected {info.get('expected')!r}",
         )
 
-    def test_all_18_patches_registered_ok_with_valid_contracts(self):
+    def test_all_19_patches_registered_ok_with_valid_contracts(self):
         expected_patches = {
             "config_env_expand",
             "mcp_token_injection",
@@ -57,6 +57,7 @@ class TestUpstreamImageContracts(unittest.TestCase):
             "listen_interrupt_handler",
             "idle_farewell",
             "reply_length_llm",
+            "llm_prefix_cache",
             "sherpa_async_asr",
         }
         summary = self.patch_registry.get_health_summary()
@@ -93,6 +94,13 @@ class TestUpstreamImageContracts(unittest.TestCase):
         self.assertIs(recv_mod.handleAbortMessage, abort_mod.handleAbortMessage)
         self.assertIs(intent_mod.checkWakeupWords, hello_mod.checkWakeupWords)
         self.assertIs(cfg_settings.read_config, cfg_loader.read_config)
+        try:
+            import core.handle.textHandler.helloMessageHandler as hello_msg_mod
+
+            if hasattr(hello_msg_mod, "handleHelloMessage"):
+                self.assertIs(hello_msg_mod.handleHelloMessage, hello_mod.handleHelloMessage)
+        except ImportError:
+            pass
 
     def test_upstream_llm_chat_asr_and_auth_callable_contracts(self):
         from core.api.ota_handler import OTAHandler

@@ -26,11 +26,11 @@ import runtime_events
 import runtime_settings
 import xz_common
 
-ROOT_DIR = "/opt/xiaozhi-esp32-server"
-DATA_DIR = os.path.join(ROOT_DIR, "data")
-_DEFAULT_AUDIO_MODE_PATH = os.path.join(DATA_DIR, "audio_output_mode.json")
+ROOT_DIR = xz_common.ROOT_DIR
+DATA_DIR = xz_common.STATE_DIR
+_DEFAULT_AUDIO_MODE_PATH = os.path.join(xz_common.STATE_DIR, "audio_output_mode.json")
 AUDIO_MODE_PATH = _DEFAULT_AUDIO_MODE_PATH
-PC_MCP_TOKEN_PATH = os.path.join(DATA_DIR, "pc_mcp_token.txt")
+PC_MCP_TOKEN_PATH = xz_common.PC_MCP_TOKEN_PATH
 PC_AUDIO_HOST = os.environ.get("PC_AUDIO_BRIDGE_URL", "http://host.docker.internal:18900").rstrip("/")
 
 _cfg_lock = threading.Lock()
@@ -52,8 +52,8 @@ _async_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.Asyn
 
 
 def read_pc_mcp_token() -> str:
-    """Read shared local 18900 Bearer token with mtime cache via xz_common."""
-    return xz_common.read_token_file(PC_MCP_TOKEN_PATH)
+    """Read shared local 18900 Bearer token via env-first xz_common (A-1)."""
+    return xz_common.get_pc_mcp_token(PC_MCP_TOKEN_PATH)
 
 
 def get_pc_mcp_auth_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -377,6 +377,17 @@ def apply_pc_audio_to_tts_patch() -> None:
     ok_sig, sig_det = patch_registry.verify_signature_contract(
         _orig_to_tts_stream, required_params=("self", "text"), require_async=False
     )
+    if not ok_sig:
+        patch_registry.record_patch(
+            "pc_audio_tts",
+            "skipped_contract",
+            target="TTSProviderBase.to_tts_stream",
+            detail=sig_det,
+            contract_ok=False,
+            category="experience",
+        )
+        print(f"[PCAudioRouter] 跳过挂载 TTS 拦截层（签名契约不匹配）: {sig_det}", flush=True)
+        return
 
     @functools.wraps(_orig_to_tts_stream)
     def _pc_aware_to_tts_stream(self, text, *args, **kwargs):
@@ -449,10 +460,11 @@ def apply_pc_audio_to_tts_patch() -> None:
     TTSProviderBase._pc_audio_tts_patched = True
     patch_registry.record_patch(
         "pc_audio_tts",
-        "ok" if ok_sig else "failed",
+        "ok",
         target="TTSProviderBase.to_tts_stream",
         detail=sig_det,
-        contract_ok=ok_sig,
+        contract_ok=True,
+        category="experience",
     )
 
 
@@ -486,6 +498,20 @@ def apply_pc_audio_playback_patches() -> None:
         ok_s, det = patch_registry.verify_signature_contract(cfn, required_params=req_p, require_async=req_a)
         if not ok_s:
             pb_failures.append(f"{cname}: {det}")
+    if pb_failures:
+        patch_registry.record_patch(
+            "pc_audio_playback",
+            "skipped_contract",
+            target="sendAudioHandle/helloHandle/abortHandle",
+            detail="; ".join(pb_failures),
+            contract_ok=False,
+            category="experience",
+        )
+        print(
+            f"[PCAudioRouter] 跳过挂载播放同步层（签名契约不匹配）: {'; '.join(pb_failures)}",
+            flush=True,
+        )
+        return
 
     @functools.wraps(_orig_wait_completion)
     async def _pc_aware_wait_completion(conn, *args, **kwargs):
@@ -618,10 +644,11 @@ def apply_pc_audio_playback_patches() -> None:
 
     patch_registry.record_patch(
         "pc_audio_playback",
-        "ok" if not pb_failures else "failed",
+        "ok",
         target="sendAudioHandle/helloHandle/abortHandle",
-        detail="; ".join(pb_failures) if pb_failures else "ok",
-        contract_ok=not pb_failures,
+        detail="ok",
+        contract_ok=True,
+        category="experience",
         rebound=rebound_all,
     )
     print("[PCAudioRouter] 已挂载电脑音响直出桥接 (48kHz 无损 + 18080 热切换 + 毫秒级打断停止)", flush=True)

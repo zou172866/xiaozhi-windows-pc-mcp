@@ -2,7 +2,11 @@
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $serverDir = Split-Path -Parent $PSScriptRoot
-$urlFile = Join-Path $serverDir "data\anima\studio_url.txt"
+$urlFile = Join-Path $serverDir "anima-data\studio_url.txt"
+if (-not (Test-Path $urlFile)) {
+    $legacyUrlFile = Join-Path $serverDir "data\anima\studio_url.txt"
+    if (Test-Path $legacyUrlFile) { $urlFile = $legacyUrlFile }
+}
 
 if (-not (Test-Path $urlFile)) {
     Write-Host "[提示] 尚未检测到 Companion Studio 访问令牌，请先确认 Docker 服务已启动！" -ForegroundColor Yellow

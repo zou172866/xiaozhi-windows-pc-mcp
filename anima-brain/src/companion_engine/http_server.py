@@ -83,12 +83,14 @@ def create_app(
                 )
             )
             if not public and not secrets.compare_digest(
-                request.headers.get("authorization", ""), "Bearer " + token
+                request.headers.get("authorization", "").encode("utf-8", errors="replace"),
+                ("Bearer " + token).encode("utf-8"),
             ):
                 return JSONResponse({"error": "A local bearer token is required"}, status_code=401)
             response = await call_next(request)
             response.headers["Cache-Control"] = "no-store"
             response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
             response.headers["Referrer-Policy"] = "no-referrer"
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; "

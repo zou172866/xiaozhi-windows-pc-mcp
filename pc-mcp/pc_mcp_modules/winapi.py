@@ -82,6 +82,53 @@ _user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.GetWindowLongW.restype = wintypes.LONG
 _user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
 _user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+_user32.OpenClipboard.argtypes = [wintypes.HWND]
+_user32.OpenClipboard.restype = wintypes.BOOL
+_user32.EmptyClipboard.argtypes = []
+_user32.EmptyClipboard.restype = wintypes.BOOL
+_user32.CloseClipboard.argtypes = []
+_user32.CloseClipboard.restype = wintypes.BOOL
+_user32.WindowFromPoint.argtypes = [wintypes.POINT]
+_user32.WindowFromPoint.restype = wintypes.HWND
+_user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+_user32.GetAncestor.restype = wintypes.HWND
+_user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+_user32.RegisterHotKey.restype = wintypes.BOOL
+_user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.UnregisterHotKey.restype = wintypes.BOOL
+_user32.GetMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG),
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.UINT,
+]
+_user32.GetMessageW.restype = ctypes.c_int
+_user32.PostThreadMessageW.argtypes = [
+    wintypes.DWORD,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+]
+_user32.PostThreadMessageW.restype = wintypes.BOOL
+
+
+class _GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
+_user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(_GUITHREADINFO)]
+_user32.GetGUIThreadInfo.restype = wintypes.BOOL
+_GA_ROOT = 2
 
 _kernel32.GetCurrentThreadId.argtypes = []
 _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
@@ -346,13 +393,107 @@ def _get_process_name_by_pid(pid: int) -> str:
     return ""
 
 
-def _get_foreground_window_info() -> dict:
-    """Inspect current Win32 foreground window's hwnd, pid, process name, class name, and title."""
+def _get_window_class_name(hwnd: int) -> str:
+    if not hwnd:
+        return ""
     u32 = facade_attr("_user32", _user32)
     try:
-        hwnd = int(u32.GetForegroundWindow() or 0)
+        cbuf = ctypes.create_unicode_buffer(256)
+        u32.GetClassNameW(wintypes.HWND(hwnd), cbuf, 256)
+        return cbuf.value.strip()
     except Exception:
-        hwnd = 0
+        return ""
+
+
+_XAML_BRIDGE_CLASSES = frozenset({
+    "microsoft.ui.content.desktopchildsitebridge",
+    "windows.ui.composition.desktopwindowcontentbridge",
+})
+
+
+def _extract_uia_control_fields(ctrl) -> dict:
+    """Extract control_type, name, automation_id, class, and ancestor_names from a UIA control."""
+    fields: dict = {}
+    if ctrl is None:
+        return fields
+    ctype = str(getattr(ctrl, "ControlTypeName", "") or "").strip()
+    cname = str(getattr(ctrl, "Name", "") or "").strip()
+    aid = str(getattr(ctrl, "AutomationId", "") or "").strip()
+    ccls = str(getattr(ctrl, "ClassName", "") or "").strip()
+    if ctype:
+        fields["control_type"] = ctype
+    if cname:
+        fields["name"] = cname
+    if aid:
+        fields["automation_id"] = aid
+    if ccls:
+        fields["class"] = ccls
+    anc_parts = []
+    parent = ctrl
+    for _ in range(4):
+        try:
+            parent = parent.GetParentControl()
+        except Exception:
+            break
+        if parent is None:
+            break
+        p_name = str(getattr(parent, "Name", "") or "").strip()
+        p_cls = str(getattr(parent, "ClassName", "") or "").strip()
+        p_aid = str(getattr(parent, "AutomationId", "") or "").strip()
+        for part in (p_name, p_cls, p_aid):
+            if part:
+                anc_parts.append(part)
+    if anc_parts:
+        fields["ancestor_names"] = " | ".join(anc_parts)
+    return fields
+
+
+def _get_focused_control_info(fg_hwnd: int = 0) -> dict:
+    """Inspect focused child control via Win32 GetGUIThreadInfo and UIA (used for CabinetWClass address bar guard)."""
+    u32 = facade_attr("_user32", _user32)
+    info: dict = {}
+    if fg_hwnd:
+        try:
+            tid = int(u32.GetWindowThreadProcessId(wintypes.HWND(fg_hwnd), None) or 0)
+            if tid:
+                gti = _GUITHREADINFO()
+                gti.cbSize = ctypes.sizeof(_GUITHREADINFO)
+                if u32.GetGUIThreadInfo(wintypes.DWORD(tid), ctypes.byref(gti)):
+                    focus_hwnd = int(gti.hwndFocus or 0)
+                    if focus_hwnd:
+                        info["hwnd"] = focus_hwnd
+                        info["class"] = _get_window_class_name(focus_hwnd)
+                        info["title"] = _get_window_title(focus_hwnd)
+        except Exception:
+            pass
+
+    if os.name == "nt":
+        uia_ok = False
+        try:
+            import uiautomation as auto
+
+            with _com_mta_scope():
+                ctrl = auto.GetFocusedControl()
+                if ctrl is not None:
+                    uia_fields = _extract_uia_control_fields(ctrl)
+                    for k, v in uia_fields.items():
+                        if k == "class":
+                            if v and not info.get("class"):
+                                info["class"] = v
+                            elif v:
+                                info["uia_class"] = v
+                        else:
+                            info[k] = v
+                    uia_ok = bool(uia_fields)
+        except Exception:
+            uia_ok = False
+        if not uia_ok and str(info.get("class") or "").strip().lower() in _XAML_BRIDGE_CLASSES:
+            info["uia_error"] = True
+    return info
+
+
+def _get_window_info_by_hwnd(hwnd: int, *, include_focused_control: bool = False) -> dict:
+    u32 = facade_attr("_user32", _user32)
     if not hwnd:
         return {"hwnd": 0, "pid": 0, "process": "", "class": "", "title": ""}
     h = wintypes.HWND(hwnd)
@@ -361,13 +502,7 @@ def _get_foreground_window_info() -> dict:
         title = _get_window_title(hwnd)
     except Exception:
         pass
-    cls_name = ""
-    try:
-        cbuf = ctypes.create_unicode_buffer(256)
-        u32.GetClassNameW(h, cbuf, 256)
-        cls_name = cbuf.value.strip()
-    except Exception:
-        pass
+    cls_name = _get_window_class_name(hwnd)
     pid_val = 0
     try:
         pid_dw = wintypes.DWORD(0)
@@ -376,13 +511,80 @@ def _get_foreground_window_info() -> dict:
     except Exception:
         pass
     proc_name = _get_process_name_by_pid(pid_val)
-    return {
-        "hwnd": hwnd,
+    result: dict = {
+        "hwnd": int(hwnd),
         "pid": pid_val,
         "process": proc_name,
         "class": cls_name,
         "title": title,
     }
+    if include_focused_control and cls_name.lower() == "cabinetwclass":
+        fc = _get_focused_control_info(hwnd)
+        if fc:
+            result["focused_control"] = fc
+    return result
+
+
+def _get_window_info_at_point(x: int, y: int) -> Optional[dict]:
+    """Inspect the top-level window (and child control class) located at physical screen point (x, y)."""
+    u32 = facade_attr("_user32", _user32)
+    try:
+        pt = wintypes.POINT(int(x), int(y))
+        child_hwnd = int(u32.WindowFromPoint(pt) or 0)
+    except Exception:
+        return None
+    if not child_hwnd:
+        return None
+    try:
+        root_hwnd = int(u32.GetAncestor(wintypes.HWND(child_hwnd), _GA_ROOT) or 0) or child_hwnd
+    except Exception:
+        root_hwnd = child_hwnd
+    info = _get_window_info_by_hwnd(root_hwnd, include_focused_control=False)
+    if info.get("class", "").lower() == "cabinetwclass":
+        pt_ctrl: dict = {}
+        if child_hwnd != root_hwnd:
+            child_cls = _get_window_class_name(child_hwnd)
+            child_title = _get_window_title(child_hwnd)
+            pt_ctrl["hwnd"] = child_hwnd
+            if child_cls:
+                pt_ctrl["class"] = child_cls
+            if child_title:
+                pt_ctrl["name"] = child_title
+        if os.name == "nt":
+            uia_ok = False
+            try:
+                import uiautomation as auto
+
+                with _com_mta_scope():
+                    ctrl = auto.ControlFromPoint(int(x), int(y))
+                    if ctrl is not None:
+                        uia_fields = _extract_uia_control_fields(ctrl)
+                        for k, v in uia_fields.items():
+                            if k == "class":
+                                if v and not pt_ctrl.get("class"):
+                                    pt_ctrl["class"] = v
+                                elif v:
+                                    pt_ctrl["uia_class"] = v
+                            else:
+                                pt_ctrl[k] = v
+                        uia_ok = bool(uia_fields)
+            except Exception:
+                uia_ok = False
+            if not uia_ok and str(pt_ctrl.get("class") or "").strip().lower() in _XAML_BRIDGE_CLASSES:
+                pt_ctrl["uia_error"] = True
+        if pt_ctrl:
+            info["point_control"] = pt_ctrl
+    return info
+
+
+def _get_foreground_window_info() -> dict:
+    """Inspect current Win32 foreground window's hwnd, pid, process name, class name, and title."""
+    u32 = facade_attr("_user32", _user32)
+    try:
+        hwnd = int(u32.GetForegroundWindow() or 0)
+    except Exception:
+        hwnd = 0
+    return _get_window_info_by_hwnd(hwnd, include_focused_control=True)
 
 
 def check_system_status() -> str:

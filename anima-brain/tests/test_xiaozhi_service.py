@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sys
@@ -657,6 +656,330 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 svc.load_or_create_token(tf, retries=2)
         self.assertEqual(tf.read_text(encoding="utf-8").strip(), tok1)
+
+    def test_batch1_b2_online_backup_integrity_and_retention(self):
+        import sqlite3
+        import datetime
+
+        # Commit a real turn so backup DB contains verifiable data
+        svc.extract_and_commit_turn(
+            self.brain,
+            svc.DEFAULT_CHARACTER_ID,
+            "b2-backup-turn-1",
+            "帮我记住今天喝了拿铁",
+            "好呀，记住今天喝了拿铁。",
+        )
+        bdir = Path(self._tmp.name) / "backups_test"
+        res = svc.run_online_backup(self.brain, bdir, force=True, keep_daily=7, keep_weekly=4)
+        self.assertTrue(res["ok"], f"Backup failed: {res}")
+        self.assertTrue(res.get("integrity_ok"))
+        self.assertEqual(res["daily_count"], 1)
+        self.assertEqual(res["weekly_count"], 1)
+
+        bk_file = bdir / res["last_backup_file"]
+        self.assertTrue(bk_file.is_file())
+        conn = sqlite3.connect(str(bk_file))
+        try:
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+            cnt = conn.execute("SELECT count(*) FROM turns WHERE request_id='b2-backup-turn-1'").fetchone()[0]
+            self.assertEqual(cnt, 1)
+        finally:
+            conn.close()
+
+        # Retention pruning: 10 days + 6 weeks -> keeps newest 7 daily and 4 weekly
+        base_dt = datetime.datetime(2026, 11, 20, 12, 0, tzinfo=datetime.timezone.utc)
+        for d_off in range(10):
+            ts = (base_dt - datetime.timedelta(days=d_off)).timestamp()
+            svc.run_online_backup(self.brain, bdir, now=ts, force=True, keep_daily=7, keep_weekly=4)
+        for w_off in range(6):
+            ts = (base_dt - datetime.timedelta(weeks=w_off)).timestamp()
+            svc.run_online_backup(self.brain, bdir, now=ts, force=True, keep_daily=7, keep_weekly=4)
+        dailies, weeklies = svc._scan_backup_dir(bdir)
+        self.assertLessEqual(len(dailies), 7)
+        self.assertLessEqual(len(weeklies), 4)
+
+        # Integrity check failure must NOT leave corrupted daily file or overwrite good one
+        bdir_bad = Path(self._tmp.name) / "backups_bad"
+        with patch.object(svc, "_verify_sqlite_integrity", return_value=(False, "corrupt page")):
+            bad_res = svc.run_online_backup(self.brain, bdir_bad, force=True)
+        self.assertFalse(bad_res["ok"])
+        self.assertFalse(bad_res.get("integrity_ok"))
+        self.assertEqual(list(bdir_bad.glob("brain-*.sqlite3")), [])
+
+        # _resolve_backup_dir must resolve beside brain.engine.database (NOT fallback to DATA_DIR!)
+        with patch.object(svc, "BACKUP_DIR_ENV", ""):
+            resolved_dir = svc._resolve_backup_dir(self.brain)
+            self.assertEqual(resolved_dir, Path(self.brain.engine.database).resolve().parent / "backups")
+
+        # Same-day restart with fresh state & missing weekly backup: verifies integrity and backfills weekly!
+        bdir_restart = Path(self._tmp.name) / "backups_restart"
+        r_init = svc.run_online_backup(self.brain, bdir_restart, force=True)
+        self.assertTrue(r_init["ok"])
+        for wf in bdir_restart.glob("brain-weekly-*.sqlite3"):
+            wf.unlink()
+        with svc._BACKUP_STATE_LOCK:
+            svc._BACKUP_STATE_BY_DIR.pop(svc._backup_dir_key(bdir_restart), None)
+        r_same_day = svc.run_online_backup(self.brain, bdir_restart, force=False)
+        self.assertTrue(r_same_day["ok"])
+        self.assertEqual(r_same_day.get("skipped"), "already_exists")
+        self.assertTrue(r_same_day.get("integrity_ok"))
+        self.assertEqual(r_same_day["weekly_count"], 1)
+
+        # Corrupted existing daily backup on same-day check must be recreated cleanly
+        daily_f = next(bdir_restart.glob("brain-20*.sqlite3"))
+        daily_f.write_bytes(b"not-a-valid-sqlite-file")
+        with svc._BACKUP_STATE_LOCK:
+            svc._BACKUP_STATE_BY_DIR.pop(svc._backup_dir_key(bdir_restart), None)
+        r_healed = svc.run_online_backup(self.brain, bdir_restart, force=False)
+        self.assertTrue(r_healed["ok"])
+        self.assertTrue(r_healed.get("created"))
+        self.assertTrue(r_healed.get("integrity_ok"))
+
+        # Empty backup dir status must NOT inherit stale state from another directory
+        bdir_empty = Path(self._tmp.name) / "backups_empty"
+        st_empty = svc.get_backup_status(self.brain, bdir_empty)
+        self.assertEqual(st_empty["daily_count"], 0)
+        self.assertEqual(st_empty["last_backup_at"], "")
+        self.assertEqual(st_empty["last_backup_file"], "")
+
+    def test_batch1_b3_wal_governance_and_b4_uuid_and_collision_guard(self):
+        # B-3: PRAGMA journal_size_limit=8388608 & idle wal_checkpoint(TRUNCATE)
+        svc.configure_sqlite_wal(self.brain.engine, 8 * 1024 * 1024)
+        lim = self.brain.engine.db.execute("PRAGMA journal_size_limit").fetchone()[0]
+        self.assertEqual(lim, 8 * 1024 * 1024)
+        skip_busy = svc.checkpoint_wal_if_idle(self.brain, is_idle=False)
+        self.assertEqual(skip_busy.get("skipped"), "busy")
+        cp_ok = svc.checkpoint_wal_if_idle(self.brain, is_idle=True)
+        self.assertTrue(cp_ok.get("ok"))
+
+        # B-4: _new_request_id uses uuid4 hex (unique across rapid calls)
+        ids = {svc._new_request_id() for _ in range(50)}
+        self.assertEqual(len(ids), 50)
+        for rid in ids:
+            self.assertRegex(rid, r"^xz-[0-9a-f]{32}$")
+
+        # B-4: Same request_id with DIFFERENT user_message or divergent LONGER reply must NOT overwrite!
+        r1 = svc.extract_and_commit_turn(
+            self.brain,
+            svc.DEFAULT_CHARACTER_ID,
+            "b4-collision-id",
+            "第一轮问题",
+            "第一轮原始回复。",
+        )
+        self.assertTrue(r1["committed"])
+        tid = r1["turn_id"]
+
+        with self.assertLogs("anima-bridge", level="WARNING") as cm_user:
+            r_diff_u = svc.extract_and_commit_turn(
+                self.brain,
+                svc.DEFAULT_CHARACTER_ID,
+                "b4-collision-id",
+                "完全不同的另一个用户问题",
+                "这是一个长得多得多的完全不同的回复，绝不能覆盖第一轮！",
+            )
+        self.assertTrue(r_diff_u.get("conflict"))
+        self.assertFalse(r_diff_u.get("updated"))
+        self.assertTrue(any("collision" in m for m in cm_user.output))
+
+        with self.assertLogs("anima-bridge", level="WARNING") as cm_rep:
+            r_diff_a = svc.extract_and_commit_turn(
+                self.brain,
+                svc.DEFAULT_CHARACTER_ID,
+                "b4-collision-id",
+                "第一轮问题",
+                "这是一条与原始回复完全不相关但更长的回复内容，也不应覆盖。",
+            )
+        self.assertTrue(r_diff_a.get("conflict"))
+        self.assertFalse(r_diff_a.get("updated"))
+        self.assertTrue(any("conflict" in m for m in cm_rep.output))
+
+        stored = self.brain.engine.db.execute(
+            "SELECT user_message, assistant_reply FROM turns WHERE id=?", (tid,)
+        ).fetchone()
+        self.assertEqual(stored["user_message"], "第一轮问题")
+        self.assertEqual(stored["assistant_reply"], "第一轮原始回复。")
+
+    def test_batch1_b6_health_grading_and_a5_clickjacking_headers(self):
+        token = "b6-a5-health-token-" + ("g" * 24)
+        frontend_override = svc.FRONTEND_DIR if (svc.FRONTEND_DIR / "index.html").is_file() else None
+        with patch.object(svc, "FRONTEND_DIR", frontend_override):
+            app = svc.create_combined_asgi_app(self.brain, token)
+            with TestClient(app, base_url="http://127.0.0.1:18787") as client:
+                # 1. Healthy /xiaozhi/health: 200, db_ok, worker_alive, backlog_ok, backup, NO host_export_dir!
+                r_ok = client.get("/xiaozhi/health")
+                self.assertEqual(r_ok.status_code, 200)
+                self.assertEqual(r_ok.headers.get("x-frame-options"), "DENY")
+                self.assertIn("frame-ancestors 'none'", r_ok.headers.get("content-security-policy", ""))
+                body = r_ok.json()
+                self.assertEqual(body["status"], "ok")
+                self.assertTrue(body["db_ok"])
+                self.assertTrue(body["worker_alive"])
+                self.assertTrue(body["backlog_ok"])
+                self.assertIn("backup", body)
+                self.assertNotIn(
+                    "host_export_dir",
+                    body.get("obsidian") or {},
+                    "Unauthenticated /xiaozhi/health must NOT expose host_export_dir",
+                )
+
+                # 2. Authenticated /xiaozhi/obsidian/status still includes host_export_dir for 18080 console
+                r_obs = client.get(
+                    "/xiaozhi/obsidian/status",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                self.assertEqual(r_obs.status_code, 200)
+                self.assertIn("host_export_dir", r_obs.json())
+
+                # 3. Non-ASCII raw Authorization header bytes via ASGI -> 401 (never TypeError/500)
+                import asyncio as _aio
+
+                sent_na = []
+
+                async def _send_na():
+                    async def _recv():
+                        return {"type": "http.request", "body": b"", "more_body": False}
+
+                    async def _snd(msg):
+                        sent_na.append(msg)
+
+                    scope = {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/xiaozhi/recall",
+                        "query_string": b"",
+                        "headers": [
+                            (b"host", b"127.0.0.1:18787"),
+                            (b"authorization", b"Bearer \xe4\xb8\xad\xe6\x96\x87"),
+                        ],
+                    }
+                    await app(scope, _recv, _snd)
+
+                _aio.run(_send_na())
+                self.assertEqual(sent_na[0]["status"], 401)
+                na_hdrs = {k.lower(): v for k, v in sent_na[0]["headers"]}
+                self.assertEqual(na_hdrs.get(b"x-frame-options"), b"DENY")
+                self.assertIn(b"frame-ancestors 'none'", na_hdrs.get(b"content-security-policy", b""))
+
+                # 3b. Non-ASCII Authorization on Studio /api/bootstrap must return 401 (NEVER 500!)
+                sent_studio_na = []
+
+                async def _send_studio_na():
+                    async def _recv():
+                        return {"type": "http.request", "body": b"", "more_body": False}
+
+                    async def _snd(msg):
+                        sent_studio_na.append(msg)
+
+                    scope = {
+                        "type": "http",
+                        "method": "GET",
+                        "path": "/api/bootstrap",
+                        "query_string": b"",
+                        "headers": [
+                            (b"host", b"127.0.0.1:18787"),
+                            (b"authorization", b"Bearer \xe4\xb8\xad\xe6\x96\x87"),
+                        ],
+                    }
+                    await app(scope, _recv, _snd)
+
+                _aio.run(_send_studio_na())
+                self.assertEqual(sent_studio_na[0]["status"], 401)
+
+                # 4. Studio route carries clickjacking protection headers (A-5)
+                r_studio = client.get("/")
+                self.assertEqual(r_studio.headers.get("x-frame-options"), "DENY")
+                self.assertIn("frame-ancestors 'none'", r_studio.headers.get("content-security-policy", ""))
+
+                # 5. DB check failure -> 503 with db_ok=False
+                orig_db = self.brain.engine.db
+
+                class _BrokenDB:
+                    def execute(self, *a, **kw):
+                        raise RuntimeError("sqlite disk I/O error")
+
+                self.brain.engine.db = _BrokenDB()
+                try:
+                    r_db_fail = client.get("/xiaozhi/health")
+                    self.assertEqual(r_db_fail.status_code, 503)
+                    self.assertFalse(r_db_fail.json()["db_ok"])
+                    self.assertEqual(r_db_fail.json()["status"], "unhealthy")
+                finally:
+                    self.brain.engine.db = orig_db
+
+            # 6. Outside lifespan (worker not running / done) -> 503 with worker_alive=False
+            sent_dead = []
+
+            async def _probe_no_worker():
+                async def _recv():
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                async def _snd(msg):
+                    sent_dead.append(msg)
+
+                await app(
+                    {
+                        "type": "http",
+                        "method": "GET",
+                        "path": "/xiaozhi/health",
+                        "query_string": b"",
+                        "headers": [(b"host", b"127.0.0.1:18787")],
+                    },
+                    _recv,
+                    _snd,
+                )
+
+            _aio.run(_probe_no_worker())
+            self.assertEqual(sent_dead[0]["status"], 503)
+            dead_body = json.loads(sent_dead[1]["body"].decode("utf-8"))
+            self.assertFalse(dead_body["worker_alive"])
+            self.assertEqual(dead_body["status"], "unhealthy")
+
+            # 7. Direct companion_engine.http_server.create_app (bypassing xiaozhi_anima_service wrapper)
+            #    MUST emit X-Frame-Options: DENY (A-5) and reject non-ASCII Authorization with 401 (E-5, never TypeError).
+            from companion_engine.http_server import create_app as create_studio_app
+
+            direct_app = create_studio_app(self.brain.runtime, token=token, port=18787, start_worker=False)
+            with TestClient(direct_app, base_url="http://127.0.0.1:18787") as direct_client:
+                r_dir_ok = direct_client.get(
+                    "/api/bootstrap",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                self.assertEqual(r_dir_ok.status_code, 200)
+                self.assertEqual(r_dir_ok.headers.get("x-frame-options"), "DENY")
+
+            sent_direct_na = []
+
+            async def _send_direct_na():
+                async def _recv():
+                    return {"type": "http.request", "body": b"", "more_body": False}
+
+                async def _snd(msg):
+                    sent_direct_na.append(msg)
+
+                await direct_app(
+                    {
+                        "type": "http",
+                        "asgi": {"version": "3.0"},
+                        "http_version": "1.1",
+                        "method": "GET",
+                        "scheme": "http",
+                        "path": "/api/bootstrap",
+                        "raw_path": b"/api/bootstrap",
+                        "query_string": b"",
+                        "root_path": "",
+                        "client": ("127.0.0.1", 12345),
+                        "server": ("127.0.0.1", 18787),
+                        "headers": [
+                            (b"host", b"127.0.0.1:18787"),
+                            (b"authorization", b"Bearer \xe4\xb8\xad\xe6\x96\x87"),
+                        ],
+                    },
+                    _recv,
+                    _snd,
+                )
+
+            _aio.run(_send_direct_na())
+            self.assertEqual(sent_direct_na[0]["status"], 401)
 
 
 if __name__ == "__main__":

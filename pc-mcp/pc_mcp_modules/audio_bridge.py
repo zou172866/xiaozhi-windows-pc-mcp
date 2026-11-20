@@ -20,7 +20,7 @@ from starlette.requests import Request as _StarletteRequest
 from starlette.responses import JSONResponse as _StarletteJSONResponse
 
 from . import facade_attr
-from .security import _get_mode
+from .security import _get_mode, is_emergency_stop_active, set_host_mode
 from .winapi import _kernel32
 
 
@@ -510,6 +510,43 @@ def register_http_routes(mcp, player: _WinMMPlayer) -> None:
         data["pc_mode"] = mode
         data["l3_mode_allowed"] = mode == "full"
         return _StarletteJSONResponse(data)
+
+    @mcp.custom_route("/mode", methods=["GET"])
+    async def _mode_get_route(request: _StarletteRequest):
+        get_mode_fn = facade_attr("_get_mode", _get_mode)
+        estop_fn = facade_attr("is_emergency_stop_active", is_emergency_stop_active)
+        return _StarletteJSONResponse(
+            {
+                "ok": True,
+                "mode": get_mode_fn(),
+                "source": "host_state",
+                "emergency_stopped": bool(estop_fn()),
+            }
+        )
+
+    @mcp.custom_route("/mode", methods=["POST"])
+    async def _mode_post_route(request: _StarletteRequest):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or "mode" not in body:
+                return _StarletteJSONResponse(
+                    {"ok": False, "error": "请求体必须包含 mode 字段 (off / safe / full)"},
+                    status_code=400,
+                )
+            extra = [k for k in body.keys() if k not in ("mode", "reason")]
+            if extra:
+                return _StarletteJSONResponse(
+                    {"ok": False, "error": f"禁止提交未知字段: {', '.join(sorted(str(k) for k in extra))}"},
+                    status_code=400,
+                )
+            set_mode_fn = facade_attr("set_host_mode", set_host_mode)
+            reason = str(body.get("reason") or "").strip()[:80]
+            res = await asyncio.to_thread(set_mode_fn, body["mode"], source="http_api", reason=reason)
+            return _StarletteJSONResponse(res)
+        except ValueError as exc:
+            return _StarletteJSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        except Exception as exc:
+            return _StarletteJSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     @mcp.custom_route("/l3/config", methods=["POST"])
     async def _l3_config_route(request: _StarletteRequest):

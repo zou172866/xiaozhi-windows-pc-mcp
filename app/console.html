@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="console-token" content="__XIAOZHI_CONSOLE_TOKEN__">
 <title>小智 ESP32 · 本地控制台</title>
 <style>
   :root {
@@ -164,6 +165,19 @@
   .banner.info { background: var(--accent-tint); color: #115E59; border-bottom-color: var(--accent-border); }
   .banner.warn { background: var(--warn-tint); color: var(--warn); border-bottom-color: #FDE68A; }
   .banner.err  { background: var(--danger-tint); color: var(--danger); border-bottom-color: #FECACA; }
+  .security-banner {
+    display: none;
+    padding: 11px 24px;
+    font-size: 13px;
+    font-weight: 600;
+    background: #DC2626;
+    color: #FFFFFF;
+    border-bottom: 1px solid #991B1B;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .security-banner.show { display: flex; }
 
   .workspace {
     max-width: 1380px;
@@ -512,6 +526,11 @@
   </div>
 </header>
 
+<div id="securityBanner" class="security-banner" role="alert">
+  <span id="securityBannerText"></span>
+  <span id="securityBannerRight" class="num"></span>
+</div>
+
 <div id="banner" class="banner" role="status">
   <span id="bannerText"></span>
   <span id="bannerRight" class="num"></span>
@@ -763,7 +782,7 @@
       </div>
 
       <div class="field-foot">
-        <span>Anima Brain 同步状态（18787）：<strong id="relStatusText">检测中…</strong></span>
+        <span>Anima Brain 同步状态（18787）：<strong id="relStatusText">检测中…</strong> · 最近一次备份：<strong id="animaBackupText" class="num">检测中…</strong></span>
         <span>下一句话即刻生效，无需重启或重连 ESP32</span>
       </div>
     </div>
@@ -825,7 +844,7 @@
       </div>
 
       <div class="field-foot">
-        <span>环境变量状态：DeepSeek <strong id="dsKeyBadge">--</strong> · Gemini <strong id="gemKeyBadge">--</strong></span>
+        <span>环境变量状态：DeepSeek <strong id="dsKeyBadge">--</strong> · Gemini <strong id="gemKeyBadge">--</strong> · 前缀缓存 <strong id="llmCacheRateBadge" class="num">--</strong></span>
         <span>修改后点击右上角「保存并立即生效」（支持免重启热更新）</span>
       </div>
     </div>
@@ -961,6 +980,9 @@
     copyOtaBtn: document.getElementById("copyOtaBtn"),
     saveBtn: document.getElementById("saveBtn"),
     saveBtnLabel: document.getElementById("saveBtnLabel"),
+    securityBanner: document.getElementById("securityBanner"),
+    securityBannerText: document.getElementById("securityBannerText"),
+    securityBannerRight: document.getElementById("securityBannerRight"),
     banner: document.getElementById("banner"),
     bannerText: document.getElementById("bannerText"),
     bannerRight: document.getElementById("bannerRight"),
@@ -1016,6 +1038,7 @@
     relRomRange: document.getElementById("relRomRange"),
     relRomVal: document.getElementById("relRomVal"),
     relStatusText: document.getElementById("relStatusText"),
+    animaBackupText: document.getElementById("animaBackupText"),
     obsStatusBadge: document.getElementById("obsStatusBadge"),
     obsSyncToggle: document.getElementById("obsSyncToggle"),
     obsToggleHint: document.getElementById("obsToggleHint"),
@@ -1029,6 +1052,7 @@
     modelCustomInput: document.getElementById("modelCustomInput"),
     dsKeyBadge: document.getElementById("dsKeyBadge"),
     gemKeyBadge: document.getElementById("gemKeyBadge"),
+    llmCacheRateBadge: document.getElementById("llmCacheRateBadge"),
     voiceSelect: document.getElementById("voiceSelect"),
     meiEmotionBar: document.getElementById("meiEmotionBar"),
     previewBtn: document.getElementById("previewBtn"),
@@ -1048,18 +1072,65 @@
     lastSeenText: document.getElementById("lastSeenText"),
   };
 
+  const CONSOLE_TOKEN = (
+    document.querySelector('meta[name="console-token"]')?.getAttribute("content") || ""
+  ).trim();
+
+  function consolePostHeaders(extra = {}) {
+    const h = { "Content-Type": "application/json", ...extra };
+    if (CONSOLE_TOKEN) h["X-Console-Token"] = CONSOLE_TOKEN;
+    return h;
+  }
+
+  async function consolePost(url, bodyObjOrStr) {
+    const body = typeof bodyObjOrStr === "string" ? bodyObjOrStr : JSON.stringify(bodyObjOrStr ?? {});
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: consolePostHeaders(),
+      body
+    });
+    if (resp.status === 401) {
+      showBanner("err", "控制台会话令牌已失效（服务端可能已重启），请刷新页面后重试。");
+    }
+    return resp;
+  }
+
   let savedConfig = null;
   let isRestarting = false;
   let lastChatJson = "";
   let logCursor = null;
   let logLines = [];
 
+  let serverVoiceDirty = false;
+  let isSaving = false;
+  let bannerHideTimer = null;
+  let stateEpoch = 0;
+  let pollPendingAfterInFlight = false;
+
   function showBanner(type, text, rightText = "") {
+    if (bannerHideTimer !== null) {
+      clearTimeout(bannerHideTimer);
+      bannerHideTimer = null;
+    }
+    delete els.banner.dataset.source;
     els.banner.className = `banner show ${type}`;
     els.bannerText.textContent = text;
     els.bannerRight.textContent = rightText;
   }
-  function hideBanner() { els.banner.className = "banner"; }
+  function hideBanner() {
+    if (bannerHideTimer !== null) {
+      clearTimeout(bannerHideTimer);
+      bannerHideTimer = null;
+    }
+    delete els.banner.dataset.source;
+    els.banner.className = "banner";
+  }
+  function scheduleHideBanner(ms) {
+    if (bannerHideTimer !== null) {
+      clearTimeout(bannerHideTimer);
+    }
+    bannerHideTimer = setTimeout(() => hideBanner(), ms);
+  }
 
   function renderModeButtons(activeMode) {
     els.modeGrid.querySelectorAll(".mode-btn").forEach(btn => {
@@ -1086,19 +1157,19 @@
     const mode = btn.dataset.mode;
     renderModeButtons(mode);
     try {
-      const resp = await fetch("/api/pc-mode", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode })
-      });
+      const resp = await consolePost("/api/pc-mode", { mode });
       const res = await resp.json();
       if (res.ok) {
         const names = { off: "关闭电脑操控", safe: "日常 / 游戏安全挡", full: "全权操控挡（已解锁键鼠与 L3）" };
         showBanner("info", `电脑操控权限已即时切换为：${names[mode]}`);
-        setTimeout(hideBanner, 2800);
+        scheduleHideBanner(2800);
+      } else {
+        showBanner("err", res.error || "宿主机 18900 MCP 拒绝或离线，未能切换挡位。");
+        pollState(true);
       }
     } catch (_) {
       showBanner("err", "切换操控挡位失败，请检查本地服务连接。");
+      pollState(true);
     }
   });
 
@@ -1152,11 +1223,7 @@
   async function saveL3Backend(payload, toastLabel) {
     l3Saving = true;
     try {
-      const resp = await fetch("/api/l3-backend", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+      const resp = await consolePost("/api/l3-backend", payload);
       const res = await resp.json();
       if (!res.ok || !res.l3_backend) throw new Error(res.error || "切换失败");
       l3AdvSynced = false;
@@ -1165,7 +1232,7 @@
         "info",
         toastLabel || `L3 后台 Agent 引擎已即时切换为：${L3_NAMES[res.l3_backend.backend] || res.l3_backend.backend}`
       );
-      setTimeout(hideBanner, 2800);
+      scheduleHideBanner(2800);
     } catch (err) {
       showBanner("err", `保存 L3 后端配置失败：${err.message}`);
     } finally {
@@ -1209,18 +1276,14 @@
       const target = btn.dataset.target;
       renderAudioOutButtons(target);
       try {
-        const resp = await fetch("/api/audio-output", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ target, volume: Number(els.pcAudioVolRange.value) / 100 })
-        });
+        const resp = await consolePost("/api/audio-output", { target, volume: Number(els.pcAudioVolRange.value) / 100 });
         const res = await resp.json();
         if (res.ok) {
           const msg = target === "pc"
             ? "语音播报已即时切换为：Windows 电脑音响（48kHz 原声）"
             : "语音播报已即时切换为：ESP32 本机喇叭";
           showBanner("info", msg);
-          setTimeout(hideBanner, 2800);
+          scheduleHideBanner(2800);
         }
       } catch (_) {
         showBanner("err", "切换播报输出端失败，请检查本地服务连接。");
@@ -1238,11 +1301,7 @@
       const vol = Number(els.pcAudioVolRange.value) / 100;
       els.pcAudioVolVal.textContent = `${els.pcAudioVolRange.value}%`;
       try {
-        await fetch("/api/audio-output", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ volume: vol })
-        });
+        await consolePost("/api/audio-output", { volume: vol });
       } catch (_) {}
     });
   }
@@ -1253,15 +1312,11 @@
       const oldTxt = els.pcAudioTestBtn.textContent;
       els.pcAudioTestBtn.textContent = "播报中…";
       try {
-        const resp = await fetch("/api/audio-test", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ volume: Number(els.pcAudioVolRange.value) / 100 })
-        });
+        const resp = await consolePost("/api/audio-test", { volume: Number(els.pcAudioVolRange.value) / 100 });
         const res = await resp.json();
         if (!res.ok) throw new Error(res.error || "试播失败");
         showBanner("info", "已通过 Windows 电脑音响播放雷电芽衣原声测试片段！");
-        setTimeout(hideBanner, 2600);
+        scheduleHideBanner(2600);
       } catch (err) {
         showBanner("err", `电脑音响试播失败：${err.message}`);
       } finally {
@@ -1302,11 +1357,7 @@
 
   async function saveReplyLength(payload, toastLabel) {
     try {
-      const resp = await fetch("/api/reply-length", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+      const resp = await consolePost("/api/reply-length", payload);
       const res = await resp.json();
       if (res.ok && res.reply_length) {
         renderReplyLengthUI(res.reply_length);
@@ -1314,7 +1365,7 @@
           "info",
           toastLabel || `回复篇幅已即时生效：日常约 ${res.reply_length.chat_chars} 字 · 故事约 ${res.reply_length.story_chars} 字`
         );
-        setTimeout(hideBanner, 2600);
+        scheduleHideBanner(2600);
       }
     } catch (_) {
       showBanner("err", "保存回复字数设置失败，请检查本地服务连接。");
@@ -1460,11 +1511,7 @@
       messages: parseIdleFarewellLines(els.idleFarewellInput ? els.idleFarewellInput.value : "")
     };
     try {
-      const resp = await fetch("/api/idle-farewell", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+      const resp = await consolePost("/api/idle-farewell", payload);
       const res = await resp.json();
       if (!resp.ok || !res || !res.ok || !res.idle_farewell) {
         throw new Error((res && res.error) || "保存超时告别语失败");
@@ -1486,7 +1533,7 @@
         }
       }
       showBanner("info", msg);
-      setTimeout(hideBanner, 3200);
+      scheduleHideBanner(3200);
     } catch (err) {
       showBanner("err", `保存超时告别语失败：${err.message}`);
     } finally {
@@ -1561,7 +1608,7 @@
       const lines = parseIdleFarewellLines(els.idleFarewellInput ? els.idleFarewellInput.value : "");
       if (!lines.length) {
         showBanner("warn", "请先输入至少一句自定义告别台词再试听。");
-        setTimeout(hideBanner, 2600);
+        scheduleHideBanner(2600);
         return;
       }
       const sampleLine = lines[0];
@@ -1572,7 +1619,7 @@
       try {
         const resp = await fetch("/api/tts-preview", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: consolePostHeaders(),
           body: JSON.stringify({
             voice: els.voiceSelect.value,
             text: sampleLine,
@@ -1584,8 +1631,13 @@
           try {
             const errJson = await resp.json();
             if (errJson && errJson.error) errMsg = errJson.error;
+            if (errJson && errJson.rollback_warning) errMsg += `（${errJson.rollback_warning}）`;
           } catch (_) {}
           throw new Error(errMsg);
+        }
+        const previewWarn = resp.headers.get("X-Preview-Warning");
+        if (previewWarn) {
+          try { showBanner("warn", decodeURIComponent(previewWarn)); } catch (_) { showBanner("warn", previewWarn); }
         }
         const blob = await resp.blob();
         const url = URL.createObjectURL(blob);
@@ -1689,11 +1741,7 @@
   async function saveRelationship(payload, toastLabel) {
     relSaving = true;
     try {
-      const resp = await fetch("/api/relationship", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+      const resp = await consolePost("/api/relationship", payload);
       const res = await resp.json();
       if (!res.ok || !res.relationship) {
         throw new Error(res.error || "写入失败");
@@ -1705,7 +1753,7 @@
         "info",
         toastLabel || `亲密度已即时生效（${res.relationship.stage_label_zh}）：熟悉 ${Math.round((ax.familiarity || 0) * 100)}% · 温暖 ${Math.round((ax.warmth || 0) * 100)}% · 信任 ${Math.round((ax.trust || 0) * 100)}% · ${romTxt}`
       );
-      setTimeout(hideBanner, 2800);
+      scheduleHideBanner(2800);
     } catch (err) {
       showBanner("err", `调节亲密度失败：${err.message}`);
     } finally {
@@ -1862,11 +1910,7 @@
       els.obsSyncToggle.disabled = true;
       if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = true;
       try {
-        const resp = await fetch("/api/obsidian/config", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled })
-        });
+        const resp = await consolePost("/api/obsidian/config", { enabled });
         httpStatus = resp.status || 0;
         const res = await resp.json();
         if (res && res.obsidian) {
@@ -1877,7 +1921,7 @@
           throw new Error((res && res.error) || "切换失败");
         }
         showBanner("info", enabled ? "已开启 Obsidian 单向自动同步并完成检查！" : "已暂停 Obsidian 自动同步（已有笔记保留不动）。");
-        setTimeout(hideBanner, 3000);
+        scheduleHideBanner(3000);
       } catch (err) {
         if (!appliedFreshState) {
           els.obsSyncToggle.checked = !enabled;
@@ -1911,11 +1955,7 @@
       if (els.obsSyncToggle) els.obsSyncToggle.disabled = true;
       els.obsRebuildBtn.textContent = "正在重建…";
       try {
-        const resp = await fetch("/api/obsidian/rebuild", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}"
-        });
+        const resp = await consolePost("/api/obsidian/rebuild", "{}");
         httpStatus = resp.status || 0;
         const res = await resp.json();
         if (res && res.obsidian) {
@@ -1930,7 +1970,7 @@
           "info",
           `Obsidian 全量重建完成：写入 ${r.written || 0} 份，哈希未变跳过 ${r.skipped || 0} 份（耗时 ${r.duration_ms || 0} ms）`
         );
-        setTimeout(hideBanner, 3600);
+        scheduleHideBanner(3600);
       } catch (err) {
         if (!appliedFreshState && (httpStatus === 0 || httpStatus >= 500)) {
           obsOnline = false;
@@ -1976,22 +2016,23 @@
 
   function checkDirty() {
     if (!savedConfig) return;
-    const dirty = (
+    els.charCount.textContent = `${els.promptInput.value.length} 字`;
+    if (isSaving || isRestarting) return;
+    const formDirty = (
       els.promptInput.value.trim() !== savedConfig.prompt ||
       els.providerSelect.value !== savedConfig.llm_provider ||
       els.modelCustomInput.value.trim() !== savedConfig.model_name ||
       els.voiceSelect.value !== savedConfig.voice
     );
-    if (dirty) {
+    if (formDirty || serverVoiceDirty) {
       els.saveBtn.disabled = false;
       els.saveBtn.classList.add("has-dirty");
-      els.saveBtnLabel.textContent = "保存并立即生效";
-    } else if (!isRestarting) {
+      els.saveBtnLabel.textContent = formDirty ? "保存并立即生效" : "立即恢复线上音色权重";
+    } else {
       els.saveBtn.disabled = true;
       els.saveBtn.classList.remove("has-dirty");
       els.saveBtnLabel.textContent = "已同步生效";
     }
-    els.charCount.textContent = `${els.promptInput.value.length} 字`;
   }
 
   els.providerSelect.addEventListener("change", () => {
@@ -2083,7 +2124,7 @@
     try {
       await navigator.clipboard.writeText(txt);
       showBanner("info", `已复制 OTA 接口地址：${txt}`);
-      setTimeout(hideBanner, 2600);
+      scheduleHideBanner(2600);
     } catch (_) {}
   });
 
@@ -2104,11 +2145,7 @@
   els.tabLogs.addEventListener("click", () => switchMonitorTab("logs"));
 
   els.clearHistoryBtn.addEventListener("click", async () => {
-    await fetch("/api/clear-history", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}"
-    });
+    await consolePost("/api/clear-history", "{}");
     lastChatJson = "";
     pollState();
   });
@@ -2125,7 +2162,7 @@
     try {
       const resp = await fetch("/api/tts-preview", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: consolePostHeaders(),
         body: JSON.stringify({
           voice: els.voiceSelect.value,
           text: els.previewTextInput.value.trim(),
@@ -2137,8 +2174,13 @@
         try {
           const errJson = await resp.json();
           if (errJson && errJson.error) errMsg = errJson.error;
+          if (errJson && errJson.rollback_warning) errMsg += `（${errJson.rollback_warning}）`;
         } catch (_) {}
         throw new Error(errMsg);
+      }
+      const previewWarn = resp.headers.get("X-Preview-Warning");
+      if (previewWarn) {
+        try { showBanner("warn", decodeURIComponent(previewWarn)); } catch (_) { showBanner("warn", previewWarn); }
       }
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
@@ -2158,7 +2200,7 @@
   });
 
   async function saveConfig() {
-    if (els.saveBtn.disabled || isRestarting) return;
+    if (els.saveBtn.disabled || isRestarting || isSaving) return;
     const payload = {
       prompt: els.promptInput.value.trim(),
       llm_provider: els.providerSelect.value,
@@ -2171,18 +2213,16 @@
       return;
     }
 
+    isSaving = true;
     els.saveBtn.disabled = true;
     els.saveBtn.classList.remove("has-dirty");
     els.saveBtnLabel.textContent = "正在应用配置…";
 
     try {
-      const resp = await fetch("/api/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+      const resp = await consolePost("/api/config", payload);
       const res = await resp.json();
       if (!res.ok) throw new Error(res.error || "保存失败");
+      stateEpoch += 1;
       savedConfig = {
         prompt: payload.prompt,
         llm_provider: payload.llm_provider,
@@ -2190,6 +2230,7 @@
         voice: payload.voice
       };
       if (res.restarting) {
+        isSaving = false;
         isRestarting = true;
         els.saveBtnLabel.textContent = "正在重启生效…";
         els.statusPill.className = "status-pill restarting";
@@ -2197,14 +2238,29 @@
         showBanner("warn", "新配置已写入，正在平滑重启语音服务并加载 MCP 工具（约需 8～12 秒）…");
         await new Promise(r => setTimeout(r, 2500));
       } else {
+        isSaving = false;
         isRestarting = false;
+        if (typeof res.voice_dirty === "boolean") {
+          serverVoiceDirty = res.voice_dirty;
+        } else if (res.voice_recovered) {
+          serverVoiceDirty = false;
+        }
         checkDirty();
         const changedCount = Array.isArray(res.changed_fields) ? res.changed_fields.length : 0;
-        showBanner("info", changedCount > 0 ? "新配置已热更新生效（免重启）！" : "配置无变化。");
-        setTimeout(hideBanner, 3600);
-        pollState();
+        let okMsg = "配置无变化。";
+        if (changedCount > 0 && res.voice_recovered) {
+          okMsg = "新配置已热更新生效，并已立即恢复线上音色权重！";
+        } else if (changedCount > 0) {
+          okMsg = "新配置已热更新生效（免重启）！";
+        } else if (res.voice_recovered) {
+          okMsg = "已立即恢复线上音色权重！";
+        }
+        showBanner("info", okMsg);
+        scheduleHideBanner(3600);
+        pollState(true);
       }
     } catch (err) {
+      isSaving = false;
       isRestarting = false;
       checkDirty();
       showBanner("err", `保存失败：${err.message}`);
@@ -2279,9 +2335,13 @@
   let pollTimer = null;
   let pollInFlight = false;
 
-  async function pollState() {
-    if (pollInFlight) return;
+  async function pollState(forceFollowUp = false) {
+    if (pollInFlight) {
+      if (forceFollowUp) pollPendingAfterInFlight = true;
+      return;
+    }
     pollInFlight = true;
+    const reqEpoch = stateEpoch;
     try {
       const stateUrl = (logCursor !== null) ? `/api/state?log_cursor=${encodeURIComponent(logCursor)}` : "/api/state";
       const resp = await fetch(stateUrl, { cache: "no-store" });
@@ -2327,6 +2387,38 @@
       if (!relDragging && !relSaving && cfg.relationship) {
         renderRelationshipUI(cfg.relationship);
       }
+      if (els.animaBackupText && cfg.anima_backup) {
+        const bk = cfg.anima_backup;
+        if (bk.last_error) {
+          els.animaBackupText.textContent = `备份异常 (${bk.last_error})`;
+          els.animaBackupText.style.color = "var(--danger)";
+        } else if (bk.last_backup_at) {
+          const okTag = bk.integrity_ok === true ? "已校验" : (bk.integrity_ok === false ? "校验异常" : "待校验");
+          els.animaBackupText.textContent = `${bk.last_backup_at} (${okTag} · 日${bk.daily_count || 0}/周${bk.weekly_count || 0})`;
+          els.animaBackupText.style.color = bk.integrity_ok === false ? "var(--danger)" : "var(--accent)";
+        } else if (bk.probed === false) {
+          els.animaBackupText.textContent = "检测中…";
+          els.animaBackupText.style.color = "var(--ink-muted)";
+        } else {
+          els.animaBackupText.textContent = "等待首次每日备份";
+          els.animaBackupText.style.color = "var(--ink-muted)";
+        }
+      }
+      if (reqEpoch === stateEpoch) {
+        const prevVoiceDirty = serverVoiceDirty;
+        serverVoiceDirty = Boolean(cfg.voice_dirty);
+        if (prevVoiceDirty !== serverVoiceDirty) {
+          checkDirty();
+        }
+        if (cfg.voice_dirty) {
+          if (els.banner && (!els.banner.classList.contains("show") || els.banner.dataset.source === "voice_dirty")) {
+            showBanner("warn", `线上音色权重待恢复（后台探测自动重试中）${cfg.voice_dirty_error ? "：" + cfg.voice_dirty_error : ""}`);
+            els.banner.dataset.source = "voice_dirty";
+          }
+        } else if (els.banner && els.banner.dataset.source === "voice_dirty") {
+          hideBanner();
+        }
+      }
       if (cfg.obsidian) {
         if (obsBusy) {
           obsOnline = Boolean(cfg.obsidian.online);
@@ -2341,6 +2433,20 @@
       els.dsKeyBadge.style.color = cfg.deepseek_key_ok ? "var(--accent)" : "var(--danger)";
       els.gemKeyBadge.textContent = cfg.gemini_key_ok ? "已就绪" : "未设置";
       els.gemKeyBadge.style.color = cfg.gemini_key_ok ? "var(--accent)" : "var(--danger)";
+      if (els.llmCacheRateBadge && cfg.llm_cache) {
+        const lc = cfg.llm_cache;
+        const rate = (typeof lc.recent_hit_rate_pct === "number")
+          ? lc.recent_hit_rate_pct
+          : lc.overall_hit_rate_pct;
+        if (typeof rate === "number" && lc.turns > 0) {
+          const ttftTxt = (typeof lc.last_ttft_ms === "number") ? ` · 首字 ${Math.round(lc.last_ttft_ms)}ms` : "";
+          els.llmCacheRateBadge.textContent = `${rate.toFixed(1)}% (${lc.turns}轮${ttftTxt} · ${lc.mode || "split"})`;
+          els.llmCacheRateBadge.style.color = rate >= 70 ? "var(--accent)" : "var(--warn)";
+        } else {
+          els.llmCacheRateBadge.textContent = `待对话 (${lc.mode || "split"})`;
+          els.llmCacheRateBadge.style.color = "var(--ink-muted)";
+        }
+      }
 
       if (!l3Saving) {
         renderL3BackendUI(cfg.l3_backend, cfg.agy_bridge_online);
@@ -2354,14 +2460,42 @@
         isRestarting = false;
         checkDirty();
         showBanner("info", "新配置已成功生效！");
-        setTimeout(hideBanner, 3600);
+        scheduleHideBanner(3600);
+      }
+
+      const hlth = data.health || {};
+      if (els.securityBanner) {
+        const secFailed = (hlth.security_ok === false) || Boolean(hlth.insecure_boot);
+        const envArmed = Boolean(hlth.insecure_boot_env);
+        if (secFailed) {
+          const fails = Array.isArray(hlth.security_failures) ? hlth.security_failures.join(", ") : "";
+          els.securityBanner.className = "security-banner show";
+          els.securityBannerText.textContent =
+            `安全告警：当前处于不安全降级模式 (XIAOZHI_ALLOW_INSECURE_BOOT=1)，以下安全补丁未生效：${fails || "请查看 /api/health"}`;
+          els.securityBannerRight.textContent = "HTTP 503";
+        } else if (envArmed) {
+          els.securityBanner.className = "security-banner show";
+          els.securityBannerText.textContent =
+            "安全提醒：应急开关 XIAOZHI_ALLOW_INSECURE_BOOT=1 已开启，建议排障完成后立即移除以恢复 fail-closed 保护。";
+          els.securityBannerRight.textContent = "OVERRIDE ARMED";
+        } else {
+          els.securityBanner.className = "security-banner";
+        }
       }
 
       if (!isRestarting) {
-        const hlth = data.health || {};
-        if (hlth.degraded) {
+        const degList = Array.isArray(hlth.degraded_list)
+          ? hlth.degraded_list
+          : (Array.isArray(hlth.degraded) ? hlth.degraded : []);
+        const isDegraded = degList.length > 0 || (typeof hlth.degraded === "boolean" && hlth.degraded);
+        if (hlth.security_ok === false) {
           els.statusPill.className = "status-pill restarting";
-          els.statusText.textContent = "补丁契约降级（查看 /api/health）";
+          els.statusText.textContent = "安全补丁异常（不安全降级模式）";
+        } else if (isDegraded) {
+          els.statusPill.className = "status-pill restarting";
+          els.statusText.textContent = degList.length
+            ? `补丁降级：${degList.join(", ")}`
+            : "补丁契约降级（查看 /api/health）";
         } else if (!dev.server_ready) {
           els.statusPill.className = "status-pill restarting";
           els.statusText.textContent = "正在加载语音识别模型…";
@@ -2396,6 +2530,10 @@
       }
     } finally {
       pollInFlight = false;
+      if (pollPendingAfterInFlight) {
+        pollPendingAfterInFlight = false;
+        pollState();
+      }
     }
   }
 

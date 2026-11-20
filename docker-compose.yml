@@ -7,6 +7,10 @@ services:
     container_name: xiaozhi-anima-brain
     restart: always
     stop_grace_period: 25s
+    env_file:
+      # A-1 最小权限：anima-brain 仅接收自身 ANIMA_STUDIO_TOKEN，严禁注入 PC_MCP_TOKEN
+      - path: ./secrets/anima_tokens.env
+        required: false
     environment:
       - TZ=Asia/Shanghai
       - MALLOC_ARENA_MAX=2
@@ -39,6 +43,8 @@ services:
     ports:
       # Companion Studio 网页控制台端口（仅绑定本机回环，防止局域网暴露）
       - "127.0.0.1:18787:18787"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:18787/xiaozhi/health', timeout=3)"]
       interval: 30s
@@ -51,11 +57,12 @@ services:
         max-size: "10m"
         max-file: "3"
     volumes:
-      # 持久化 Anima Brain SQLite 数据库与访问令牌
-      - ./data/anima:/data/anima
+      # 持久化 Anima Brain SQLite 数据库与访问令牌（仅挂载给 anima-brain，主容器完全不可见，A-1）
+      - ./anima-data:/data/anima
       - ./anima-brain/xiaozhi_anima_service.py:/app/xiaozhi_anima_service.py:ro
       - ./anima-brain/obsidian_exporter.py:/app/obsidian_exporter.py:ro
       - ./anima-brain/src/companion_engine/automation.py:/app/src/companion_engine/automation.py:ro
+      - ./anima-brain/src/companion_engine/http_server.py:/app/src/companion_engine/http_server.py:ro
       # Obsidian 单向导出目录（默认挂载本地 ./data/obsidian_export，配置 OBSIDIAN_EXPORT_DIR 后直连指定 Vault）
       - ${OBSIDIAN_EXPORT_DIR:-./data/obsidian_export}:/obsidian
 
@@ -66,13 +73,26 @@ services:
     depends_on:
       anima-brain:
         condition: service_healthy
-    command: ["python", "data/start_with_env.py"]
+    command: ["python", "/opt/xiaozhi-esp32-server/app/start_with_env.py"]
+    env_file:
+      # A-1 最小权限：主容器按需接收 18900 与 18787 两个独立环境文件，零令牌文件挂载
+      - path: ./secrets/pc_mcp_tokens.env
+        required: false
+      - path: ./secrets/anima_tokens.env
+        required: false
     environment:
       - TZ=Asia/Shanghai
       - MALLOC_ARENA_MAX=2
       - OMP_NUM_THREADS=2
       - HOST_LAN_IP=${HOST_LAN_IP:-127.0.0.1}
+      - HOST_PROJECT_DIR=${HOST_PROJECT_DIR:-}
       - HOST_DATA_DIR=${HOST_DATA_DIR:-/opt/xiaozhi-esp32-server/data}
+      - HOST_VOICES_DIR=${HOST_VOICES_DIR:-}
+      - HOST_GSV_WEIGHTS_DIR=${HOST_GSV_WEIGHTS_DIR:-}
+      - XIAOZHI_APP_DIR=/opt/xiaozhi-esp32-server/app
+      - XIAOZHI_CONFIG_DIR=/opt/xiaozhi-esp32-server/data
+      - XIAOZHI_STATE_DIR=/opt/xiaozhi-esp32-server/state
+      - XIAOZHI_VOICES_DIR=/opt/xiaozhi-esp32-server/voices
       - ESP32_AUTH_KEY=${ESP32_AUTH_KEY:-}
       - ESP32_ALLOWED_DEVICES=${ESP32_ALLOWED_DEVICES:-}
       - L3_BACKEND=${L3_BACKEND:-dsh}
@@ -89,6 +109,8 @@ services:
       - "18003:8003"
       # 小智语音与音色本地控制台端口 -> http://localhost:18080（仅绑定本机回环，防止局域网暴露）
       - "127.0.0.1:18080:18080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:18080/api/health', timeout=3)"]
       interval: 30s
@@ -101,8 +123,13 @@ services:
         max-size: "10m"
         max-file: "3"
     volumes:
-      # 配置文件与 Anima Brain 记忆插件目录
-      - ./data:/opt/xiaozhi-esp32-server/data
+      # A-1 按职责拆分挂载：代码与模板只读，运行态与配置最小权限隔离，secrets/backups/anima-data/宿主机权重永不挂载
+      - ./app:/opt/xiaozhi-esp32-server/app:ro
+      - ./config:/opt/xiaozhi-esp32-server/config_templates:ro
+      - ./config/runtime:/opt/xiaozhi-esp32-server/data
+      - ./config/.mcp_server_settings.json:/opt/xiaozhi-esp32-server/data/.mcp_server_settings.json:ro
+      - ./state:/opt/xiaozhi-esp32-server/state
+      - ./voices:/opt/xiaozhi-esp32-server/voices:ro
       # 轻量 Sherpa-ONNX SenseVoice int8 本地离线语音识别模型（默认，内存仅 ~350MB；需可写以支持首次启动自动下载）
       - ./models/sherpa-onnx-sense-voice:/opt/xiaozhi-esp32-server/models/sherpa-onnx-sense-voice
       # 可选 FunASR PyTorch 模型目录挂载（不遮蔽镜像内置 snakers4_silero-vad，新电脑无 model.pt 也可正常启动）

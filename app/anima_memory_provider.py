@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from typing import Any, Callable
 
 import httpx
@@ -27,8 +28,8 @@ TAG = __name__
 _GLOBAL_CONFIG = {
     "service_url": "http://anima-brain:18787",
     "character_id": "xiaozhi",
-    "token_file": "/opt/xiaozhi-esp32-server/data/anima/studio_token.txt",
-    "outbox_db": "/opt/xiaozhi-esp32-server/data/anima_outbox.sqlite",
+    "token_file": xz_common.ANIMA_TOKEN_PATH,
+    "outbox_db": os.path.join(xz_common.STATE_DIR, "anima_outbox.sqlite"),
 }
 
 _SENSITIVE_ERR_RE = re.compile(
@@ -37,13 +38,17 @@ _SENSITIVE_ERR_RE = re.compile(
 
 
 def _read_token() -> str:
-    return xz_common.read_token_file(_GLOBAL_CONFIG["token_file"])
+    return xz_common.get_anima_token(_GLOBAL_CONFIG["token_file"])
 
 
 def _sanitize_err(msg: Any, limit: int = 200) -> str:
     cleaned = _SENSITIVE_ERR_RE.sub("[REDACTED]", str(msg or ""))
     cleaned = " ".join(cleaned.split())
     return cleaned[:limit]
+
+
+def _new_request_id() -> str:
+    return f"xz-{uuid.uuid4().hex}"
 
 
 def _canonical_turn_payload(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -53,9 +58,8 @@ def _canonical_turn_payload(item: dict[str, Any]) -> dict[str, Any] | None:
     a_msg = str(item.get("assistant_reply") or "").strip()
     if not u_msg or not a_msg:
         return None
-    req_id = str(item.get("request_id") or f"xz-{int(time.time() * 1000)}").strip()[:110]
-    if not req_id:
-        req_id = f"xz-{int(time.time() * 1000)}"
+    raw_req = str(item.get("request_id") or "").strip()[:110]
+    req_id = raw_req or _new_request_id()
     payload: dict[str, Any] = {
         "request_id": req_id,
         "user_message": u_msg,
@@ -72,20 +76,34 @@ def _canonical_turn_payload(item: dict[str, Any]) -> dict[str, Any] | None:
     return payload
 
 
-def _merge_turn_payloads(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    """Merge duplicate request_id updates without ever losing reply length, tool flag, or earliest timestamp."""
+def _merge_turn_payloads(existing: dict[str, Any], incoming: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Merge duplicate request_id updates safely (B-4):
+    - Refuse overwriting if user_message differs OR assistant_reply diverges (non-prefix continuation).
+    - Allow legitimate post-tool continuation when user_message matches and new_reply extends old_reply.
+    Returns (merged_payload, conflict_detected).
+    """
+    old_user = str(existing.get("user_message") or "").strip()
+    new_user = str(incoming.get("user_message") or "").strip()
+    old_reply = str(existing.get("assistant_reply") or "").strip()
+    new_reply = str(incoming.get("assistant_reply") or "").strip()
+
+    if old_user and new_user and new_user != old_user:
+        return dict(existing), True
+
+    if old_reply and new_reply and new_reply != old_reply:
+        is_continuation = len(new_reply) > len(old_reply) and new_reply.startswith(old_reply)
+        is_shorter_prefix = old_reply.startswith(new_reply)
+        if not is_continuation and not is_shorter_prefix:
+            return dict(existing), True
+
     merged = dict(existing)
     merged["request_id"] = incoming["request_id"]
-    merged["user_message"] = incoming["user_message"] or existing.get("user_message", "")
+    merged["user_message"] = old_user or new_user
 
-    old_reply = str(existing.get("assistant_reply") or "")
-    new_reply = str(incoming.get("assistant_reply") or "")
-    if len(new_reply) > len(old_reply):
-        merged["assistant_reply"] = new_reply
-    elif len(new_reply) == len(old_reply) and new_reply != old_reply:
+    if len(new_reply) > len(old_reply) and (not old_reply or new_reply.startswith(old_reply)):
         merged["assistant_reply"] = new_reply
     else:
-        merged["assistant_reply"] = old_reply
+        merged["assistant_reply"] = old_reply or new_reply
 
     merged["used_tools"] = bool(existing.get("used_tools", False)) or bool(
         incoming.get("used_tools", False)
@@ -105,7 +123,7 @@ def _merge_turn_payloads(existing: dict[str, Any], incoming: dict[str, Any]) -> 
     dev = str(incoming.get("device_id") or existing.get("device_id") or "").strip()
     if dev:
         merged["device_id"] = dev[:64]
-    return merged
+    return merged, False
 
 
 def _payload_hash(payload: dict[str, Any]) -> str:
@@ -127,6 +145,8 @@ class AnimaOutbox:
         base_backoff: float = 2.0,
         max_backoff: float = 300.0,
         keep_sent_rows: int = 500,
+        wal_journal_size_limit: int = 8 * 1024 * 1024,
+        wal_checkpoint_interval: float = 180.0,
         auto_start: bool = True,
     ):
         self.db_path = db_path
@@ -143,6 +163,8 @@ class AnimaOutbox:
         self.base_backoff = max(0.05, float(base_backoff))
         self.max_backoff = max(self.base_backoff, float(max_backoff))
         self.keep_sent_rows = max(20, int(keep_sent_rows))
+        self.wal_journal_size_limit = max(65536, int(wal_journal_size_limit))
+        self.wal_checkpoint_interval = max(1.0, float(wal_checkpoint_interval))
         self._auto_start = bool(auto_start)
 
         self._lock = threading.RLock()
@@ -153,6 +175,7 @@ class AnimaOutbox:
         self._worker: threading.Thread | None = None
         self._last_error: str = ""
         self._prune_counter: int = 0
+        self._last_wal_checkpoint_ts: float | None = None
 
     def _ensure_db(self) -> sqlite3.Connection:
         with self._lock:
@@ -166,6 +189,7 @@ class AnimaOutbox:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(f"PRAGMA journal_size_limit={self.wal_journal_size_limit}")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS outbox_turns (
@@ -239,7 +263,12 @@ class AnimaOutbox:
                         prev_payload = json.loads(existing["payload_json"])
                     except Exception:
                         prev_payload = {}
-                    merged = _merge_turn_payloads(prev_payload, item)
+                    merged, conflict = _merge_turn_payloads(prev_payload, item)
+                    if conflict:
+                        logger.bind(tag=TAG).warning(
+                            f"Anima 本地发件箱检测到 request_id={req_id} 内容冲突，拒绝覆盖历史记录"
+                        )
+                        continue
                     new_hash = _payload_hash(merged)
                     if existing["payload_hash"] == new_hash and existing["status"] in ("sent", "pending"):
                         continue
@@ -473,12 +502,34 @@ class AnimaOutbox:
             return 15.0
         return max(0.1, min(15.0, float(row[0]) - now))
 
+    def checkpoint_wal(self) -> tuple[int, int, int] | None:
+        """Truncate SQLite WAL file while idle to bound disk growth (B-3)."""
+        with self._lock:
+            db = self._ensure_db()
+            if db.in_transaction:
+                return None
+            try:
+                row = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                self._last_wal_checkpoint_ts = time.monotonic()
+                if row is not None:
+                    return (int(row[0]), int(row[1]), int(row[2]))
+            except Exception as exc:
+                self._last_error = _sanitize_err(exc)
+        return None
+
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 res = self.drain_once(batch_size=16, force_due=False)
                 if res["sent"] > 0 and res["remaining"] > 0 and res["failed"] == 0:
                     continue
+                if res["remaining"] == 0:
+                    now_mono = time.monotonic()
+                    if (
+                        self._last_wal_checkpoint_ts is None
+                        or (now_mono - self._last_wal_checkpoint_ts) >= self.wal_checkpoint_interval
+                    ):
+                        self.checkpoint_wal()
             except Exception as exc:
                 self._last_error = _sanitize_err(exc)
             wait_sec = self._next_wait_seconds()
@@ -538,7 +589,7 @@ def register_pre_flush_hook(hook: Callable[[], None]) -> None:
 
 def get_default_outbox(*, auto_start: bool = True) -> AnimaOutbox:
     global _default_outbox
-    target_db = str(_GLOBAL_CONFIG.get("outbox_db") or "/opt/xiaozhi-esp32-server/data/anima_outbox.sqlite")
+    target_db = str(_GLOBAL_CONFIG.get("outbox_db") or os.path.join(xz_common.STATE_DIR, "anima_outbox.sqlite"))
     with _outbox_lock:
         if _default_outbox is not None and _default_outbox.db_path != target_db:
             _default_outbox.close()
@@ -600,6 +651,7 @@ def _read_occurred_at(msg: Any) -> float | None:
 def extract_clean_pairs(messages, *, device_id: str = "", source: str = "esp32") -> list:
     """Pair genuine non-temporary user utterances with full assistant replies and turn metadata."""
     pairs = []
+    cur_user_msg = None
     cur_uid = None
     cur_user = None
     cur_occurred_at: float | None = None
@@ -609,8 +661,21 @@ def extract_clean_pairs(messages, *, device_id: str = "", source: str = "esp32")
     def _emit_current():
         if not (cur_user and cur_assistant_parts):
             return
+        if cur_uid:
+            req_id = f"xz-{cur_uid}"
+        else:
+            cached_req = getattr(cur_user_msg, "_anima_fallback_req_id", None) if cur_user_msg is not None else None
+            if cached_req:
+                req_id = str(cached_req)
+            else:
+                req_id = _new_request_id()
+                if cur_user_msg is not None:
+                    try:
+                        cur_user_msg._anima_fallback_req_id = req_id
+                    except Exception:
+                        pass
         pair: dict[str, Any] = {
-            "request_id": f"xz-{cur_uid}",
+            "request_id": req_id,
             "user_message": cur_user,
             "assistant_reply": " ".join(cur_assistant_parts).strip(),
             "source": source or "esp32",
@@ -631,6 +696,7 @@ def extract_clean_pairs(messages, *, device_id: str = "", source: str = "esp32")
             if content.startswith("[系统提示]"):
                 continue
             _emit_current()
+            cur_user_msg = m
             cur_uid = str(getattr(m, "uniq_id", ""))[:64]
             cur_user = content
             cur_occurred_at = _read_occurred_at(m)
