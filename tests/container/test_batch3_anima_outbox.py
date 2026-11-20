@@ -16,7 +16,12 @@ from unittest.mock import patch
 import httpx
 
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+APP_DIR = os.environ.get("XIAOZHI_APP_DIR") or (
+    os.path.join(ROOT_DIR, "app")
+    if os.path.isdir(os.path.join(ROOT_DIR, "app"))
+    else os.path.join(_REPO_ROOT, "app")
+)
 for _p in (ROOT_DIR, APP_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)

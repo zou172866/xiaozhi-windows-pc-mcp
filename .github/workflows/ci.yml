@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pc-mcp-windows:
+    name: Host pc-mcp unit tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install hash-locked pc-mcp dependencies
+        run: python -m pip install --require-hashes -r pc-mcp/requirements.txt
+
+      - name: Run pc-mcp unittest suite
+        run: python -m unittest discover -s pc-mcp -p "test_*.py" -v
+
+  container-unit-and-contract:
+    name: Container offline unit & upstream contract tests (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pull pinned upstream xiaozhi-esp32-server image
+        run: |
+          IMAGE=$(python3 -c "import re, pathlib; m=re.search(r'^\s*image:\s*(\S+xiaozhi-esp32-server\S+)\s*$', pathlib.Path('docker-compose.yml').read_text(encoding='utf-8'), re.M); assert m; print(m.group(1))")
+          if ! docker pull "$IMAGE"; then
+            FALLBACK="ghcr.io/${IMAGE#ghcr.nju.edu.cn/}"
+            echo "Mirror pull failed, falling back to official digest-pinned image: $FALLBACK"
+            docker pull "$FALLBACK"
+            IMAGE="$FALLBACK"
+          fi
+          echo "XIAOZHI_TEST_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Run ephemeral container unit suites (zero running container required)
+        run: python3 scripts/run_tests.py --layer unit --skip-pc-mcp --skip-anima
+
+      - name: Run ephemeral upstream contract tests
+        run: python3 scripts/run_tests.py --layer contract
+
+  anima-brain-build-and-test:
+    name: Anima Brain reproducible Docker build & unit tests (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build anima-brain image (pinned digests + Py3.12 constraints + non-root USER app)
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          docker build --build-arg BUILD_SHA="$SHORT_SHA" -t xiaozhi-anima-brain:local ./anima-brain
+
+      - name: Run Anima Brain & Obsidian Exporter unit tests inside built image
+        run: |
+          docker run --rm --entrypoint python \
+            -v "$PWD/anima-brain/tests:/app/tests:ro" \
+            -v "$PWD/anima-brain/scripts:/app/scripts:ro" \
+            xiaozhi-anima-brain:local \
+            -m unittest /app/tests/test_xiaozhi_service.py /app/tests/test_obsidian_exporter.py -v
+
+  hygiene-and-docs:
+    name: Docs sync & repository hygiene (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify docs/patches.md matches registry catalog
+        run: python3 scripts/generate_patches_doc.py --check
+
+      - name: Verify zero production test files in app/ and zero single-file mounts in docker-compose.yml
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+          app_tests = list(pathlib.Path("app").glob("test_*.py"))
+          assert not app_tests, f"Test files must live in tests/container/, not app/: {app_tests}"
+          dc = pathlib.Path("docker-compose.yml").read_text(encoding="utf-8")
+          for forbidden in ("xiaozhi_anima_service.py:ro", "obsidian_exporter.py:ro", "automation.py:ro", "http_server.py:ro"):
+              assert forbidden not in dc, f"Single-file mount drift forbidden (H-3): {forbidden}"
+          print("Hygiene checks PASSED")
+          PY

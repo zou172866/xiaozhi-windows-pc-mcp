@@ -5,6 +5,7 @@ memory/ASR optimizations (G-1/G-2/G-4), and router hardening (C-4/C-5/C-6/C-7/C-
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import struct
@@ -19,8 +20,13 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = "/opt/xiaozhi-esp32-server"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+APP_DIR = os.environ.get("XIAOZHI_APP_DIR") or (
+    os.path.join(ROOT_DIR, "app")
+    if os.path.isdir(os.path.join(ROOT_DIR, "app"))
+    else os.path.join(_REPO_ROOT, "app")
+)
 for _p in (ROOT_DIR, APP_DIR):
     if _p not in sys.path and os.path.isdir(_p):
         sys.path.insert(0, _p)
@@ -32,6 +38,7 @@ import pc_audio_router as par
 import runtime_events
 import runtime_settings as rs
 import vad_speculative_router as vsr
+import xz_common
 
 try:
     import boot
@@ -272,97 +279,105 @@ class TestBatch3ContainerPipeline(unittest.TestCase):
         tts._first_segment_done_sid = "live-sid-99"
         tts._segment_emotion_queue = [("live-sid-99", "保持不变", "😆", "happy")]
 
-        # 1. Snapshot builds gentle + full sample_steps=16 WITHOUT mutating tts
-        url, snap_json, prof, emo_key = mer.build_gsv_request_snapshot(
-            tts,
-            "我在呢，哥哥请说吧。",
-            explicit_segment_emotion="gentle",
-            turn_explicit_emotion="gentle",
-            is_first_segment=False,
-            suppress_first_seg_fast_steps=True,
+        # On clean CI runners without gitignored private voices/raiden_mei WAVs, stub ref_audio_exists
+        # so pure snapshot/lock logic still executes in full; on local hosts, real FS check runs unchanged.
+        _ref_ctx = (
+            contextlib.nullcontext()
+            if os.path.isdir(os.path.join(xz_common.VOICES_DIR, "raiden_mei"))
+            else patch.object(mer, "ref_audio_exists", return_value=True)
         )
-        self.assertEqual(url, "http://host.docker.internal:19880/tts")
-        self.assertEqual(emo_key, "gentle")
-        self.assertTrue(snap_json["ref_audio_path"].endswith("mei_gentle_ref.wav"))
-        self.assertEqual(snap_json["sample_steps"], 16)
-        self.assertEqual(snap_json["text_split_method"], "cut0")
-        self.assertEqual(tts._turn_explicit_emotion, "happy")
-        self.assertEqual(tts._pending_segment_emotion, "playful")
-        self.assertFalse(tts._suppress_first_seg_fast_steps)
+        with _ref_ctx:
+            # 1. Snapshot builds gentle + full sample_steps=16 WITHOUT mutating tts
+            url, snap_json, prof, emo_key = mer.build_gsv_request_snapshot(
+                tts,
+                "我在呢，哥哥请说吧。",
+                explicit_segment_emotion="gentle",
+                turn_explicit_emotion="gentle",
+                is_first_segment=False,
+                suppress_first_seg_fast_steps=True,
+            )
+            self.assertEqual(url, "http://host.docker.internal:19880/tts")
+            self.assertEqual(emo_key, "gentle")
+            self.assertTrue(snap_json["ref_audio_path"].endswith("mei_gentle_ref.wav"))
+            self.assertEqual(snap_json["sample_steps"], 16)
+            self.assertEqual(snap_json["text_split_method"], "cut0")
+            self.assertEqual(tts._turn_explicit_emotion, "happy")
+            self.assertEqual(tts._pending_segment_emotion, "playful")
+            self.assertFalse(tts._suppress_first_seg_fast_steps)
 
-        # 2. Full wakeupWordsResponse runs via snapshot, leaves shared tts untouched, releases async lock cleanly
-        wav_sample = _make_silence_wav_bytes(0.6, 16000)
-        posted_payloads = []
+            # 2. Full wakeupWordsResponse runs via snapshot, leaves shared tts untouched, releases async lock cleanly
+            wav_sample = _make_silence_wav_bytes(0.6, 16000)
+            posted_payloads = []
 
-        class _FakeResp:
-            status_code = 200
-            content = wav_sample
-            text = "ok"
+            class _FakeResp:
+                status_code = 200
+                content = wav_sample
+                text = "ok"
 
-        def _fake_post(u, json=None, timeout=None):
-            posted_payloads.append(dict(json or {}))
-            return _FakeResp()
+            def _fake_post(u, json=None, timeout=None):
+                posted_payloads.append(dict(json or {}))
+                return _FakeResp()
 
-        async def _run():
-            with tempfile.TemporaryDirectory() as td:
-                out_wav = os.path.join(td, "raiden_mei.wav")
-                conn = SimpleNamespace(tts=tts, sample_rate=16000)
-                with (
-                    patch.object(mer._get_gsv_http_session(), "post", side_effect=_fake_post),
-                    patch.object(hello_mod.wakeup_words_config, "generate_file_path", return_value=out_wav),
-                    patch.object(hello_mod.wakeup_words_config, "update_wakeup_response") as m_upd,
-                    patch.object(hello_mod, "audio_to_data", new=AsyncMock(return_value=[b"opus"])),
-                ):
-                    # 2a. When GSV is busy -> skips completely (0 HTTP calls)
-                    with patch.object(mer, "is_live_gsv_busy", return_value=True):
-                        await hello_mod.wakeupWordsResponse(conn)
-                    self.assertEqual(len(posted_payloads), 0)
-                    m_upd.assert_not_called()
-
-                    # 2b. When GSV_GPU_LOCK is held by another thread -> skips without blocking!
-                    held = threading.Event()
-                    release = threading.Event()
-
-                    def _hold():
-                        with mer.GSV_GPU_LOCK:
-                            held.set()
-                            release.wait(3.0)
-
-                    th = threading.Thread(target=_hold, daemon=True)
-                    th.start()
-                    self.assertTrue(held.wait(2.0))
-                    try:
-                        t0 = time.monotonic()
-                        await hello_mod.wakeupWordsResponse(conn)
-                        self.assertLess(time.monotonic() - t0, 0.5)
-                        self.assertEqual(len(posted_payloads), 0)
-                    finally:
-                        release.set()
-                        th.join(timeout=2.0)
-
-                    # 2c. When GSV is idle -> synthesizes gentle snapshot with sample_steps=16, ZERO tts mutation
-                    await hello_mod.wakeupWordsResponse(conn)
-                    self.assertEqual(len(posted_payloads), 1)
-                    self.assertTrue(posted_payloads[0]["ref_audio_path"].endswith("mei_gentle_ref.wav"))
-                    self.assertEqual(posted_payloads[0]["sample_steps"], 16)
-                    self.assertTrue(os.path.isfile(out_wav))
-                    m_upd.assert_called_once()
-
-                    # Shared TTS state remained 100% intact!
-                    self.assertEqual(tts._turn_explicit_emotion, "happy")
-                    self.assertEqual(tts._pending_segment_emotion, "playful")
-                    self.assertFalse(tts._suppress_first_seg_fast_steps)
-                    self.assertEqual(tts._first_segment_done_sid, "live-sid-99")
-                    self.assertEqual(len(tts._segment_emotion_queue), 1)
-                    self.assertFalse(hello_mod._wakeup_response_lock.locked())
-
-                    # 2d. Exception inside synthesis still releases async with lock cleanly
-                    with patch.object(mer._get_gsv_http_session(), "post", side_effect=RuntimeError("boom")):
-                        with self.assertRaises(RuntimeError):
+            async def _run():
+                with tempfile.TemporaryDirectory() as td:
+                    out_wav = os.path.join(td, "raiden_mei.wav")
+                    conn = SimpleNamespace(tts=tts, sample_rate=16000)
+                    with (
+                        patch.object(mer._get_gsv_http_session(), "post", side_effect=_fake_post),
+                        patch.object(hello_mod.wakeup_words_config, "generate_file_path", return_value=out_wav),
+                        patch.object(hello_mod.wakeup_words_config, "update_wakeup_response") as m_upd,
+                        patch.object(hello_mod, "audio_to_data", new=AsyncMock(return_value=[b"opus"])),
+                    ):
+                        # 2a. When GSV is busy -> skips completely (0 HTTP calls)
+                        with patch.object(mer, "is_live_gsv_busy", return_value=True):
                             await hello_mod.wakeupWordsResponse(conn)
-                    self.assertFalse(hello_mod._wakeup_response_lock.locked())
+                        self.assertEqual(len(posted_payloads), 0)
+                        m_upd.assert_not_called()
 
-        asyncio.run(_run())
+                        # 2b. When GSV_GPU_LOCK is held by another thread -> skips without blocking!
+                        held = threading.Event()
+                        release = threading.Event()
+
+                        def _hold():
+                            with mer.GSV_GPU_LOCK:
+                                held.set()
+                                release.wait(3.0)
+
+                        th = threading.Thread(target=_hold, daemon=True)
+                        th.start()
+                        self.assertTrue(held.wait(2.0))
+                        try:
+                            t0 = time.monotonic()
+                            await hello_mod.wakeupWordsResponse(conn)
+                            self.assertLess(time.monotonic() - t0, 0.5)
+                            self.assertEqual(len(posted_payloads), 0)
+                        finally:
+                            release.set()
+                            th.join(timeout=2.0)
+
+                        # 2c. When GSV is idle -> synthesizes gentle snapshot with sample_steps=16, ZERO tts mutation
+                        await hello_mod.wakeupWordsResponse(conn)
+                        self.assertEqual(len(posted_payloads), 1)
+                        self.assertTrue(posted_payloads[0]["ref_audio_path"].endswith("mei_gentle_ref.wav"))
+                        self.assertEqual(posted_payloads[0]["sample_steps"], 16)
+                        self.assertTrue(os.path.isfile(out_wav))
+                        m_upd.assert_called_once()
+
+                        # Shared TTS state remained 100% intact!
+                        self.assertEqual(tts._turn_explicit_emotion, "happy")
+                        self.assertEqual(tts._pending_segment_emotion, "playful")
+                        self.assertFalse(tts._suppress_first_seg_fast_steps)
+                        self.assertEqual(tts._first_segment_done_sid, "live-sid-99")
+                        self.assertEqual(len(tts._segment_emotion_queue), 1)
+                        self.assertFalse(hello_mod._wakeup_response_lock.locked())
+
+                        # 2d. Exception inside synthesis still releases async with lock cleanly
+                        with patch.object(mer._get_gsv_http_session(), "post", side_effect=RuntimeError("boom")):
+                            with self.assertRaises(RuntimeError):
+                                await hello_mod.wakeupWordsResponse(conn)
+                        self.assertFalse(hello_mod._wakeup_response_lock.locked())
+
+            asyncio.run(_run())
 
     def test_c5_async_gsv_nonblocking_and_queue_empty_event_bounded_wait(self):
         import core.handle.sendAudioHandle as send_audio_mod

@@ -1,9 +1,10 @@
-"""Unified 3-layer test runner for xiaozhi-server (P2-24).
+"""Unified 3-layer test runner for xiaozhi-server (P2-24, H-8).
 
 Layers:
-  - unit:     Pure offline unit tests (host pc-mcp + anima-brain + container offline tests)
-  - contract: Upstream xiaozhi-esp32-server image contract & patch signature tests (run after image upgrades)
-  - live:     Live end-to-end integration tests across 18000 / 18003 / 18080 / 18787 / 18900 / 19880
+  - unit:     Pure offline unit tests (host pc-mcp + anima-brain + ephemeral `docker run --rm` container suites)
+              Zero dependency on any already-running container!
+  - contract: Upstream xiaozhi-esp32-server image contract & patch signature tests (ephemeral `docker run --rm`)
+  - live:     Live end-to-end integration tests across running 18000 / 18003 / 18080 / 18787 / 18900 / 19880
   - all:      Runs unit + contract + live and prints a unified summary table
 
 Usage:
@@ -16,26 +17,107 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 SERVER_DIR = Path(__file__).resolve().parent.parent
+APP_DIR = SERVER_DIR / "app"
+TESTS_CONTAINER_DIR = SERVER_DIR / "tests" / "container"
+CONFIG_DIR = SERVER_DIR / "config"
+DATA_SCRIPTS_DIR = SERVER_DIR / "data"
+VOICES_DIR = SERVER_DIR / "voices"
 PC_MCP_DIR = SERVER_DIR / "pc-mcp"
 PC_MCP_PYTHON = PC_MCP_DIR / ".venv" / "Scripts" / "python.exe"
 ANIMA_DIR = SERVER_DIR / "anima-brain"
+COMPOSE_FILE = SERVER_DIR / "docker-compose.yml"
 
+_DEFAULT_UPSTREAM_IMAGE = (
+    "ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server_latest"
+    "@sha256:cececd7752e00e044bf9f099751a140834053573bbe6dd55ecbcedcb20c19c25"
+)
 _RAN_RE = re.compile(r"Ran\s+(\d+)\s+tests?\s+in\s+([0-9.]+)s")
 _SKIP_RE = re.compile(r"skipped=(\d+)")
+_IMAGE_RE = re.compile(r"^\s*image:\s*(\S+xiaozhi-esp32-server\S+)\s*$", re.MULTILINE)
 
 
-def _run_suite(layer: str, name: str, cmd: list[str], *, verbose: bool = False) -> dict:
+def resolve_upstream_image() -> str:
+    """Resolve pinned xiaozhi-esp32-server image ref from env override or docker-compose.yml."""
+    override = (os.environ.get("XIAOZHI_TEST_IMAGE") or "").strip()
+    if override:
+        return override
+    if COMPOSE_FILE.is_file():
+        raw = COMPOSE_FILE.read_text(encoding="utf-8", errors="replace")
+        m = _IMAGE_RE.search(raw)
+        if m:
+            return m.group(1).strip()
+    return _DEFAULT_UPSTREAM_IMAGE
+
+
+def _ephemeral_container_cmd(test_filename: str, *, image: str) -> list[str]:
+    """Build an ephemeral `docker run --rm` command (H-8: zero dependency on running containers).
+
+    Seeds disposable `/opt/xiaozhi-esp32-server/data/.config.yaml` from public
+    `config/.config.example.yaml` inside the ephemeral container so upstream imports
+    succeed identically on local hosts and clean GitHub Actions CI runners.
+    """
+    bootstrap_sh = (
+        "mkdir -p /opt/xiaozhi-esp32-server/data /opt/xiaozhi-esp32-server/state /tmp/xz_test_state && "
+        "cp /opt/xiaozhi-esp32-server/config_templates/.config.example.yaml /opt/xiaozhi-esp32-server/data/.config.yaml && "
+        f"exec python3 /opt/xiaozhi-esp32-server/tests/{test_filename}"
+    )
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "--entrypoint",
+        "sh",
+        "-e",
+        "TZ=Asia/Shanghai",
+        "-e",
+        "XIAOZHI_USING_EXAMPLE_CONFIG=1",
+        "-e",
+        "XIAOZHI_APP_DIR=/opt/xiaozhi-esp32-server/app",
+        "-e",
+        "XIAOZHI_CONFIG_DIR=/opt/xiaozhi-esp32-server/data",
+        "-e",
+        "XIAOZHI_STATE_DIR=/tmp/xz_test_state",
+        "-e",
+        "XIAOZHI_VOICES_DIR=/opt/xiaozhi-esp32-server/voices",
+        "-e",
+        "XIAOZHI_HOST_SCRIPTS_DIR=/opt/xiaozhi-esp32-server/host_scripts",
+        "-v",
+        f"{APP_DIR}:/opt/xiaozhi-esp32-server/app:ro",
+        "-v",
+        f"{TESTS_CONTAINER_DIR}:/opt/xiaozhi-esp32-server/tests:ro",
+        "-v",
+        f"{CONFIG_DIR}:/opt/xiaozhi-esp32-server/config_templates:ro",
+    ]
+    if DATA_SCRIPTS_DIR.is_dir():
+        cmd.extend(["-v", f"{DATA_SCRIPTS_DIR}:/opt/xiaozhi-esp32-server/host_scripts:ro"])
+    if VOICES_DIR.is_dir():
+        cmd.extend(["-v", f"{VOICES_DIR}:/opt/xiaozhi-esp32-server/voices:ro"])
+    cmd.extend([image, "-c", bootstrap_sh])
+    return cmd
+
+
+def _run_suite(
+    layer: str,
+    name: str,
+    cmd: list[str],
+    *,
+    verbose: bool = False,
+    stdin_text: Optional[str] = None,
+) -> dict:
     t0 = time.monotonic()
     proc = subprocess.run(
         cmd,
         cwd=str(SERVER_DIR),
+        input=stdin_text,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -69,91 +151,81 @@ def _run_suite(layer: str, name: str, cmd: list[str], *, verbose: bool = False) 
     }
 
 
-def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
+def _build_plan(
+    layer: str,
+    *,
+    skip_pc_mcp: bool = False,
+    skip_anima: bool = False,
+) -> list[tuple[str, str, list[str], Optional[str]]]:
     py_host = str(PC_MCP_PYTHON) if PC_MCP_PYTHON.is_file() else sys.executable
-    plan: list[tuple[str, str, list[str]]] = []
+    upstream_image = resolve_upstream_image()
+    plan: list[tuple[str, str, list[str], Optional[str]]] = []
 
     if layer in ("unit", "all"):
+        if not skip_pc_mcp:
+            plan.append(
+                (
+                    "unit",
+                    "Host pc-mcp (L1/L2/L3 security, guardrails, watchdog, vision, sidecar, launcher, common, reqs)",
+                    [py_host, "-m", "unittest", "discover", "-s", str(PC_MCP_DIR), "-p", "test_*.py", "-v"],
+                    None,
+                )
+            )
+        if not skip_anima:
+            plan.append(
+                (
+                    "unit",
+                    "Anima Brain & Obsidian Exporter (Docker isolated, built image + B-1 inbox & rollback)",
+                    [
+                        "docker",
+                        "run",
+                        "--rm",
+                        "--entrypoint",
+                        "python",
+                        "-v",
+                        f"{ANIMA_DIR / 'tests'}:/app/tests:ro",
+                        "-v",
+                        f"{ANIMA_DIR / 'scripts'}:/app/scripts:ro",
+                        "xiaozhi-anima-brain:local",
+                        "-m",
+                        "unittest",
+                        "/app/tests/test_xiaozhi_service.py",
+                        "/app/tests/test_obsidian_exporter.py",
+                        "-v",
+                    ],
+                    None,
+                )
+            )
         plan.append(
             (
                 "unit",
-                "Host pc-mcp (L1/L2/L3 security, guardrails, watchdog, vision, sidecar, launcher)",
-                [py_host, "-m", "unittest", "discover", "-s", str(PC_MCP_DIR), "-p", "test_*.py", "-v"],
+                "Container offline pipeline (ephemeral docker run --rm: emotion, auth, outbox, recall, farewell, state)",
+                _ephemeral_container_cmd("test_mei_emotion_and_prosody.py", image=upstream_image),
+                None,
             )
         )
         plan.append(
             (
                 "unit",
-                "Anima Brain & Obsidian Exporter (Docker isolated, built image + B-1 inbox & rollback)",
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "--entrypoint",
-                    "python",
-                    "-v",
-                    f"{ANIMA_DIR / 'tests'}:/app/tests:ro",
-                    "-v",
-                    f"{ANIMA_DIR / 'scripts'}:/app/scripts:ro",
-                    "xiaozhi-anima-brain:local",
-                    "-m",
-                    "unittest",
-                    "/app/tests/test_xiaozhi_service.py",
-                    "/app/tests/test_obsidian_exporter.py",
-                    "-v",
-                ],
+                "Batch 3 Anima outbox dead-lettering/replay & per-device recall (ephemeral docker run --rm: B-5, C-6)",
+                _ephemeral_container_cmd("test_batch3_anima_outbox.py", image=upstream_image),
+                None,
             )
         )
         plan.append(
             (
                 "unit",
-                "Container offline pipeline (emotion, auth, outbox, recall, farewell, state, settings)",
-                [
-                    "docker",
-                    "exec",
-                    "xiaozhi-esp32-server",
-                    "python3",
-                    "/opt/xiaozhi-esp32-server/app/test_mei_emotion_and_prosody.py",
-                ],
+                "Batch 3 voice pipeline, speculative VAD 34-case suite, idle trim & ASR corrections (ephemeral docker run --rm)",
+                _ephemeral_container_cmd("test_batch3_pipeline_vad.py", image=upstream_image),
+                None,
             )
         )
         plan.append(
             (
                 "unit",
-                "Batch 3 Anima outbox dead-lettering/replay & per-device recall (B-5, C-6)",
-                [
-                    "docker",
-                    "exec",
-                    "xiaozhi-esp32-server",
-                    "python3",
-                    "/opt/xiaozhi-esp32-server/app/test_batch3_anima_outbox.py",
-                ],
-            )
-        )
-        plan.append(
-            (
-                "unit",
-                "Batch 3 voice pipeline, speculative VAD 34-case suite, idle trim & ASR corrections (C-4..8, F-1, G-1/2/4)",
-                [
-                    "docker",
-                    "exec",
-                    "xiaozhi-esp32-server",
-                    "python3",
-                    "/opt/xiaozhi-esp32-server/app/test_batch3_pipeline_vad.py",
-                ],
-            )
-        )
-        plan.append(
-            (
-                "unit",
-                "Batch 3 18080 console hardening, allowlists, redaction & B-5/F-1/G-4 API/UI (D-1..7, H-6)",
-                [
-                    "docker",
-                    "exec",
-                    "xiaozhi-esp32-server",
-                    "python3",
-                    "/opt/xiaozhi-esp32-server/app/test_batch3_console.py",
-                ],
+                "Batch 3 18080 console hardening, allowlists, redaction & static assets (ephemeral docker run --rm)",
+                _ephemeral_container_cmd("test_batch3_console.py", image=upstream_image),
+                None,
             )
         )
 
@@ -161,18 +233,14 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
         plan.append(
             (
                 "contract",
-                "Upstream image contracts (SERVER_VERSION, 19+1 patches, anchors, rebind)",
-                [
-                    "docker",
-                    "exec",
-                    "xiaozhi-esp32-server",
-                    "python3",
-                    "/opt/xiaozhi-esp32-server/app/test_upstream_contracts.py",
-                ],
+                "Upstream image contracts (ephemeral docker run --rm: SERVER_VERSION, 19+1 patches, anchors, zero side-effects)",
+                _ephemeral_container_cmd("test_upstream_contracts.py", image=upstream_image),
+                None,
             )
         )
 
     if layer in ("live", "all"):
+        live_test_src = (TESTS_CONTAINER_DIR / "test_mei_emotion_and_prosody.py").read_text(encoding="utf-8")
         plan.append(
             (
                 "live",
@@ -180,19 +248,16 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
                 [
                     "docker",
                     "exec",
+                    "-i",
+                    "-e",
+                    "XIAOZHI_RUN_LIVE_TESTS=1",
                     "xiaozhi-esp32-server",
                     "python3",
-                    "-c",
-                    (
-                        "import os, sys, unittest; "
-                        "os.environ['XIAOZHI_RUN_LIVE_TESTS'] = '1'; "
-                        "sys.path.insert(0, '/opt/xiaozhi-esp32-server/app'); "
-                        "import test_mei_emotion_and_prosody as m; "
-                        "suite = unittest.defaultTestLoader.loadTestsFromTestCase(m.TestLiveOnlineIntegration); "
-                        "res = unittest.TextTestRunner(verbosity=2).run(suite); "
-                        "sys.exit(0 if res.wasSuccessful() else 1)"
-                    ),
+                    "-",
+                    "TestLiveOnlineIntegration",
+                    "-v",
                 ],
+                live_test_src,
             )
         )
         plan.append(
@@ -215,6 +280,7 @@ def _build_plan(layer: str) -> list[tuple[str, str, list[str]]]:
                         "raise SystemExit(0 if res.wasSuccessful() else 1)\n"
                     ),
                 ],
+                None,
             )
         )
 
@@ -229,14 +295,16 @@ def main(argv: list[str] | None = None) -> int:
         default="all",
         help="Test layer to run (default: all)",
     )
+    parser.add_argument("--skip-pc-mcp", action="store_true", help="Skip host Windows pc-mcp unittest suite")
+    parser.add_argument("--skip-anima", action="store_true", help="Skip Anima Brain Docker unittest suite")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print full suite stdout/stderr even on pass")
     args = parser.parse_args(argv)
 
-    plan = _build_plan(args.layer)
+    plan = _build_plan(args.layer, skip_pc_mcp=args.skip_pc_mcp, skip_anima=args.skip_anima)
     results = []
-    for lyr, name, cmd in plan:
+    for lyr, name, cmd, stdin_text in plan:
         print(f"==> [{lyr.upper()}] {name} ...", flush=True)
-        res = _run_suite(lyr, name, cmd, verbose=args.verbose)
+        res = _run_suite(lyr, name, cmd, verbose=args.verbose, stdin_text=stdin_text)
         status = "PASS" if res["ok"] else "FAIL"
         skip_note = f" (skipped={res['skipped']})" if res["skipped"] else ""
         print(f"    {status}: {res['executed']} executed{skip_note} in {res['elapsed']:.2f}s", flush=True)

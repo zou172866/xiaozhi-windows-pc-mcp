@@ -1,11 +1,24 @@
 """Unit & integration tests for Raiden Mei multi-emotion routing and prosodic clause segmentation."""
 
+import contextlib
 import os
 import sys
 import unittest
+from unittest import mock as _umock
 import wave
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = "/opt/xiaozhi-esp32-server"
+_THIS_FILE = globals().get("__file__")
+_REPO_ROOT = (
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_THIS_FILE))))
+    if _THIS_FILE
+    else ROOT_DIR
+)
+APP_DIR = os.environ.get("XIAOZHI_APP_DIR") or (
+    os.path.join(ROOT_DIR, "app")
+    if os.path.isdir(os.path.join(ROOT_DIR, "app"))
+    else os.path.join(_REPO_ROOT, "app")
+)
 DATA_DIR = APP_DIR  # code modules moved from data/ -> app/ (A-1)
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
@@ -13,7 +26,11 @@ if APP_DIR not in sys.path:
 import xz_common
 import mei_emotion_router as router
 
-PROJECT_ROOT = os.path.dirname(APP_DIR)
+PROJECT_ROOT = (
+    _REPO_ROOT
+    if os.path.isfile(os.path.join(_REPO_ROOT, "docker-compose.yml"))
+    else os.path.dirname(APP_DIR)
+)
 CONFIG_DIR = (
     xz_common.CONFIG_DIR
     if os.path.isdir(xz_common.CONFIG_DIR)
@@ -29,7 +46,11 @@ VOICES_DIR = (
     if os.path.isdir(xz_common.VOICES_DIR)
     else os.path.join(PROJECT_ROOT, "voices")
 )
-HOST_SCRIPTS_DIR = os.path.join(PROJECT_ROOT, "data")
+HOST_SCRIPTS_DIR = (
+    os.environ.get("XIAOZHI_HOST_SCRIPTS_DIR")
+    if os.environ.get("XIAOZHI_HOST_SCRIPTS_DIR") and os.path.isdir(os.environ.get("XIAOZHI_HOST_SCRIPTS_DIR", ""))
+    else os.path.join(PROJECT_ROOT, "data")
+)
 
 
 def _simple_quote_safe_cut(text: str, pos: int, punctuations) -> int:
@@ -46,11 +67,28 @@ def _simple_quote_safe_cut(text: str, pos: int, punctuations) -> int:
     return end - 1
 
 
+@contextlib.contextmanager
+def _assume_mei_ref_audios_if_absent():
+    """On clean CI runners without private gitignored `voices/raiden_mei/`, stub `ref_audio_exists`
+    so pure emotion-routing logic tests still execute in full. On local hosts with real WAV assets,
+    this is a no-op and real filesystem verification runs unchanged."""
+    if os.path.isdir(os.path.join(VOICES_DIR, "raiden_mei")):
+        yield
+        return
+    with _umock.patch.object(router, "ref_audio_exists", return_value=True):
+        yield
+
+
 class TestMeiEmotionAndProsody(unittest.TestCase):
     def test_all_seven_emotion_wavs_exist_and_valid_duration(self):
         emotions = router.load_mei_emotions(force_reload=True)
         expected = {"calm", "gentle", "happy", "playful", "shy", "serious", "tender"}
         self.assertTrue(expected.issubset(set(emotions.keys())))
+        for key in expected:
+            self.assertTrue(emotions[key].get("prompt_text", "").strip(), f"Empty prompt_text for {key}")
+        mei_voices_dir = os.path.join(VOICES_DIR, "raiden_mei")
+        if not os.path.isdir(mei_voices_dir):
+            self.skipTest(f"Private voices/raiden_mei WAV assets not present ({mei_voices_dir})")
         seen_paths = set()
         for key in expected:
             prof = emotions[key]
@@ -64,7 +102,6 @@ class TestMeiEmotionAndProsody(unittest.TestCase):
                 dur = frames / float(sr)
                 self.assertGreater(dur, 3.0, f"{key} clip too short ({dur:.2f}s) for GPT-SoVITS 3-10s rule")
                 self.assertLess(dur, 10.0, f"{key} clip too long ({dur:.2f}s) for GPT-SoVITS 3-10s rule")
-            self.assertTrue(prof.get("prompt_text", "").strip(), f"Empty prompt_text for {key}")
         self.assertEqual(len(seen_paths), 7, "All 7 emotions should point to 7 distinct reference wav files")
 
     def test_tag_extraction_and_stripping_variants(self):
@@ -163,17 +200,18 @@ class TestMeiEmotionAndProsody(unittest.TestCase):
         self.assertEqual(runon[cut], "，")
 
     def test_three_layer_emotion_resolution_and_anima_sync(self):
-        router.set_anima_mood("stage=close, last_emotion=warm")
-        self.assertEqual(router.get_anima_mood(), "gentle")
-        # Neutral text with no tag or lexical cue falls back to Anima mood ('gentle')
-        self.assertEqual(router.resolve_mei_emotion("我已经把文件整理到桌面目录了。"), "gentle")
-        # Lexical cue overrides Anima mood when no explicit tag is present
-        self.assertEqual(router.resolve_mei_emotion("太棒啦哥哥！恭喜你顺利搞定！"), "happy")
-        # Explicit tag has top priority
-        self.assertEqual(
-            router.resolve_mei_emotion("太棒啦哥哥！", explicit_segment_emotion="shy"),
-            "shy",
-        )
+        with _assume_mei_ref_audios_if_absent():
+            router.set_anima_mood("stage=close, last_emotion=warm")
+            self.assertEqual(router.get_anima_mood(), "gentle")
+            # Neutral text with no tag or lexical cue falls back to Anima mood ('gentle')
+            self.assertEqual(router.resolve_mei_emotion("我已经把文件整理到桌面目录了。"), "gentle")
+            # Lexical cue overrides Anima mood when no explicit tag is present
+            self.assertEqual(router.resolve_mei_emotion("太棒啦哥哥！恭喜你顺利搞定！"), "happy")
+            # Explicit tag has top priority
+            self.assertEqual(
+                router.resolve_mei_emotion("太棒啦哥哥！", explicit_segment_emotion="shy"),
+                "shy",
+            )
         # Anima persona stripper removes [calm]/[gentle] rule while keeping persona intact
         sample_prompt = (
             "你是《崩坏3》中的雷电芽衣，称呼对方为“哥哥”。\n"
@@ -186,16 +224,17 @@ class TestMeiEmotionAndProsody(unittest.TestCase):
         self.assertIn("有呼吸感的口语交流", anima_p)
 
     def test_wave_does_not_hijack_explicit_turn_emotion(self):
-        # Soft `～` in a second sentence must NOT override an explicit `[happy]` or `[gentle]` turn tag
-        self.assertEqual(
-            router.resolve_mei_emotion("这下你可以放心去吃饭啦～", turn_explicit_emotion="happy"),
-            "happy",
-        )
-        # Whereas a calm turn tag can smoothly shift to gentle when strong caring cues appear
-        self.assertEqual(
-            router.resolve_mei_emotion("哥哥今天辛苦了，早点休息吧。", turn_explicit_emotion="calm"),
-            "gentle",
-        )
+        with _assume_mei_ref_audios_if_absent():
+            # Soft `～` in a second sentence must NOT override an explicit `[happy]` or `[gentle]` turn tag
+            self.assertEqual(
+                router.resolve_mei_emotion("这下你可以放心去吃饭啦～", turn_explicit_emotion="happy"),
+                "happy",
+            )
+            # Whereas a calm turn tag can smoothly shift to gentle when strong caring cues appear
+            self.assertEqual(
+                router.resolve_mei_emotion("哥哥今天辛苦了，早点休息吧。", turn_explicit_emotion="calm"),
+                "gentle",
+            )
 
     def test_leading_emoji_and_unclosed_typo_resilience(self):
         # Leading emoji before unclosed tag must still hold stream buffer
@@ -342,7 +381,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         sess = router._get_gsv_http_session()
         self.assertFalse(sess.trust_env, "GSV requests.Session must disable proxy env lookup")
         emitted_segments = []
-        with patch.object(sess, "post", side_effect=_fake_post):
+        with _assume_mei_ref_audios_if_absent(), patch.object(sess, "post", side_effect=_fake_post):
             for idx, tok in enumerate(tokens):
                 provider.tts_text_buff.append(tok)
                 seg = provider._get_segment_text()
@@ -480,7 +519,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                 content = b"RIFF\x24\x00\x00\x00WAVEfmt "
                 text = "ok"
 
-            with patch.object(router._get_gsv_http_session(), "post", return_value=_FakeResp()):
+            with _assume_mei_ref_audios_if_absent(), patch.object(router._get_gsv_http_session(), "post", return_value=_FakeResp()):
                 # Sentence 1 synthesizes (gentle -> loving)
                 provider._turn_explicit_emotion = "gentle"
                 provider._pending_segment_emotion = "gentle"
@@ -513,14 +552,20 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         ww = cfg.get("wakeup_words") or []
-        self.assertIn("你好芽衣", ww, "config/runtime/.config.yaml wakeup_words must include 你好芽衣")
+        self.assertTrue(isinstance(ww, list) and len(ww) > 0, ".config.yaml wakeup_words must be a non-empty list")
+        if os.environ.get("XIAOZHI_USING_EXAMPLE_CONFIG") == "1":
+            self.assertIn("你好小智", ww, "public config/.config.example.yaml wakeup_words must include 你好小智")
+        else:
+            self.assertIn("你好芽衣", ww, "config/runtime/.config.yaml wakeup_words must include 你好芽衣")
 
-        wav_path = os.path.join(VOICES_DIR, "raiden_mei", "wakeup_mei_default.wav")
-        self.assertTrue(os.path.isfile(wav_path), f"Missing Mei default wakeup WAV: {wav_path}")
-        with wave.open(wav_path, "rb") as wf:
-            dur = wf.getnframes() / float(wf.getframerate())
-            self.assertGreater(dur, 0.8)
-            self.assertLess(dur, 4.0)
+        mei_voices_dir = os.path.join(VOICES_DIR, "raiden_mei")
+        if os.path.isdir(mei_voices_dir):
+            wav_path = os.path.join(mei_voices_dir, "wakeup_mei_default.wav")
+            self.assertTrue(os.path.isfile(wav_path), f"Missing Mei default wakeup WAV: {wav_path}")
+            with wave.open(wav_path, "rb") as wf:
+                dur = wf.getnframes() / float(wf.getframerate())
+                self.assertGreater(dur, 0.8)
+                self.assertLess(dur, 4.0)
 
         class _DummyMeiTts:
             ref_audio_path = "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav"
@@ -4972,6 +5017,21 @@ class TestLiveOnlineIntegration(unittest.TestCase):
                         pass
 
         asyncio.run(_probe_ws())
+
+    def test_live_runtime_wakeup_config_and_mei_wav(self):
+        import yaml
+
+        cfg_path = os.path.join(CONFIG_DIR, ".config.yaml")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        ww = cfg.get("wakeup_words") or []
+        self.assertIn("你好芽衣", ww, "live config/runtime/.config.yaml wakeup_words must include 你好芽衣")
+        wav_path = os.path.join(VOICES_DIR, "raiden_mei", "wakeup_mei_default.wav")
+        self.assertTrue(os.path.isfile(wav_path), f"Missing Mei default wakeup WAV: {wav_path}")
+        with wave.open(wav_path, "rb") as wf:
+            dur = wf.getnframes() / float(wf.getframerate())
+            self.assertGreater(dur, 0.8)
+            self.assertLess(dur, 4.0)
 
 
 if __name__ == "__main__":

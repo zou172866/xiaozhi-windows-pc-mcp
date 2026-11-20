@@ -24,23 +24,37 @@ from unittest.mock import MagicMock, patch
 import httpx
 import yaml
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = "/opt/xiaozhi-esp32-server"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+APP_DIR = os.environ.get("XIAOZHI_APP_DIR") or (
+    os.path.join(ROOT_DIR, "app")
+    if os.path.isdir(os.path.join(ROOT_DIR, "app"))
+    else os.path.join(_REPO_ROOT, "app")
+)
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
-if "/opt/xiaozhi-esp32-server" not in sys.path and os.path.isdir("/opt/xiaozhi-esp32-server"):
-    sys.path.insert(0, "/opt/xiaozhi-esp32-server")
+if ROOT_DIR not in sys.path and os.path.isdir(ROOT_DIR):
+    sys.path.insert(0, ROOT_DIR)
 
 import console_server as cs
 import runtime_settings as rs
 import xz_common
 
-PROJECT_ROOT = os.path.dirname(APP_DIR)
+PROJECT_ROOT = (
+    _REPO_ROOT
+    if os.path.isfile(os.path.join(_REPO_ROOT, "docker-compose.yml"))
+    else os.path.dirname(APP_DIR)
+)
 CONFIG_TEMPLATES_DIR = (
     os.path.join(xz_common.ROOT_DIR, "config_templates")
     if os.path.isdir(os.path.join(xz_common.ROOT_DIR, "config_templates"))
     else os.path.join(PROJECT_ROOT, "config")
 )
-HOST_SCRIPTS_DIR = os.path.join(PROJECT_ROOT, "data")
+HOST_SCRIPTS_DIR = (
+    os.environ.get("XIAOZHI_HOST_SCRIPTS_DIR")
+    if os.environ.get("XIAOZHI_HOST_SCRIPTS_DIR") and os.path.isdir(os.environ.get("XIAOZHI_HOST_SCRIPTS_DIR", ""))
+    else os.path.join(PROJECT_ROOT, "data")
+)
 
 
 def _start_test_console_server():
