@@ -401,7 +401,14 @@ class TestPluggableL3Backends(unittest.TestCase):
         self.assertNotIn(">", fb[5])
         # Actually execute custom_tool.bat with sanitized args to confirm ZERO OS command injection and ZERO truncation!
         if os.name == "nt":
-            res = subprocess.run(fb, capture_output=True, text=True, timeout=10)
+            res = subprocess.run(
+                fb,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
             self.assertEqual(res.returncode, 0)
             self.assertFalse(marker.exists(), "Batch fallback allowed OS command injection!")
             self.assertIn("line2", res.stdout)

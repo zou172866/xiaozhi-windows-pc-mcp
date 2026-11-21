@@ -176,70 +176,157 @@ class TestPcControlMcpHardening(unittest.TestCase):
         asyncio.run(_exercise())
 
     def test_winmm_double_buffered_playback_and_stop(self):
+        import contextlib
         import threading
         import time
+        from unittest.mock import patch
+        from pc_mcp_modules import audio_bridge
 
-        # Exercises real CALLBACK_EVENT WinMM player with ultra-short silent WAV clips
-        player = pcm._WinMMPlayer(max_inflight=2)
-        try:
-            silent = _make_silence_wav(0.06, 48000)
-            dur1 = player.enqueue_wav(silent, turn_id="t1", volume=1.0)
-            dur2 = player.enqueue_wav(silent, turn_id="t1", volume=1.2)
-            self.assertEqual(dur1, 60)
-            self.assertEqual(dur2, 60)
-            self.assertTrue(player.wait_idle(timeout=3.0), "Player did not finish double-buffered silent clips")
+        # On headless Windows CI runners with zero audio output devices (waveOutGetNumDevs() == 0),
+        # provide a timing-accurate WinMM stub so _WinMMPlayer's full double-buffered state machine,
+        # 48kHz->24kHz format switch pending_next tracking, and stop() abort still run end-to-end.
+        class _FakeWinMM:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._next_handle = 1001
+                self._handles: dict[int, dict] = {}
 
-            # Format switch 48kHz -> 24kHz: status()["queued"] must reflect pending_next while 48kHz plays
-            w48 = _make_silence_wav(0.45, 48000)
-            w24 = _make_silence_wav(0.10, 24000)
-            player.enqueue_wav(w48, turn_id="fmt", volume=1.0)
-            player.enqueue_wav(w24, turn_id="fmt", volume=1.0)
-            time.sleep(0.15)
-            st_mid = player.status()
-            self.assertTrue(st_mid["playing"] or st_mid["queued"] >= 1)
-            if st_mid["playing"]:
-                self.assertGreaterEqual(st_mid["queued"], 1, f"pending_next dropped from status().queued: {st_mid}")
-            self.assertTrue(player.wait_idle(timeout=3.0), "Player did not finish 48k->24k format switch")
+            def waveOutGetNumDevs(self) -> int:
+                return 1
 
-            # Enqueue a longer silent clip and immediately stop() -> must become idle promptly
-            long_silent = _make_silence_wav(1.2, 48000)
-            player.enqueue_wav(long_silent, turn_id="t2", volume=1.0)
-            player.stop()
-            self.assertTrue(player.wait_idle(timeout=1.5), "Player did not abort promptly on stop()")
+            def waveOutOpen(self, hwo_ref, _dev_id, wfx_ref, cb_arg, _inst, _flags) -> int:
+                wfx = wfx_ref._obj
+                avg_bps = max(1, int(wfx.nAvgBytesPerSec))
+                with self._lock:
+                    hid = self._next_handle
+                    self._next_handle += 1
+                    self._handles[hid] = {
+                        "cb_event": int(cb_arg) if cb_arg else 0,
+                        "avg_bps": avg_bps,
+                        "inflight": [],
+                    }
+                hwo_ref._obj.value = hid
+                return 0
 
-            # Concurrent enqueue_wav + stop stress test across threads (must never deadlock or leak)
-            errors = []
+            def waveOutPrepareHeader(self, _hwo, _hdr_ref, _size) -> int:
+                return 0
 
-            def _spam_enqueue():
-                try:
-                    for i in range(12):
-                        player.enqueue_wav(silent, turn_id=f"r{i}", volume=1.0)
-                        time.sleep(0.005)
-                except Exception as exc:
-                    errors.append(exc)
+            def waveOutWrite(self, hwo, hdr_ref, _size) -> int:
+                hid = int(hwo.value) if hasattr(hwo, "value") else int(hwo)
+                hdr = hdr_ref._obj
+                with self._lock:
+                    st = self._handles.get(hid)
+                    if st is None:
+                        return 5
+                    dur = max(0.02, float(hdr.dwBufferLength) / float(st["avg_bps"]))
+                    cb_ev = st["cb_event"]
 
-            def _spam_stop():
-                try:
-                    for _ in range(12):
-                        player.stop()
-                        time.sleep(0.006)
-                except Exception as exc:
-                    errors.append(exc)
+                    def _complete():
+                        hdr.dwFlags |= audio_bridge._WHDR_DONE
+                        if cb_ev:
+                            audio_bridge._kernel32.SetEvent(cb_ev)
 
-            t_enq = threading.Thread(target=_spam_enqueue)
-            t_stp = threading.Thread(target=_spam_stop)
-            t_enq.start()
-            t_stp.start()
-            t_enq.join(timeout=5.0)
-            t_stp.join(timeout=5.0)
-            player.stop()
-            self.assertEqual(errors, [])
-            self.assertTrue(player.wait_idle(timeout=2.0), "Player stuck non-idle after enqueue/stop race")
-            st = player.status()
-            self.assertFalse(st["playing"])
-            self.assertEqual(st["queued"], 0)
-        finally:
-            player.close()
+                    timer = threading.Timer(dur, _complete)
+                    timer.daemon = True
+                    st["inflight"].append((hdr, timer))
+                    timer.start()
+                return 0
+
+            def waveOutUnprepareHeader(self, _hwo, _hdr_ref, _size) -> int:
+                return 0
+
+            def waveOutReset(self, hwo) -> int:
+                hid = int(hwo.value) if hasattr(hwo, "value") else int(hwo)
+                with self._lock:
+                    st = self._handles.get(hid)
+                    if st is None:
+                        return 0
+                    items = list(st["inflight"])
+                    st["inflight"].clear()
+                    cb_ev = st["cb_event"]
+                for hdr, timer in items:
+                    timer.cancel()
+                    hdr.dwFlags |= audio_bridge._WHDR_DONE
+                if cb_ev:
+                    audio_bridge._kernel32.SetEvent(cb_ev)
+                return 0
+
+            def waveOutClose(self, hwo) -> int:
+                self.waveOutReset(hwo)
+                hid = int(hwo.value) if hasattr(hwo, "value") else int(hwo)
+                with self._lock:
+                    self._handles.pop(hid, None)
+                return 0
+
+        has_audio_hw = int(audio_bridge._winmm.waveOutGetNumDevs()) > 0
+        winmm_ctx = (
+            contextlib.nullcontext()
+            if has_audio_hw
+            else patch.object(audio_bridge, "_winmm", _FakeWinMM())
+        )
+
+        # Exercises CALLBACK_EVENT WinMM player with ultra-short silent WAV clips
+        with winmm_ctx:
+            player = pcm._WinMMPlayer(max_inflight=2)
+            try:
+                silent = _make_silence_wav(0.06, 48000)
+                dur1 = player.enqueue_wav(silent, turn_id="t1", volume=1.0)
+                dur2 = player.enqueue_wav(silent, turn_id="t1", volume=1.2)
+                self.assertEqual(dur1, 60)
+                self.assertEqual(dur2, 60)
+                self.assertTrue(player.wait_idle(timeout=3.0), "Player did not finish double-buffered silent clips")
+
+                # Format switch 48kHz -> 24kHz: status()["queued"] must reflect pending_next while 48kHz plays
+                w48 = _make_silence_wav(0.45, 48000)
+                w24 = _make_silence_wav(0.10, 24000)
+                player.enqueue_wav(w48, turn_id="fmt", volume=1.0)
+                player.enqueue_wav(w24, turn_id="fmt", volume=1.0)
+                time.sleep(0.15)
+                st_mid = player.status()
+                self.assertTrue(st_mid["playing"] or st_mid["queued"] >= 1)
+                if st_mid["playing"]:
+                    self.assertGreaterEqual(st_mid["queued"], 1, f"pending_next dropped from status().queued: {st_mid}")
+                self.assertTrue(player.wait_idle(timeout=3.0), "Player did not finish 48k->24k format switch")
+
+                # Enqueue a longer silent clip and immediately stop() -> must become idle promptly
+                long_silent = _make_silence_wav(1.2, 48000)
+                player.enqueue_wav(long_silent, turn_id="t2", volume=1.0)
+                player.stop()
+                self.assertTrue(player.wait_idle(timeout=1.5), "Player did not abort promptly on stop()")
+
+                # Concurrent enqueue_wav + stop stress test across threads (must never deadlock or leak)
+                errors = []
+
+                def _spam_enqueue():
+                    try:
+                        for i in range(12):
+                            player.enqueue_wav(silent, turn_id=f"r{i}", volume=1.0)
+                            time.sleep(0.005)
+                    except Exception as exc:
+                        errors.append(exc)
+
+                def _spam_stop():
+                    try:
+                        for _ in range(12):
+                            player.stop()
+                            time.sleep(0.006)
+                    except Exception as exc:
+                        errors.append(exc)
+
+                t_enq = threading.Thread(target=_spam_enqueue)
+                t_stp = threading.Thread(target=_spam_stop)
+                t_enq.start()
+                t_stp.start()
+                t_enq.join(timeout=5.0)
+                t_stp.join(timeout=5.0)
+                player.stop()
+                self.assertEqual(errors, [])
+                self.assertTrue(player.wait_idle(timeout=2.0), "Player stuck non-idle after enqueue/stop race")
+                st = player.status()
+                self.assertFalse(st["playing"])
+                self.assertEqual(st["queued"], 0)
+            finally:
+                player.close()
 
     def test_type_text_preserves_non_text_clipboard_and_restores_text_clipboard(self):
         copied_calls = []

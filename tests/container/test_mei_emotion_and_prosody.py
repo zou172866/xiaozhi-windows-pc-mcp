@@ -4069,13 +4069,14 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                                 return {}
 
                         class _ProbeHttp:
-                            def get(self, url, params=None, timeout=None):
+                            def get(self, url, params=None, timeout=None, **kwargs):
                                 http_gets.append((url, dict(params or {})))
                                 return _ProbeResp()
 
                         cs._active_gsv_loaded = "__dirty__"
                         cs._set_voice_dirty("__gsv_raiden_mei__", "old err")
                         with (
+                            patch.object(cs, "_probe_gsv_tcp_once", return_value=True),
                             patch.object(cs, "_ensure_gsv_weights", side_effect=_ensure_race),
                             patch.object(cs, "_get_voice_dirty_state", side_effect=_traced_dirty),
                             patch.object(cs, "_is_device_busy", return_value=False),
@@ -4118,6 +4119,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                         cs._active_gsv_loaded = "__dirty__"
                         cs._set_voice_dirty("__gsv_raiden_mei__", "old err")
                         with (
+                            patch.object(cs, "_probe_gsv_tcp_once", return_value=True),
                             patch.object(cs, "_ensure_gsv_weights", side_effect=_ensure_probe_first),
                             patch.object(cs, "_is_device_busy", return_value=False),
                             patch.object(cs, "_fetch_l3_backend_status", return_value={"online": True}),
@@ -4144,6 +4146,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                         cs._active_gsv_loaded = "__gsv_raiden_mei__"
                         cs._set_voice_dirty("__gsv_raiden_mei__", "stale gpu weights")
                         with (
+                            patch.object(cs, "_probe_gsv_tcp_once", return_value=True),
                             patch.object(cs, "_is_device_busy", return_value=False),
                             patch.object(cs, "_fetch_l3_backend_status", return_value={"online": True}),
                             patch.object(cs, "_fetch_anima_relationship", return_value={"online": True}),
