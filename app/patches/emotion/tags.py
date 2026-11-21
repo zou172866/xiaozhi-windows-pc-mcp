@@ -2,23 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import functools
 import json
 import os
 import re
 import threading
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-import patch_registry
-import runtime_events
-import runtime_settings
 import xz_common
 
-_LEGACY_HOST_DATA_PREFIX = "e:/故事/1/xiaozhi-server/data"
-_LEGACY_HOST_VOICES_PREFIX = "e:/故事/1/xiaozhi-server/voices"
+_LEGACY_PROJECT_DATA_VOICES_RE = re.compile(r"^.+?/xiaozhi-server/data/voices/(.+)$", re.IGNORECASE)
+_LEGACY_PROJECT_VOICES_RE = re.compile(r"^.+?/xiaozhi-server/voices/(.+)$", re.IGNORECASE)
+_LEGACY_PROJECT_DATA_RE = re.compile(r"^.+?/xiaozhi-server/data/(.+)$", re.IGNORECASE)
 CONTAINER_DATA_PREFIX = xz_common.DATA_DIR
 CONTAINER_VOICES_PREFIX = xz_common.VOICES_DIR
 _HOST_DIRS = xz_common.resolve_host_dirs()
@@ -444,25 +438,32 @@ def _rewrite_host_data_path(raw_path: str) -> str:
         p = p.replace("${HOST_DATA_DIR}", HOST_DATA_PREFIX)
 
     p_low = p.lower()
-    # Map legacy .../data/voices/<rest> -> HOST_VOICES_PREFIX/<rest>
+    # Map legacy .../data/voices/<rest> or .../xiaozhi-server/{data/voices,voices}/<rest> -> HOST_VOICES_PREFIX/<rest>
     for pfx in (
         f"{HOST_DATA_PREFIX}/voices/".lower(),
-        f"{_LEGACY_HOST_DATA_PREFIX}/voices/".lower(),
-        f"{_LEGACY_HOST_VOICES_PREFIX}/".lower(),
         "data/voices/",
         "voices/",
     ):
         if p_low.startswith(pfx):
             return f"{HOST_VOICES_PREFIX}/{p[len(pfx):]}"
+    if not p_low.startswith(f"{HOST_VOICES_PREFIX}/".lower()):
+        for legacy_re in (_LEGACY_PROJECT_DATA_VOICES_RE, _LEGACY_PROJECT_VOICES_RE):
+            m = legacy_re.match(p)
+            if m:
+                return f"{HOST_VOICES_PREFIX}/{m.group(1)}"
 
     # Map legacy taiwan ref audio under data/ -> HOST_VOICES_PREFIX/
+    m_legacy_data = _LEGACY_PROJECT_DATA_RE.match(p)
+    legacy_data_rel = m_legacy_data.group(1) if m_legacy_data else ""
     for fname in ("xiaozhi_taiwan_ref.wav", "xiaozhi_taiwan_aux.wav", "wakeup_words_short.wav"):
-        for pfx in (f"{HOST_DATA_PREFIX}/", f"{_LEGACY_HOST_DATA_PREFIX}/", "data/"):
+        for pfx in (f"{HOST_DATA_PREFIX}/", "data/"):
             if p_low == f"{pfx.lower()}{fname}":
                 return f"{HOST_VOICES_PREFIX}/{fname}"
+        if legacy_data_rel.lower() == fname:
+            return f"{HOST_VOICES_PREFIX}/{fname}"
 
-    if p_low.startswith(_LEGACY_HOST_DATA_PREFIX.lower()):
-        p = HOST_DATA_PREFIX + p[len(_LEGACY_HOST_DATA_PREFIX) :]
+    if m_legacy_data and not p_low.startswith(f"{HOST_DATA_PREFIX}/".lower()):
+        p = f"{HOST_DATA_PREFIX}/{legacy_data_rel}"
     elif p.startswith("data/"):
         p = HOST_DATA_PREFIX + "/" + p[len("data/") :]
     return p
@@ -475,14 +476,11 @@ def _to_local_fs_path(host_or_local_path: str) -> str:
         for v_pfx in (
             HOST_VOICES_PREFIX,
             f"{HOST_DATA_PREFIX}/voices",
-            f"{_LEGACY_HOST_DATA_PREFIX}/voices",
-            _LEGACY_HOST_VOICES_PREFIX,
         ):
             if v_pfx and p_low.startswith(v_pfx.lower()):
                 return CONTAINER_VOICES_PREFIX + p[len(v_pfx) :]
-        for d_pfx in (HOST_DATA_PREFIX, _LEGACY_HOST_DATA_PREFIX):
-            if d_pfx and p_low.startswith(d_pfx.lower()):
-                return CONTAINER_DATA_PREFIX + p[len(d_pfx) :]
+        if HOST_DATA_PREFIX and p_low.startswith(HOST_DATA_PREFIX.lower()):
+            return CONTAINER_DATA_PREFIX + p[len(HOST_DATA_PREFIX) :]
     return p
 
 

@@ -568,10 +568,10 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                 self.assertLess(dur, 4.0)
 
         class _DummyMeiTts:
-            ref_audio_path = "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav"
+            ref_audio_path = "D:/legacy-host/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav"
 
         class _DummyOtherTts:
-            ref_audio_path = "e:/故事/1/xiaozhi-server/data/xiaozhi_taiwan_ref.wav"
+            ref_audio_path = "D:/legacy-host/xiaozhi-server/data/xiaozhi_taiwan_ref.wav"
 
         self.assertTrue(router.get_wakeup_responses_for_tts(_DummyMeiTts()))
         self.assertEqual(router.get_wakeup_responses_for_tts(_DummyOtherTts()), [])
@@ -2924,7 +2924,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
             cs._raw_logs.clear()
             cs._raw_log_seq = 0
             s1 = cs._append_raw_log_locked("line one")
-            s2 = cs._append_raw_log_locked("line two")
+            cs._append_raw_log_locked("line two")
             s3 = cs._append_raw_log_locked("line three")
         try:
             full_lines, cur_full, inc_full, rst_full = cs._get_logs_for_state(None)
@@ -3000,10 +3000,6 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         # 1. reply_length_router max_tokens scales UP and cleanly scales BACK DOWN
         rl.apply_reply_length_llm_patch()
 
-        class _DummyLLM:
-            max_tokens = 1024
-
-        dummy = _DummyLLM()
         with tempfile.TemporaryDirectory() as td:
             tmp_cfg = os.path.join(td, "reply_length_config.json")
             orig_cache = dict(rl._cfg_cache)
@@ -4194,7 +4190,7 @@ class TestContainerOfflinePipeline(unittest.TestCase):
             )
 
         rewritten_legacy = router._rewrite_host_data_path(
-            "e:/故事/1/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav"
+            "D:/legacy-host/xiaozhi-server/data/voices/raiden_mei/mei_default_ref.wav"
         )
         self.assertEqual(rewritten_legacy, f"{router.HOST_VOICES_PREFIX}/raiden_mei/mei_default_ref.wav")
         rewritten_placeholder = router._rewrite_host_data_path(
@@ -4499,7 +4495,6 @@ class TestContainerOfflinePipeline(unittest.TestCase):
 
     def test_batch2_f3_wakeup_and_hello_async_gsv_prime(self):
         """F-3: prime_gsv_async fires non-blocking POST /prime with debounce and never raises on failure."""
-        import asyncio
         import threading
         from unittest.mock import patch
         import core.handle.helloHandle as hello_mod
@@ -4542,11 +4537,6 @@ class TestContainerOfflinePipeline(unittest.TestCase):
                     "url": "http://host.docker.internal:19880/tts",
                     "ref_audio_path": "${HOST_VOICES_DIR}/xiaozhi_taiwan_ref.wav",
                 },
-            )()
-            fake_conn = type(
-                "FakeConn",
-                (),
-                {"tts": fake_tw_tts, "config": {"enable_wakeup_words_response_cache": True, "wakeup_words": ["你好小智"]}},
             )()
             orig_inner_wakeup = hello_mod.checkWakeupWords.__wrapped__
             with (
@@ -4632,6 +4622,140 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         self.assertIn("M3", out_tool[1]["content"])
         self.assertEqual(out_tool[2]["tool_calls"][0]["id"], "tc1")
         self.assertEqual(out_tool[3]["role"], "tool")
+
+    def test_p0_1_config_env_expand_security_gate_and_placeholder_auth_key_rejected(self):
+        """P0-1 & 4.1#1: config_env_expand is security-gated; unexpanded ${ESP32_AUTH_KEY} rejected on OTA/WS/Vision; no hardcoded personal path."""
+        import asyncio
+        import json
+        from unittest.mock import patch
+        import boot
+        import patch_registry
+        import start_with_env
+        from core.api.ota_handler import OTAHandler
+        from core.api.vision_handler import VisionHandler
+        from core.auth import AuthManager, AuthenticationError
+        from core.utils.auth import AuthToken
+        from core.websocket_server import WebSocketServer
+
+        boot.install_all(start_background_workers=False, run_contract_self_check=False)
+
+        # 1. config_env_expand MUST be a required security patch in both SECURITY_PATCH_NAMES and registry
+        self.assertIn("config_env_expand", patch_registry.SECURITY_PATCH_NAMES)
+        st = patch_registry.get_patch_status("config_env_expand")
+        self.assertIsNotNone(st)
+        self.assertEqual(st.get("category"), "security")
+
+        orig_cfg_entry = patch_registry.get_patch_status("config_env_expand")
+        try:
+            patch_registry.record_patch(
+                "config_env_expand",
+                "skipped_contract",
+                target="config.config_loader.read_config",
+                detail="simulated contract drift",
+                contract_ok=False,
+                category="security",
+            )
+            with patch.dict(os.environ, {"XIAOZHI_ALLOW_INSECURE_BOOT": ""}, clear=False):
+                with self.assertRaises(SystemExit) as cm:
+                    patch_registry.enforce_security_patches_or_exit(exit_code=2)
+                self.assertEqual(cm.exception.code, 2)
+        finally:
+            with patch_registry._lock:
+                patch_registry._patches["config_env_expand"] = orig_cfg_entry
+
+        # 2. Defense-in-depth: even if literal "${ESP32_AUTH_KEY}" reaches OTA/WS/Vision handlers,
+        #    all 3 endpoints MUST reject forged tokens signed with that public placeholder string!
+        start_with_env.install_esp32_auth_hardening_patch()
+        placeholder_key = "${ESP32_AUTH_KEY}"
+        allowed_mac = "de:ad:be:ef:12:34"
+        bad_cfg = {
+            "server": {
+                "ip": "0.0.0.0",
+                "port": 8000,
+                "http_port": 8003,
+                "websocket": "ws://127.0.0.1:18000/xiaozhi/v1/",
+                "vision_explain": "http://127.0.0.1:18003/mcp/vision/explain",
+                "timezone_offset": 8,
+                "auth_key": placeholder_key,
+                "auth": {"enabled": True, "allowed_devices": [allowed_mac]},
+            }
+        }
+
+        class _FakeReq:
+            def __init__(self, headers, body="{}"):
+                self.method = "POST"
+                self.headers = headers
+                self._body = body
+
+            async def text(self):
+                return self._body
+
+        ota = OTAHandler(bad_cfg)
+        r_ota = asyncio.run(ota.handle_post(_FakeReq({"device-id": allowed_mac, "client-id": "cli-1"})))
+        self.assertEqual(r_ota.status, 503)
+        self.assertNotIn("websocket", json.loads(r_ota.text))
+
+        ws_srv = WebSocketServer.__new__(WebSocketServer)
+        ws_srv.config = bad_cfg
+        ws_srv.auth_enable = True
+        ws_srv.allowed_devices = {allowed_mac}
+        ws_srv.auth = AuthManager(placeholder_key)
+        forged_ws_tok = AuthManager(placeholder_key).generate_token("cli-1", allowed_mac)
+
+        class _FakeWS:
+            def __init__(self, headers):
+                self.request = type("_Req", (), {"headers": headers})()
+
+        with self.assertRaises(AuthenticationError):
+            asyncio.run(
+                ws_srv._handle_auth(
+                    _FakeWS(
+                        {
+                            "Device-Id": allowed_mac,
+                            "Client-Id": "cli-1",
+                            "Authorization": f"Bearer {forged_ws_tok}",
+                        }
+                    )
+                )
+            )
+
+        vis = VisionHandler(bad_cfg)
+        forged_vis_tok = AuthToken(placeholder_key).generate_token(allowed_mac)
+        r_vis = asyncio.run(
+            vis.handle_post(
+                _FakeReq({"Device-Id": allowed_mac, "Authorization": f"Bearer {forged_vis_tok}"})
+            )
+        )
+        self.assertEqual(r_vis.status, 401)
+
+        # 2b. OTAHandler fails closed (503) if auth is missing or token generation throws
+        valid_cfg = {
+            "server": {
+                **bad_cfg["server"],
+                "auth_key": "a-valid-long-test-secret-key-0123456789",
+            }
+        }
+        ota_broken = OTAHandler(valid_cfg)
+        ota_broken.auth = type(
+            "_BoomAuth",
+            (),
+            {
+                "secret_key": "a-valid-long-test-secret-key-0123456789",
+                "generate_token": staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sign boom"))),
+            },
+        )()
+        r_ota_boom = asyncio.run(
+            ota_broken.handle_post(_FakeReq({"device-id": allowed_mac, "client-id": "cli-1"}))
+        )
+        self.assertEqual(r_ota_boom.status, 503)
+
+        # 3. 4.1 #1: No hardcoded personal drive/directory path in tags.py
+        tags_path = os.path.join(APP_DIR, "patches", "emotion", "tags.py")
+        with open(tags_path, "r", encoding="utf-8") as f:
+            tags_src = f.read()
+        forbidden_marker = "e:/\u6545\u4e8b/1"
+        self.assertNotIn(forbidden_marker, tags_src.lower())
+        self.assertNotIn(forbidden_marker.replace("/", "\\"), tags_src.lower())
 
 
 @unittest.skipUnless(

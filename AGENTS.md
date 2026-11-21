@@ -15,7 +15,7 @@
   - `anima-brain/src/companion_engine/static/{memory-panel,provider-settings,voice-player}.html` 与 `voice-player-notices.txt` 由 Dockerfile 构建期 `ui/build.mjs` 生成，严禁重新提交入库。
 - **密钥零明文与安全 fail-closed**：
   - `DEEPSEEK_API_KEY`、`GEMINI_API_KEY`、`ESP32_AUTH_KEY` 等仅由环境变量/占位符 `${ENV_VAR}` 在内存展开，严禁落盘明文或回显日志；严禁硬编码盘符路径、用户名或固定局域网 IP。
-  - `security` 类补丁（`esp32_auth_ota`、`esp32_auth_ws`、`esp32_auth_vision`、`mcp_token_injection`）失败或契约不匹配时必须拒绝启动（`sys.exit(2)`；仅显式设置 `XIAOZHI_ALLOW_INSECURE_BOOT=1` 应急放行，且 `/api/health` 持续返回 `503` + `18080` 挂红横幅）。`experience` 类补丁契约不匹配时跳过挂载（`skipped_contract`），提示词锚点缺失时逐条软跳过（`partial`），`/api/health` 标注 `degraded`。
+  - `security` 类补丁（`config_env_expand`、`esp32_auth_ota`、`esp32_auth_ws`、`esp32_auth_vision`、`mcp_token_injection`）失败或契约不匹配时必须拒绝启动（`sys.exit(2)`；仅显式设置 `XIAOZHI_ALLOW_INSECURE_BOOT=1` 应急放行，且 `/api/health` 持续返回 `503` + `18080` 挂红横幅）。`experience` 类补丁契约不匹配时跳过挂载（`skipped_contract`），提示词锚点缺失时逐条软跳过（`partial`），`/api/health` 标注 `degraded`。
   - 严禁修改宿主机 Antigravity `user_config.json`/`config.json`；Sidecar 若指向 `language_server.exe`，首参必须显式传 `"agentapi"` 且 `<prompt>` 前不加 `--`。
 - **硬件刷机与隐私库热备**：ESP32-S3 执行 `write-flash` 前必先备份 `0x9000` NVS 与引导区至 `backups/`；手工维护 `anima-data/brain.sqlite3` 前必先停止 `xiaozhi-anima-brain` 并备份至 `backups/`（严禁宿主机直开 WAL 模式库文件）。
 - **GitHub 公开仓库脱敏拦截**：每次提交前必跑 `git add -n .`，严禁将 `.env`、`*.bin`、`secrets/`、`backups/`、`anima-data/`、`state/`、`config/runtime/`、`voices/`、`models/gsv_weights/`、`pc-mcp/state/`、`logs/`、`.venv`、截图或私人路径/MAC/密钥推入版本库；保持 `.gitattributes` 锁定 `*.bat`/`*.ps1` 为 `eol=crlf`。
@@ -39,7 +39,7 @@
 ## 3. 必跑验证命令
 
 ```powershell
-# 1. 全链路三层回归（当前 199 项：unit 183 + contract 7 + live 9）
+# 1. 全链路三层回归（当前 211 项：unit 195 + contract 7 + live 9）
 python scripts/run_tests.py --layer all
 
 # 2. 离线单测 / 上游镜像契约（临时 docker run --rm，无需运行中容器；升级上游镜像必跑 contract）

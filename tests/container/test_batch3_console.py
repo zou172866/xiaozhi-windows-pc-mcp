@@ -19,7 +19,7 @@ import types
 import unittest
 from contextlib import redirect_stdout
 from http.server import ThreadingHTTPServer
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import yaml
@@ -1090,6 +1090,245 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
         self.assertIn("--log_backup_count 3", txt)
         self.assertIn("gsv_19880_boot.log", txt)
         self.assertNotIn('> `"$logOut`"', txt, "cmd.exe must not hold > redirect on rotating gsv_19880.log")
+
+    def test_p1_1_console_cors_port_restriction_and_malformed_headers_safety(self):
+        """P1-1: 18080 CORS reflects ONLY exact http loopback origin matching CONSOLE_PORT, and tolerates headers=None."""
+        httpd, port = _start_test_console_server()
+        orig_port = cs.CONSOLE_PORT
+        cs.CONSOLE_PORT = port
+        try:
+            with httpx.Client(trust_env=False, timeout=5.0) as client:
+                # 1. Cross-port / https / external origins MUST NOT receive Access-Control-Allow-Origin
+                for bad_origin in (
+                    "http://localhost:3000",
+                    "http://127.0.0.1:8888",
+                    f"https://localhost:{port}",
+                    f"https://127.0.0.1:{port}",
+                    "http://evil.example",
+                    "null",
+                ):
+                    r_bad = client.get(
+                        f"http://127.0.0.1:{port}/api/health",
+                        headers={"Origin": bad_origin},
+                    )
+                    self.assertEqual(r_bad.status_code, 200)
+                    self.assertNotIn(
+                        "access-control-allow-origin",
+                        {k.lower() for k in r_bad.headers.keys()},
+                        f"Cross-port/scheme Origin {bad_origin!r} must NOT be reflected in ACAO",
+                    )
+
+                # 2. Exact matching http loopback origin on CONSOLE_PORT IS allowed
+                good_origin = f"http://127.0.0.1:{port}"
+                r_good = client.get(
+                    f"http://127.0.0.1:{port}/api/health",
+                    headers={"Origin": good_origin},
+                )
+                self.assertEqual(r_good.status_code, 200)
+                self.assertEqual(r_good.headers.get("Access-Control-Allow-Origin"), good_origin)
+                self.assertEqual(r_good.headers.get("Vary"), "Origin")
+
+            # 3. Malformed HTTP request (self.headers not initialized / None) must NOT raise AttributeError
+            sent_hdrs: list[tuple[str, str]] = []
+
+            class _BrokenHandler(cs.ConsoleHandler):
+                def __init__(self):
+                    self.headers = None
+                    self._headers_buffer = []
+
+                def send_header(self, keyword, value):
+                    sent_hdrs.append((keyword, value))
+
+            bh = _BrokenHandler()
+            with patch.object(cs.BaseHTTPRequestHandler, "end_headers", lambda self: None):
+                bh.end_headers()
+            hdr_names = {k.lower() for k, _ in sent_hdrs}
+            self.assertIn("x-frame-options", hdr_names)
+            self.assertIn("content-security-policy", hdr_names)
+            self.assertIn("x-content-type-options", hdr_names)
+            self.assertNotIn("access-control-allow-origin", hdr_names)
+        finally:
+            cs.CONSOLE_PORT = orig_port
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_p1_5_gsv_preview_rereads_configured_voice_in_lock_and_finally(self):
+        """P1-5: handle_post_tts_preview re-reads configured GSV voice after acquiring lock and before rollback."""
+        import console.routes.gsv as gsv_mod
+
+        orig_loaded = gsv_mod._active_gsv_loaded
+        gsv_mod._set_voice_dirty(None, "")
+        try:
+            # Case A: Concurrent POST /api/config switches configured voice from raiden_mei -> xiaozhi_tw
+            # WHILE preview is synthesizing xiaozhi_tw. Preview MUST NOT roll back GPU to old raiden_mei!
+            cfg_reads = {"n": 0}
+            ensure_calls: list[str] = []
+
+            def _changing_cfg():
+                cfg_reads["n"] += 1
+                # Read 1 (before lock): raiden_mei; Read 2 (after lock): raiden_mei; Read 3 (in finally): xiaozhi_tw!
+                return "__gsv_raiden_mei__" if cfg_reads["n"] <= 2 else "__gsv_xiaozhi_tw__"
+
+            def _fake_ensure(v, persist_boot_yaml=False):
+                ensure_calls.append(v)
+                gsv_mod._active_gsv_loaded = v
+
+            class _FakeResp:
+                status_code = 200
+                content = b"RIFFfakewav"
+
+            class _FakeCli:
+                def post(self, url, **kwargs):
+                    return _FakeResp()
+
+            class _FakeHandler:
+                def __init__(self, body):
+                    self._body = body
+                    self.status = None
+                    self.headers_sent = {}
+                    self.wfile = io.BytesIO()
+
+                def _read_body_json(self):
+                    return self._body
+
+                def _send_json(self, data, status=200):
+                    self.status = int(status)
+                    self.wfile.write(json.dumps(data).encode("utf-8"))
+
+                def send_response(self, status):
+                    self.status = int(status)
+
+                def send_header(self, k, v):
+                    self.headers_sent[k] = v
+
+                def end_headers(self):
+                    pass
+
+            gsv_mod._active_gsv_loaded = "__gsv_raiden_mei__"
+            h1 = _FakeHandler({"voice": "__gsv_xiaozhi_tw__", "text": "测试切换"})
+            with (
+                patch.object(gsv_mod, "_get_configured_gsv_voice", side_effect=_changing_cfg),
+                patch.object(gsv_mod, "_ensure_gsv_weights", side_effect=_fake_ensure),
+                patch.object(gsv_mod.shared, "_is_device_busy", return_value=False),
+                patch.object(gsv_mod.shared, "_get_console_http_client", return_value=_FakeCli()),
+            ):
+                gsv_mod.handle_post_tts_preview(h1)
+
+            self.assertEqual(h1.status, 200)
+            self.assertEqual(
+                ensure_calls,
+                ["__gsv_xiaozhi_tw__"],
+                f"Must NOT revert GPU back to stale __gsv_raiden_mei__ after config switched to __gsv_xiaozhi_tw__: {ensure_calls}",
+            )
+            self.assertEqual(gsv_mod._active_gsv_loaded, "__gsv_xiaozhi_tw__")
+
+            # Case B: Config switches from raiden_mei -> xiaozhi_tw while previewing raiden_mei:
+            # finally MUST restore NEW configured voice (__gsv_xiaozhi_tw__) instead of leaving raiden_mei loaded!
+            cfg_reads["n"] = 0
+            ensure_calls.clear()
+            gsv_mod._active_gsv_loaded = "__gsv_raiden_mei__"
+            h2 = _FakeHandler({"voice": "__gsv_raiden_mei__", "text": "试听旧音色"})
+            with (
+                patch.object(gsv_mod, "_get_configured_gsv_voice", side_effect=_changing_cfg),
+                patch.object(gsv_mod, "_ensure_gsv_weights", side_effect=_fake_ensure),
+                patch.object(gsv_mod.shared, "_is_device_busy", return_value=False),
+                patch.object(gsv_mod.shared, "_get_console_http_client", return_value=_FakeCli()),
+            ):
+                gsv_mod.handle_post_tts_preview(h2)
+
+            self.assertEqual(h2.status, 200)
+            self.assertEqual(
+                ensure_calls,
+                ["__gsv_raiden_mei__", "__gsv_xiaozhi_tw__"],
+                f"Expected rollback to newly configured __gsv_xiaozhi_tw__, got: {ensure_calls}",
+            )
+            self.assertEqual(gsv_mod._active_gsv_loaded, "__gsv_xiaozhi_tw__")
+
+            # Case C: config._write_updated_yaml keeps gsv._gsv_weights_lock held across atomic .config.yaml write
+            # so a concurrent preview thread can NEVER observe pre-write YAML after GPU weights already switched.
+            import console.routes.config as cfg_mod
+
+            orig_cfg_path = cs.CONFIG_PATH
+            orig_infer_path = cs.GSV_INFER_YAML
+            lock_held_at_write = {"held": False}
+            with tempfile.TemporaryDirectory() as td_p15:
+                tmp_cfg = os.path.join(td_p15, ".config.yaml")
+                tmp_infer = os.path.join(td_p15, "gsv_infer.yaml")
+                with open(tmp_cfg, "w", encoding="utf-8") as wf:
+                    yaml.safe_dump(
+                        {
+                            "selected_module": {"TTS": "GPT_SOVITS_V2", "LLM": "DeepSeekLLM"},
+                            "TTS": {"GPT_SOVITS_V2": dict(gsv_mod.GSV_PROFILES["__gsv_raiden_mei__"]["block"])},
+                            "LLM": {"DeepSeekLLM": {"model_name": "deepseek-chat"}},
+                        },
+                        wf,
+                        allow_unicode=True,
+                    )
+                cs.CONFIG_PATH = tmp_cfg
+                cs.GSV_INFER_YAML = tmp_infer
+                orig_atomic = cs.shared._atomic_write_text
+
+                def _spy_atomic(path, content):
+                    if path == tmp_cfg:
+                        # From another thread, non-blocking acquire of _gsv_weights_lock MUST fail (lock is still held!)
+                        other_res = []
+
+                        def _probe():
+                            got = gsv_mod._gsv_weights_lock.acquire(blocking=False)
+                            if got:
+                                gsv_mod._gsv_weights_lock.release()
+                            other_res.append(got)
+
+                        t_probe = threading.Thread(target=_probe)
+                        t_probe.start()
+                        t_probe.join(timeout=2.0)
+                        lock_held_at_write["held"] = (other_res == [False])
+                    return orig_atomic(path, content)
+
+                try:
+                    with (
+                        patch.object(gsv_mod, "_ensure_gsv_weights", side_effect=_fake_ensure),
+                        patch.object(cs.shared, "_atomic_write_text", side_effect=_spy_atomic),
+                    ):
+                        cfg_mod._write_updated_yaml(voice="__gsv_xiaozhi_tw__")
+                    self.assertTrue(
+                        lock_held_at_write["held"],
+                        "gsv._gsv_weights_lock MUST stay held during atomic .config.yaml write to close TOCTOU!",
+                    )
+                finally:
+                    cs.CONFIG_PATH = orig_cfg_path
+                    cs.GSV_INFER_YAML = orig_infer_path
+
+            # Case D: P0-4 18080 POST /api/pc-mode propagates host 18900 HTTP 423 Locked cleanly (not HTTP 502)
+            import console.routes.l3 as l3_mod
+
+            class _Fake423Resp:
+                status_code = 423
+                content = b'{"ok":false,"emergency_stopped":true,"error":"\xe6\x80\xa5\xe5\x81\x9c\xe9\x94\x81\xe5\xae\x9a"}'
+                text = '{"ok":false,"emergency_stopped":true,"error":"急停锁定"}'
+
+                def json(self):
+                    return {"ok": False, "emergency_stopped": True, "error": "急停锁定"}
+
+            class _Fake423Cli:
+                def post(self, url, **kwargs):
+                    return _Fake423Resp()
+
+            h423 = _FakeHandler({"mode": "full"})
+            orig_mode_path = l3_mod.shared.MODE_PATH
+            l3_mod.shared.MODE_PATH = l3_mod.shared._DEFAULT_MODE_PATH
+            try:
+                with patch.object(l3_mod.shared, "_get_console_http_client", return_value=_Fake423Cli()):
+                    l3_mod.handle_post_pc_mode(h423)
+            finally:
+                l3_mod.shared.MODE_PATH = orig_mode_path
+            self.assertEqual(h423.status, 423)
+            body_423 = json.loads(h423.wfile.getvalue().decode("utf-8"))
+            self.assertTrue(body_423.get("emergency_stopped"))
+            self.assertEqual(body_423.get("error"), "急停锁定")
+        finally:
+            gsv_mod._active_gsv_loaded = orig_loaded
+            gsv_mod._set_voice_dirty(None, "")
 
 
 if __name__ == "__main__":

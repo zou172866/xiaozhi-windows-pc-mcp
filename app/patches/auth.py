@@ -132,7 +132,7 @@ def install_config_env_expand_patch() -> Any:
         config_loader,
         "read_config",
         _make_patched_read_config,
-        category="experience",
+        category="security",
         target="config.config_loader.read_config",
         required_params=("config_path",),
         require_async=False,
@@ -225,6 +225,29 @@ def install_mcp_token_injection_patch() -> None:
 
 
 # 1c. Harden ESP32 18000 WebSocket, 18003 OTA, and 18003 vision_explain authentication (P0 #1)
+def _has_unexpanded_or_invalid_auth_key(handler) -> bool:
+    """Return True if the handler's signing secret is missing, empty, or contains an unexpanded ${...} placeholder (P0-1)."""
+    auth_obj = getattr(handler, "auth", None)
+    if auth_obj is None:
+        return True
+    candidates = []
+    if hasattr(auth_obj, "secret_key"):
+        candidates.append(getattr(auth_obj, "secret_key", None))
+    srv_cfg = (getattr(handler, "config", None) or {}).get("server") or {}
+    if isinstance(srv_cfg, dict) and "auth_key" in srv_cfg:
+        candidates.append(srv_cfg.get("auth_key"))
+    if not candidates:
+        return True
+    for raw in candidates:
+        if isinstance(raw, (bytes, bytearray)):
+            s = raw.decode("utf-8", errors="replace").strip()
+        else:
+            s = str(raw or "").strip()
+        if not s or "${" in s or "你" in s:
+            return True
+    return False
+
+
 def _extract_handler_allowed_devices(handler) -> set[str]:
     if hasattr(handler, "allowed_devices"):
         raw = getattr(handler, "allowed_devices")
@@ -279,6 +302,23 @@ def install_esp32_auth_hardening_patch() -> None:
                     client_raw = (hdrs.get("client-id") or "").strip()
                     dev_norm = _normalize_device_id(dev_raw)
                     if auth_enabled:
+                        if _has_unexpanded_or_invalid_auth_key(self):
+                            try:
+                                self.logger.bind(tag="esp32_auth").error(
+                                    "服务端 auth_key 无效或包含未展开占位符，拒绝签发 OTA 令牌"
+                                )
+                            except Exception:
+                                pass
+                            resp = _aiohttp_web.Response(
+                                text=json.dumps(
+                                    {"success": False, "message": "服务端认证密钥未正确展开，拒绝签发令牌"},
+                                    ensure_ascii=False,
+                                ),
+                                content_type="application/json",
+                                status=503,
+                            )
+                            self._add_cors_headers(resp)
+                            return resp
                         if not dev_norm or not client_raw:
                             resp = _aiohttp_web.Response(
                                 text=json.dumps(
@@ -336,6 +376,16 @@ def install_esp32_auth_hardening_patch() -> None:
                                 self.logger.bind(tag="esp32_auth").error(f"OTA 注入签名令牌失败: {exc}")
                             except Exception:
                                 pass
+                            err_resp = _aiohttp_web.Response(
+                                text=json.dumps(
+                                    {"success": False, "message": "OTA 签名令牌生成失败，拒绝签发未签名响应"},
+                                    ensure_ascii=False,
+                                ),
+                                content_type="application/json",
+                                status=503,
+                            )
+                            self._add_cors_headers(err_resp)
+                            return err_resp
                     return resp
 
                 ota_cls.handle_post = _patched_ota_handle_post
@@ -442,6 +492,9 @@ def install_esp32_auth_hardening_patch() -> None:
                         except Exception:
                             pass
                         raise _AuthErr(reason)
+
+                    if _has_unexpanded_or_invalid_auth_key(self):
+                        _reject("Server auth_key is empty or contains unexpanded placeholder")
 
                     allowed = _extract_handler_allowed_devices(self)
                     if not dev_norm or not allowed or dev_norm not in allowed:
@@ -561,6 +614,8 @@ def install_esp32_auth_hardening_patch() -> None:
             else:
                 @functools.wraps(_orig_vision_verify)
                 def _patched_vision_verify_auth_token(self, request, *args, **kwargs):
+                    if _has_unexpanded_or_invalid_auth_key(self):
+                        return False, None
                     hdrs = {str(k).lower(): str(v) for k, v in dict(request.headers).items()}
                     auth_header = (hdrs.get("authorization") or "").strip()
                     if not auth_header.lower().startswith("bearer "):

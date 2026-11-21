@@ -347,6 +347,25 @@ def _flush_all_pending_dialogues() -> None:
 
 
 
+def _publish_assistant_message_event(content: str, dev_id: str, *, standalone: bool) -> None:
+    try:
+        import mei_emotion_router as _mer
+
+        clean_ai = _mer.strip_emotion_tags(content).strip()
+    except Exception:
+        clean_ai = content
+    if clean_ai:
+        try:
+            runtime_events.publish_event(
+                "assistant_message",
+                text=clean_ai,
+                device_id=dev_id,
+                standalone=standalone,
+            )
+        except Exception:
+            pass
+
+
 def _patched_put(self, message, *args, **kwargs):
     if not isinstance(getattr(message, "_occurred_at", None), (int, float)) or isinstance(
         getattr(message, "_occurred_at", None), bool
@@ -399,22 +418,7 @@ def _patched_put(self, message, *args, **kwargs):
         # 3. Inside ConnectionHandler.chat(): wait until depth=0 exits so multi-step tool turns commit complete replies.
         if int(getattr(self, "_in_chat_depth", 0) or 0) > 0:
             _cancel_dialogue_timer(self)
-            try:
-                import mei_emotion_router as _mer
-
-                clean_ai = _mer.strip_emotion_tags(content).strip()
-            except Exception:
-                clean_ai = content
-            if clean_ai:
-                try:
-                    runtime_events.publish_event(
-                        "assistant_message",
-                        text=clean_ai,
-                        device_id=dev_id,
-                        standalone=False,
-                    )
-                except Exception:
-                    pass
+            _publish_assistant_message_event(content, dev_id, standalone=False)
             return
 
         # 3b. Standalone assistant greetings (e.g. helloHandle wakeup response / incoming call text)
@@ -425,41 +429,11 @@ def _patched_put(self, message, *args, **kwargs):
                 message._standalone_assistant = True
             except Exception:
                 pass
-            try:
-                import mei_emotion_router as _mer
-
-                clean_ai = _mer.strip_emotion_tags(content).strip()
-            except Exception:
-                clean_ai = content
-            if clean_ai:
-                try:
-                    runtime_events.publish_event(
-                        "assistant_message",
-                        text=clean_ai,
-                        device_id=dev_id,
-                        standalone=True,
-                    )
-                except Exception:
-                    pass
+            _publish_assistant_message_event(content, dev_id, standalone=True)
             return
 
         # 4. Outside chat() (e.g. direct intentHandler reply): emit event & schedule fallback debounce timer.
-        try:
-            import mei_emotion_router as _mer
-
-            clean_ai = _mer.strip_emotion_tags(content).strip()
-        except Exception:
-            clean_ai = content
-        if clean_ai:
-            try:
-                runtime_events.publish_event(
-                    "assistant_message",
-                    text=clean_ai,
-                    device_id=dev_id,
-                    standalone=False,
-                )
-            except Exception:
-                pass
+        _publish_assistant_message_event(content, dev_id, standalone=False)
         import anima_memory_provider
 
         msgs_snapshot = list(self.dialogue)
@@ -471,6 +445,24 @@ def _patched_put(self, message, *args, **kwargs):
         _schedule_dialogue_fallback_flush(self, latest_pair, user_msg=latest_user_ref)
     except Exception:
         pass
+
+
+def _has_trailing_tool_exchange(messages, user_msg) -> bool:
+    """Return True if messages after `user_msg` contain tool_calls or tool results (P1-6)."""
+    if user_msg is None or not messages:
+        return False
+    seen_user = False
+    for m in list(messages):
+        if m is user_msg:
+            seen_user = True
+            continue
+        if not seen_user:
+            continue
+        role = getattr(m, "role", "")
+        raw_tc = getattr(m, "tool_calls", None)
+        if role == "tool" or (role == "assistant" and isinstance(raw_tc, (list, tuple)) and len(raw_tc) > 0):
+            return True
+    return False
 
 
 def _patched_get_llm_dialogue_with_memory(self, *args, **kwargs):
@@ -487,15 +479,55 @@ def _patched_get_llm_dialogue_with_memory(self, *args, **kwargs):
     # cannot swallow <core_rules>/<tool_usage> if persona prose mentions '<memory>' inline;
     # turn_context_router handles memory_str safely in both split and legacy modes.
     msgs = _orig_get_llm_dialogue_with_memory(self, *fwd_args, **fwd_kwargs)
+
+    # P1-6: Preserve depth=0 <turn_context> & <memory> verbatim on tool-call continuations (depth > 0)
+    # where upstream invokes chat(None, depth=1) -> get_llm_dialogue_with_memory(None, ...).
+    dlg_msgs = getattr(self, "dialogue", None) or ()
+    latest_user = _find_latest_real_user(dlg_msgs)
+    cache = getattr(self, "_turn_ctx_cache", None)
+    eff_memory_str = memory_str
+    eff_time_str = None
+    pinned_turn_ctx = None
+    has_explicit_mem = bool(memory_str is not None and str(memory_str).strip())
+    in_chat_depth = int(getattr(self, "_in_chat_depth", 0) or 0)
+
+    if (
+        not has_explicit_mem
+        and latest_user is not None
+        and isinstance(cache, dict)
+        and cache.get("user_ref") is latest_user
+        and (in_chat_depth > 1 or _has_trailing_tool_exchange(dlg_msgs, latest_user))
+    ):
+        pinned_turn_ctx = cache.get("turn_context") or None
+        if cache.get("memory_str"):
+            eff_memory_str = cache["memory_str"]
+        if cache.get("current_time_str"):
+            eff_time_str = cache["current_time_str"]
+
     try:
-        return turn_context_router.apply_turn_context_to_messages(
+        meta: dict[str, str] = {}
+        res = turn_context_router.apply_turn_context_to_messages(
             msgs,
-            memory_str=memory_str,
+            memory_str=eff_memory_str,
+            current_time_str=eff_time_str,
+            pinned_turn_context=pinned_turn_ctx,
+            out_meta=meta,
         )
+        if latest_user is not None and pinned_turn_ctx is None:
+            try:
+                self._turn_ctx_cache = {
+                    "user_ref": latest_user,
+                    "turn_context": meta.get("turn_context", ""),
+                    "memory_str": meta.get("memory_str", str(eff_memory_str or "").strip()),
+                    "current_time_str": meta.get("current_time_str", ""),
+                }
+            except Exception:
+                pass
+        return res
     except Exception:
-        if memory_str and msgs and msgs[0].get("role") == "system":
-            if memory_str not in msgs[0].get("content", ""):
-                msgs[0]["content"] += f"\n\n<memory>\n{memory_str}\n</memory>"
+        if eff_memory_str and msgs and msgs[0].get("role") == "system":
+            if eff_memory_str not in msgs[0].get("content", ""):
+                msgs[0]["content"] += f"\n\n<memory>\n{eff_memory_str}\n</memory>"
         try:
             import reply_length_router
 
@@ -585,25 +617,86 @@ def install_chat_turn_flush_patch() -> None:
                 _orig_handle_fn, required_params=("self", "tool_results"), require_async=False
             )
 
-        if not (ok_chat and ok_fn):
+        ok_init_mem = True
+        det_init_mem = "not_present"
+        has_init_mem = hasattr(ConnectionHandler, "_initialize_memory")
+        _orig_init_mem = ConnectionHandler._initialize_memory if has_init_mem else None
+        if has_init_mem:
+            ok_init_mem, det_init_mem = patch_registry.verify_signature_contract(
+                _orig_init_mem, required_params=("self",), require_async=False
+            )
+
+        if not (ok_chat and ok_fn and ok_init_mem):
             patch_registry.record_patch(
                 "anima_turn_flush",
                 "skipped_contract",
-                target="ConnectionHandler.chat/_handle_function_result",
-                detail=f"{det_chat}; {det_fn}",
+                target="ConnectionHandler.{_initialize_memory,chat,_handle_function_result}",
+                detail=f"{det_chat}; {det_fn}; init_mem={det_init_mem}",
                 contract_ok=False,
                 category="experience",
             )
             print(
-                f"[AnimaTurnFlush] 跳过挂载 ConnectionHandler.chat 补丁（签名契约不匹配）: {det_chat}; {det_fn}",
+                f"[AnimaTurnFlush] 跳过挂载 ConnectionHandler.chat 补丁（签名契约不匹配）: {det_chat}; {det_fn}; {det_init_mem}",
                 flush=True,
             )
             return
 
+        if has_init_mem and _orig_init_mem is not None:
+            @functools.wraps(_orig_init_mem)
+            def _patched_initialize_memory(self, *args, **kwargs):
+                # P0-5: Bind per-connection device_id proxy over the shared MemoryProvider singleton
+                # BEFORE upstream calls self.memory.init_memory(role_id=self.device_id).
+                mem = getattr(self, "memory", None)
+                dev_id = str(getattr(self, "device_id", "") or "").strip()
+                amp = None
+                try:
+                    import anima_memory_provider as amp
+                except Exception:
+                    amp = None
+                if mem is not None and amp is not None:
+                    try:
+                        self.memory = amp.bind_memory_provider(mem, dev_id)
+                    except Exception:
+                        pass
+                res = _orig_init_mem(self, *args, **kwargs)
+                # Re-verify proxy binding in case upstream replaced self.memory inside _initialize_memory
+                mem_after = getattr(self, "memory", None)
+                dev_after = str(getattr(self, "device_id", "") or "").strip() or dev_id
+                if mem_after is not None and dev_after and amp is not None:
+                    try:
+                        if isinstance(mem_after, amp.MemoryProvider) or (
+                            isinstance(mem_after, amp._DeviceBoundMemoryProxy)
+                            and not mem_after._device_id
+                        ):
+                            self.memory = amp.bind_memory_provider(mem_after, dev_after)
+                    except Exception:
+                        pass
+                return res
+
+            ConnectionHandler._initialize_memory = _patched_initialize_memory
+
         @functools.wraps(_orig_chat)
         def _patched_chat(self, *args, **kwargs):
             dlg = getattr(self, "dialogue", None)
-            dev_id = str(getattr(self, "device_id", "") or "")
+            dev_id = str(getattr(self, "device_id", "") or "").strip()
+            mem = getattr(self, "memory", None)
+            amp = None
+            ctx_tok = None
+            if dev_id:
+                try:
+                    import anima_memory_provider as amp
+
+                    if mem is not None and (
+                        isinstance(mem, amp.MemoryProvider)
+                        or (
+                            isinstance(mem, amp._DeviceBoundMemoryProxy)
+                            and mem._device_id != dev_id
+                        )
+                    ):
+                        self.memory = amp.bind_memory_provider(mem, dev_id)
+                    ctx_tok = amp.set_current_device_id(dev_id)
+                except Exception:
+                    ctx_tok = None
             if dlg is not None:
                 if dev_id:
                     try:
@@ -629,6 +722,11 @@ def install_chat_turn_flush_patch() -> None:
                 chat_raised = True
                 raise
             finally:
+                if ctx_tok is not None and amp is not None:
+                    try:
+                        amp.reset_current_device_id(ctx_tok)
+                    except Exception:
+                        pass
                 if dlg is not None:
                     new_depth = 0
                     try:
@@ -675,8 +773,8 @@ def install_chat_turn_flush_patch() -> None:
         patch_registry.record_patch(
             "anima_turn_flush",
             "ok",
-            target="ConnectionHandler.chat/_handle_function_result",
-            detail=f"{det_chat}; {det_fn}",
+            target="ConnectionHandler.{_initialize_memory,chat,_handle_function_result}",
+            detail=f"{det_chat}; {det_fn}; init_mem={det_init_mem}",
             contract_ok=True,
             category="experience",
         )

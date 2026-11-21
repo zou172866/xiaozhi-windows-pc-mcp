@@ -25,7 +25,7 @@ import functools
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import asr_corrections
 import patch_registry
@@ -296,9 +296,62 @@ def judge_utterance_completeness(
 
 
 def is_story_or_dictation_mode(conn: Any, *, audio_bytes_len: int = 0) -> bool:
-    """Auto-disable speculative early-commit in story/dictation/manual modes or long monologues."""
+    """Auto-disable speculative early-commit in story/dictation/manual modes, storyteller preset, or long monologues (F-1, P1-12)."""
     if conn is None:
         return False
+    # P1-12: Always synchronize explicit dictation/story session state from dialogue history BEFORE
+    # checking storyteller/monologue overrides so enter/exit cues are never missed if overrides later toggle off.
+    dlg = getattr(conn, "dialogue", None)
+    msgs = getattr(dlg, "dialogue", None)
+    active_flag = bool(getattr(conn, "_vad_dictation_active", False))
+    seen_objs = getattr(conn, "_vad_dictation_seen_objs", None)
+    if not isinstance(seen_objs, dict):
+        seen_objs = {}
+        try:
+            conn._vad_dictation_seen_objs = seen_objs
+        except Exception:
+            pass
+    prev_dlg = getattr(conn, "_vad_dictation_dlg_ref", None)
+    if dlg is not prev_dlg:
+        active_flag = False
+        seen_objs.clear()
+        try:
+            conn._vad_dictation_dlg_ref = dlg
+            conn._vad_dictation_active = False
+        except Exception:
+            pass
+    if isinstance(msgs, list) and msgs:
+        for m in msgs:
+            if getattr(m, "is_temporary", False):
+                continue
+            if getattr(m, "role", "") != "user":
+                continue
+            mid = id(m)
+            if seen_objs.get(mid) is m:
+                continue
+            txt = str(getattr(m, "content", "") or "").strip()
+            if not txt:
+                continue
+            seen_objs[mid] = m
+            if any(cue in txt for cue in _DICTATION_EXIT_CUES):
+                active_flag = False
+            elif any(cue in txt for cue in _DICTATION_ENTER_CUES):
+                active_flag = True
+        live_ids = {id(m) for m in msgs}
+        for stale_id in [k for k in seen_objs if k not in live_ids]:
+            seen_objs.pop(stale_id, None)
+        try:
+            conn._vad_dictation_active = active_flag
+        except Exception:
+            pass
+    else:
+        active_flag = False
+        seen_objs.clear()
+        try:
+            conn._vad_dictation_active = False
+        except Exception:
+            pass
+
     if getattr(conn, "client_listen_mode", "auto") == "manual":
         return True
     if (
@@ -310,30 +363,15 @@ def is_story_or_dictation_mode(conn: Any, *, audio_bytes_len: int = 0) -> bool:
     cfg = getattr(conn, "config", None)
     if isinstance(cfg, dict) and (cfg.get("dictation_mode") or cfg.get("story_mode")):
         return True
+    try:
+        rl_cfg = runtime_settings.get_reply_length()
+        if isinstance(rl_cfg, dict) and str(rl_cfg.get("preset") or "").strip().lower() == "storyteller":
+            return True
+    except Exception:
+        pass
     if audio_bytes_len >= _LONG_MONOLOGUE_BYTES:
         return True
-
-    # Inspect recent user dialogue turns for explicit dictation/storytelling session cues
-    dlg = getattr(conn, "dialogue", None)
-    msgs = getattr(dlg, "dialogue", None)
-    if isinstance(msgs, list) and msgs:
-        checked = 0
-        for m in reversed(msgs):
-            if getattr(m, "is_temporary", False):
-                continue
-            if getattr(m, "role", "") != "user":
-                continue
-            txt = str(getattr(m, "content", "") or "").strip()
-            if not txt:
-                continue
-            if any(cue in txt for cue in _DICTATION_EXIT_CUES):
-                return False
-            if any(cue in txt for cue in _DICTATION_ENTER_CUES):
-                return True
-            checked += 1
-            if checked >= 4:
-                break
-    return False
+    return active_flag
 
 
 class _SpeculativeState:
@@ -522,10 +560,10 @@ def _pop_asr_speculative_hit(asr: Any, session_id: str, pcm_len: int) -> Optiona
     if entry is None:
         return None
     cached_len, cached_text, ts = entry
-    # Allow up to ~300ms (5 frames = 9600 bytes) of trailing silence appended between trigger and commit
+    # Allow up to ~900ms (15 frames = 28800 bytes) of trailing silence appended between speculative trigger and commit/1100ms cutoff
     if (time.monotonic() - ts) > 3.0:
         return None
-    if pcm_len < cached_len or (pcm_len - cached_len) > 1920 * 8:
+    if pcm_len < cached_len or (pcm_len - cached_len) > 1920 * 15:
         return None
     return cached_text
 
@@ -597,11 +635,27 @@ def apply_vad_speculative_patch() -> None:
     async def _spec_aware_receive_audio(self, conn, pcm_frame, audio_have_voice, *args, **kwargs):
         if getattr(conn, "client_listen_mode", "auto") != "manual" and _is_sherpa_asr(self):
             state = _get_spec_state(conn)
-            if audio_have_voice:
-                # Speech is active or resumed: discard any in-flight/completed speculative result immediately
+            if audio_have_voice or getattr(conn, "last_is_voice", False):
+                # P1-12: Speech is active or resumed (including 1-2 opening frames where Silero last_is_voice=True
+                # before the sliding window flips audio_have_voice=True): discard any in-flight/completed
+                # speculative snapshot immediately so a short resumed syllable is never dropped at 1100ms!
                 if state.triggered_gen == state.generation or state.result_gen == state.generation:
                     state.invalidate(count_discard=True)
-            elif getattr(conn, "client_have_voice", False) and not getattr(conn, "client_voice_stop", False):
+            elif getattr(conn, "client_voice_stop", False):
+                # P1-12: Hard 1100ms cutoff reached: hand off completed speculative result (zero double-decode)
+                # or cancel any still-in-flight speculative task before upstream decode runs.
+                if (
+                    state.result_gen == state.generation
+                    and state.result_text
+                    and not getattr(conn, "last_is_voice", False)
+                ):
+                    state.committed_text = state.result_text
+                    state.committed_pcm_len = state.result_pcm_len
+                elif state.task is not None and not state.task.done():
+                    state.invalidate(count_discard=False)
+            elif getattr(conn, "client_have_voice", False) and not getattr(conn, "last_is_voice", False):
+                # P1-12: Never early-commit or start speculative decode while SileroVAD last_is_voice=True
+                # (protects the opening frames when a user resumes speaking inside the sliding window).
                 cfg = runtime_settings.get_vad_speculative()
                 if cfg.get("enabled", True) and getattr(self, "interface_type", None) != InterfaceType.STREAM:
                     now_ms = time.time() * 1000.0

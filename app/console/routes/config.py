@@ -2,37 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
-import atexit
-from collections import deque
+import contextlib
 import copy
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import io
-import json
-import math
 import os
-import re
-import secrets
-import socket
-import struct
 import threading
 import time
-from urllib.parse import parse_qs, quote, urlparse
-import wave
 
-import httpx
 import yaml
 
-import asr_corrections
-import mei_emotion_router
-import patch_registry
-import pc_audio_router
 import reply_length_router
 import runtime_events
 import runtime_settings
-import turn_context_router
-import xz_common
 from console import shared
 from console.routes import anima, gsv
 
@@ -260,12 +241,16 @@ def _write_updated_yaml(
             prov_patch["model_name"] = validated_model
 
         voice_recovered = False
-        if validated_voice is not None:
-            v_id = validated_voice
-            if v_id != cur_voice:
-                changed_fields.append("voice")
-                if v_id in gsv.GSV_PROFILES:
-                    with gsv._gsv_weights_lock:
+        with contextlib.ExitStack() as weight_lock_stack:
+            if validated_voice is not None:
+                v_id = validated_voice
+                if v_id != cur_voice:
+                    changed_fields.append("voice")
+                    # P1-5: Keep _gsv_weights_lock held across GPU weight swap AND atomic .config.yaml commit
+                    # (strict lock hierarchy: _config_write_lock -> _gsv_weights_lock) so concurrent
+                    # POST /api/tts-preview never observes stale pre-write YAML after GPU weights changed.
+                    weight_lock_stack.enter_context(gsv._gsv_weights_lock)
+                    if v_id in gsv.GSV_PROFILES:
                         dirty_before, _ = gsv._get_voice_dirty_state()
                         if dirty_before is not None:
                             gsv._active_gsv_loaded = "__dirty__"
@@ -280,67 +265,66 @@ def _write_updated_yaml(
                         if gsv._active_gsv_loaded == "__dirty__":
                             gsv._active_gsv_loaded = v_id
                         gsv._set_voice_dirty(None, "")
-                    patch.setdefault("selected_module", {})["TTS"] = "GPT_SOVITS_V2"
-                    existing_gsv = ((cfg.get("TTS") or {}).get("GPT_SOVITS_V2")) or {}
-                    prof_blk = gsv.GSV_PROFILES[v_id]["block"]
-                    gsv_patch: dict = {}
-                    # Populate missing defaults only once, never overwriting user-customized tuning keys
-                    for dk, dv in prof_blk.items():
-                        if dk not in existing_gsv:
-                            gsv_patch[dk] = dv
-                    # Update only voice-identity fields (incl. explicit voice_id) for the newly selected GSV profile
-                    for ik in gsv._GSV_VOICE_IDENTITY_KEYS:
-                        if ik in prof_blk:
-                            gsv_patch[ik] = prof_blk[ik]
-                    gsv_patch["voice_id"] = v_id
-                    if "sample_steps" in prof_blk and "sample_steps" not in existing_gsv:
-                        gsv_patch["sample_steps"] = prof_blk["sample_steps"]
-                    patch.setdefault("TTS", {})["GPT_SOVITS_V2"] = gsv_patch
-                else:
-                    with gsv._gsv_weights_lock:
+                        patch.setdefault("selected_module", {})["TTS"] = "GPT_SOVITS_V2"
+                        existing_gsv = ((cfg.get("TTS") or {}).get("GPT_SOVITS_V2")) or {}
+                        prof_blk = gsv.GSV_PROFILES[v_id]["block"]
+                        gsv_patch: dict = {}
+                        # Populate missing defaults only once, never overwriting user-customized tuning keys
+                        for dk, dv in prof_blk.items():
+                            if dk not in existing_gsv:
+                                gsv_patch[dk] = dv
+                        # Update only voice-identity fields (incl. explicit voice_id) for the newly selected GSV profile
+                        for ik in gsv._GSV_VOICE_IDENTITY_KEYS:
+                            if ik in prof_blk:
+                                gsv_patch[ik] = prof_blk[ik]
+                        gsv_patch["voice_id"] = v_id
+                        if "sample_steps" in prof_blk and "sample_steps" not in existing_gsv:
+                            gsv_patch["sample_steps"] = prof_blk["sample_steps"]
+                        patch.setdefault("TTS", {})["GPT_SOVITS_V2"] = gsv_patch
+                    else:
                         gsv._set_voice_dirty(None, "")
-                    patch.setdefault("selected_module", {})["TTS"] = "EdgeTTS"
-                    existing_edge = ((cfg.get("TTS") or {}).get("EdgeTTS")) or {}
-                    edge_patch = {"voice": v_id, "voice_id": v_id}
-                    if "type" not in existing_edge:
-                        edge_patch["type"] = "edge"
-                    if "output_dir" not in existing_edge:
-                        edge_patch["output_dir"] = "tmp/"
-                    patch.setdefault("TTS", {})["EdgeTTS"] = edge_patch
-            else:
-                if v_id in gsv.GSV_PROFILES:
-                    with gsv._gsv_weights_lock:
+                        patch.setdefault("selected_module", {})["TTS"] = "EdgeTTS"
+                        existing_edge = ((cfg.get("TTS") or {}).get("EdgeTTS")) or {}
+                        edge_patch = {"voice": v_id, "voice_id": v_id}
+                        if "type" not in existing_edge:
+                            edge_patch["type"] = "edge"
+                        if "output_dir" not in existing_edge:
+                            edge_patch["output_dir"] = "tmp/"
+                        patch.setdefault("TTS", {})["EdgeTTS"] = edge_patch
+                else:
+                    if v_id in gsv.GSV_PROFILES:
+                        with gsv._gsv_weights_lock:
+                            dirty_target, _ = gsv._get_voice_dirty_state()
+                            is_dirty = (dirty_target is not None) or (gsv._active_gsv_loaded == "__dirty__")
+                            if is_dirty:
+                                gsv._active_gsv_loaded = "__dirty__"
+                                try:
+                                    gsv._ensure_gsv_weights(v_id, persist_boot_yaml=True)
+                                except Exception as exc:
+                                    gsv._set_voice_dirty(v_id, str(exc))
+                                    raise
+                                if gsv._active_gsv_loaded == "__dirty__":
+                                    gsv._active_gsv_loaded = v_id
+                                gsv._set_voice_dirty(None, "")
+                                voice_recovered = True
+                    else:
                         dirty_target, _ = gsv._get_voice_dirty_state()
-                        is_dirty = (dirty_target is not None) or (gsv._active_gsv_loaded == "__dirty__")
-                        if is_dirty:
-                            gsv._active_gsv_loaded = "__dirty__"
-                            try:
-                                gsv._ensure_gsv_weights(v_id, persist_boot_yaml=True)
-                            except Exception as exc:
-                                gsv._set_voice_dirty(v_id, str(exc))
-                                raise
-                            if gsv._active_gsv_loaded == "__dirty__":
-                                gsv._active_gsv_loaded = v_id
+                        if dirty_target is not None:
                             gsv._set_voice_dirty(None, "")
-                            voice_recovered = True
-                else:
-                    dirty_target, _ = gsv._get_voice_dirty_state()
-                    if dirty_target is not None:
-                        gsv._set_voice_dirty(None, "")
 
-        if not changed_fields:
-            return {"changed_fields": [], "written": False, "voice_recovered": voice_recovered}
+            if not changed_fields:
+                return {"changed_fields": [], "written": False, "voice_recovered": voice_recovered}
 
-        merged_cfg = _deep_merge_dict(cfg, patch)
-        header = (
-            "# =====================================================================\n"
-            "# 小智 ESP32 本地服务端精简配置（由本地 Web 控制台管理）\n"
-            "# 自动读取 DEEPSEEK_API_KEY 与 GEMINI_API_KEY 环境变量，不落盘明文密钥\n"
-            "# =====================================================================\n\n"
-        )
-        body = yaml.safe_dump(merged_cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
-        shared._atomic_write_text(shared.CONFIG_PATH, header + body)
-        shared._get_config_yaml_cache(shared.CONFIG_PATH).set(shared.CONFIG_PATH, copy.deepcopy(merged_cfg))
+            merged_cfg = _deep_merge_dict(cfg, patch)
+            header = (
+                "# =====================================================================\n"
+                "# 小智 ESP32 本地服务端精简配置（由本地 Web 控制台管理）\n"
+                "# 自动读取 DEEPSEEK_API_KEY 与 GEMINI_API_KEY 环境变量，不落盘明文密钥\n"
+                "# =====================================================================\n\n"
+            )
+            body = yaml.safe_dump(merged_cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
+            shared._atomic_write_text(shared.CONFIG_PATH, header + body)
+            shared._get_config_yaml_cache(shared.CONFIG_PATH).set(shared.CONFIG_PATH, copy.deepcopy(merged_cfg))
 
     if "prompt" in changed_fields and prompt is not None:
         threading.Thread(target=anima._sync_persona_to_anima, args=(prompt,), daemon=True).start()

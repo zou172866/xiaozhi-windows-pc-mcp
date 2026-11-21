@@ -21,6 +21,7 @@ VALID_PATCH_STATUSES = frozenset({"ok", "partial", "skipped", "skipped_contract"
 VALID_PATCH_CATEGORIES = frozenset({"security", "experience"})
 SECURITY_PATCH_NAMES = frozenset(
     {
+        "config_env_expand",
         "esp32_auth_ota",
         "esp32_auth_ws",
         "esp32_auth_vision",
@@ -52,9 +53,9 @@ PATCH_CATALOG: List[Dict[str, Any]] = [
         "name": "config_env_expand",
         "module": "app/patches/auth.py",
         "target": "config.config_loader.read_config",
-        "category": "experience",
+        "category": "security",
         "contract": "sync callable, >=1 positional arg; rebinds config.settings.read_config",
-        "failure_behavior": "fail-soft (records failed/skipped_contract, marks /api/health degraded)",
+        "failure_behavior": "fail-closed (sys.exit(2) unless XIAOZHI_ALLOW_INSECURE_BOOT=1 -> /api/health 503 + red banner)",
         "tests": ["tests/container/test_mei_emotion_and_prosody.py", "tests/container/test_upstream_contracts.py"],
     },
     {
@@ -114,9 +115,9 @@ PATCH_CATALOG: List[Dict[str, Any]] = [
     {
         "name": "anima_turn_flush",
         "module": "app/patches/memory_hooks.py",
-        "target": "core.connection.ConnectionHandler.{chat,_handle_function_result,close}",
+        "target": "core.connection.ConnectionHandler.{_initialize_memory,chat,_handle_function_result,close}",
         "category": "experience",
-        "contract": "sync chat / _handle_function_result and async close(self, ...)",
+        "contract": "sync _initialize_memory / chat / _handle_function_result and async close(self, ...)",
         "failure_behavior": "fail-soft (falls back to debounced loop flush, marks /api/health degraded)",
         "tests": ["tests/container/test_mei_emotion_and_prosody.py", "tests/container/test_batch3_pipeline_vad.py"],
     },

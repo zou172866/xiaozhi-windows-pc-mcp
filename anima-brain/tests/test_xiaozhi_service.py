@@ -1563,6 +1563,164 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
                 self.assertEqual(srv.resources[memory_ui.MEMORY_URI](), "<html>memory-built</html>")
                 self.assertEqual(srv.resources[settings_ui.SETTINGS_URI](), "<html>settings-built</html>")
 
+    def test_p1_7_ingest_worker_survives_claim_error_and_renews_heartbeat_lease(self):
+        """P1-7: ingest_worker survives transient _claim_next_inbox_row DB errors and renews updated_at lease during slow extraction."""
+        import sqlite3
+        import threading
+        from unittest.mock import patch
+
+        tok = "tok-p17-test-" + ("z" * 24)
+        hdrs = {"Authorization": f"Bearer {tok}", "Host": "127.0.0.1:18787"}
+
+        # 1. Transient OperationalError in _claim_next_inbox_row must NOT kill ingest_worker
+        orig_claim = svc._claim_next_inbox_row
+        claim_calls = {"n": 0}
+
+        def _flaky_claim(*args, **kwargs):
+            claim_calls["n"] += 1
+            if claim_calls["n"] <= 2:
+                raise sqlite3.OperationalError("database is locked (simulated)")
+            return orig_claim(*args, **kwargs)
+
+        committed_ids: list[str] = []
+
+        def _fast_extract(brain, cid, req_id, u, a, **kwargs):
+            committed_ids.append(req_id)
+            return {"committed": True, "request_id": req_id}
+
+        app = svc.create_combined_asgi_app(self.brain, tok)
+        with (
+            patch.object(svc, "_claim_next_inbox_row", side_effect=_flaky_claim),
+            patch.object(svc, "extract_and_commit_turn", side_effect=_fast_extract),
+        ):
+            with TestClient(app, base_url="http://127.0.0.1:18787") as client:
+                r_in = client.post(
+                    "/xiaozhi/ingest",
+                    headers=hdrs,
+                    json={
+                        "character_id": "xiaozhi",
+                        "turns": [{"request_id": "req-p17-claim-ok", "user_message": "u", "assistant_reply": "a"}],
+                    },
+                )
+                self.assertEqual(r_in.status_code, 200)
+                deadline = time.monotonic() + 5.0
+                while "req-p17-claim-ok" not in committed_ids and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertIn("req-p17-claim-ok", committed_ids)
+                self.assertGreaterEqual(claim_calls["n"], 3)
+
+        # 2. Heartbeat lease keeps slow in-flight extraction alive past INBOX_PROCESSING_TIMEOUT_SECONDS
+        orig_timeout = svc.INBOX_PROCESSING_TIMEOUT_SECONDS
+        svc.INBOX_PROCESSING_TIMEOUT_SECONDS = 0.25
+        extraction_started = threading.Event()
+        allow_finish = threading.Event()
+        recovered_midway: dict = {}
+
+        def _slow_extract(brain, cid, req_id, u, a, **kwargs):
+            extraction_started.set()
+            allow_finish.wait(timeout=4.0)
+            return {"committed": True, "request_id": req_id}
+
+        try:
+            app2 = svc.create_combined_asgi_app(self.brain, tok)
+            with patch.object(svc, "extract_and_commit_turn", side_effect=_slow_extract):
+                with TestClient(app2, base_url="http://127.0.0.1:18787") as client:
+                    r_in2 = client.post(
+                        "/xiaozhi/ingest",
+                        headers=hdrs,
+                        json={
+                            "character_id": "xiaozhi",
+                            "turns": [{"request_id": "req-p17-hb", "user_message": "slow", "assistant_reply": "reply"}],
+                        },
+                    )
+                    self.assertEqual(r_in2.status_code, 200)
+                    self.assertTrue(extraction_started.wait(timeout=3.0))
+                    # Sleep LONGER than INBOX_PROCESSING_TIMEOUT_SECONDS (0.25s) while extraction is active!
+                    time.sleep(0.45)
+                    # review_healer's recover_inbox_rows MUST NOT reclaim or mark dead the leased row!
+                    recovered_midway.update(svc.recover_inbox_rows(self.brain, is_startup=False))
+                    self.assertEqual(recovered_midway["recovered_processing"], 0)
+                    self.assertEqual(recovered_midway["marked_dead"], 0)
+                    allow_finish.set()
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
+                        with self.brain.engine._lock:
+                            row = self.brain.engine.db.execute(
+                                "SELECT status FROM xiaozhi_inbox WHERE request_id='req-p17-hb'"
+                            ).fetchone()
+                        if row and row["status"] == "done":
+                            break
+                        time.sleep(0.03)
+                    self.assertIsNotNone(row)
+                    self.assertEqual(row["status"], "done")
+
+            # 3. _complete_inbox_row marks a committed turn 'done' even if review_healer had flipped it to 'dead'
+            #    while payload stayed identical, and transient DB error on _complete_inbox_row never marks committed turn dead.
+            svc.enqueue_inbox_turn(
+                self.brain,
+                character_id="xiaozhi",
+                request_id="req-p17-reclaimed",
+                user_message="u",
+                assistant_reply="a",
+            )
+            with self.brain.engine._lock:
+                with self.brain.engine._transaction():
+                    cur_p = self.brain.engine.db.execute(
+                        "SELECT payload FROM xiaozhi_inbox WHERE request_id='req-p17-reclaimed'"
+                    ).fetchone()["payload"]
+                    self.brain.engine.db.execute(
+                        "UPDATE xiaozhi_inbox SET status='dead', attempts=4 WHERE request_id='req-p17-reclaimed'"
+                    )
+            self.assertTrue(svc._complete_inbox_row(self.brain, "req-p17-reclaimed", cur_p))
+            with self.brain.engine._lock:
+                st_rec = self.brain.engine.db.execute(
+                    "SELECT status FROM xiaozhi_inbox WHERE request_id='req-p17-reclaimed'"
+                ).fetchone()["status"]
+            self.assertEqual(st_rec, "done")
+
+            # 4. If review_healer reclaims a processing row to 'pending' and an upgraded continuation arrives
+            #    before the worker completes, both enqueue_inbox_turn and _complete_inbox_row must reset
+            #    attempts=0 / updated_at=0.0 so the fuller continuation is immediately claimable without backoff.
+            svc.enqueue_inbox_turn(
+                self.brain,
+                character_id="xiaozhi",
+                request_id="req-p17-reclaimed-upgrade",
+                user_message="你好",
+                assistant_reply="前半句",
+                now=100.0,
+            )
+            claimed_row, _ = svc._claim_next_inbox_row(self.brain, now=101.0)
+            self.assertIsNotNone(claimed_row)
+            svc.recover_inbox_rows(self.brain, processing_timeout_seconds=10.0, is_startup=False, now=300.0)
+            svc.enqueue_inbox_turn(
+                self.brain,
+                character_id="xiaozhi",
+                request_id="req-p17-reclaimed-upgrade",
+                user_message="你好",
+                assistant_reply="前半句加上完整后半句",
+                now=301.0,
+            )
+            self.assertFalse(
+                svc._complete_inbox_row(
+                    self.brain, "req-p17-reclaimed-upgrade", claimed_row["payload"], now=302.0
+                )
+            )
+            with self.brain.engine._lock:
+                upg_row = self.brain.engine.db.execute(
+                    "SELECT status, attempts, last_error, updated_at FROM xiaozhi_inbox "
+                    "WHERE request_id='req-p17-reclaimed-upgrade'"
+                ).fetchone()
+            self.assertEqual(upg_row["status"], "pending")
+            self.assertEqual(upg_row["attempts"], 0)
+            self.assertEqual(upg_row["last_error"], "")
+            self.assertEqual(upg_row["updated_at"], 0.0)
+            claimed_upg, wait_upg = svc._claim_next_inbox_row(self.brain, now=302.1)
+            self.assertIsNotNone(claimed_upg)
+            self.assertEqual(claimed_upg["request_id"], "req-p17-reclaimed-upgrade")
+            self.assertEqual(wait_upg, 0.0)
+        finally:
+            svc.INBOX_PROCESSING_TIMEOUT_SECONDS = orig_timeout
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

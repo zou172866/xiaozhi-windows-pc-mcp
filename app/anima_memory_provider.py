@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import os
@@ -22,6 +23,27 @@ import httpx
 import mei_emotion_router
 import xz_common
 from core.providers.memory.base import MemoryProviderBase, logger
+
+_CURRENT_DEVICE_ID_VAR: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "anima_current_device_id", default=None
+)
+_RETRYABLE_HTTP_4XX = frozenset({401, 408, 429})
+
+
+def get_current_device_id() -> str | None:
+    return _CURRENT_DEVICE_ID_VAR.get()
+
+
+def set_current_device_id(device_id: str | None) -> contextvars.Token:
+    cleaned = str(device_id or "").strip()
+    return _CURRENT_DEVICE_ID_VAR.set(cleaned or None)
+
+
+def reset_current_device_id(token: contextvars.Token) -> None:
+    try:
+        _CURRENT_DEVICE_ID_VAR.reset(token)
+    except Exception:
+        pass
 
 TAG = __name__
 
@@ -343,8 +365,8 @@ class AnimaOutbox:
                 cur = db.execute(
                     "UPDATE outbox_turns "
                     "SET status='dead', attempts=?, next_retry_at=0, last_error=?, updated_at=? "
-                    "WHERE request_id=? AND status='pending'",
-                    (attempts, sanitized, now, r["request_id"]),
+                    "WHERE request_id=? AND status='pending' AND payload_hash=?",
+                    (attempts, sanitized, now, r["request_id"], r["payload_hash"]),
                 )
                 marked += max(0, cur.rowcount or 0)
             db.commit()
@@ -363,16 +385,16 @@ class AnimaOutbox:
                     cur = db.execute(
                         "UPDATE outbox_turns "
                         "SET status='dead', attempts=?, next_retry_at=0, last_error=?, updated_at=? "
-                        "WHERE request_id=? AND status='pending'",
-                        (attempts, sanitized, now, r["request_id"]),
+                        "WHERE request_id=? AND status='pending' AND payload_hash=?",
+                        (attempts, sanitized, now, r["request_id"], r["payload_hash"]),
                     )
                     dead_count += max(0, cur.rowcount or 0)
                 else:
                     delay = min(self.max_backoff, self.base_backoff * (2 ** min(attempts - 1, 8)))
                     db.execute(
                         "UPDATE outbox_turns SET attempts=?, next_retry_at=?, last_error=?, updated_at=? "
-                        "WHERE request_id=? AND status='pending'",
-                        (attempts, now + delay, sanitized, now, r["request_id"]),
+                        "WHERE request_id=? AND status='pending' AND payload_hash=?",
+                        (attempts, now + delay, sanitized, now, r["request_id"], r["payload_hash"]),
                     )
             db.commit()
         if dead_count > 0:
@@ -443,18 +465,26 @@ class AnimaOutbox:
         with self._drain_lock:
             return self._drain_once_locked(batch_size=batch_size, force_due=force_due)
 
-    def _quarantine_corrupt_rows(self, req_ids: list[str]) -> None:
-        if not req_ids:
+    def _quarantine_corrupt_rows(self, rows_or_ids: list) -> None:
+        if not rows_or_ids:
             return
         now = time.time()
         with self._lock:
             db = self._ensure_db()
-            for rid in req_ids:
-                db.execute(
-                    "UPDATE outbox_turns SET status='corrupt', last_error='corrupt_payload_json', updated_at=? "
-                    "WHERE request_id=? AND status='pending'",
-                    (now, rid),
-                )
+            for item in rows_or_ids:
+                if isinstance(item, tuple) and len(item) == 2:
+                    rid, phash = item
+                    db.execute(
+                        "UPDATE outbox_turns SET status='corrupt', last_error='corrupt_payload_json', updated_at=? "
+                        "WHERE request_id=? AND status='pending' AND payload_hash=?",
+                        (now, rid, phash),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE outbox_turns SET status='corrupt', last_error='corrupt_payload_json', updated_at=? "
+                        "WHERE request_id=? AND status='pending'",
+                        (now, item),
+                    )
             db.commit()
 
     def _drain_once_locked(self, *, batch_size: int = 16, force_due: bool = False) -> dict[str, Any]:
@@ -496,7 +526,7 @@ class AnimaOutbox:
             turns_batch = []
             snapshot_hashes: dict[str, str] = {}
             valid_rows: list[sqlite3.Row] = []
-            corrupt_ids: list[str] = []
+            corrupt_items: list[tuple[str, str]] = []
             for r in group_rows:
                 try:
                     parsed = json.loads(r["payload_json"])
@@ -506,11 +536,11 @@ class AnimaOutbox:
                     snapshot_hashes[r["request_id"]] = r["payload_hash"]
                     valid_rows.append(r)
                 except Exception:
-                    corrupt_ids.append(r["request_id"])
-            if corrupt_ids:
-                self._quarantine_corrupt_rows(corrupt_ids)
+                    corrupt_items.append((r["request_id"], r["payload_hash"]))
+            if corrupt_items:
+                self._quarantine_corrupt_rows(corrupt_items)
                 logger.bind(tag=TAG).warning(
-                    f"Anima 本地发件箱隔离 {len(corrupt_ids)} 条损坏记录，防止阻塞重试队列"
+                    f"Anima 本地发件箱隔离 {len(corrupt_items)} 条损坏记录，防止阻塞重试队列"
                 )
             if not valid_rows:
                 continue
@@ -567,7 +597,7 @@ class AnimaOutbox:
                         logger.bind(tag=TAG).warning(
                             f"Anima Brain ingest 队列繁忙，{len(fail_rows)} 轮已保留在本地发件箱稍后重试"
                         )
-                elif 400 <= resp.status_code < 500:
+                elif 400 <= resp.status_code < 500 and resp.status_code not in _RETRYABLE_HTTP_4XX:
                     total_failed += len(valid_rows)
                     err = f"HTTP {resp.status_code}: {resp.text[:160]}"
                     dead_n = self._mark_dead(valid_rows, err)
@@ -1003,7 +1033,10 @@ class MemoryProvider(MemoryProviderBase):
         )
 
     def _resolve_device_key(self, device_id: str | None = None) -> str:
-        raw = device_id if device_id is not None else getattr(self, "role_id", None)
+        raw = device_id
+        if raw is None:
+            ctx_dev = _CURRENT_DEVICE_ID_VAR.get()
+            raw = ctx_dev if ctx_dev else getattr(self, "role_id", None)
         cleaned = str(raw or "").strip().lower()[:64]
         return cleaned or "__default__"
 
@@ -1264,9 +1297,75 @@ class MemoryProvider(MemoryProviderBase):
             logger.bind(tag=TAG).warning(f"Anima Brain recall 超时或暂不可用，降级直接回复: {e}")
         return ""
 
-    async def save_memory(self, msgs, session_id=None):
-        dev_id = str(getattr(self, "role_id", "") or "")
+    async def save_memory(self, msgs, session_id=None, *, device_id: str | None = None):
+        if device_id is not None:
+            dev_id = str(device_id or "").strip()
+        else:
+            ctx_dev = _CURRENT_DEVICE_ID_VAR.get()
+            dev_id = str(ctx_dev or getattr(self, "role_id", "") or "").strip()
         pairs = extract_clean_pairs(msgs, device_id=dev_id)
         if pairs:
             push_turns_async(pairs)
         return "ok"
+
+
+class _DeviceBoundMemoryProxy:
+    """Lightweight per-connection proxy binding an immutable device_id over a shared MemoryProvider singleton (P0-5)."""
+
+    def __init__(self, base: MemoryProvider, device_id: str | None = None):
+        self._base = base
+        self._device_id = str(device_id or "").strip()
+
+    @property
+    def role_id(self) -> str:
+        return self._device_id or str(getattr(self._base, "role_id", "") or "")
+
+    @role_id.setter
+    def role_id(self, value: str) -> None:
+        self._device_id = str(value or "").strip()
+
+    @property
+    def _cached_context(self) -> str | None:
+        dev_key = self._base._resolve_device_key(self._device_id or None)
+        entry = self._base._recall_cache.get(dev_key)
+        return entry[0] if entry is not None else None
+
+    @property
+    def _bg_refresh_task(self) -> asyncio.Task | None:
+        dev_key = self._base._resolve_device_key(self._device_id or None)
+        return self._base._bg_refresh_tasks.get(dev_key)
+
+    def init_memory(self, role_id=None, *args, **kwargs):
+        if role_id:
+            self._device_id = str(role_id).strip()
+        orig_init = getattr(self._base, "init_memory", None)
+        if callable(orig_init):
+            if args:
+                return orig_init(self._device_id, *args, **kwargs)
+            return orig_init(role_id=self._device_id, **kwargs)
+        return None
+
+    async def query_memory(self, query: str, *, device_id: str | None = None) -> str:
+        eff_dev = device_id if device_id is not None else (self._device_id or None)
+        return await self._base.query_memory(query, device_id=eff_dev)
+
+    async def save_memory(self, msgs, session_id=None, *, device_id: str | None = None):
+        eff_dev = device_id if device_id is not None else (self._device_id or None)
+        return await self._base.save_memory(msgs, session_id=session_id, device_id=eff_dev)
+
+    def get_recall_stats(self, device_id: str | None = None) -> dict[str, Any]:
+        eff_dev = device_id if device_id is not None else (self._device_id or None)
+        return self._base.get_recall_stats(device_id=eff_dev)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+def bind_memory_provider(memory_obj: Any, device_id: str | None) -> Any:
+    """Wrap a shared MemoryProvider singleton in a per-connection _DeviceBoundMemoryProxy (P0-5)."""
+    dev = str(device_id or "").strip()
+    if isinstance(memory_obj, _DeviceBoundMemoryProxy):
+        return _DeviceBoundMemoryProxy(memory_obj._base, dev or memory_obj._device_id)
+    if isinstance(memory_obj, MemoryProvider):
+        return _DeviceBoundMemoryProxy(memory_obj, dev)
+    return memory_obj

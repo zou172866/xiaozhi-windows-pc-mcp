@@ -16,6 +16,7 @@ from . import (
     atomic_write_json,
     find_busy_workspace_task,
     format_workspace_busy_message,
+    guard_leading_dash_prompt,
     is_workspace_queue_mode,
     load_last_active_task,
     normalize_workspace_key,
@@ -29,11 +30,8 @@ TRANSCRIPT_TAIL_BYTES = 64 * 1024  # H-6: Read at most the last 64 KB of transcr
 
 
 def _guard_leading_dash_prompt(prompt: str, prefix_tag: str = "[指令]") -> str:
-    """Prevent leading '-' prompt from being parsed as a CLI flag by agentapi without passing '--' (E-4)."""
-    s = str(prompt or "").strip()
-    if s.startswith("-"):
-        return f"{prefix_tag} {s}"
-    return s
+    """Prevent leading '-' prompt from being parsed as a CLI flag by agentapi without passing '--' (E-4, P1-3)."""
+    return guard_leading_dash_prompt(prompt, prefix_tag=prefix_tag)
 
 
 def _read_tail_lines(path: Path, max_bytes: int = TRANSCRIPT_TAIL_BYTES) -> tuple[list[str], bool]:

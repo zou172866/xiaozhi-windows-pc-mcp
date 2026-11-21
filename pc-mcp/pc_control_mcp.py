@@ -117,6 +117,7 @@ from pc_mcp_modules.security import (  # noqa: E402
     _summarize_typed_text_for_audit,
     _validate_hotkey_keys,
     _write_l2_audit_log,
+    EmergencyStopLockedError,
     clear_emergency_stop,
     is_emergency_stop_active,
     load_or_create_pc_mcp_token as _load_or_create_pc_mcp_token_impl,
@@ -243,11 +244,22 @@ def pc_inspect_window_ui(window_keyword: str = "") -> str:
             tool="pc_inspect_window_ui",
             action="inspect_window_ui",
             outcome="blocked",
-            reason="mode_blocked",
+            reason="emergency_stop" if is_emergency_stop_active() else "mode_blocked",
             target=window_keyword,
             detail=err,
         )
         return err
+    if is_emergency_stop_active():
+        msg = "安全急停已触发（Ctrl+Alt+Pause），已立即中止 L2 窗口组件读取，请在宿主机侧显式复位急停后再试。"
+        _write_l2_audit_log(
+            tool="pc_inspect_window_ui",
+            action="inspect_window_ui",
+            outcome="blocked",
+            reason="emergency_stop",
+            target=window_keyword,
+            detail=msg,
+        )
+        return msg
     return inspect_window_ui(window_keyword)
 
 
@@ -277,7 +289,7 @@ def pc_ui_action(
             tool="pc_ui_action",
             action=act,
             outcome="blocked",
-            reason="mode_blocked",
+            reason="emergency_stop" if is_emergency_stop_active() else "mode_blocked",
             target=element_name or (f"({x},{y})" if x >= 0 and y >= 0 else ""),
             hotkey=hotkey,
             text=text,

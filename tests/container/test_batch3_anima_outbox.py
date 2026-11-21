@@ -467,6 +467,239 @@ class TestBatch3AnimaOutboxAndRecall(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_p0_5_shared_memory_provider_per_connection_device_isolation(self):
+        """P0-5: Shared MemoryProvider singleton wrapped via ConnectionHandler._initialize_memory isolates concurrent devices."""
+        import threading
+        from types import SimpleNamespace
+        import boot
+        from core.connection import ConnectionHandler
+
+        boot.install_all(start_background_workers=False, run_contract_self_check=False)
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as td:
+                tok_file = os.path.join(td, "tok.txt")
+                outbox_db = os.path.join(td, "outbox.sqlite")
+                with open(tok_file, "w", encoding="utf-8") as f:
+                    f.write("test-p05-token-1234567890123456")
+
+                shared_singleton = amp.MemoryProvider(
+                    {
+                        "service_url": "http://127.0.0.1:18787",
+                        "token_file": tok_file,
+                        "outbox_db": outbox_db,
+                        "recall_budget_seconds": 0.4,
+                        "recall_warm_budget_seconds": 0.12,
+                        "recall_cb_threshold": 5,
+                    }
+                )
+                slow_flag = {"slow": False}
+                mood_calls: list[tuple[str, str | None]] = []
+                pushed_batches: list[list[dict]] = []
+
+                class _Client:
+                    async def post(self, url, **kwargs):
+                        q = (kwargs.get("json") or {}).get("query", "")
+                        if slow_flag["slow"]:
+                            await asyncio.sleep(0.4)
+                        return _FakeResp(200, {"context_text": f"mem:{q}", "mood": "happy"})
+
+                await shared_singleton._client.aclose()
+                shared_singleton._client = _Client()
+
+                def _make_conn(dev_id: str):
+                    c = ConnectionHandler.__new__(ConnectionHandler)
+                    c.device_id = dev_id
+                    c.memory = shared_singleton
+                    c.llm = SimpleNamespace()
+                    c.read_config_from_api = False
+                    c.config = {
+                        "selected_module": {"Memory": "anima_brain"},
+                        "Memory": {"anima_brain": {"type": "anima_brain"}},
+                    }
+                    c.logger = SimpleNamespace(bind=lambda **kw: SimpleNamespace(info=lambda *a, **k: None))
+                    c._initialize_memory()
+                    return c
+
+                # Simulate real upstream: Conn A connects, then Conn B connects sharing the SAME singleton!
+                conn_a = _make_conn("AA:BB:CC:01")
+                conn_b = _make_conn("AA:BB:CC:02")
+
+                # Positional init_memory(role_id, llm) MUST NOT raise TypeError (multiple values for 'role_id')
+                dummy_llm = object()
+                conn_a.memory.init_memory("AA:BB:CC:01", dummy_llm)
+                self.assertEqual(conn_a.memory.role_id, "AA:BB:CC:01")
+                self.assertIs(shared_singleton.llm, dummy_llm)
+
+                # Even though Conn B connected AFTER Conn A, Conn A's proxy MUST keep device A!
+                with (
+                    patch.object(
+                        mei_emotion_router,
+                        "set_anima_mood",
+                        side_effect=lambda m, device_id=None: mood_calls.append((m, device_id)),
+                    ),
+                    patch.object(amp, "push_turns_async", side_effect=lambda pairs: pushed_batches.append(list(pairs))),
+                ):
+                    # Upstream chat() calls query_memory(query) WITHOUT passing device_id!
+                    res_a1 = await conn_a.memory.query_memory("queryA1")
+                    self.assertEqual(res_a1, "mem:queryA1")
+                    self.assertEqual(mood_calls[-1][1], "aa:bb:cc:01")
+
+                    res_b1 = await conn_b.memory.query_memory("queryB1")
+                    self.assertEqual(res_b1, "mem:queryB1")
+                    self.assertEqual(mood_calls[-1][1], "aa:bb:cc:02")
+
+                    # Under timeout, Conn A MUST fall back to A's cache (NEVER B's!) even with zero device_id arg
+                    slow_flag["slow"] = True
+                    fb_a = await conn_a.memory.query_memory("queryA2")
+                    fb_b = await conn_b.memory.query_memory("queryB2")
+                    self.assertEqual(fb_a, "mem:queryA1")
+                    self.assertEqual(fb_b, "mem:queryB1")
+
+                    # Simulate upstream save_memory_task running in a brand-new daemon thread (no ContextVar!)
+                    msgs_a = [
+                        SimpleNamespace(role="user", content="我是A设备", _occurred_at=1700000001.0),
+                        SimpleNamespace(role="assistant", content="你好A", _occurred_at=1700000002.0),
+                    ]
+                    save_err: list[Exception] = []
+
+                    def _save_in_new_thread():
+                        loop = asyncio.new_event_loop()
+                        try:
+                            loop.run_until_complete(conn_a.memory.save_memory(msgs_a, "sess-a"))
+                        except Exception as exc:
+                            save_err.append(exc)
+                        finally:
+                            loop.close()
+
+                    th = threading.Thread(target=_save_in_new_thread)
+                    th.start()
+                    th.join(timeout=5.0)
+                    self.assertEqual(save_err, [])
+                    self.assertTrue(pushed_batches)
+                    self.assertEqual(pushed_batches[-1][0]["device_id"], "AA:BB:CC:01")
+
+                    # Also verify ContextVar isolates raw singleton calls directly
+                    tok = amp.set_current_device_id("AA:BB:CC:01")
+                    try:
+                        self.assertEqual(shared_singleton._resolve_device_key(), "aa:bb:cc:01")
+                    finally:
+                        amp.reset_current_device_id(tok)
+
+                for t in list(shared_singleton._bg_refresh_tasks.values()):
+                    t.cancel()
+                await asyncio.gather(*list(shared_singleton._bg_refresh_tasks.values()), return_exceptions=True)
+
+        asyncio.run(_run())
+
+    def test_p1_10_outbox_retries_401_408_429_and_payload_hash_protects_upgraded_row(self):
+        """P1-10: Outbox retries transient 401/408/429 with backoff, and payload_hash protects concurrent upgrades."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "outbox_p110.sqlite")
+            status_seq = iter([401, 408, 429, 200])
+
+            def _handler(request: httpx.Request) -> httpx.Response:
+                code = next(status_seq)
+                if code == 200:
+                    body = json.loads(request.content.decode("utf-8"))
+                    ids = [t["request_id"] for t in body["turns"]]
+                    return httpx.Response(200, json={"accepted_ids": ids})
+                return httpx.Response(code, text=f"transient {code}")
+
+            ob = amp.AnimaOutbox(
+                db_path,
+                service_url_getter=lambda: "http://anima-brain:18787",
+                character_id_getter=lambda: "xiaozhi",
+                token_getter=lambda: "tok-123456789012345678901234",
+                client_factory=lambda: httpx.Client(transport=httpx.MockTransport(_handler), trust_env=False),
+                base_backoff=0.01,
+                auto_start=False,
+            )
+            try:
+                ob.enqueue([{"request_id": "xz-p110-retry", "user_message": "u", "assistant_reply": "a"}])
+                for expected_code in (401, 408, 429):
+                    r = ob.drain_once(force_due=True)
+                    self.assertEqual(r["dead"], 0, f"HTTP {expected_code} must NOT immediately mark dead")
+                    self.assertEqual(r["remaining"], 1, f"HTTP {expected_code} must stay pending for retry")
+                r_ok = ob.drain_once(force_due=True)
+                self.assertEqual(r_ok["sent"], 1)
+                self.assertEqual(r_ok["remaining"], 0)
+            finally:
+                ob.close()
+
+            # Concurrent upgrade during in-flight 400 / 503 MUST NOT mark upgraded row dead or bump attempts
+            db_path2 = os.path.join(td, "outbox_p110_race.sqlite")
+            race_code = {"code": 400}
+
+            def _race_handler(request: httpx.Request) -> httpx.Response:
+                # While old payload is in-flight, enqueue() upgrades the SAME request_id with a valid continuation reply!
+                upgraded_n = ob2.enqueue(
+                    [
+                        {
+                            "request_id": "xz-p110-up",
+                            "user_message": "u",
+                            "assistant_reply": "short — upgraded longer reply after tool",
+                        }
+                    ]
+                )
+                self.assertEqual(upgraded_n, 1)
+                return httpx.Response(race_code["code"], text="bad old payload")
+
+            ob2 = amp.AnimaOutbox(
+                db_path2,
+                service_url_getter=lambda: "http://anima-brain:18787",
+                character_id_getter=lambda: "xiaozhi",
+                token_getter=lambda: "tok-123456789012345678901234",
+                client_factory=lambda: httpx.Client(transport=httpx.MockTransport(_race_handler), trust_env=False),
+                base_backoff=5.0,
+                auto_start=False,
+            )
+            try:
+                ob2.enqueue([{"request_id": "xz-p110-up", "user_message": "u", "assistant_reply": "short"}])
+                res_400 = ob2.drain_once(force_due=True)
+                self.assertEqual(res_400["dead"], 0, "Stale 400 must NOT kill newly upgraded payload")
+                st = ob2.stats()
+                self.assertEqual(st["dead"], 0)
+                self.assertEqual(st["pending"], 1)
+
+                # Verify same protection for 503 backoff
+                race_code["code"] = 503
+
+                def _race_handler_503(request: httpx.Request) -> httpx.Response:
+                    upgraded_n2 = ob2.enqueue(
+                        [
+                            {
+                                "request_id": "xz-p110-up",
+                                "user_message": "u",
+                                "assistant_reply": "short — upgraded longer reply after tool v3",
+                            }
+                        ]
+                    )
+                    self.assertEqual(upgraded_n2, 1)
+                    return httpx.Response(503, text="temp unavailable")
+
+                ob2._client_factory = lambda: httpx.Client(
+                    transport=httpx.MockTransport(_race_handler_503), trust_env=False
+                )
+                ob2.drain_once(force_due=True)
+                with ob2._lock:
+                    row = ob2._ensure_db().execute(
+                        "SELECT status, attempts, next_retry_at FROM outbox_turns WHERE request_id='xz-p110-up'"
+                    ).fetchone()
+                self.assertEqual(row["status"], "pending")
+                self.assertEqual(row["attempts"], 0, "Stale 503 must NOT bump attempts on upgraded row")
+                self.assertEqual(row["next_retry_at"], 0.0, "Stale 503 must NOT delay newly upgraded row")
+
+                # _quarantine_corrupt_rows with stale payload_hash MUST NOT quarantine an upgraded valid row
+                ob2._quarantine_corrupt_rows([("xz-p110-up", "stale-corrupt-hash")])
+                with ob2._lock:
+                    row_after_q = ob2._ensure_db().execute(
+                        "SELECT status FROM outbox_turns WHERE request_id='xz-p110-up'"
+                    ).fetchone()
+                self.assertEqual(row_after_q["status"], "pending")
+            finally:
+                ob2.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

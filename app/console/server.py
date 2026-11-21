@@ -32,14 +32,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         return
 
     def end_headers(self):
-        origin = (self.headers.get("Origin") or "").strip()
-        if origin:
-            p = urlparse(origin)
-            if p.scheme in ("http", "https") and (p.hostname or "").lower() in ("localhost", "127.0.0.1"):
-                self.send_header("Access-Control-Allow-Origin", origin)
-                self.send_header("Vary", "Origin")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Console-Token")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        hdrs = getattr(self, "headers", None)
+        origin = (hdrs.get("Origin") or "").strip() if hdrs is not None else ""
+        origin_low = origin.lower()
+        if origin_low and origin_low in shared.get_allowed_console_origins(shared.CONSOLE_PORT):
+            self.send_header("Access-Control-Allow-Origin", origin_low)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Console-Token")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")

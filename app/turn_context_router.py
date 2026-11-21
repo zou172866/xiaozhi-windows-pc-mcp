@@ -159,6 +159,8 @@ def apply_turn_context_to_messages(
     memory_str: Optional[str] = None,
     current_time_str: Optional[str] = None,
     mode: Optional[str] = None,
+    pinned_turn_context: Optional[str] = None,
+    out_meta: Optional[Dict[str, str]] = None,
 ) -> list:
     """Stabilize system prompt prefix by relocating volatile per-turn blocks into <turn_context>.
 
@@ -167,18 +169,23 @@ def apply_turn_context_to_messages(
       msgs[0], strips any stale <turn_context> from all messages, and prefixes a single fresh
       <turn_context> right onto the latest user message so system + few-shot + prior turns stay
       byte-identical across turns.
+    - When `pinned_turn_context` is provided (e.g. tool-call depth > 0 continuation, P1-6),
+      reuses that exact <turn_context> block verbatim on the current turn's real user message
+      so <memory> is preserved and the LLM KV prefix cache before assistant(tool_calls)+tool
+      remains 100% byte-identical.
     """
     if not msgs or not isinstance(msgs, list):
         return msgs
 
     active_mode = get_turn_context_mode(mode)
     mem_clean = str(memory_str).strip() if memory_str else ""
+    eff_time = current_time_str or datetime.now().strftime("%H:%M")
 
     if active_mode == "legacy":
         out_leg = [dict(m) if isinstance(m, dict) else m for m in msgs]
         if out_leg and isinstance(out_leg[0], dict) and out_leg[0].get("role") == "system":
             sys_c = _resolve_current_time_placeholder(
-                str(out_leg[0].get("content") or ""), current_time_str
+                str(out_leg[0].get("content") or ""), eff_time
             )
             if mem_clean and mem_clean not in sys_c:
                 if _MEMORY_BLOCK_RE.search(sys_c):
@@ -194,6 +201,11 @@ def apply_turn_context_to_messages(
             reply_length_router.inject_reply_length_into_messages(out_leg)
         except Exception:
             pass
+        if isinstance(out_meta, dict):
+            out_meta["mode"] = "legacy"
+            out_meta["turn_context"] = ""
+            out_meta["memory_str"] = mem_clean
+            out_meta["current_time_str"] = eff_time
         return out_leg
 
     # Split mode: clone list & modified message dicts so caller/Dialogue state is never mutated
@@ -231,43 +243,64 @@ def apply_turn_context_to_messages(
         sys_txt = re.sub(r"\n{3,}", "\n\n", sys_txt).strip()
         out_msgs[0]["content"] = sys_txt
 
-    # Resolve context block (with live HH:MM if placeholder still present)
-    ctx_joined = "\n\n".join(
-        _resolve_current_time_placeholder(b, current_time_str) for b in context_blocks if b.strip()
-    )
+    pinned_clean = str(pinned_turn_context or "").strip()
+    if pinned_clean:
+        turn_ctx = pinned_clean
+        effective_memory = mem_clean
+    else:
+        # Resolve context block (with live HH:MM if placeholder still present)
+        ctx_joined = "\n\n".join(
+            _resolve_current_time_placeholder(b, eff_time) for b in context_blocks if b.strip()
+        )
 
-    # Resolve memory text: prefer explicit memory_str, else non-empty <memory> extracted from system
-    effective_memory = mem_clean
-    if not effective_memory:
-        for mb in memory_blocks:
-            inner = _extract_inner_tag_text(mb, "memory")
-            if inner:
-                effective_memory = inner
-                break
+        # Resolve memory text: prefer explicit memory_str, else non-empty <memory> extracted from system
+        effective_memory = mem_clean
+        if not effective_memory:
+            for mb in memory_blocks:
+                inner = _extract_inner_tag_text(mb, "memory")
+                if inner:
+                    effective_memory = inner
+                    break
 
-    try:
-        reply_len_blk = reply_length_router.build_length_directive()
-    except Exception:
-        reply_len_blk = ""
+        try:
+            reply_len_blk = reply_length_router.build_length_directive()
+        except Exception:
+            reply_len_blk = ""
 
-    speakers_joined = "\n\n".join(b for b in speakers_blocks if b.strip())
+        speakers_joined = "\n\n".join(b for b in speakers_blocks if b.strip())
 
-    turn_ctx = build_turn_context_block(
-        context_block=ctx_joined,
-        memory_text=effective_memory,
-        reply_length_block=reply_len_blk,
-        speakers_block=speakers_joined,
-    )
+        turn_ctx = build_turn_context_block(
+            context_block=ctx_joined,
+            memory_text=effective_memory,
+            reply_length_block=reply_len_blk,
+            speakers_block=speakers_joined,
+        )
+
+    if isinstance(out_meta, dict):
+        out_meta["mode"] = "split"
+        out_meta["turn_context"] = turn_ctx
+        out_meta["memory_str"] = effective_memory
+        out_meta["current_time_str"] = eff_time
+
     if not turn_ctx:
         return out_msgs
 
-    # Find the latest user message (skipping few-shot naturally since actual user turns come last)
+    # Find the latest user message. When reusing pinned_turn_context on tool-call depth > 0,
+    # skip synthetic "[系统提示]" max-depth notices so the real user turn stays anchored byte-identically.
     last_user_idx: Optional[int] = None
+    fallback_user_idx: Optional[int] = None
     for idx in range(len(out_msgs) - 1, -1, -1):
         m = out_msgs[idx]
         if isinstance(m, dict) and m.get("role") == "user":
+            if fallback_user_idx is None:
+                fallback_user_idx = idx
+            raw_c = m.get("content")
+            if pinned_clean and isinstance(raw_c, str) and raw_c.strip().startswith("[系统提示]"):
+                continue
             last_user_idx = idx
             break
+    if last_user_idx is None:
+        last_user_idx = fallback_user_idx
 
     if last_user_idx is not None:
         target = dict(out_msgs[last_user_idx])

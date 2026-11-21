@@ -2,35 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
-import atexit
-from collections import deque
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import io
 import json
-import math
 import os
-import re
-import secrets
-import socket
-import struct
 import threading
 import time
-from urllib.parse import parse_qs, quote, urlparse
-import wave
 
-import httpx
-import yaml
-
-import asr_corrections
-import mei_emotion_router
-import patch_registry
 import pc_audio_router
-import reply_length_router
-import runtime_events
-import runtime_settings
-import turn_context_router
 import xz_common
 from console import shared
 
@@ -70,8 +48,12 @@ def _read_pc_mode() -> str:
     return "safe"
 
 
+class _EmergencyStopLockedError(RuntimeError):
+    """Raised when host 18900 returns HTTP 423 Locked due to active physical emergency stop (P0-4)."""
+
+
 def _write_pc_mode(mode: str) -> dict:
-    """Switch PC control mode via authenticated host 18900 POST /mode (A-2; fail-closed if 18900 unreachable)."""
+    """Switch PC control mode via authenticated host 18900 POST /mode (A-2, P0-4; fail-closed if 18900 unreachable)."""
     m = str(mode or "safe").strip().lower()
     if m not in ("off", "safe", "full"):
         raise ValueError("无效的权限挡位")
@@ -86,6 +68,15 @@ def _write_pc_mode(mode: str) -> dict:
         json={"mode": m},
         timeout=3.0,
     )
+    if resp.status_code == int(HTTPStatus.LOCKED):
+        err_msg = "宿主机当前处于物理急停锁定状态（Ctrl+Alt+Pause），禁止通过控制台自动切至全权操控挡，请在宿主机侧显式复位急停后再切换。"
+        try:
+            body_423 = resp.json() if resp.content else {}
+            if isinstance(body_423, dict) and body_423.get("error"):
+                err_msg = shared._redact_secrets(str(body_423["error"]))
+        except Exception as exc:
+            shared._log_rate_limited("write_pc_mode_423_json", exc)
+        raise _EmergencyStopLockedError(err_msg)
     if resp.status_code != 200:
         raise RuntimeError(
             f"宿主机 18900 MCP 拒绝切换挡位 (HTTP {resp.status_code}): {shared._redact_secrets(resp.text[:160])}"
@@ -95,7 +86,12 @@ def _write_pc_mode(mode: str) -> dict:
     if confirmed not in ("off", "safe", "full"):
         confirmed = m
     _set_cached_pc_mode(confirmed, online=True)
-    return {"ok": True, "mode": confirmed, "source": "host_18900"}
+    return {
+        "ok": True,
+        "mode": confirmed,
+        "source": "host_18900",
+        "emergency_stopped": bool(data.get("emergency_stopped", False)),
+    }
 
 
 def _check_agy_bridge_online(l3_status: dict | None = None) -> bool:
@@ -272,6 +268,11 @@ def handle_post_pc_mode(handler) -> None:
         handler._send_json(res)
     except shared._BadRequestError:
         raise
+    except _EmergencyStopLockedError as e:
+        handler._send_json(
+            {"ok": False, "emergency_stopped": True, "error": str(e)},
+            HTTPStatus.LOCKED,
+        )
     except ValueError as e:
         handler._send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
     except Exception as e:

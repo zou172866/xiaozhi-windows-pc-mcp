@@ -13,6 +13,7 @@ from . import (
     L3Backend,
     claim_workspace_or_enqueue,
     get_process_create_time,
+    guard_leading_dash_prompt,
     is_task_cancelled,
     load_last_active_task,
     release_workspace_slot,
@@ -84,10 +85,13 @@ class WorkBuddyBackend(L3Backend):
     def _build_command(
         self, prefix: List[str], prompt: str, follow_up_last: bool, auto_approve: bool
     ) -> List[str]:
+        safe_prompt = guard_leading_dash_prompt(
+            prompt, prefix_tag="[追问]" if follow_up_last else "[指令]"
+        )
         cmd = [*prefix]
         if follow_up_last:
             cmd.append("-c")
-        cmd.extend(["-p", prompt, "--output-format", "text"])
+        cmd.extend(["-p", safe_prompt, "--output-format", "text"])
         if auto_approve:
             cmd.append("-y")
         return cmd

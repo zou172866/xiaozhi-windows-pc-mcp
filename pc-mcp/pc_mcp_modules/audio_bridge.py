@@ -20,7 +20,12 @@ from starlette.requests import Request as _StarletteRequest
 from starlette.responses import JSONResponse as _StarletteJSONResponse
 
 from . import facade_attr
-from .security import _get_mode, is_emergency_stop_active, set_host_mode
+from .security import (
+    EmergencyStopLockedError,
+    _get_mode,
+    is_emergency_stop_active,
+    set_host_mode,
+)
 from .winapi import _kernel32
 
 
@@ -505,10 +510,13 @@ def register_http_routes(mcp, player: _WinMMPlayer) -> None:
     async def _l3_status_route(request: _StarletteRequest):
         l3_mod = facade_attr("l3_backends", l3_backends)
         get_mode_fn = facade_attr("_get_mode", _get_mode)
+        estop_fn = facade_attr("is_emergency_stop_active", is_emergency_stop_active)
         data = await asyncio.to_thread(l3_mod.get_status_overview)
         mode = get_mode_fn()
+        estop = bool(estop_fn())
         data["pc_mode"] = mode
-        data["l3_mode_allowed"] = mode == "full"
+        data["emergency_stopped"] = estop
+        data["l3_mode_allowed"] = (mode == "full") and not estop
         return _StarletteJSONResponse(data)
 
     @mcp.custom_route("/mode", methods=["GET"])
@@ -543,6 +551,11 @@ def register_http_routes(mcp, player: _WinMMPlayer) -> None:
             reason = str(body.get("reason") or "").strip()[:80]
             res = await asyncio.to_thread(set_mode_fn, body["mode"], source="http_api", reason=reason)
             return _StarletteJSONResponse(res)
+        except EmergencyStopLockedError as exc:
+            return _StarletteJSONResponse(
+                {"ok": False, "error": str(exc), "emergency_stopped": True},
+                status_code=423,
+            )
         except ValueError as exc:
             return _StarletteJSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         except Exception as exc:
@@ -553,13 +566,16 @@ def register_http_routes(mcp, player: _WinMMPlayer) -> None:
         try:
             l3_mod = facade_attr("l3_backends", l3_backends)
             get_mode_fn = facade_attr("_get_mode", _get_mode)
+            estop_fn = facade_attr("is_emergency_stop_active", is_emergency_stop_active)
             body = await request.json()
             cleaned = _validate_l3_config_payload(body)
             await asyncio.to_thread(l3_mod.write_l3_config, cleaned)
             overview = await asyncio.to_thread(l3_mod.get_status_overview)
             mode = get_mode_fn()
+            estop = bool(estop_fn())
             overview["pc_mode"] = mode
-            overview["l3_mode_allowed"] = mode == "full"
+            overview["emergency_stopped"] = estop
+            overview["l3_mode_allowed"] = (mode == "full") and not estop
             return _StarletteJSONResponse(overview)
         except Exception as exc:
             return _StarletteJSONResponse({"ok": False, "error": str(exc)}, status_code=400)

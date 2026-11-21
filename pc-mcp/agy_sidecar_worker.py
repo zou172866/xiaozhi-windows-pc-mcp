@@ -149,7 +149,7 @@ MAX_ACTIVE_TASK_RECORDS = _pc_common.MAX_ACTIVE_TASK_RECORDS
 
 
 def _guard_leading_dash_prompt(prompt: str, prefix_tag: str = "[指令]") -> str:
-    """Prevent leading '-' prompt from being parsed as a CLI flag by agentapi without using '--' (E-4).
+    """Prevent leading '-' prompt from being parsed as a CLI flag by agentapi without using '--' (E-4, P1-3).
 
     Empirically verified against `language_server.exe agentapi` (Go stdlib flag.FlagSet):
     - `new-conversation` parses leading '-' positional args as flags and errors out.
@@ -157,10 +157,7 @@ def _guard_leading_dash_prompt(prompt: str, prefix_tag: str = "[指令]") -> str
       before `<content>` would corrupt `<content>` (and violates AGENTS.md §2).
     - Prefixing leading-dash prompts with a non-dash tag is universally safe without '--'.
     """
-    s = str(prompt or "").strip()
-    if s.startswith("-"):
-        return f"{prefix_tag} {s}"
-    return s
+    return _pc_common.guard_leading_dash_prompt(prompt, prefix_tag=prefix_tag)
 
 
 def _prune_active_tasks(

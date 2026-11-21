@@ -158,6 +158,14 @@ def prepare_subprocess_command(cmd: List[str]) -> List[str]:
     return unwrapped
 
 
+def guard_leading_dash_prompt(prompt: str, prefix_tag: str = "[指令]") -> str:
+    """Prevent a leading '-' prompt from being parsed as a CLI option flag across all L3 backends (E-4, P1-3)."""
+    s = str(prompt or "").lstrip("\ufeff \t\r\n").strip()
+    if s.startswith("-"):
+        return f"{prefix_tag} {s}"
+    return s
+
+
 def safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:
     if val is None or isinstance(val, bool):
         return default

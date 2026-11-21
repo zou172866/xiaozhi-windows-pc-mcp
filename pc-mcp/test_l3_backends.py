@@ -105,12 +105,18 @@ class TestPluggableL3Backends(unittest.TestCase):
             self.fail(f"Background L3 worker threads still alive during tearDown: {alive_threads}")
 
     def test_dynamic_paths_have_no_hardcoded_username_or_drive(self):
+        server_dir = MCP_DIR.parent
+        forbidden_private_posix = "e:/\u6545\u4e8b/1"
+        forbidden_private_win = "e:\\\u6545\u4e8b\\1"
         for fname in ("pc_control_mcp.py", "agy_sidecar_worker.py"):
             src = (MCP_DIR / fname).read_text(encoding="utf-8")
             self.assertNotIn("C:\\Users\\Administrator", src)
-            self.assertNotIn("e:\\故事\\1", src)
-            self.assertNotIn("e:/故事/1", src)
-        server_dir = MCP_DIR.parent
+            self.assertNotIn(forbidden_private_win, src.lower())
+            self.assertNotIn(forbidden_private_posix, src.lower())
+        for rel in ("app/patches/emotion/tags.py", "tests/container/test_mei_emotion_and_prosody.py"):
+            src = (server_dir / rel).read_text(encoding="utf-8")
+            self.assertNotIn(forbidden_private_win, src.lower(), f"Hardcoded private path found in {rel}")
+            self.assertNotIn(forbidden_private_posix, src.lower(), f"Hardcoded private path found in {rel}")
         personal_vault = "E:" + "\\love"
         for rel in (".env.example", "data/init_setup.ps1", "anima-brain/obsidian_exporter.py"):
             src = (server_dir / rel).read_text(encoding="utf-8-sig")

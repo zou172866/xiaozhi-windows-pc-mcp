@@ -1597,8 +1597,16 @@ def enqueue_inbox_turn(
                         "WHERE request_id=?",
                         (cid, merged_json, ts, req_id),
                     )
+                elif prev_status == "pending":
+                    # Upgraded continuation while pending: reset retry state so fuller turn is immediately eligible
+                    engine.db.execute(
+                        "UPDATE xiaozhi_inbox "
+                        "SET character_id=?, payload=?, attempts=0, last_error='', updated_at=0.0 "
+                        "WHERE request_id=?",
+                        (cid, merged_json, req_id),
+                    )
                 else:
-                    # pending or processing: update payload in-place; worker verifies payload before marking done
+                    # processing: update payload in-place while preserving active heartbeat lease; worker verifies payload before marking done
                     engine.db.execute(
                         "UPDATE xiaozhi_inbox "
                         "SET character_id=?, payload=?, updated_at=? "
@@ -1800,6 +1808,24 @@ def _claim_next_inbox_row(
         )
 
 
+def _touch_inbox_row_heartbeat(
+    brain: CompanionBrain,
+    request_id: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Renew updated_at lease on an actively-processing inbox row so review_healer never prematurely reclaims it (P1-7)."""
+    engine = brain.engine
+    ts = float(now) if now is not None else time.time()
+    with engine._lock:
+        with engine._transaction():
+            cur = engine.db.execute(
+                "UPDATE xiaozhi_inbox SET updated_at=? WHERE request_id=? AND status='processing'",
+                (ts, request_id),
+            )
+            return bool(cur.rowcount and cur.rowcount > 0)
+
+
 def _complete_inbox_row(
     brain: CompanionBrain,
     request_id: str,
@@ -1807,14 +1833,14 @@ def _complete_inbox_row(
     *,
     now: float | None = None,
 ) -> bool:
-    """Mark a 'processing' row 'done' if payload hasn't changed; else requeue for upgraded payload."""
+    """Mark an extracted row 'done' if payload hasn't changed; else requeue for upgraded payload (P1-7)."""
     engine = brain.engine
     ts = float(now) if now is not None else time.time()
     with engine._lock:
         with engine._transaction():
             cur = engine.db.execute(
                 "UPDATE xiaozhi_inbox SET status='done', last_error='', updated_at=? "
-                "WHERE request_id=? AND status='processing' AND payload=?",
+                "WHERE request_id=? AND payload=? AND status IN ('processing', 'pending', 'dead')",
                 (ts, request_id, claimed_payload),
             )
             if cur.rowcount and cur.rowcount > 0:
@@ -1823,7 +1849,7 @@ def _complete_inbox_row(
             engine.db.execute(
                 "UPDATE xiaozhi_inbox "
                 "SET status='pending', attempts=0, last_error='', updated_at=0.0 "
-                "WHERE request_id=? AND status='processing'",
+                "WHERE request_id=? AND status IN ('processing', 'pending', 'dead')",
                 (request_id,),
             )
             return False
@@ -2367,15 +2393,42 @@ def create_combined_asgi_app(
     }
 
     async def ingest_worker():
+        claim_err_streak = 0
         while True:
             if inbox_wake is not None:
                 inbox_wake.clear()
-            row, wait_sec = await asyncio.to_thread(
-                _claim_next_inbox_row, brain, force_due=shutting_down
-            )
+            try:
+                row, wait_sec = await asyncio.to_thread(
+                    _claim_next_inbox_row, brain, force_due=shutting_down
+                )
+                claim_err_streak = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as claim_exc:
+                claim_err_streak += 1
+                backoff_s = min(5.0, 0.2 * (2 ** min(claim_err_streak - 1, 5)))
+                log.warning(
+                    "Transient inbox claim error (streak=%d, retry in %.2fs): %s",
+                    claim_err_streak,
+                    backoff_s,
+                    _sanitize_inbox_error(claim_exc),
+                )
+                await asyncio.sleep(backoff_s)
+                continue
+
             if row is None:
                 if shutting_down:
-                    ib_st = await asyncio.to_thread(get_inbox_stats, brain)
+                    try:
+                        ib_st = await asyncio.to_thread(get_inbox_stats, brain)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as st_exc:
+                        log.warning(
+                            "Transient inbox stats error during shutdown drain: %s",
+                            _sanitize_inbox_error(st_exc),
+                        )
+                        await asyncio.sleep(0.1)
+                        continue
                     if ib_st["pending"] == 0 and ib_st["processing"] == 0:
                         return
                     await asyncio.sleep(0.05)
@@ -2405,38 +2458,74 @@ def create_combined_asgi_app(
                 reply_msg = str(parsed.get("assistant_reply") or "").strip()
                 turn_meta = parsed.get("turn_meta") if isinstance(parsed.get("turn_meta"), dict) else {}
             except Exception as exc:
-                await asyncio.to_thread(
-                    _fail_inbox_row,
-                    brain,
-                    req_id,
-                    attempts_before,
-                    f"corrupt_inbox_payload: {exc}",
-                    force_dead=True,
-                )
+                try:
+                    await asyncio.to_thread(
+                        _fail_inbox_row,
+                        brain,
+                        req_id,
+                        attempts_before,
+                        f"corrupt_inbox_payload: {exc}",
+                        force_dead=True,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as db_exc:
+                    log.warning(
+                        "Failed to mark corrupt inbox row %s dead: %s",
+                        req_id,
+                        _sanitize_inbox_error(db_exc),
+                    )
                 ingest_stats["dropped_total"] += 1
                 log.error("Marked corrupt inbox row %s as dead: %s", req_id, exc)
                 continue
 
+            async def _heartbeat_lease_loop(target_req_id: str) -> None:
+                while True:
+                    interval = max(0.01, min(30.0, float(INBOX_PROCESSING_TIMEOUT_SECONDS) / 3.0))
+                    await asyncio.sleep(interval)
+                    try:
+                        still_processing = await asyncio.to_thread(
+                            _touch_inbox_row_heartbeat, brain, target_req_id
+                        )
+                        if not still_processing:
+                            return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as hb_exc:
+                        log.warning(
+                            "Inbox heartbeat lease renewal failed for %s: %s",
+                            target_req_id,
+                            _sanitize_inbox_error(hb_exc),
+                        )
+
+            hb_task = asyncio.create_task(_heartbeat_lease_loop(req_id))
             try:
-                if turn_meta:
-                    result = await asyncio.to_thread(
-                        extract_and_commit_turn,
-                        brain,
-                        character_id,
-                        req_id,
-                        user_msg,
-                        reply_msg,
-                        turn_meta=turn_meta,
-                    )
-                else:
-                    result = await asyncio.to_thread(
-                        extract_and_commit_turn,
-                        brain,
-                        character_id,
-                        req_id,
-                        user_msg,
-                        reply_msg,
-                    )
+                try:
+                    if turn_meta:
+                        result = await asyncio.to_thread(
+                            extract_and_commit_turn,
+                            brain,
+                            character_id,
+                            req_id,
+                            user_msg,
+                            reply_msg,
+                            turn_meta=turn_meta,
+                        )
+                    else:
+                        result = await asyncio.to_thread(
+                            extract_and_commit_turn,
+                            brain,
+                            character_id,
+                            req_id,
+                            user_msg,
+                            reply_msg,
+                        )
+                finally:
+                    hb_task.cancel()
+                    try:
+                        await hb_task
+                    except asyncio.CancelledError:
+                        pass
                 if isinstance(result, dict) and result.get("skipped") == "another_turn_pending":
                     new_status, new_attempts = await asyncio.to_thread(
                         _fail_inbox_row,
@@ -2468,9 +2557,32 @@ def create_combined_asgi_app(
                 elif isinstance(result, dict) and (
                     result.get("committed") or result.get("skipped") == "empty_message"
                 ):
-                    marked_done = await asyncio.to_thread(
-                        _complete_inbox_row, brain, req_id, claimed_payload
-                    )
+                    marked_done = None
+                    for comp_try in range(3):
+                        try:
+                            marked_done = await asyncio.to_thread(
+                                _complete_inbox_row, brain, req_id, claimed_payload
+                            )
+                            break
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as comp_exc:
+                            log.warning(
+                                "Transient DB error marking committed inbox row %s done (try %d/3): %s",
+                                req_id,
+                                comp_try + 1,
+                                _sanitize_inbox_error(comp_exc),
+                            )
+                            if comp_try < 2:
+                                await asyncio.sleep(0.05 * (comp_try + 1))
+                    if marked_done is None:
+                        # Turn already committed; do NOT call _fail_inbox_row (which could falsely dead-letter it).
+                        if result.get("committed") and (not result.get("replayed") or result.get("updated")):
+                            obsidian_runner.notify_turn(
+                                result.get("occurred_at") or (turn_meta or {}).get("occurred_at"),
+                                extra_occurred_at=result.get("prev_occurred_at"),
+                            )
+                        continue
                     if not marked_done:
                         if inbox_wake is not None:
                             inbox_wake.set()
@@ -2496,13 +2608,25 @@ def create_combined_asgi_app(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                new_status, new_attempts = await asyncio.to_thread(
-                    _fail_inbox_row,
-                    brain,
-                    req_id,
-                    attempts_before,
-                    exc,
-                )
+                try:
+                    new_status, new_attempts = await asyncio.to_thread(
+                        _fail_inbox_row,
+                        brain,
+                        req_id,
+                        attempts_before,
+                        exc,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as db_exc:
+                    log.warning(
+                        "Failed to record inbox error for %s: %s (orig=%s)",
+                        req_id,
+                        _sanitize_inbox_error(db_exc),
+                        _sanitize_inbox_error(exc),
+                    )
+                    await asyncio.sleep(0.25)
+                    continue
                 if new_status == "dead":
                     ingest_stats["dropped_total"] += 1
                     log.error(

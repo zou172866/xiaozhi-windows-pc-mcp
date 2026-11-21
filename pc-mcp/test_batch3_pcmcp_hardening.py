@@ -39,7 +39,7 @@ from l3_backends.dsh import DshBackend
 from l3_backends.workbuddy import WorkBuddyBackend
 import pc_control_mcp as pcm
 import pc_mcp_watchdog as wd
-from pc_mcp_modules import launcher, security, ui_tools, vision
+from pc_mcp_modules import launcher, security, vision
 
 
 _BENIGN_FG = {
@@ -1027,6 +1027,182 @@ class TestBatch3PcMcpHardening(unittest.TestCase):
             os.utime(sub_dir, ns=(st_sub.st_atime_ns, st_sub.st_mtime_ns + 1_000_000_000))
             self.assertEqual(launcher._find_start_menu_shortcut("SubAppTwo", start_dirs=[sm_root]).stem, "SubAppTwo")
             self.assertEqual(walk_calls["n"], 3)
+
+    def test_p0_3_and_p1_4_builtin_apps_removed_lnk_target_and_unicode_boundary(self):
+        """P0-3 & P1-4: _BUILTIN_APPS excludes cmd/wt/taskmgr; Unicode word boundary blocks 中文+cmd/underscore; IShellLinkW blocks renamed .lnk targets."""
+        import ctypes
+
+        # 1. P0-3: _BUILTIN_APPS must NOT contain cmd.exe, wt.exe, taskmgr.exe or their Chinese aliases
+        for bad_key in ("命令行", "终端", "任务管理器"):
+            self.assertNotIn(bad_key, launcher._BUILTIN_APPS)
+        builtin_vals = {str(v).lower() for v in launcher._BUILTIN_APPS.values()}
+        for bad_exe in ("cmd.exe", "wt.exe", "taskmgr.exe"):
+            self.assertNotIn(bad_exe, builtin_vals)
+
+        # Calling pc_open_app_or_web in safe mode with 命令行 / 终端 / 任务管理器 MUST NOT invoke _shell_open
+        self.mode_file.write_text(json.dumps({"mode": "safe"}), encoding="utf-8")
+        with (
+            patch.object(pcm, "_shell_open") as m_open,
+            patch.object(pcm, "_find_start_menu_shortcut", return_value=None),
+        ):
+            for q in ("命令行", "终端", "任务管理器"):
+                res = pcm.pc_open_app_or_web(q)
+                self.assertIn("未在开始菜单", res)
+            m_open.assert_not_called()
+
+        # 2. P1-4: Unicode/underscore boundary bypasses MUST be blocked while benign words containing 'sh' stay allowed
+        sm_unicode = self.tmp_root / "StartMenuUnicode"
+        sm_unicode.mkdir(parents=True)
+        for fn in (
+            "打开cmd.lnk",
+            "启动wsl.lnk",
+            "my_mshta.lnk",
+            "运行_powershell.lnk",
+            "工具_bash.lnk",
+            "Photoshop.lnk",
+            "Clash.lnk",
+            "PowerPoint.lnk",
+        ):
+            (sm_unicode / fn).write_bytes(b"LNK")
+
+        for bad_stem in ("打开cmd", "启动wsl", "my_mshta", "运行_powershell", "工具_bash"):
+            self.assertIsNone(
+                launcher._find_start_menu_shortcut(bad_stem, start_dirs=[sm_unicode]),
+                f"Unicode/underscore bypass should be blocked: {bad_stem}",
+            )
+        for good_stem in ("Photoshop", "Clash", "PowerPoint"):
+            found = launcher._find_start_menu_shortcut(good_stem, start_dirs=[sm_unicode])
+            self.assertIsNotNone(found, f"Benign app should remain allowed: {good_stem}")
+            self.assertEqual(found.stem, good_stem)
+
+        # 3. P1-4: Real Windows .lnk target & arguments inspection via IShellLinkW
+        if os.name == "nt":
+            def _create_real_lnk(lnk_path: Path, target_path: str, arguments: str = "") -> None:
+                ole32 = ctypes.windll.ole32
+                clsid_sl, iid_sl, iid_pf = launcher._get_shell_link_guids()
+                psl = ctypes.c_void_p()
+                ppf = ctypes.c_void_p()
+                with launcher._com_mta_scope():
+                    hr = ole32.CoCreateInstance(
+                        ctypes.byref(clsid_sl), None, 1, ctypes.byref(iid_sl), ctypes.byref(psl)
+                    )
+                    self.assertEqual(hr, 0)
+                    try:
+                        vtbl_sl = ctypes.cast(psl, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+                        set_path = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p)(vtbl_sl[20])
+                        set_args = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p)(vtbl_sl[11])
+                        self.assertEqual(set_path(psl, target_path), 0)
+                        if arguments:
+                            self.assertEqual(set_args(psl, arguments), 0)
+                        qi = ctypes.WINFUNCTYPE(
+                            ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(launcher._GUID), ctypes.POINTER(ctypes.c_void_p)
+                        )(vtbl_sl[0])
+                        self.assertEqual(qi(psl, ctypes.byref(iid_pf), ctypes.byref(ppf)), 0)
+                        vtbl_pf = ctypes.cast(ppf, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+                        pf_save = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int)(
+                            vtbl_pf[6]
+                        )
+                        self.assertEqual(pf_save(ppf, str(lnk_path), 1), 0)
+                    finally:
+                        if ppf.value:
+                            vtbl_pf = ctypes.cast(ppf, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+                            ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl_pf[2])(ppf)
+                        if psl.value:
+                            vtbl_sl = ctypes.cast(psl, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+                            ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl_sl[2])(psl)
+
+            sm_real = self.tmp_root / "StartMenuRealLnk"
+            sm_real.mkdir(parents=True)
+            sys32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+            _create_real_lnk(sm_real / "正常笔记.lnk", str(sys32 / "cmd.exe"))
+            _create_real_lnk(sm_real / "日常助手.lnk", "%ComSpec%", "/k echo hi")
+            _create_real_lnk(sm_real / "快捷面板.lnk", str(sys32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"))
+            _create_real_lnk(sm_real / "文档预览.lnk", str(sys32 / "notepad.exe"), "payload.ps1")
+            _create_real_lnk(sm_real / "纯良记事本.lnk", str(sys32 / "notepad.exe"))
+
+            for disguised in ("正常笔记", "日常助手", "快捷面板", "文档预览"):
+                self.assertIsNone(
+                    launcher._find_start_menu_shortcut(disguised, start_dirs=[sm_real]),
+                    f"Disguised .lnk targeting sensitive binary/script must be blocked: {disguised}",
+                )
+            benign = launcher._find_start_menu_shortcut("纯良记事本", start_dirs=[sm_real])
+            self.assertIsNotNone(benign)
+            self.assertEqual(benign.stem, "纯良记事本")
+
+            # Verify COM IShellLinkW resolution works cleanly on a fresh worker thread (Release BEFORE CoUninitialize)
+            worker_res: list = []
+            worker_err: list = []
+
+            def _resolve_on_fresh_thread():
+                try:
+                    worker_res.append(launcher._resolve_lnk_targets(sm_real / "纯良记事本.lnk"))
+                except Exception as exc:
+                    worker_err.append(exc)
+
+            th = threading.Thread(target=_resolve_on_fresh_thread)
+            th.start()
+            th.join(timeout=5.0)
+            self.assertEqual(worker_err, [])
+            self.assertTrue(worker_res and worker_res[0] is not None)
+
+        # 4. P1-4 red-team regressions: blocked exes/scripts/%ComSpec% in Arguments, extensionless/trailing-dot targets,
+        #    Shell-CLSID Control Panel, & 8.3 short paths MUST be blocked
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\explorer.exe", "windowsterminal.exe"))
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\explorer.exe", "msiexec.exe /i foo.msi"))
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\explorer.exe", "regsvr32 /s evil.dll"))
+        self.assertTrue(
+            launcher._is_blocked_shortcut_target(r"C:\Windows\explorer.exe", r"forfiles /p c:\windows\system32 /c calc")
+        )
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\System32\conhost", ""))
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\System32\msiexec", "/x {GUID}"))
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\System32\regsvr32", ""))
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\System32\windowsterminal.exe.", ""))
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\explorer.exe", "evil.wsf"))
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\explorer.exe", "evil.jse"))
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\explorer.exe", "evil.cpl"))
+        self.assertTrue(launcher._is_blocked_shortcut_target(r"C:\Windows\explorer.exe", "%ComSpec%"))
+        self.assertTrue(
+            launcher._is_blocked_shortcut_target(r"C:\Windows\System32\WindowsPowerShell\v1.0\POWERS~1.EXE", "")
+        )
+        self.assertFalse(launcher._is_blocked_shortcut_target(r"C:\Windows\System32\notepad.exe", "notes.txt"))
+        sm_cp = self.tmp_root / "StartMenuControlPanel"
+        sm_cp.mkdir(parents=True)
+        (sm_cp / "Control Panel.lnk").write_bytes(b"LNK")
+        (sm_cp / "控制面板.lnk").write_bytes(b"LNK")
+        (sm_cp / "Virtual IO Control Panel.lnk").write_bytes(b"LNK")
+        (sm_cp / "File Explorer.lnk").write_bytes(b"LNK")
+        self.assertTrue(launcher._is_blocked_shortcut(sm_cp / "Control Panel.lnk", root_dir=sm_cp))
+        self.assertTrue(launcher._is_blocked_shortcut(sm_cp / "控制面板.lnk", root_dir=sm_cp))
+        self.assertFalse(launcher._is_blocked_shortcut(sm_cp / "Virtual IO Control Panel.lnk", root_dir=sm_cp))
+        self.assertFalse(launcher._is_blocked_shortcut(sm_cp / "File Explorer.lnk", root_dir=sm_cp))
+
+    def test_p1_3_dsh_and_workbuddy_guard_leading_dash_prompt(self):
+        """P1-3: Shared common.guard_leading_dash_prompt protects DSH, WorkBuddy, Antigravity, and Sidecar against leading '-' prompts."""
+        import common as pc_common
+        from l3_backends.workbuddy import WorkBuddyBackend
+
+        # 1. Shared helper in pc-mcp/common (including BOM-prefixed dashes)
+        self.assertEqual(pc_common.guard_leading_dash_prompt("-y --danger"), "[指令] -y --danger")
+        self.assertEqual(pc_common.guard_leading_dash_prompt("\ufeff-y"), "[指令] -y")
+        self.assertEqual(pc_common.guard_leading_dash_prompt("  --model=evil", prefix_tag="[追问]"), "[追问] --model=evil")
+        self.assertEqual(pc_common.guard_leading_dash_prompt("正常任务"), "正常任务")
+
+        # 2. DshBackend._build_command guards leading '-' prompts
+        dsh_cmd = DshBackend()._build_command(["dsh"], "--dangerously-allow-all -y")
+        self.assertEqual(dsh_cmd[:3], ["dsh", "--profile", "headless"])
+        self.assertFalse(dsh_cmd[-1].startswith("-"))
+        self.assertIn("--dangerously-allow-all -y", dsh_cmd[-1])
+
+        # 3. WorkBuddyBackend._build_command guards leading '-' prompts for both fresh and follow-up
+        wb_cmd1 = WorkBuddyBackend()._build_command(["workbuddy"], "-y --model=evil", False, False)
+        p_idx1 = wb_cmd1.index("-p")
+        self.assertFalse(wb_cmd1[p_idx1 + 1].startswith("-"))
+        self.assertIn("-y --model=evil", wb_cmd1[p_idx1 + 1])
+
+        wb_cmd2 = WorkBuddyBackend()._build_command(["workbuddy"], "--help", True, True)
+        p_idx2 = wb_cmd2.index("-p")
+        self.assertTrue(wb_cmd2[p_idx2 + 1].startswith("[追问] "))
+        self.assertIn("--help", wb_cmd2[p_idx2 + 1])
 
 
 if __name__ == "__main__":

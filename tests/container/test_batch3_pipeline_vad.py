@@ -35,7 +35,6 @@ import asr_corrections
 import mei_emotion_router as mer
 import patch_registry
 import pc_audio_router as par
-import runtime_events
 import runtime_settings as rs
 import vad_speculative_router as vsr
 import xz_common
@@ -288,7 +287,7 @@ class TestBatch3ContainerPipeline(unittest.TestCase):
         )
         with _ref_ctx:
             # 1. Snapshot builds gentle + full sample_steps=16 WITHOUT mutating tts
-            url, snap_json, prof, emo_key = mer.build_gsv_request_snapshot(
+            url, snap_json, _prof, emo_key = mer.build_gsv_request_snapshot(
                 tts,
                 "我在呢，哥哥请说吧。",
                 explicit_segment_emotion="gentle",
@@ -1173,6 +1172,267 @@ class TestBatch3ContainerPipeline(unittest.TestCase):
             300.0,
             f"Expected >=300ms average tail wait reduction, got {avg_saved_ms:.1f}ms",
         )
+
+    def test_p1_6_tool_continuation_depth_preserves_turn_context_and_prefix_cache(self):
+        """P1-6: Tool-call continuation (depth > 0, memory_str=None) keeps depth=0 <turn_context> & <memory> byte-identical."""
+        from core.utils.dialogue import Dialogue, Message
+        import boot
+        import turn_context_router as tcr
+
+        boot.install_all(start_background_workers=False, run_contract_self_check=False)
+
+        dlg = Dialogue()
+        dlg.put(Message(role="system", content="你是雷电芽衣。\n<context>当前时间 {{current_time}}</context>"))
+        dlg.put(Message(role="user", content="帮我查一下明天天气"))
+
+        # depth=0 call: real memory_str provided
+        dlg._in_chat_depth = 1
+        with patch.object(tcr, "get_turn_context_mode", return_value="split"):
+            msgs_d0 = dlg.get_llm_dialogue_with_memory("用户住在长沙，喜欢晴天", {}, None)
+            self.assertEqual(msgs_d0[0]["role"], "system")
+            self.assertIn("<memory>", msgs_d0[1]["content"])
+            self.assertIn("用户住在长沙，喜欢晴天", msgs_d0[1]["content"])
+
+            # Upstream appends assistant(tool_calls) + tool(result), then calls chat(None, depth=1) -> memory_str=None!
+            dlg.put(
+                Message(
+                    role="assistant",
+                    tool_calls=[
+                        {"id": "tc-1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+                    ],
+                )
+            )
+            dlg.put(Message(role="tool", tool_call_id="tc-1", content="长沙明天晴 24°C"))
+            dlg._in_chat_depth = 2
+
+            msgs_d1 = dlg.get_llm_dialogue_with_memory(None, {}, None)
+            # Prefix up to user[n] MUST be 100% byte-identical to depth=0 (preserving <memory> and KV prefix cache!)
+            self.assertEqual(msgs_d1[0], msgs_d0[0])
+            self.assertEqual(msgs_d1[1], msgs_d0[1])
+            self.assertIn("用户住在长沙，喜欢晴天", msgs_d1[1]["content"])
+
+            # Even at MAX_DEPTH when upstream appends synthetic "[系统提示]" user message,
+            # the real user[n] message STILL retains the exact depth=0 <turn_context>!
+            dlg.put(Message(role="user", content="[系统提示] 已达到最大工具调用次数限制，请直接回答。"))
+            msgs_d5 = dlg.get_llm_dialogue_with_memory(None, {}, None)
+            self.assertEqual(msgs_d5[1], msgs_d0[1])
+            self.assertNotIn("<turn_context>", msgs_d5[-1]["content"])
+
+            # A brand new real user turn MUST generate a fresh <turn_context> (not reuse previous turn's)
+            dlg._in_chat_depth = 1
+            dlg.put(Message(role="user", content="谢谢芽衣"))
+            msgs_next = dlg.get_llm_dialogue_with_memory("新记忆片段", {}, None)
+            self.assertIn("新记忆片段", msgs_next[-1]["content"])
+            self.assertNotIn("用户住在长沙，喜欢晴天", msgs_next[-1]["content"])
+
+    def test_p1_12_vad_hard_cap_handoff_cancel_last_is_voice_and_persistent_dictation(self):
+        """P1-12: 1100ms hard cap reuses completed or cancels in-flight speculative decode; last_is_voice guards opening frames; dictation persists >4 turns + storyteller preset."""
+        import core.providers.asr.base as asr_base_mod
+
+        class _TestAsr(ASRProviderBase):
+            def __init__(self, decode_fn):
+                super().__init__()
+                self.interface_type = InterfaceType.LOCAL
+                self.output_dir = "/tmp"
+                self.delete_audio_file = True
+                self._speculative_decode_pcm = decode_fn
+                self.full_stt_calls = 0
+
+            async def speech_to_text(self, opus_data, session_id, artifacts=None):
+                self.full_stt_calls += 1
+                return "full-stt-result", None
+
+        def _make_conn(asr, *, dialogue_msgs=None):
+            c = SimpleNamespace(
+                session_id=f"p112-{time.monotonic_ns()}",
+                asr=asr,
+                vad=SimpleNamespace(silence_threshold_ms=1100),
+                client_listen_mode="auto",
+                client_have_voice=True,
+                client_voice_stop=False,
+                last_is_voice=False,
+                vad_last_voice_time=0.0,
+                asr_audio=[b"\x01\x00" * 960 for _ in range(18)],
+                voiceprint_provider=None,
+                logger=MagicMock(),
+                just_woken_up=False,
+                _vad_post_wakeup_pending=False,
+                dictation_mode=False,
+                story_mode=False,
+                dialogue=SimpleNamespace(dialogue=list(dialogue_msgs or [])),
+                config={},
+            )
+
+            def _reset():
+                st_obj = getattr(c, "_vad_spec_state", None)
+                if st_obj is not None:
+                    st_obj.invalidate(count_discard=False)
+                c.client_have_voice = False
+                c.client_voice_stop = False
+                c.asr_audio.clear()
+
+            c.reset_audio_states = _reset
+            return c
+
+        async def _run():
+            frame = b"\x00\x00" * 960
+            cfg = dict(rs.DEFAULT_SETTINGS["vad_speculative"])
+
+            # 1. Completed speculative decode (held because incomplete) is handed off at 1100ms hard cap -> 0 double decode!
+            asr1 = _TestAsr(lambda _pcm: "帮我打开")  # incomplete bare transitive -> held until 1100ms
+            conn1 = _make_conn(asr1)
+            chats1 = []
+
+            async def _cap1(c, txt):
+                chats1.append(txt)
+
+            with (
+                patch.object(rs, "get_vad_speculative", return_value=cfg),
+                patch.object(rs, "get_reply_length", return_value={"preset": "balanced", "chat_chars": 150, "story_chars": 450}),
+                patch.object(asr_base_mod, "startToChat", side_effect=_cap1),
+                patch.object(asr_base_mod, "enqueue_asr_report"),
+            ):
+                conn1.vad_last_voice_time = (time.time() - 0.60) * 1000.0
+                await asr1.receive_audio(conn1, frame, False)
+                st1 = getattr(conn1, "_vad_spec_state")
+                self.assertIsNotNone(st1.task)
+                await st1.task
+                self.assertFalse(st1.should_commit)
+                # Append ~500ms more silence frames up to 1100ms hard cap
+                for _ in range(8):
+                    conn1.asr_audio.append(frame)
+                conn1.client_voice_stop = True
+                await asr1.receive_audio(conn1, frame, False)
+                self.assertEqual(chats1, ["帮我打开"])
+                self.assertEqual(asr1.full_stt_calls, 0, "1100ms hard cap must reuse completed speculative result")
+
+            # 2. In-flight speculative task is cancelled immediately when 1100ms hard cap arrives
+            started_ev = threading.Event()
+            release_ev = threading.Event()
+
+            def _hang_dec(_pcm):
+                started_ev.set()
+                release_ev.wait(2.0)
+                return "迟到结果"
+
+            asr2 = _TestAsr(_hang_dec)
+            conn2 = _make_conn(asr2)
+            with (
+                patch.object(rs, "get_vad_speculative", return_value=cfg),
+                patch.object(rs, "get_reply_length", return_value={"preset": "balanced", "chat_chars": 150, "story_chars": 450}),
+                patch.object(asr_base_mod, "startToChat", new=AsyncMock()),
+                patch.object(asr_base_mod, "enqueue_asr_report"),
+            ):
+                conn2.vad_last_voice_time = (time.time() - 0.60) * 1000.0
+                await asr2.receive_audio(conn2, frame, False)
+                await asyncio.sleep(0.02)
+                self.assertTrue(started_ev.wait(1.0))
+                st2 = getattr(conn2, "_vad_spec_state")
+                in_flight_task = st2.task
+                gen_before = st2.generation
+                conn2.client_voice_stop = True
+                await asr2.receive_audio(conn2, frame, False)
+                self.assertGreater(st2.generation, gen_before)
+                self.assertIsNone(st2.task)
+                release_ev.set()
+                await asyncio.sleep(0.02)
+                self.assertTrue(in_flight_task.cancelled() or in_flight_task.done())
+
+            # 3. conn.last_is_voice=True prevents early-commit from cutting off resumed speech's opening frame
+            asr3 = _TestAsr(lambda _pcm: "今天天气怎么样？")
+            conn3 = _make_conn(asr3)
+            with (
+                patch.object(rs, "get_vad_speculative", return_value=cfg),
+                patch.object(rs, "get_reply_length", return_value={"preset": "balanced", "chat_chars": 150, "story_chars": 450}),
+                patch.object(asr_base_mod, "startToChat", new=AsyncMock()),
+                patch.object(asr_base_mod, "enqueue_asr_report"),
+            ):
+                conn3.vad_last_voice_time = (time.time() - 0.60) * 1000.0
+                await asr3.receive_audio(conn3, frame, False)
+                await getattr(conn3, "_vad_spec_state").task
+                # First frame of user's continuation: Silero sets last_is_voice=True while window count < threshold (audio_have_voice=False)
+                conn3.last_is_voice = True
+                conn3.vad_last_voice_time = (time.time() - 0.66) * 1000.0
+                await asr3.receive_audio(conn3, frame, False)
+                self.assertFalse(conn3.client_voice_stop, "Must NOT early-commit while Silero last_is_voice=True!")
+
+            # 3b. Short 1-2 frame speech burst (last_is_voice=True, audio_have_voice=False) between 550ms and 1100ms
+            # MUST invalidate stale speculative text so full 1100ms ASR runs instead of dropping the short syllable!
+            asr4 = _TestAsr(lambda _pcm: "今天天气")  # incomplete -> held until 1100ms
+            conn4 = _make_conn(asr4)
+            chats4 = []
+
+            async def _cap4(c, txt):
+                chats4.append(txt)
+
+            with (
+                patch.object(rs, "get_vad_speculative", return_value=cfg),
+                patch.object(rs, "get_reply_length", return_value={"preset": "balanced", "chat_chars": 150, "story_chars": 450}),
+                patch.object(asr_base_mod, "startToChat", side_effect=_cap4),
+                patch.object(asr_base_mod, "enqueue_asr_report"),
+            ):
+                conn4.vad_last_voice_time = (time.time() - 0.60) * 1000.0
+                await asr4.receive_audio(conn4, frame, False)
+                await getattr(conn4, "_vad_spec_state").task
+                # User utters a short 1-frame syllable ("吗"): last_is_voice=True while audio_have_voice stays False
+                conn4.last_is_voice = True
+                await asr4.receive_audio(conn4, frame, False)
+                # User stops again and hits 1100ms cutoff
+                conn4.last_is_voice = False
+                conn4.client_voice_stop = True
+                await asr4.receive_audio(conn4, frame, False)
+                self.assertEqual(asr4.full_stt_calls, 1, "Short last_is_voice burst must invalidate stale speculative decode")
+                self.assertEqual(chats4, ["full-stt-result"])
+
+        asyncio.run(_run())
+
+        # 4. Dictation cue persists past 5+ turns (and even if cue scrolls out of dialogue) until exit cue; storyteller preset also disables speculative VAD
+        dlg_list = [SimpleNamespace(role="user", content="开始听写模式，帮我记一段笔记", is_temporary=False)]
+        conn_d = SimpleNamespace(
+            client_listen_mode="auto",
+            dictation_mode=False,
+            story_mode=False,
+            vad_speculative_disabled=False,
+            config={},
+            dialogue=SimpleNamespace(dialogue=dlg_list),
+        )
+        with patch.object(rs, "get_reply_length", return_value={"preset": "balanced", "chat_chars": 150, "story_chars": 450}):
+            self.assertTrue(vsr.is_story_or_dictation_mode(conn_d))
+            for i in range(6):
+                dlg_list.append(SimpleNamespace(role="user", content=f"第{i+1}条待办事项内容", is_temporary=False))
+                self.assertTrue(vsr.is_story_or_dictation_mode(conn_d), f"Dictation mode must persist on turn {i+2}")
+            # Even if the original enter-cue message is evicted from sliding dialogue history, state stays active
+            del dlg_list[0]
+            self.assertTrue(vsr.is_story_or_dictation_mode(conn_d))
+            # Explicit exit cue turns dictation mode back off
+            dlg_list.append(SimpleNamespace(role="user", content="好了说完了，退出听写", is_temporary=False))
+            self.assertFalse(vsr.is_story_or_dictation_mode(conn_d))
+
+        # storyteller reply-length preset disables speculative early-commit automatically
+        conn_st = SimpleNamespace(
+            client_listen_mode="auto",
+            dictation_mode=False,
+            story_mode=False,
+            vad_speculative_disabled=False,
+            config={},
+            dialogue=SimpleNamespace(dialogue=[]),
+        )
+        with patch.object(rs, "get_reply_length", return_value={"preset": "storyteller", "chat_chars": 200, "story_chars": 1000}):
+            self.assertTrue(vsr.is_story_or_dictation_mode(conn_st))
+            # Enter dictation cue while storyteller preset is ON must still be synchronized when storyteller turns OFF
+            conn_st.dialogue.dialogue.append(SimpleNamespace(role="user", content="开始听写模式", is_temporary=False))
+            self.assertTrue(vsr.is_story_or_dictation_mode(conn_st))
+        with patch.object(rs, "get_reply_length", return_value={"preset": "balanced", "chat_chars": 150, "story_chars": 450}):
+            self.assertTrue(vsr.is_story_or_dictation_mode(conn_st))
+            # Clearing or replacing conn.dialogue must cleanly reset persisted dictation state
+            conn_st.dialogue.dialogue.clear()
+            self.assertFalse(vsr.is_story_or_dictation_mode(conn_st))
+            conn_st.dialogue.dialogue.append(SimpleNamespace(role="user", content="开始听写模式", is_temporary=False))
+            self.assertTrue(vsr.is_story_or_dictation_mode(conn_st))
+            conn_st.dialogue = SimpleNamespace(
+                dialogue=[SimpleNamespace(role="user", content="今天天气怎么样", is_temporary=False)]
+            )
+            self.assertFalse(vsr.is_story_or_dictation_mode(conn_st))
 
 
 if __name__ == "__main__":

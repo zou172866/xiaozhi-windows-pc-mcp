@@ -28,7 +28,6 @@ from . import (
     LEGACY_TOKEN_FILE as _LEGACY_TOKEN_FILE,
     LOG_FILE as _DEFAULT_LOG_FILE,
     MODE_FILE as _DEFAULT_MODE_FILE,
-    RUNTIME_SETTINGS_FILE as _DEFAULT_RUNTIME_SETTINGS_FILE,
     TOKEN_FILE as _DEFAULT_TOKEN_FILE,
     _audit_log_lock,
     _get_env_key,
@@ -38,6 +37,12 @@ from .winapi import _get_foreground_window_info, _kernel32, _user32
 
 _ACTIVE_BEARER_TOKEN = ""
 _VALID_MODES = frozenset({"off", "safe", "full"})
+_mode_lock = threading.Lock()
+
+
+class EmergencyStopLockedError(PermissionError):
+    """Raised when an HTTP/remote caller tries to escalate to 'full' while physical emergency stop is active (P0-4)."""
+
 
 # A-3: Global emergency stop state (triggered by Ctrl+Alt+Pause/Break or PyAutoGUI FailSafe)
 # Note: On Windows, holding Ctrl while pressing Pause/Break generates VK_CANCEL (0x03), NOT VK_PAUSE (0x13);
@@ -245,8 +250,18 @@ def _notify_full_mode_escalation(prev_mode: str, source: str) -> None:
         pass
 
 
-def set_host_mode(mode: str, *, source: str = "http_api", reason: str = "") -> dict:
-    """Validate, atomically persist to host-private MODE_FILE, and audit every PC control mode change (A-2)."""
+def set_host_mode(
+    mode: str,
+    *,
+    source: str = "http_api",
+    reason: str = "",
+    allow_clear_emergency_stop: bool = False,
+) -> dict:
+    """Validate, atomically persist to host-private MODE_FILE, and audit every PC control mode change (A-2, P0-4).
+
+    Physical emergency stop (Ctrl+Alt+Pause / PyAutoGUI FailSafe) is NEVER cleared by HTTP API callers;
+    attempting to escalate to 'full' via HTTP while emergency stop is active is rejected fail-closed.
+    """
     if not isinstance(mode, str):
         raise ValueError("mode 必须为字符串 (off / safe / full)")
     m = mode.strip().lower()
@@ -254,43 +269,67 @@ def set_host_mode(mode: str, *, source: str = "http_api", reason: str = "") -> d
         raise ValueError(f"无效的权限挡位: {mode!r}（仅允许 off / safe / full）")
 
     mode_file = Path(facade_attr("MODE_FILE", _DEFAULT_MODE_FILE))
-    prev_mode = _get_mode()
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    payload = {
-        "mode": m,
-        "updated_at": ts,
-        "source": str(source or "http_api"),
-    }
-    l3_mod = facade_attr("l3_backends", l3_backends)
-    l3_mod.atomic_write_json(mode_file, payload)
-
-    if source != "emergency_stop":
-        clear_emergency_stop()
-
     audit_fn = facade_attr("_write_l2_audit_log", _write_l2_audit_log)
-    audit_reason = "mode_escalated_to_full" if m == "full" else (
-        "emergency_stop_downgrade" if source == "emergency_stop" else "mode_changed"
-    )
-    detail_str = f"{prev_mode}->{m} (source={source}" + (f", reason={reason})" if reason else ")")
-    audit_fn(
-        tool="pc_mode",
-        action="set_mode",
-        outcome="allowed",
-        reason=audit_reason,
-        mode=m,
-        detail=detail_str,
-    )
-    logging.getLogger("xiaozhi.pc_mcp").info("[Mode] Host PC control mode changed: %s", detail_str)
-    if m == "full" and prev_mode != "full":
-        _notify_full_mode_escalation(prev_mode, source)
-    return {
-        "ok": True,
-        "mode": m,
-        "previous_mode": prev_mode,
-        "updated_at": ts,
-        "source": "host_state",
-        "emergency_stopped": is_emergency_stop_active(),
-    }
+    src = str(source or "http_api")
+    can_clear_estop = bool(allow_clear_emergency_stop) and src not in ("emergency_stop", "http_api")
+
+    with _mode_lock:
+        prev_mode = _get_mode()
+        if is_emergency_stop_active() and src != "emergency_stop" and not can_clear_estop:
+            if m == "full":
+                detail_blk = f"{prev_mode}->{m} blocked while emergency_stop active (source={src})"
+                audit_fn(
+                    tool="pc_mode",
+                    action="set_mode",
+                    outcome="blocked",
+                    reason="emergency_stop_locked",
+                    mode=prev_mode,
+                    detail=detail_blk,
+                )
+                logging.getLogger("xiaozhi.pc_mcp").warning(
+                    "[Mode] Rejected full-mode escalation while physical emergency stop is active: %s",
+                    detail_blk,
+                )
+                raise EmergencyStopLockedError(
+                    "宿主机当前处于物理急停锁定状态（Ctrl+Alt+Pause），禁止通过 POST /mode 自动解除急停或切至全权操控挡；"
+                    "请在宿主机侧显式复位急停后再切换。"
+                )
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload = {
+            "mode": m,
+            "updated_at": ts,
+            "source": src,
+        }
+        l3_mod = facade_attr("l3_backends", l3_backends)
+        l3_mod.atomic_write_json(mode_file, payload)
+
+        if can_clear_estop:
+            clear_emergency_stop()
+
+        audit_reason = "mode_escalated_to_full" if m == "full" else (
+            "emergency_stop_downgrade" if src == "emergency_stop" else "mode_changed"
+        )
+        detail_str = f"{prev_mode}->{m} (source={src}" + (f", reason={reason})" if reason else ")")
+        audit_fn(
+            tool="pc_mode",
+            action="set_mode",
+            outcome="allowed",
+            reason=audit_reason,
+            mode=m,
+            detail=detail_str,
+        )
+        logging.getLogger("xiaozhi.pc_mcp").info("[Mode] Host PC control mode changed: %s", detail_str)
+        if m == "full" and prev_mode != "full":
+            _notify_full_mode_escalation(prev_mode, src)
+        return {
+            "ok": True,
+            "mode": m,
+            "previous_mode": prev_mode,
+            "updated_at": ts,
+            "source": "host_state",
+            "emergency_stopped": is_emergency_stop_active(),
+        }
 
 
 def is_emergency_stop_active() -> bool:
@@ -425,8 +464,12 @@ def _check_permission(required_level: str) -> Optional[str]:
         return "电脑操控当前处于【关闭】挡位，请先在 18080 网页控制台开启电脑操控开关。"
     if required_level == "L1":
         return None
+    if required_level == "L2" and is_emergency_stop_active():
+        return "安全急停已触发（Ctrl+Alt+Pause），已锁定 L2 界面操控，请在宿主机侧显式复位急停后再试。"
     if required_level == "L2" and mode != "full":
         return "当前处于【日常/游戏安全挡】，已物理锁定模拟鼠标点击与键盘输入以防切屏误触。如需点按窗口按钮或打字，请在 18080 网页控制台切至【全权操控挡】(full)。"
+    if required_level == "L3" and is_emergency_stop_active():
+        return "安全急停已触发（Ctrl+Alt+Pause），已锁定 L3 本地后台 Agent，请在宿主机侧显式复位急停后再试。"
     if required_level == "L3" and mode != "full":
         return "当前处于【日常/游戏安全挡】，L3 本地后台 Agent 仅允许在【全权操控挡】(full) 下运行。如需派发或查询后台任务，请先在 18080 网页控制台切至【全权操控挡】(full)。"
     if mode != "full":
@@ -500,6 +543,7 @@ _CREATE_TASK_DIALOG_TITLES = frozenset({
 _EXPLORER_ADDRESS_BAR_IDS = frozenset({
     "41477",
     "1001",
+    "1148",
     "addressbandroot",
     "searcheditbox",
     "textbox",
@@ -531,7 +575,36 @@ _EXPLORER_ADDRESS_BAR_NAME_TOKENS = (
 
 _EXPLORER_XAML_BRIDGE_CLASSES = frozenset({
     "microsoft.ui.content.desktopchildsitebridge",
+    "microsoft.ui.content.contentwindowsitebridge",
     "windows.ui.composition.desktopwindowcontentbridge",
+    "windows.ui.input.inputsite.windowclass",
+    "inputsitewindowclass",
+})
+
+_EXPLORER_ADDR_SEARCH_ANCESTOR_TOKENS = (
+    "address",
+    "地址",
+    "breadcrumb",
+    "autosuggest",
+    "search",
+    "搜索",
+)
+
+_EXPLORER_TOOLBAR_ADDR_ANCESTOR_TOKENS = _EXPLORER_ADDR_SEARCH_ANCESTOR_TOKENS + (
+    "rebarwindow32",
+    "travelband",
+)
+
+_SAFE_EXPLORER_FILE_LIST_TYPES = frozenset({
+    "listitemcontrol",
+    "listcontrol",
+    "datagriditemcontrol",
+    "datagridcontrol",
+})
+
+_ADDRESS_BAR_GUARDED_WINDOW_CLASSES = frozenset({
+    "cabinetwclass",
+    "#32770",
 })
 
 _EXPLORER_ADDRESS_BAR_HOTKEYS = frozenset({
@@ -539,15 +612,20 @@ _EXPLORER_ADDRESS_BAR_HOTKEYS = frozenset({
     frozenset({"ctrl", "l"}),
     frozenset({"f3"}),
     frozenset({"f4"}),
+    frozenset({"f6"}),
     frozenset({"ctrl", "e"}),
     frozenset({"ctrl", "f"}),
 })
 
+_DIALOG_ADDRESS_BAR_HOTKEYS = _EXPLORER_ADDRESS_BAR_HOTKEYS | frozenset({
+    frozenset({"alt", "n"}),
+})
+
 
 def _is_explorer_address_or_search_bar(info: dict) -> bool:
-    """Detect focused or clicked Explorer (CabinetWClass) address bar / search Edit controls (A-3)."""
+    """Detect focused or clicked Explorer (CabinetWClass) or Common File Dialog (#32770) address/search/edit bars (A-3, P0-2, P1-2)."""
     cls = str(info.get("class") or "").strip().lower()
-    if cls != "cabinetwclass":
+    if cls not in _ADDRESS_BAR_GUARDED_WINDOW_CLASSES:
         return False
     for key in ("focused_control", "point_control"):
         ctrl = info.get(key)
@@ -559,13 +637,40 @@ def _is_explorer_address_or_search_bar(info: dict) -> bool:
         cname = str(ctrl.get("name") or "").strip().lower()
         caid = str(ctrl.get("automation_id") or "").strip().lower()
         canc = str(ctrl.get("ancestor_names") or "").strip().lower()
+        canc_types = str(ctrl.get("ancestor_types") or "").strip().lower()
 
-        is_rename = ("重命名" in cname or "rename" in cname) and caid not in _EXPLORER_ADDRESS_BAR_IDS
+        anc_type_tokens = {t.strip().lower() for t in canc_types.split("|") if t.strip()}
+        has_list_item_ancestor = "listitemcontrol" in anc_type_tokens
+        has_addr_search_ancestor = any(tok in canc for tok in _EXPLORER_ADDR_SEARCH_ANCESTOR_TOKENS)
+        # P1-2: Strict inline file rename exemption: ONLY inside CabinetWClass file list items
+        # verified via UIA ancestor_types (never untrusted ancestor_names folder titles, #32770, or XAML bridges).
+        is_rename = (
+            cls == "cabinetwclass"
+            and has_list_item_ancestor
+            and ("重命名" in cname or "rename" in cname)
+            and caid not in _EXPLORER_ADDRESS_BAR_IDS
+            and ccls not in _EXPLORER_XAML_BRIDGE_CLASSES
+            and ucls not in _EXPLORER_XAML_BRIDGE_CLASSES
+            and not any(tok in cname for tok in _EXPLORER_ADDRESS_BAR_NAME_TOKENS)
+            and not has_addr_search_ancestor
+        )
         if is_rename:
             continue
 
-        # Fail-closed when Win10/11 Explorer XAML chrome bridge cannot be inspected via UIA
-        if ctrl.get("uia_error") and ccls in _EXPLORER_XAML_BRIDGE_CLASSES:
+        # P1-2 & P0-2: Fail-closed for Win10/11 XAML Islands bridge controls unless positively confirmed as a
+        # CabinetWClass file-list item (never #32770, never AutoSuggestBox/address/search/breadcrumb dropdowns).
+        if ccls in _EXPLORER_XAML_BRIDGE_CLASSES or ucls in _EXPLORER_XAML_BRIDGE_CLASSES:
+            confirmed_file_list = (
+                cls == "cabinetwclass"
+                and not ctrl.get("uia_error")
+                and not has_addr_search_ancestor
+                and not any(tok in cname for tok in _EXPLORER_ADDRESS_BAR_NAME_TOKENS)
+                and ucls not in _EXPLORER_XAML_BRIDGE_CLASSES
+                and (ctype in _SAFE_EXPLORER_FILE_LIST_TYPES or has_list_item_ancestor)
+            )
+            if not confirmed_file_list:
+                return True
+        elif ctrl.get("uia_error") and cls in _ADDRESS_BAR_GUARDED_WINDOW_CLASSES:
             return True
 
         if caid in _EXPLORER_ADDRESS_BAR_IDS:
@@ -577,7 +682,9 @@ def _is_explorer_address_or_search_bar(info: dict) -> bool:
                 continue
             if cand_cls in _EXPLORER_ADDRESS_BAR_CLASSES:
                 if cand_cls in ("toolbarwindow32", "msctls_progress32"):
-                    if any(tok in cname or tok in canc for tok in _EXPLORER_ADDRESS_BAR_NAME_TOKENS):
+                    if any(tok in cname or tok in canc for tok in _EXPLORER_ADDRESS_BAR_NAME_TOKENS) or any(
+                        tok in canc for tok in _EXPLORER_TOOLBAR_ADDR_ANCESTOR_TOKENS
+                    ):
                         return True
                 else:
                     return True
@@ -592,7 +699,7 @@ def _is_explorer_address_or_search_bar(info: dict) -> bool:
 
 def _check_foreground_input_guard(fg_info: Optional[dict] = None) -> Optional[str]:
     """Refuse L2 keyboard/text/hotkey input when foreground window is a terminal, Start/Search,
-    Windows Run dialog, Task Manager 'Run new task', or Explorer address bar (A-3)."""
+    Windows Run dialog, Task Manager 'Run new task', or Explorer/#32770 address bar (A-3, P0-2)."""
     info = fg_info if fg_info is not None else _get_foreground_window_info()
     proc_raw = str(info.get("process") or "").strip().lower()
     proc = os.path.basename(proc_raw) if proc_raw else ""
@@ -614,20 +721,21 @@ def _check_foreground_input_guard(fg_info: Optional[dict] = None) -> Optional[st
     ):
         return f"安全护栏已拦截：当前前台窗口为任务管理器「{title or '创建新任务'}」对话框，已拒绝 L2 输入。"
     if _is_explorer_address_or_search_bar(info):
-        return "安全护栏已拦截：检测到焦点位于资源管理器（CabinetWClass）地址栏或搜索框，已拒绝 L2 输入以防命令执行绕过。"
+        return f"安全护栏已拦截：检测到焦点位于资源管理器/文件对话框（{cls_raw or 'CabinetWClass'}）地址栏、搜索框或输入控件，已拒绝 L2 输入以防命令执行绕过。"
     return None
 
 
 def _check_foreground_hotkey_guard(canon_keys: list[str], fg_info: Optional[dict] = None) -> Optional[str]:
-    """Block hotkeys that focus Explorer's address/search bar while CabinetWClass is in foreground (A-3)."""
+    """Block hotkeys that focus address/search bars while CabinetWClass or #32770 dialog is in foreground (A-3, P0-2)."""
     info = fg_info if fg_info is not None else _get_foreground_window_info()
     cls = str(info.get("class") or "").strip().lower()
-    if cls == "cabinetwclass":
+    if cls in _ADDRESS_BAR_GUARDED_WINDOW_CLASSES:
+        combos = _DIALOG_ADDRESS_BAR_HOTKEYS if cls == "#32770" else _EXPLORER_ADDRESS_BAR_HOTKEYS
         key_set = frozenset(canon_keys)
-        for combo in _EXPLORER_ADDRESS_BAR_HOTKEYS:
+        for combo in combos:
             if combo.issubset(key_set):
                 label = "+".join(sorted(combo))
-                return f"安全护栏已拦截：资源管理器窗口下禁止发送地址栏/搜索聚焦快捷键（{label}）。"
+                return f"安全护栏已拦截：资源管理器/文件对话框窗口下禁止发送地址栏/搜索聚焦快捷键（{label}）。"
     return None
 
 

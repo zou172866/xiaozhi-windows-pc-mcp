@@ -772,8 +772,13 @@ class TestL2GuardrailsAndL3Gate(unittest.TestCase):
             self.assertIn("急停", blocked_res)
             m_clk.assert_not_called()
 
-        # 2. Switching mode via set_host_mode clears emergency stop cleanly
-        pcm.set_host_mode("full", source="http_api")
+        # 2. P0-4: HTTP API set_host_mode MUST NOT clear physical emergency stop or escalate to full!
+        with self.assertRaises(pcm.EmergencyStopLockedError):
+            pcm.set_host_mode("full", source="http_api")
+        self.assertTrue(pcm.is_emergency_stop_active())
+
+        # Host-side explicit reset clears emergency stop cleanly and allows full mode again
+        pcm.set_host_mode("full", source="host_admin", allow_clear_emergency_stop=True)
         self.assertFalse(pcm.is_emergency_stop_active())
 
         # 3. PyAutoGUI FailSafeException during action triggers emergency stop & downgrades to safe
@@ -1005,6 +1010,360 @@ class TestL2GuardrailsAndL3Gate(unittest.TestCase):
             self.assertIn("急停", res_es)
             m_copy2.assert_not_called()
             m_clear2.assert_not_called()
+
+    def test_p0_4_http_mode_cannot_clear_physical_emergency_stop_and_blocks_l3_and_inspect(self):
+        """P0-4: POST /mode cannot clear physical emergency stop (423 on full, keeps lock on off/safe); L3 & inspect also blocked."""
+        tok = "test-p04-estop-token-abcdefghijklmnopqrstuvwxyz"
+        app = pcm.create_secured_asgi_app(tok, port=18900, bind_host="127.0.0.1")
+        headers = {
+            "Host": "127.0.0.1:18900",
+            "Authorization": f"Bearer {tok}",
+        }
+        self._set_mode("full")
+        pcm.trigger_emergency_stop("hotkey:ctrl+alt+pause")
+        self.assertTrue(pcm.is_emergency_stop_active())
+        self.assertEqual(pcm._get_mode(), "safe")
+
+        async def _exercise():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:18900") as client:
+                # 1. Container/HTTP POST /mode {"mode": "full"} MUST fail closed with 423 Locked
+                r_esc = await client.post("/mode", headers=headers, json={"mode": "full"})
+                self.assertEqual(r_esc.status_code, 423, r_esc.text)
+                self.assertFalse(r_esc.json().get("ok"))
+                self.assertTrue(r_esc.json().get("emergency_stopped"))
+                self.assertEqual(pcm._get_mode(), "safe")
+                self.assertTrue(pcm.is_emergency_stop_active())
+
+                # 2. Downgrading to off/safe via HTTP succeeds WITHOUT clearing physical emergency_stop!
+                r_off = await client.post("/mode", headers=headers, json={"mode": "off"})
+                self.assertEqual(r_off.status_code, 200, r_off.text)
+                self.assertEqual(r_off.json().get("mode"), "off")
+                self.assertTrue(r_off.json().get("emergency_stopped"))
+                self.assertTrue(pcm.is_emergency_stop_active())
+
+                # 3. GET /mode still reports emergency_stopped=True
+                r_get = await client.get("/mode", headers=headers)
+                self.assertEqual(r_get.status_code, 200)
+                self.assertTrue(r_get.json().get("emergency_stopped"))
+
+                # 4. Even if MODE_FILE is forced to 'full', L2, L3, /l3/status, and pc_inspect_window_ui remain blocked!
+                self._set_mode("full")
+                l2_err = pcm._check_permission("L2")
+                self.assertIsNotNone(l2_err)
+                self.assertIn("急停", l2_err)
+                l3_err = pcm._check_permission("L3")
+                self.assertIsNotNone(l3_err)
+                self.assertIn("急停", l3_err)
+                insp_res = pcm.pc_inspect_window_ui("")
+                self.assertIn("急停", insp_res)
+                r_l3st = await client.get("/l3/status", headers=headers)
+                self.assertEqual(r_l3st.status_code, 200)
+                self.assertTrue(r_l3st.json().get("emergency_stopped"))
+                self.assertFalse(r_l3st.json().get("l3_mode_allowed"))
+
+                # 5. Host-side explicit reset unlocks emergency stop, after which HTTP POST /mode full works
+                pcm.set_host_mode("safe", source="host_admin", allow_clear_emergency_stop=True)
+                self.assertFalse(pcm.is_emergency_stop_active())
+                r_full_ok = await client.post("/mode", headers=headers, json={"mode": "full"})
+                self.assertEqual(r_full_ok.status_code, 200, r_full_ok.text)
+                self.assertEqual(r_full_ok.json().get("mode"), "full")
+                self.assertFalse(r_full_ok.json().get("emergency_stopped"))
+
+        asyncio.run(_exercise())
+
+        recs = self._read_audit_records()
+        locked_audits = [r for r in recs if r["tool"] == "pc_mode" and r["reason"] == "emergency_stop_locked"]
+        self.assertGreaterEqual(len(locked_audits), 1)
+
+    def test_p0_2_and_p1_2_dialog_32770_xaml_bridge_and_rename_hardening(self):
+        """P0-2 & P1-2: Guard #32770 common file dialog address/edit/hotkeys, Win11 XAML bridge fail-closed, deep ancestors, and strict rename."""
+        import pc_mcp_modules.winapi as winapi_mod
+
+        self._set_mode("full")
+
+        # 1. P0-2: #32770 Open/Save dialog address bar, Breadcrumb Parent, filename Edit (1148), SearchEditBox blocked
+        dialog_bypass_cases = [
+            {
+                "hwnd": 501,
+                "pid": 901,
+                "process": "notepad.exe",
+                "class": "#32770",
+                "title": "打开",
+                "focused_control": {
+                    "class": "Breadcrumb Parent",
+                    "name": "地址: C:\\Users",
+                    "control_type": "ToolBarControl",
+                },
+            },
+            {
+                "hwnd": 502,
+                "pid": 901,
+                "process": "notepad.exe",
+                "class": "#32770",
+                "title": "Open",
+                "focused_control": {
+                    "class": "Edit",
+                    "automation_id": "1148",
+                    "control_type": "EditControl",
+                    "name": "文件名(N):",
+                },
+            },
+            {
+                "hwnd": 503,
+                "pid": 901,
+                "process": "notepad.exe",
+                "class": "#32770",
+                "title": "另存为",
+                "focused_control": {
+                    "class": "ComboBoxEx32",
+                    "control_type": "ComboBoxControl",
+                    "name": "文件名",
+                },
+            },
+            {
+                "hwnd": 504,
+                "pid": 901,
+                "process": "notepad.exe",
+                "class": "#32770",
+                "title": "打开",
+                "focused_control": {
+                    "class": "Microsoft.UI.Content.DesktopChildSiteBridge",
+                    "uia_error": True,
+                },
+            },
+        ]
+        for fg in dialog_bypass_cases:
+            err = pcm._check_foreground_input_guard(fg)
+            self.assertIsNotNone(err, f"Expected #32770 dialog control to be blocked: {fg}")
+            self.assertIn("安全护栏已拦截", err)
+
+        # 2. P0-2: #32770 hotkeys (alt+d, ctrl+l, f4, f6, alt+n) and CabinetWClass f6 blocked
+        dlg_fg = {"hwnd": 501, "pid": 901, "process": "notepad.exe", "class": "#32770", "title": "打开"}
+        for combo in ("alt+d", "ctrl+l", "f4", "f6", "alt+n"):
+            with (
+                patch.object(pcm, "_get_foreground_window_info", return_value=dlg_fg),
+                patch.object(pcm.pyautogui, "hotkey") as m_hk,
+            ):
+                res = pcm.pc_ui_action(action="hotkey", hotkey=combo)
+                self.assertIn("安全护栏已拦截", res, f"Expected #32770 hotkey {combo} blocked, got: {res}")
+                m_hk.assert_not_called()
+
+        exp_fg = {"hwnd": 505, "pid": 902, "process": "explorer.exe", "class": "CabinetWClass", "title": "此电脑"}
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=exp_fg),
+            patch.object(pcm.pyautogui, "hotkey") as m_hk,
+        ):
+            res_f6 = pcm.pc_ui_action(action="hotkey", hotkey="f6")
+            self.assertIn("安全护栏已拦截", res_f6)
+            m_hk.assert_not_called()
+
+        # 3. P1-2: Win11 XAML bridge returning outer DesktopChildSiteBridge (uia_error NOT set!) MUST still fail closed!
+        xaml_outer_bridge = {
+            "hwnd": 506,
+            "pid": 902,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "文件资源管理器",
+            "point_control": {
+                "hwnd": 507,
+                "class": "Microsoft.UI.Content.DesktopChildSiteBridge",
+                "uia_class": "Microsoft.UI.Content.DesktopChildSiteBridge",
+                "control_type": "PaneControl",
+                "name": "DesktopWindowXamlSource",
+            },
+        }
+        self.assertTrue(pcm._is_explorer_address_or_search_bar(xaml_outer_bridge))
+        self.assertTrue(
+            winapi_mod._is_unresolved_xaml_bridge(
+                {"class": "Microsoft.UI.Content.DesktopChildSiteBridge"},
+                {"class": "Microsoft.UI.Content.DesktopChildSiteBridge", "control_type": "PaneControl"},
+                True,
+            )
+        )
+
+        # 4. P1-2: Folder named "rename" / "重命名" in address bar MUST NOT bypass guard; genuine ListItemControl rename IS allowed
+        fake_rename_bypass = {
+            "hwnd": 508,
+            "pid": 902,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "rename",
+            "focused_control": {
+                "control_type": "EditControl",
+                "class": "Edit",
+                "name": "地址: C:\\Users\\rename",
+                "automation_id": "",
+                "ancestor_names": "Address Band Root | Breadcrumb Parent",
+                "ancestor_types": "PaneControl | ToolBarControl",
+            },
+        }
+        self.assertTrue(
+            pcm._is_explorer_address_or_search_bar(fake_rename_bypass),
+            "Folder named 'rename' in address bar must NOT bypass guard!",
+        )
+        fake_rename_no_listitem = {
+            "hwnd": 509,
+            "pid": 902,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "重命名",
+            "focused_control": {
+                "control_type": "EditControl",
+                "class": "RichEditD2DPT",
+                "name": "重命名",
+                "automation_id": "",
+                "ancestor_names": "NavigationBar",
+                "ancestor_types": "PaneControl | GroupControl",
+            },
+        }
+        self.assertTrue(
+            pcm._is_explorer_address_or_search_bar(fake_rename_no_listitem),
+            "Edit without ListItemControl ancestor must NOT get rename exemption!",
+        )
+        legit_file_rename = {
+            "hwnd": 510,
+            "pid": 902,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "文档",
+            "focused_control": {
+                "control_type": "EditControl",
+                "class": "DirectUIHWND",
+                "name": "重命名",
+                "automation_id": "System.ItemNameDisplay",
+                "ancestor_names": "report.txt | 项目视图",
+                "ancestor_types": "ListItemControl | ListControl",
+            },
+        }
+        self.assertFalse(
+            pcm._is_explorer_address_or_search_bar(legit_file_rename),
+            "Genuine Explorer ListItemControl inline file rename should remain allowed",
+        )
+
+        # 5. P1-2: _extract_uia_control_fields walks >= 8 parent levels and populates ancestor_types
+        class _MockNode:
+            def __init__(self, idx: int, parent=None):
+                self.ControlTypeName = "ListItemControl" if idx == 8 else "PaneControl"
+                self.Name = f"Node{idx}"
+                self.AutomationId = f"aid{idx}"
+                self.ClassName = f"Cls{idx}"
+                self._parent = parent
+
+            def GetParentControl(self):
+                return self._parent
+
+        chain = None
+        for idx in range(9, -1, -1):
+            chain = _MockNode(idx, parent=chain)
+        fields = winapi_mod._extract_uia_control_fields(chain)
+        self.assertIn("Node8", fields.get("ancestor_names", ""))
+        self.assertIn("ListItemControl", fields.get("ancestor_types", ""))
+
+        # 6. Red-team hardening regressions:
+        # 6a. User-controlled folder literally named "ListItemControl" in ancestor_names MUST NOT spoof has_list_item_ancestor
+        spoofed_folder_rename = {
+            "hwnd": 511,
+            "pid": 902,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "rename",
+            "focused_control": {
+                "control_type": "EditControl",
+                "class": "Edit",
+                "name": "rename",
+                "automation_id": "",
+                "ancestor_names": "C:\\Temp\\ListItemControl",
+                "ancestor_types": "PaneControl | ToolBarControl",
+            },
+        }
+        self.assertTrue(
+            pcm._is_explorer_address_or_search_bar(spoofed_folder_rename),
+            "Folder named 'ListItemControl' in ancestor_names must NOT spoof rename exemption!",
+        )
+
+        # 6b. Win11 XAML AutoSuggestBox ListItemControl dropdown inside DesktopChildSiteBridge MUST be blocked
+        xaml_autosuggest_item = {
+            "hwnd": 512,
+            "pid": 902,
+            "process": "explorer.exe",
+            "class": "CabinetWClass",
+            "title": "文件资源管理器",
+            "focused_control": {
+                "class": "Microsoft.UI.Content.DesktopChildSiteBridge",
+                "uia_class": "ListViewItem",
+                "control_type": "ListItemControl",
+                "name": "cmd.exe",
+                "ancestor_names": "AutoSuggestBox | Address Band Root",
+                "ancestor_types": "ListControl",
+            },
+        }
+        self.assertTrue(
+            pcm._is_explorer_address_or_search_bar(xaml_autosuggest_item),
+            "XAML AutoSuggestBox ListItemControl dropdown must be blocked!",
+        )
+
+        # 6c. Win11 22H2/23H2/24H2 XAML InputSite HWND MUST fail closed when UIA is unresolved
+        self.assertTrue(
+            winapi_mod._is_unresolved_xaml_bridge(
+                {"class": "Windows.UI.Input.InputSite.WindowClass"}, {}, False
+            )
+        )
+        self.assertTrue(
+            pcm._is_explorer_address_or_search_bar(
+                {
+                    "hwnd": 513,
+                    "pid": 902,
+                    "process": "explorer.exe",
+                    "class": "CabinetWClass",
+                    "title": "此电脑",
+                    "focused_control": {
+                        "class": "Windows.UI.Input.InputSite.WindowClass",
+                        "uia_error": True,
+                    },
+                }
+            )
+        )
+
+        # 6d. #32770 Breadcrumb ToolbarWindow32 click with neutral name ("Desktop") MUST be blocked
+        self.assertTrue(
+            pcm._is_explorer_address_or_search_bar(
+                {
+                    "hwnd": 514,
+                    "pid": 901,
+                    "process": "notepad.exe",
+                    "class": "#32770",
+                    "title": "打开",
+                    "point_control": {
+                        "class": "ToolbarWindow32",
+                        "name": "Desktop",
+                        "ancestor_names": "Breadcrumb Parent | ReBarWindow32",
+                    },
+                }
+            )
+        )
+
+        # 6e. #32770 sets uia_error=True fail-closed even for classic Win32 child controls when UIA raises,
+        #     and CabinetWClass also sets uia_error=True fail-closed when both focus HWND & UIA are unavailable.
+        import sys as _sys
+        broken_uia = type("_BrokenUia", (), {"GetFocusedControl": staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("uia fail")))})()
+        with patch.dict(_sys.modules, {"uiautomation": broken_uia}):
+            fc_32770 = winapi_mod._get_focused_control_info(0, parent_class="#32770")
+            fc_cab_uninspectable = winapi_mod._get_focused_control_info(0, parent_class="CabinetWClass")
+        self.assertTrue(fc_32770.get("uia_error"))
+        self.assertTrue(fc_cab_uninspectable.get("uia_error"))
+        self.assertTrue(
+            pcm._is_explorer_address_or_search_bar(
+                {
+                    "hwnd": 515,
+                    "pid": 902,
+                    "process": "explorer.exe",
+                    "class": "CabinetWClass",
+                    "title": "此电脑",
+                    "focused_control": fc_cab_uninspectable,
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -15,8 +15,6 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-import psutil
-
 MCP_DIR = Path(__file__).resolve().parent.parent
 if str(MCP_DIR) not in sys.path:
     sys.path.insert(0, str(MCP_DIR))
@@ -197,6 +195,11 @@ def sanitize_arg_for_windows_batch(arg: str) -> str:
 def prepare_subprocess_command(cmd: List[str]) -> List[str]:
     """Unwrap .cmd/.bat shims to direct .exe where possible; otherwise sanitize args against cmd.exe truncation."""
     return _pc_common.prepare_subprocess_command(cmd)
+
+
+def guard_leading_dash_prompt(prompt: str, prefix_tag: str = "[指令]") -> str:
+    """Prevent a leading '-' prompt from being parsed as a CLI option flag across all L3 backends (E-4, P1-3)."""
+    return _pc_common.guard_leading_dash_prompt(prompt, prefix_tag=prefix_tag)
 
 
 def _safe_int(val: Any, default: Optional[int] = None) -> Optional[int]:

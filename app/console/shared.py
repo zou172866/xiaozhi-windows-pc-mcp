@@ -180,6 +180,18 @@ def _atomic_write_text(path: str, content: str) -> None:
     xz_common.atomic_write_text(path, content)
 
 
+def get_allowed_console_origins(port: int | None = None) -> frozenset[str]:
+    """Return exact allowed http-only loopback origins for the console port (A-4, P1-1)."""
+    p = CONSOLE_PORT if port is None else int(port)
+    return frozenset(
+        {
+            f"http://localhost:{p}",
+            f"http://127.0.0.1:{p}",
+            f"http://[::1]:{p}",
+        }
+    )
+
+
 def validate_console_request(
     method: str,
     headers: dict,
@@ -203,11 +215,7 @@ def validate_console_request(
         f"xiaozhi-esp32-server:{port}",
         "xiaozhi-esp32-server",
     }
-    allowed_origins = {
-        f"http://localhost:{port}",
-        f"http://127.0.0.1:{port}",
-        f"http://[::1]:{port}",
-    }
+    allowed_origins = get_allowed_console_origins(port)
 
     host = norm_headers.get("host", "").lower()
     is_internal = host in internal_hosts

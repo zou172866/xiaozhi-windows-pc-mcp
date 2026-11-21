@@ -3,39 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
-from collections import deque
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
-import json
 import math
 import os
-import re
-import secrets
-import socket
 import struct
 import threading
 import time
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import quote
 import wave
 
-import httpx
 import yaml
 try:
     import edge_tts
 except ImportError:
     edge_tts = None
 
-import asr_corrections
 import mei_emotion_router
-import patch_registry
 import pc_audio_router
-import reply_length_router
-import runtime_events
-import runtime_settings
-import turn_context_router
-import xz_common
 from console import shared
 
 GSV_PROFILES = {
@@ -368,6 +353,10 @@ def handle_post_tts_preview(handler) -> None:
             rollback_warning = ""
             total_cap = max(0.01, float(_GSV_PREVIEW_LOCK_MAX_SECONDS))
             lock_deadline = time.monotonic() + total_cap
+            # P1-5: Re-read active configured GSV voice AFTER acquiring _gsv_weights_lock
+            # to close the TOCTOU window against concurrent POST /api/config voice switches.
+            configured_gsv = _get_configured_gsv_voice()
+            needs_weight_swap = bool(configured_gsv and configured_gsv != voice)
             rollback_reserve = min(12.0, total_cap * 0.30) if needs_weight_swap else 0.0
             _gsv_op_deadline_tls.deadline = lock_deadline - rollback_reserve
             try:
@@ -427,30 +416,37 @@ def handle_post_tts_preview(handler) -> None:
                     wav_bytes = r.content
                 finally:
                     global _active_gsv_loaded
+                    # P1-5: Re-read latest configured GSV voice right before rollback while still
+                    # holding _gsv_weights_lock so concurrent config switches are never reverted to old weights.
+                    restore_target = _get_configured_gsv_voice()
                     should_restore = bool(
-                        configured_gsv
-                        and (configured_gsv != voice or _active_gsv_loaded == "__dirty__")
+                        restore_target
+                        and (restore_target != voice or _active_gsv_loaded == "__dirty__")
                     )
                     if should_restore:
                         _gsv_op_deadline_tls.deadline = lock_deadline
                         try:
                             if time.monotonic() >= lock_deadline:
                                 raise TimeoutError("GPU 锁持有时间已达上限，跳过同步回滚，由后台自动恢复")
-                            _ensure_gsv_weights(configured_gsv, persist_boot_yaml=False)
+                            _ensure_gsv_weights(restore_target, persist_boot_yaml=False)
                             cur_dirty, _ = _get_voice_dirty_state()
-                            if cur_dirty == configured_gsv:
+                            if cur_dirty == restore_target:
                                 _set_voice_dirty(None, "")
                         except Exception as rb_exc:
                             _active_gsv_loaded = "__dirty__"
-                            _set_voice_dirty(configured_gsv, str(rb_exc))
+                            _set_voice_dirty(restore_target, str(rb_exc))
                             redacted_rb = shared._redact_secrets(str(rb_exc))
                             rollback_warning = (
-                                f"试听后恢复线上音色权重 ({configured_gsv}) 失败，后台将自动重试：{redacted_rb}"
+                                f"试听后恢复线上音色权重 ({restore_target}) 失败，后台将自动重试：{redacted_rb}"
                             )
                             warn_log = f"[WebConsole] WARNING: {rollback_warning}"
                             print(warn_log, flush=True)
                             with shared._state_lock:
                                 shared._append_raw_log_locked(warn_log)
+                    elif restore_target == voice and _active_gsv_loaded == voice:
+                        cur_dirty, _ = _get_voice_dirty_state()
+                        if cur_dirty == restore_target:
+                            _set_voice_dirty(None, "")
             finally:
                 _gsv_op_deadline_tls.deadline = None
                 _gsv_weights_lock.release()

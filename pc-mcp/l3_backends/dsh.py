@@ -6,12 +6,13 @@ import os
 import shutil
 import subprocess
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from . import (
     L3Backend,
     claim_workspace_or_enqueue,
     get_process_create_time,
+    guard_leading_dash_prompt,
     is_task_cancelled,
     load_last_active_task,
     read_env_key,
@@ -69,7 +70,8 @@ class DshBackend(L3Backend):
         return {"ready": True, "detail": f"已就绪：{source}（国内直连）"}
 
     def _build_command(self, prefix: List[str], prompt: str) -> List[str]:
-        return [*prefix, "--profile", "headless", prompt]
+        safe_prompt = guard_leading_dash_prompt(prompt, prefix_tag="[指令]")
+        return [*prefix, "--profile", "headless", safe_prompt]
 
     def dispatch(
         self, task_id: str, instruction: str, follow_up_last: bool, cfg: Dict[str, Any]

@@ -407,12 +407,28 @@ def _get_window_class_name(hwnd: int) -> str:
 
 _XAML_BRIDGE_CLASSES = frozenset({
     "microsoft.ui.content.desktopchildsitebridge",
+    "microsoft.ui.content.contentwindowsitebridge",
     "windows.ui.composition.desktopwindowcontentbridge",
+    "windows.ui.input.inputsite.windowclass",
+    "inputsitewindowclass",
+})
+
+_INSPECT_CHILD_WINDOW_CLASSES = frozenset({
+    "cabinetwclass",
+    "#32770",
+})
+
+_UIA_GENERIC_CONTAINER_TYPES = frozenset({
+    "",
+    "panecontrol",
+    "windowcontrol",
+    "customcontrol",
+    "groupcontrol",
 })
 
 
 def _extract_uia_control_fields(ctrl) -> dict:
-    """Extract control_type, name, automation_id, class, and ancestor_names from a UIA control."""
+    """Extract control_type, name, automation_id, class, ancestor_names, and ancestor_types from a UIA control."""
     fields: dict = {}
     if ctrl is None:
         return fields
@@ -429,27 +445,49 @@ def _extract_uia_control_fields(ctrl) -> dict:
     if ccls:
         fields["class"] = ccls
     anc_parts = []
+    anc_types = []
     parent = ctrl
-    for _ in range(4):
+    for _ in range(10):
         try:
             parent = parent.GetParentControl()
         except Exception:
             break
         if parent is None:
             break
+        p_type = str(getattr(parent, "ControlTypeName", "") or "").strip()
         p_name = str(getattr(parent, "Name", "") or "").strip()
         p_cls = str(getattr(parent, "ClassName", "") or "").strip()
         p_aid = str(getattr(parent, "AutomationId", "") or "").strip()
+        if p_type:
+            anc_types.append(p_type)
         for part in (p_name, p_cls, p_aid):
             if part:
                 anc_parts.append(part)
     if anc_parts:
         fields["ancestor_names"] = " | ".join(anc_parts)
+    if anc_types:
+        fields["ancestor_types"] = " | ".join(anc_types)
     return fields
 
 
-def _get_focused_control_info(fg_hwnd: int = 0) -> dict:
-    """Inspect focused child control via Win32 GetGUIThreadInfo and UIA (used for CabinetWClass address bar guard)."""
+def _is_unresolved_xaml_bridge(ctrl_info: dict, uia_fields: dict, uia_ok: bool) -> bool:
+    """Return True when a XAML Islands bridge HWND was not resolved to a concrete inner UIA control (P1-2)."""
+    base_cls = str(ctrl_info.get("class") or "").strip().lower()
+    if base_cls not in _XAML_BRIDGE_CLASSES:
+        return False
+    if not uia_ok or not uia_fields:
+        return True
+    ucls = str(uia_fields.get("class") or "").strip().lower()
+    utype = str(uia_fields.get("control_type") or "").strip().lower()
+    if ucls in _XAML_BRIDGE_CLASSES:
+        return True
+    if utype in _UIA_GENERIC_CONTAINER_TYPES and not uia_fields.get("automation_id") and not uia_fields.get("name"):
+        return True
+    return False
+
+
+def _get_focused_control_info(fg_hwnd: int = 0, *, parent_class: str = "") -> dict:
+    """Inspect focused child control via Win32 GetGUIThreadInfo and UIA (used for CabinetWClass/#32770 address bar guard)."""
     u32 = facade_attr("_user32", _user32)
     info: dict = {}
     if fg_hwnd:
@@ -469,6 +507,7 @@ def _get_focused_control_info(fg_hwnd: int = 0) -> dict:
 
     if os.name == "nt":
         uia_ok = False
+        uia_fields: dict = {}
         try:
             import uiautomation as auto
 
@@ -487,7 +526,14 @@ def _get_focused_control_info(fg_hwnd: int = 0) -> dict:
                     uia_ok = bool(uia_fields)
         except Exception:
             uia_ok = False
-        if not uia_ok and str(info.get("class") or "").strip().lower() in _XAML_BRIDGE_CLASSES:
+        parent_cls_low = str(parent_class or "").strip().lower()
+        if _is_unresolved_xaml_bridge(info, uia_fields, uia_ok) or (
+            not uia_ok
+            and (
+                parent_cls_low == "#32770"
+                or (parent_cls_low == "cabinetwclass" and not info.get("class"))
+            )
+        ):
             info["uia_error"] = True
     return info
 
@@ -518,8 +564,8 @@ def _get_window_info_by_hwnd(hwnd: int, *, include_focused_control: bool = False
         "class": cls_name,
         "title": title,
     }
-    if include_focused_control and cls_name.lower() == "cabinetwclass":
-        fc = _get_focused_control_info(hwnd)
+    if include_focused_control and cls_name.lower() in _INSPECT_CHILD_WINDOW_CLASSES:
+        fc = _get_focused_control_info(hwnd, parent_class=cls_name)
         if fc:
             result["focused_control"] = fc
     return result
@@ -540,7 +586,7 @@ def _get_window_info_at_point(x: int, y: int) -> Optional[dict]:
     except Exception:
         root_hwnd = child_hwnd
     info = _get_window_info_by_hwnd(root_hwnd, include_focused_control=False)
-    if info.get("class", "").lower() == "cabinetwclass":
+    if info.get("class", "").lower() in _INSPECT_CHILD_WINDOW_CLASSES:
         pt_ctrl: dict = {}
         if child_hwnd != root_hwnd:
             child_cls = _get_window_class_name(child_hwnd)
@@ -552,6 +598,7 @@ def _get_window_info_at_point(x: int, y: int) -> Optional[dict]:
                 pt_ctrl["name"] = child_title
         if os.name == "nt":
             uia_ok = False
+            uia_fields: dict = {}
             try:
                 import uiautomation as auto
 
@@ -570,7 +617,14 @@ def _get_window_info_at_point(x: int, y: int) -> Optional[dict]:
                         uia_ok = bool(uia_fields)
             except Exception:
                 uia_ok = False
-            if not uia_ok and str(pt_ctrl.get("class") or "").strip().lower() in _XAML_BRIDGE_CLASSES:
+            win_cls_low = info.get("class", "").lower()
+            if _is_unresolved_xaml_bridge(pt_ctrl, uia_fields, uia_ok) or (
+                not uia_ok
+                and (
+                    win_cls_low == "#32770"
+                    or (win_cls_low == "cabinetwclass" and not pt_ctrl.get("class"))
+                )
+            ):
                 pt_ctrl["uia_error"] = True
         if pt_ctrl:
             info["point_control"] = pt_ctrl
