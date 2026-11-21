@@ -118,7 +118,7 @@ def _fetch_anima_relationship(force: bool = False, cfg: dict | None = None) -> d
 
 _RELATIONSHIP_AXIS_KEYS = frozenset({"familiarity", "warmth", "trust", "romance", "tension"})
 _RELATIONSHIP_ALLOWED_KEYS = frozenset({"preset", "relationship_enabled", "romance_enabled", "axes"}) | _RELATIONSHIP_AXIS_KEYS
-_RELATIONSHIP_PRESETS_ALLOWED = frozenset({"restrained", "gentle", "warm", "close", "intimate", "sweet", "default"})
+_RELATIONSHIP_PRESETS_ALLOWED = frozenset({"restrained", "confidant", "intimate"})
 
 
 def _validate_relationship_payload(payload: dict) -> dict:
@@ -136,8 +136,10 @@ def _validate_relationship_payload(payload: dict) -> dict:
         if not isinstance(payload["preset"], str):
             raise ValueError("字段 preset 必须为字符串")
         p_val = payload["preset"].strip().lower()
-        if p_val and len(p_val) > 32:
-            raise ValueError("字段 preset 长度超出限制")
+        if p_val and p_val not in _RELATIONSHIP_PRESETS_ALLOWED:
+            raise ValueError(
+                f"无效的 preset: {p_val!r}（仅允许 {', '.join(sorted(_RELATIONSHIP_PRESETS_ALLOWED))}）"
+            )
         cleaned["preset"] = p_val
 
     for bkey in ("relationship_enabled", "romance_enabled"):
@@ -150,8 +152,8 @@ def _validate_relationship_payload(payload: dict) -> dict:
         if isinstance(val, bool) or not isinstance(val, (int, float)):
             raise ValueError(f"维度 {name} 必须为数字")
         fv = float(val)
-        if not math.isfinite(fv) or fv < -1.0 or fv > 1.0:
-            raise ValueError(f"维度 {name} 必须为 -1.0 到 1.0 之间的有限数字")
+        if not math.isfinite(fv) or fv < 0.0 or fv > 1.0:
+            raise ValueError(f"维度 {name} 必须为 0.0 到 1.0 之间的有限数字")
         return fv
 
     for ax in _RELATIONSHIP_AXIS_KEYS:

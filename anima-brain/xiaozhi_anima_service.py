@@ -547,8 +547,10 @@ def run_online_backup(
         err_msg = str(exc)
         with _BACKUP_STATE_LOCK:
             cur = dict(_BACKUP_STATE_BY_DIR.get(dir_key) or _default_backup_state())
+            cur["integrity_ok"] = False
             cur["last_error"] = err_msg
             _BACKUP_STATE_BY_DIR[dir_key] = cur
+            _BACKUP_VERIFIED_SIGS.pop(dir_key, None)
         log.warning("Online SQLite backup failed: %s", exc)
         return {"ok": False, "error": err_msg, **get_backup_status(brain, bdir)}
 
@@ -1651,7 +1653,8 @@ def enqueue_inbox_turn(
                 return {"accepted": False, "reason": "insert_failed", "request_id": req_id}
 
             # 4.1 #4: Refuse cross-character overwrite on existing request_id
-            existing_cid = str(existing["character_id"] or "").strip() or DEFAULT_CHARACTER_ID
+            raw_existing_cid = str(existing["character_id"] or "")
+            existing_cid = raw_existing_cid.strip() or DEFAULT_CHARACTER_ID
             if existing_cid != cid:
                 log.warning(
                     "Inbox request_id %s belongs to character %s; refusing cross-character overwrite by %s",
@@ -1698,7 +1701,7 @@ def enqueue_inbox_turn(
                     "UPDATE xiaozhi_inbox "
                     "SET payload=?, status='pending', attempts=0, last_error='', updated_at=? "
                     "WHERE request_id=? AND character_id=?",
-                    (merged_json, ts, req_id, existing_cid),
+                    (merged_json, ts, req_id, raw_existing_cid),
                 )
                 return {
                     "accepted": True,
@@ -1715,7 +1718,7 @@ def enqueue_inbox_turn(
                         "UPDATE xiaozhi_inbox "
                         "SET payload=?, status='pending', attempts=0, last_error='', updated_at=? "
                         "WHERE request_id=? AND character_id=?",
-                        (merged_json, ts, req_id, existing_cid),
+                        (merged_json, ts, req_id, raw_existing_cid),
                     )
                 elif prev_status == "pending":
                     # Upgraded continuation while pending: reset retry state so fuller turn is immediately eligible
@@ -1723,7 +1726,7 @@ def enqueue_inbox_turn(
                         "UPDATE xiaozhi_inbox "
                         "SET payload=?, attempts=0, last_error='', updated_at=0.0 "
                         "WHERE request_id=? AND character_id=?",
-                        (merged_json, req_id, existing_cid),
+                        (merged_json, req_id, raw_existing_cid),
                     )
                 else:
                     # processing: update payload in-place while preserving active heartbeat lease; worker verifies payload before marking done
@@ -1731,7 +1734,7 @@ def enqueue_inbox_turn(
                         "UPDATE xiaozhi_inbox "
                         "SET payload=?, updated_at=? "
                         "WHERE request_id=? AND character_id=?",
-                        (merged_json, ts, req_id, existing_cid),
+                        (merged_json, ts, req_id, raw_existing_cid),
                     )
                 return {
                     "accepted": True,

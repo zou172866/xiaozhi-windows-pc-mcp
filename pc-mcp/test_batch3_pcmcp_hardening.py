@@ -1285,6 +1285,44 @@ class TestBatch3PcMcpHardening(unittest.TestCase):
         pending_files = list(self.pending.glob("*.json"))
         self.assertEqual(len(pending_files), 1, f"Expected exactly 1 pending task under lock, got {pending_files}")
         self.assertTrue(any("已有任务进行中" in m for m in msgs), f"Second dispatch should be rejected as busy: {msgs}")
+        for pf in pending_files:
+            pf.unlink(missing_ok=True)
+
+        # 5. Orphaned .claimed.<dead_pid>.<ms>.tmp from crashed sidecar worker is reaped and does NOT deadlock workspace;
+        #    while a live-PID fresh .claimed.<live_pid>.<now_ms>.tmp STILL blocks concurrent dispatch.
+        orphan_claim = self.pending / ".dead_task.claimed.99999991.1000.tmp"
+        orphan_claim.write_text(
+            json.dumps({"id": "dead_task", "workdir": str(self.tmp_root), "prompt": "crashed"}),
+            encoding="utf-8",
+        )
+        with patch("l3_backends.antigravity._is_worker_alive", return_value=False):
+            msg_after_orphan = ag_backend.dispatch("ag_after_orphan", "恢复任务", False, cfg_ag)
+        self.assertNotIn("已有任务进行中", msg_after_orphan)
+        self.assertFalse(orphan_claim.exists(), "Orphaned dead-PID claim file must be reaped automatically")
+        for pf in self.pending.glob("*.json"):
+            pf.unlink(missing_ok=True)
+
+        live_claim = self.pending / f".live_task.claimed.{os.getpid()}.{int(time.time() * 1000)}.tmp"
+        live_claim.write_text(
+            json.dumps({"id": "live_task", "workdir": str(self.tmp_root), "prompt": "in-flight"}),
+            encoding="utf-8",
+        )
+        try:
+            with patch("l3_backends.antigravity._is_worker_alive", return_value=False):
+                msg_live_busy = ag_backend.dispatch("ag_vs_live_claim", "冲突任务", False, cfg_ag)
+            self.assertIn("已有任务进行中", msg_live_busy)
+            self.assertTrue(live_claim.exists(), "Fresh live-PID claim file must NOT be reaped")
+        finally:
+            live_claim.unlink(missing_ok=True)
+
+        # 6. _salvage_and_clean_task_logs refuses to read or delete files outside LOGS_DIR
+        outside_file = self.tmp_root / "do_not_delete.txt"
+        outside_file.write_text("SECRET_OUTSIDE_CONTENT", encoding="utf-8")
+        tampered_obj = {"stdout_log": str(outside_file), "stderr_log": str(outside_file)}
+        l3_backends._salvage_and_clean_task_logs(tampered_obj)
+        self.assertTrue(outside_file.exists(), "_salvage_and_clean_task_logs must NEVER unlink files outside LOGS_DIR")
+        self.assertNotIn("stdout", tampered_obj)
+        self.assertNotIn("stderr", tampered_obj)
 
     def test_p2_watchdog_identity_hung_cleanup_sidecar_atomic_claim_and_vision_phash(self):
         """4.1 #3: Watchdog port-owner verify + hung spawn kill, sidecar atomic claim, vision UIA hash & cursor-tolerant phash."""
@@ -1342,6 +1380,19 @@ class TestBatch3PcMcpHardening(unittest.TestCase):
             # Second concurrent attempt on same path immediately returns False
             self.assertFalse(agy_sidecar_worker._process_task(tf))
         self.assertEqual(seen_pending_during_popen, [False], "Pending .json must be claimed/renamed before agentapi runs")
+
+        # 3b. Sidecar _reap_orphaned_claim_files removes dead-PID claims while preserving live-PID fresh claims
+        sc_dead_claim = self.pending / ".sc_dead.claimed.99999991.1000.tmp"
+        sc_live_claim = self.pending / f".sc_live.claimed.{os.getpid()}.{int(time.time() * 1000)}.tmp"
+        sc_dead_claim.write_text("{}", encoding="utf-8")
+        sc_live_claim.write_text("{}", encoding="utf-8")
+        try:
+            reaped_claims = agy_sidecar_worker._reap_orphaned_claim_files(self.pending)
+            self.assertEqual(reaped_claims, 1)
+            self.assertFalse(sc_dead_claim.exists())
+            self.assertTrue(sc_live_claim.exists())
+        finally:
+            sc_live_claim.unlink(missing_ok=True)
 
         # 4. Vision: Stage-1 UIA hit populates region_hash; perceptual hash tolerates 1-2px blinking cursor
         base_img = Image.new("RGB", (200, 120), color=(240, 240, 240))

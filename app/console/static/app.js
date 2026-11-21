@@ -735,14 +735,10 @@
       els.idleFarewellPreviewBtn.disabled = true;
       els.idleFarewellPreviewBtn.textContent = "合成中…";
       try {
-        const resp = await fetch("/api/tts-preview", {
-          method: "POST",
-          headers: consolePostHeaders(),
-          body: JSON.stringify({
-            voice: els.voiceSelect.value,
-            text: sampleLine,
-            emotion: hasExplicitTag ? "auto" : "gentle"
-          })
+        const resp = await consolePost("/api/tts-preview", {
+          voice: els.voiceSelect.value,
+          text: sampleLine,
+          emotion: hasExplicitTag ? "auto" : "gentle"
         });
         if (!resp.ok) {
           let errMsg = "告别语试听失败，请确认本机语音合成服务运行正常。";
@@ -1586,14 +1582,10 @@
     els.previewBtn.disabled = true;
     els.previewBtnText.textContent = "合成中…";
     try {
-      const resp = await fetch("/api/tts-preview", {
-        method: "POST",
-        headers: consolePostHeaders(),
-        body: JSON.stringify({
-          voice: els.voiceSelect.value,
-          text: els.previewTextInput.value.trim(),
-          emotion: selectedMeiEmotion
-        })
+      const resp = await consolePost("/api/tts-preview", {
+        voice: els.voiceSelect.value,
+        text: els.previewTextInput.value.trim(),
+        emotion: selectedMeiEmotion
       });
       if (!resp.ok) {
         let errMsg = "音色试听失败，请确认本机语音合成服务运行正常。";
@@ -1657,7 +1649,7 @@
       };
       if (res.restarting) {
         isSaving = false;
-        restartTargetBootId = knownBootId;
+        restartTargetBootId = knownBootId || (typeof res.boot_id === "string" ? res.boot_id.trim() : "");
         isRestarting = true;
         els.saveBtnLabel.textContent = "正在重启生效…";
         els.statusPill.className = "status-pill restarting";
@@ -1893,10 +1885,12 @@
       els.lastSeenText.textContent = `最近活跃: ${dev.last_seen || "等待唤醒"}`;
 
       const incomingBootId = typeof data.boot_id === "string" ? data.boot_id.trim() : "";
+      let tokenRefreshed = false;
       if (incomingBootId) {
         if (knownBootId && incomingBootId !== knownBootId) {
           knownBootId = incomingBootId;
           await refreshConsoleToken();
+          tokenRefreshed = true;
         } else if (!knownBootId) {
           knownBootId = incomingBootId;
         }
@@ -1907,7 +1901,9 @@
         if (bootChanged) {
           isRestarting = false;
           restartTargetBootId = "";
-          await refreshConsoleToken();
+          if (!tokenRefreshed) {
+            await refreshConsoleToken();
+          }
           checkDirty();
           showBanner("info", "新配置已成功生效！");
           scheduleHideBanner(3600);

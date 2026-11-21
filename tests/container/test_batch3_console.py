@@ -1374,8 +1374,8 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
         self.assertIn("content-security-policy", hdr_keys)
         self.assertIn("x-content-type-options", hdr_keys)
 
-        # 2. /api/relationship rejects unknown fields & character_id override with 400, and forces configured character_id
-        h_rel_bad = _FakeH({"character_id": "hijacked_char", "preset": "warm"})
+        # 2. /api/relationship rejects unknown fields, character_id override, invalid presets & out-of-range axes with 400
+        h_rel_bad = _FakeH({"character_id": "hijacked_char", "preset": "confidant"})
         anima_mod.handle_post_relationship(h_rel_bad)
         self.assertEqual(h_rel_bad.status, 400)
 
@@ -1383,20 +1383,28 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
         anima_mod.handle_post_relationship(h_rel_nan)
         self.assertEqual(h_rel_nan.status, 400)
 
+        h_rel_neg = _FakeH({"familiarity": -0.5})
+        anima_mod.handle_post_relationship(h_rel_neg)
+        self.assertEqual(h_rel_neg.status, 400)
+
+        h_rel_bad_preset = _FakeH({"preset": "totally_invalid_junk_preset"})
+        anima_mod.handle_post_relationship(h_rel_bad_preset)
+        self.assertEqual(h_rel_bad_preset.status, 400)
+
         posted_rel = []
 
         class _FakeRelResp:
             status_code = 200
 
             def json(self):
-                return {"character_id": "xiaozhi", "preset": "warm"}
+                return {"character_id": "xiaozhi", "preset": "confidant"}
 
         class _FakeRelCli:
             def post(self, url, **kwargs):
                 posted_rel.append(kwargs.get("json"))
                 return _FakeRelResp()
 
-        h_rel_ok = _FakeH({"preset": "warm", "warmth": 0.6})
+        h_rel_ok = _FakeH({"preset": "confidant", "warmth": 0.6})
         with (
             patch.object(anima_mod, "_read_anima_token", return_value="tok-test-123456"),
             patch.object(anima_mod, "_get_anima_character_id", return_value="xiaozhi"),
@@ -1405,6 +1413,7 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
             anima_mod.handle_post_relationship(h_rel_ok)
         self.assertEqual(h_rel_ok.status, 200)
         self.assertEqual(posted_rel[0]["character_id"], "xiaozhi")
+        self.assertEqual(posted_rel[0]["preset"], "confidant")
         self.assertEqual(posted_rel[0]["warmth"], 0.6)
 
         # 3. /api/audio-test rejects NaN, Inf, bool, string, and out-of-range volume with 400
@@ -1440,12 +1449,14 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
         state_mod.handle_get_health(h_hlth)
         hlth_body = json.loads(h_hlth.wfile.getvalue().decode("utf-8"))
         self.assertEqual(hlth_body.get("boot_id"), shared_mod.get_console_boot_id())
-        app_js = open(os.path.join(os.path.dirname(srv_mod.__file__), "static", "app.js"), encoding="utf-8").read()
+        with open(os.path.join(os.path.dirname(srv_mod.__file__), "static", "app.js"), encoding="utf-8") as _f:
+            app_js = _f.read()
         self.assertIn("refreshConsoleToken", app_js)
         self.assertIn("restartTargetBootId", app_js)
         self.assertIn("data.boot_id", app_js)
+        self.assertNotIn('fetch("/api/tts-preview"', app_js, "All /api/tts-preview POSTs must go through consolePost() for 401 token refresh")
 
-        # 6. handle_post_config holds _config_write_lock during _hot_reload_runtime_config
+        # 6. handle_post_config holds _config_write_lock during _hot_reload_runtime_config and exposes boot_id
         lock_held_in_reload = {"held": False}
 
         def _spy_reload(changed):
@@ -1470,6 +1481,8 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
         ):
             cfg_mod.handle_post_config(h_cfg, shutdown_flush_fn=lambda: None)
         self.assertTrue(lock_held_in_reload["held"], "_config_write_lock must remain held during _hot_reload_runtime_config")
+        cfg_body = json.loads(h_cfg.wfile.getvalue().decode("utf-8"))
+        self.assertEqual(cfg_body.get("boot_id"), shared_mod.get_console_boot_id())
 
         # 7. H-1 facade broadcast setattr syncs ALL submodules holding the same attribute (e.g. start_with_env.ROOT_DIR)
         orig_root = boot_mod.ROOT_DIR

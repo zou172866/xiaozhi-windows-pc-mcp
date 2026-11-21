@@ -541,19 +541,31 @@ def _is_task_in_memory_queue(task_id: str) -> bool:
 
 
 def _salvage_and_clean_task_logs(obj: Dict[str, Any]) -> None:
-    """Salvage tail output from surviving child task log files after MCP restart and clean up temp logs (P1-11)."""
+    """Salvage tail output from surviving child task log files after MCP restart and clean up temp logs (P1-11).
+
+    Strictly confines reads/unlinks to non-symlink files inside `ACTIVE_DIR.parent / 'logs'`.
+    """
+    try:
+        logs_root = (ACTIVE_DIR.parent / "logs").resolve()
+    except OSError:
+        return
     for field, key in (("stdout_log", "stdout"), ("stderr_log", "stderr")):
         raw_p = str(obj.get(field) or "").strip()
         if not raw_p:
             continue
         p = Path(raw_p)
         try:
-            if p.is_file():
+            if p.is_symlink():
+                continue
+            resolved_p = p.resolve()
+            if not resolved_p.is_relative_to(logs_root) or resolved_p.parent != logs_root:
+                continue
+            if resolved_p.is_file():
                 limit = 4000 if key == "stdout" else 2000
-                tail = p.read_bytes()[-65536:].decode("utf-8", errors="replace").strip()
+                tail = resolved_p.read_bytes()[-65536:].decode("utf-8", errors="replace").strip()
                 if tail and not obj.get(key):
                     obj[key] = tail[-limit:]
-                p.unlink(missing_ok=True)
+                resolved_p.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -711,6 +723,7 @@ def cleanup_running_task_processes() -> int:
                 verified_ct = child_ct or get_process_create_time(child_pid)
                 kill_process_tree(child_pid, grace_seconds=1.5, expected_create_time=verified_ct)
                 cleaned += 1
+            _salvage_and_clean_task_logs(obj)
             obj["status"] = "error"
             obj["stderr"] = "宿主机 MCP 服务关闭/重启，已清理 L3 子进程树"
             obj["summary"] = obj["stderr"]

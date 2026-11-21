@@ -548,6 +548,8 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     @functools.wraps(_orig_gsv_init)
     def _patched_gsv_init(self, config, delete_audio_file, *args, **kwargs):
         _orig_gsv_init(self, config, delete_audio_file, *args, **kwargs)
+        raw_vid = (config or {}).get("voice_id")
+        self.voice_id = raw_vid.strip() if isinstance(raw_vid, str) else ""
         raw_steps = (config or {}).get("sample_steps")
         if raw_steps not in (None, ""):
             try:

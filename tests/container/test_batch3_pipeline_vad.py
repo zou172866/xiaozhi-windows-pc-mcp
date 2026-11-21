@@ -1498,6 +1498,39 @@ class TestBatch3ContainerPipeline(unittest.TestCase):
         tts_legacy = SimpleNamespace(ref_audio_path="/voices/raiden_mei/mei_calm_ref.wav", config={})
         self.assertTrue(emo_tags.is_raiden_mei_voice(tts_legacy.ref_audio_path, tts=tts_legacy))
 
+        # 3b. D-7 real upstream cold-start: patched GPT_SOVITS_V2.TTSProvider.__init__ MUST preserve config['voice_id']
+        tts_route.apply_xiaozhi_emotion_and_prosody_patches()
+        from core.providers.tts import gpt_sovits_v2 as _real_gsv_mod
+
+        real_gsv_non_mei = _real_gsv_mod.TTSProvider(
+            {
+                "voice_id": "__gsv_xiaozhi_tw__",
+                "ref_audio_path": "/voices/raiden_mei/copied_ref.wav",
+                "url": "http://127.0.0.1:19880/tts",
+            },
+            True,
+        )
+        self.assertEqual(real_gsv_non_mei.voice_id, "__gsv_xiaozhi_tw__")
+        self.assertFalse(emo_tags.is_raiden_mei_voice(real_gsv_non_mei.ref_audio_path, tts=real_gsv_non_mei))
+
+        real_gsv_mei = _real_gsv_mod.TTSProvider(
+            {
+                "voice_id": "__gsv_raiden_mei__",
+                "ref_audio_path": "/voices/custom_renamed/ref.wav",
+                "url": "http://127.0.0.1:19880/tts",
+            },
+            True,
+        )
+        self.assertEqual(real_gsv_mei.voice_id, "__gsv_raiden_mei__")
+        self.assertTrue(emo_tags.is_raiden_mei_voice(real_gsv_mei.ref_audio_path, tts=real_gsv_mei))
+
+        real_gsv_legacy = _real_gsv_mod.TTSProvider(
+            {"ref_audio_path": "/voices/raiden_mei/mei_default_ref.wav", "url": "http://127.0.0.1:19880/tts"},
+            True,
+        )
+        self.assertEqual(real_gsv_legacy.voice_id, "")
+        self.assertTrue(emo_tags.is_raiden_mei_voice(real_gsv_legacy.ref_audio_path, tts=real_gsv_legacy))
+
         # 4. F-4: build_gsv_request_snapshot omits dead keys split_bucket & batch_threshold
         fake_provider = SimpleNamespace(
             url="http://host.docker.internal:19880/tts",

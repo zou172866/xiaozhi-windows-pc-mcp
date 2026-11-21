@@ -339,8 +339,46 @@ def _process_task(task_file: Path) -> bool:
         claim_path.unlink(missing_ok=True)
 
 
+_CLAIMED_TMP_RE = re.compile(r"^\..+\.claimed\.(\d+)\.(\d+)\.tmp$")
+_CLAIMED_TMP_MAX_AGE_SECONDS = 120.0
+
+
+def _reap_orphaned_claim_files(
+    pending_dir: Path | None = None,
+    *,
+    max_age_seconds: float = _CLAIMED_TMP_MAX_AGE_SECONDS,
+) -> int:
+    """Clean up orphaned `.claimed.<pid>.<ms>.tmp` files left behind by crashed sidecar workers."""
+    pdir = pending_dir if pending_dir is not None else PENDING_DIR
+    reaped = 0
+    if not pdir.exists():
+        return 0
+    now = time.time()
+    for cf in sorted(pdir.glob(".*.claimed.*.tmp")):
+        if cf.is_symlink():
+            continue
+        m = _CLAIMED_TMP_RE.match(cf.name)
+        stale = True
+        if m:
+            try:
+                claim_pid = int(m.group(1))
+                claim_ts = int(m.group(2)) / 1000.0
+                if claim_pid > 0 and (now - claim_ts) <= max_age_seconds and _pc_common.is_pid_running(claim_pid):
+                    stale = False
+            except Exception:
+                stale = True
+        if stale:
+            try:
+                cf.unlink(missing_ok=True)
+                reaped += 1
+            except OSError:
+                pass
+    return reaped
+
+
 def main():
     print(f"[xiaozhi-agy-bridge v3] Sidecar worker started (pid={MY_PID}, ppid={PARENT_PID}).", flush=True)
+    _reap_orphaned_claim_files()
     stop_event = threading.Event()
     takeover_event = threading.Event()
     hb_thread = start_heartbeat_thread(stop_event, takeover_event, interval=3.0)
@@ -352,6 +390,7 @@ def main():
                 print(f"[xiaozhi-agy-bridge] Parent {PARENT_PID} exited, stopping orphan worker {MY_PID}.", flush=True)
                 sys.exit(0)
             try:
+                _reap_orphaned_claim_files()
                 pending_files = sorted(PENDING_DIR.glob("*.json"))
             except Exception as e:
                 print(f"[xiaozhi-agy-bridge] scan error: {e}", file=sys.stderr, flush=True)

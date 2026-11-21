@@ -337,9 +337,11 @@ def _apply_tts_attrs_in_place(tts_obj, tts_module_name: str, tts_cfg: dict) -> b
         return False
     cls_mod = str(getattr(type(tts_obj), "__module__", "") or "")
     if tts_module_name == "GPT_SOVITS_V2" and "gpt_sovits" in cls_mod:
-        for attr in ("ref_audio_path", "prompt_text", "prompt_lang", "text_split_method", "url", "voice_id"):
+        for attr in ("ref_audio_path", "prompt_text", "prompt_lang", "text_split_method", "url"):
             if attr in tts_cfg and tts_cfg[attr] is not None:
                 setattr(tts_obj, attr, tts_cfg[attr])
+        raw_vid = tts_cfg.get("voice_id")
+        tts_obj.voice_id = raw_vid.strip() if isinstance(raw_vid, str) else ""
         if "aux_ref_audio_paths" in tts_cfg:
             raw_aux = tts_cfg["aux_ref_audio_paths"]
             tts_obj.aux_ref_audio_paths = list(raw_aux) if isinstance(raw_aux, (list, tuple)) else []
@@ -361,8 +363,8 @@ def _apply_tts_attrs_in_place(tts_obj, tts_module_name: str, tts_cfg: dict) -> b
     if tts_module_name == "EdgeTTS" and "edge" in cls_mod:
         if tts_cfg.get("voice"):
             tts_obj.voice = tts_cfg["voice"]
-        if tts_cfg.get("voice_id"):
-            tts_obj.voice_id = tts_cfg["voice_id"]
+        raw_vid = tts_cfg.get("voice_id")
+        tts_obj.voice_id = raw_vid.strip() if isinstance(raw_vid, str) else ""
         if isinstance(getattr(tts_obj, "config", None), dict):
             tts_obj.config.update(tts_cfg)
         return True
@@ -776,6 +778,7 @@ def handle_post_config(handler, *, shutdown_flush_fn) -> None:
         handler._send_json(
             {
                 "ok": True,
+                "boot_id": shared.get_console_boot_id(),
                 "restarting": will_restart,
                 "hot_reloaded": bool(hot_ok and not will_restart),
                 "changed_fields": changed_fields,

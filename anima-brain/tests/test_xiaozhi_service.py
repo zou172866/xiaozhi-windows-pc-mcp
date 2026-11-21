@@ -1841,6 +1841,14 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
         ok_w3, _ = svc._verify_sqlite_integrity(weekly_file)
         self.assertTrue(ok_w3)
 
+        # 4. Subsequent backup exception MUST flip integrity_ok=False (never keep stale True from prior backup)
+        with patch.object(svc, "_snapshot_sqlite_to_file", side_effect=RuntimeError("simulated backup io failure")):
+            res4 = svc.run_online_backup(self.brain, bdir, now=1763600000.0, force=True)
+        self.assertFalse(res4["ok"])
+        self.assertIs(res4["integrity_ok"], False)
+        st_after_err = svc.get_backup_status(self.brain, bdir)
+        self.assertIs(st_after_err["integrity_ok"], False)
+
     def test_p2_health_sanitization_backup_503_500_headers_and_cross_character_inbox(self):
         token = "p2-anima-token-" + ("k" * 24)
         frontend_override = svc.FRONTEND_DIR if (svc.FRONTEND_DIR / "index.html").is_file() else None

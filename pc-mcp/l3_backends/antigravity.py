@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -14,6 +15,7 @@ from . import (
     L3Backend,
     PENDING_DIR,
     _find_active_workspace_task_locked,
+    _is_pid_running,
     _workspace_guard_lock,
     atomic_write_json,
     find_busy_workspace_task,
@@ -30,6 +32,31 @@ from . import (
 )
 
 TRANSCRIPT_TAIL_BYTES = 64 * 1024  # H-6: Read at most the last 64 KB of transcript.jsonl
+_CLAIMED_TMP_RE = re.compile(r"^\..+\.claimed\.(\d+)\.(\d+)\.tmp$")
+_CLAIMED_TMP_MAX_AGE_SECONDS = 120.0
+
+
+def _is_live_claim_file(pfp: Path, *, max_age_seconds: float = _CLAIMED_TMP_MAX_AGE_SECONDS) -> bool:
+    """Return True if a sidecar `.claimed.<pid>.<ms>.tmp` file belongs to a live worker within TTL; else reap it."""
+    m = _CLAIMED_TMP_RE.match(pfp.name)
+    now = time.time()
+    is_stale = True
+    if m:
+        try:
+            claim_pid = int(m.group(1))
+            claim_ts = int(m.group(2)) / 1000.0
+            age = now - claim_ts
+            if claim_pid > 0 and age <= max_age_seconds and _is_pid_running(claim_pid):
+                is_stale = False
+        except Exception:
+            is_stale = True
+    if is_stale:
+        try:
+            pfp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def _guard_leading_dash_prompt(prompt: str, prefix_tag: str = "[指令]") -> str:
@@ -148,9 +175,12 @@ class AntigravityBackend(L3Backend):
             if busy is not None:
                 return format_workspace_busy_message(workdir, busy)
             if not follow_up_last and not is_workspace_queue_mode(cfg) and PENDING_DIR.exists():
-                pending_candidates = list(sorted(PENDING_DIR.glob("*.json"))) + list(
-                    sorted(PENDING_DIR.glob(".*.claimed.*.tmp"))
-                )
+                live_claims = [
+                    cfp
+                    for cfp in sorted(PENDING_DIR.glob(".*.claimed.*.tmp"))
+                    if not cfp.is_symlink() and _is_live_claim_file(cfp)
+                ]
+                pending_candidates = list(sorted(PENDING_DIR.glob("*.json"))) + live_claims
                 for pfp in pending_candidates:
                     if pfp.is_symlink():
                         continue
