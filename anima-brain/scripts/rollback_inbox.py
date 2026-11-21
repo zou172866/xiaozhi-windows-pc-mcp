@@ -95,7 +95,7 @@ def rollback_inbox(
     if not db_file.is_file():
         raise FileNotFoundError(f"SQLite database not found: {db_file}")
 
-    conn = sqlite3.connect(str(db_file), timeout=15.0)
+    conn = sqlite3.connect(str(db_file), timeout=15.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
         if not _table_exists(conn, "xiaozhi_inbox"):
@@ -110,6 +110,7 @@ def rollback_inbox(
                 "dropped": False,
                 "dry_run": bool(dry_run),
                 "integrity_ok": True,
+                "wal_checkpoint_ok": True,
             }
 
         counts_initial = _count_by_status(conn)
@@ -130,6 +131,7 @@ def rollback_inbox(
                 "dropped": False,
                 "dry_run": True,
                 "integrity_ok": True,
+                "wal_checkpoint_ok": True,
             }
 
         drained = 0
@@ -144,11 +146,14 @@ def rollback_inbox(
                 row_dict = _serialize_row(r)
                 try:
                     res = drain_fn(row_dict)
-                    succeeded = (
-                        bool(res.get("committed")) or res.get("skipped") == "empty_message"
-                        if isinstance(res, dict)
-                        else bool(res)
-                    )
+                    # P1-8: Conflict results (committed=True, conflict=True) MUST NOT be treated as drained/done.
+                    if isinstance(res, dict):
+                        succeeded = (
+                            (bool(res.get("committed")) and not bool(res.get("conflict")))
+                            or res.get("skipped") == "empty_message"
+                        )
+                    else:
+                        succeeded = bool(res)
                 except Exception:
                     succeeded = False
                 if succeeded:
@@ -159,85 +164,138 @@ def rollback_inbox(
                             "WHERE request_id=?",
                             (time.time(), row_dict["request_id"]),
                         )
-                        conn.commit()
+                        conn.execute("COMMIT")
                     except Exception:
-                        conn.rollback()
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
                         raise
                     drained += 1
                 else:
                     drain_failed += 1
+            # Release any external brain handle held by drain_fn before acquiring EXCLUSIVE lock / WAL checkpoint
+            closer = getattr(drain_fn, "_close_brain", None)
+            if callable(closer):
+                closer()
 
-        counts_before_drop = _count_by_status(conn)
-        if include_done:
-            rows_to_export = conn.execute(
-                "SELECT request_id, character_id, payload, status, attempts, last_error, created_at, updated_at "
-                "FROM xiaozhi_inbox ORDER BY created_at ASC, rowid ASC"
-            ).fetchall()
-        else:
-            rows_to_export = conn.execute(
-                "SELECT request_id, character_id, payload, status, attempts, last_error, created_at, updated_at "
-                "FROM xiaozhi_inbox WHERE status != 'done' ORDER BY created_at ASC, rowid ASC"
-            ).fetchall()
-
-        serialized_rows = [_serialize_row(r) for r in rows_to_export]
+        # P1-8: Export and DROP TABLE inside a SINGLE BEGIN EXCLUSIVE transaction so no concurrent
+        # writer can sneak rows in between export snapshot and DROP TABLE (eliminates TOCTOU row loss).
         written_export_path: str | None = None
-        if serialized_rows or export_path is not None:
-            if export_path is not None:
-                out_path = Path(export_path)
-            else:
-                stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                out_path = db_file.parent / f"xiaozhi_inbox_rollback_{stamp}.json"
-            export_doc = {
-                "schema_version": 1,
-                "exported_at": datetime.datetime.now().astimezone().isoformat(),
-                "db_path": str(db_file.resolve()),
-                "counts_before_drop": counts_before_drop,
-                "exported_count": len(serialized_rows),
-                "rows": serialized_rows,
-            }
-            _atomic_write_json(out_path, export_doc)
-            # Verify exported archive parses cleanly with exact row count before any table drop
-            verified = json.loads(out_path.read_text(encoding="utf-8"))
-            if not isinstance(verified, dict) or len(verified.get("rows") or []) != len(serialized_rows):
-                raise RuntimeError(f"Export verification failed for {out_path}")
-            written_export_path = str(out_path)
-
-        if drain_failed > 0 and not force_drop_on_drain_error:
-            return {
-                "ok": False,
-                "error": f"drain_incomplete ({drain_failed} row(s) failed to drain; table preserved)",
-                "table_existed": True,
-                "counts": counts_before_drop,
-                "drained": drained,
-                "drain_failed": drain_failed,
-                "exported": len(serialized_rows),
-                "export_path": written_export_path,
-                "dropped": False,
-                "dry_run": False,
-                "integrity_ok": True,
-            }
-
         dropped = False
-        if drop_table:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
+        counts_before_drop: dict[str, int] = {}
+        serialized_rows: list[dict[str, Any]] = []
+
+        conn.execute("BEGIN EXCLUSIVE")
+        try:
+            if not _table_exists(conn, "xiaozhi_inbox"):
+                conn.execute("ROLLBACK")
+                return {
+                    "ok": True,
+                    "table_existed": False,
+                    "counts": {},
+                    "drained": drained,
+                    "drain_failed": drain_failed,
+                    "exported": 0,
+                    "export_path": None,
+                    "dropped": False,
+                    "dry_run": False,
+                    "integrity_ok": True,
+                    "wal_checkpoint_ok": True,
+                }
+
+            counts_before_drop = _count_by_status(conn)
+            if include_done:
+                rows_to_export = conn.execute(
+                    "SELECT request_id, character_id, payload, status, attempts, last_error, created_at, updated_at "
+                    "FROM xiaozhi_inbox ORDER BY created_at ASC, rowid ASC"
+                ).fetchall()
+            else:
+                rows_to_export = conn.execute(
+                    "SELECT request_id, character_id, payload, status, attempts, last_error, created_at, updated_at "
+                    "FROM xiaozhi_inbox WHERE status != 'done' ORDER BY created_at ASC, rowid ASC"
+                ).fetchall()
+
+            serialized_rows = [_serialize_row(r) for r in rows_to_export]
+            if serialized_rows or export_path is not None:
+                if export_path is not None:
+                    out_path = Path(export_path)
+                else:
+                    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    out_path = db_file.parent / f"xiaozhi_inbox_rollback_{stamp}.json"
+                export_doc = {
+                    "schema_version": 1,
+                    "exported_at": datetime.datetime.now().astimezone().isoformat(),
+                    "db_path": str(db_file.resolve()),
+                    "counts_before_drop": counts_before_drop,
+                    "exported_count": len(serialized_rows),
+                    "rows": serialized_rows,
+                }
+                _atomic_write_json(out_path, export_doc)
+                # Verify exported archive parses cleanly with exact row count before any table drop
+                verified = json.loads(out_path.read_text(encoding="utf-8"))
+                if not isinstance(verified, dict) or len(verified.get("rows") or []) != len(serialized_rows):
+                    raise RuntimeError(f"Export verification failed for {out_path}")
+                written_export_path = str(out_path)
+
+            if drain_failed > 0 and not force_drop_on_drain_error:
+                conn.execute("ROLLBACK")
+                return {
+                    "ok": False,
+                    "error": f"drain_incomplete ({drain_failed} row(s) failed to drain; table preserved)",
+                    "table_existed": True,
+                    "counts": counts_before_drop,
+                    "drained": drained,
+                    "drain_failed": drain_failed,
+                    "exported": len(serialized_rows),
+                    "export_path": written_export_path,
+                    "dropped": False,
+                    "dry_run": False,
+                    "integrity_ok": True,
+                    "wal_checkpoint_ok": True,
+                }
+
+            if drop_table:
                 conn.execute("DROP INDEX IF EXISTS idx_xiaozhi_inbox_status")
                 conn.execute("DROP TABLE IF EXISTS xiaozhi_inbox")
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            dropped = True
+                conn.execute("COMMIT")
+                dropped = True
+            else:
+                conn.execute("ROLLBACK")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+        wal_checkpoint_ok = True
+        wal_checkpoint_info: dict[str, int] | None = None
+        wal_error = ""
+        if dropped:
             try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.OperationalError:
-                pass
+                cp_row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if cp_row is not None:
+                    busy = int(cp_row[0])
+                    log_frames = int(cp_row[1])
+                    checkpointed = int(cp_row[2])
+                    wal_checkpoint_info = {
+                        "busy": busy,
+                        "log": log_frames,
+                        "checkpointed": checkpointed,
+                    }
+                    if busy != 0:
+                        wal_checkpoint_ok = False
+                        wal_error = (
+                            f"wal_checkpoint_busy (busy={busy}, log={log_frames}, checkpointed={checkpointed}; "
+                            "another reader/process holds the WAL open)"
+                        )
+            except sqlite3.OperationalError as cp_exc:
+                wal_checkpoint_ok = False
+                wal_error = f"wal_checkpoint_error: {cp_exc}"
 
         chk_rows = conn.execute("PRAGMA integrity_check").fetchall()
         integrity_ok = len(chk_rows) == 1 and str(chk_rows[0][0]).strip().lower() == "ok"
 
-        return {
-            "ok": bool(integrity_ok),
+        ok = bool(integrity_ok) and bool(wal_checkpoint_ok)
+        result: dict[str, Any] = {
+            "ok": ok,
             "table_existed": True,
             "counts": counts_before_drop,
             "drained": drained,
@@ -247,7 +305,13 @@ def rollback_inbox(
             "dropped": dropped,
             "dry_run": False,
             "integrity_ok": integrity_ok,
+            "wal_checkpoint_ok": wal_checkpoint_ok,
         }
+        if wal_checkpoint_info is not None:
+            result["wal_checkpoint"] = wal_checkpoint_info
+        if wal_error:
+            result["error"] = wal_error
+        return result
     finally:
         conn.close()
 
@@ -266,10 +330,16 @@ def _build_default_drain_fn(db_path: Path):
     brain = CompanionBrain(
         db_path,
         user_id="local",
-        settings=Settings(),
+        settings=Settings.from_env(),
         config=BrainConfig(start_worker=False),
     )
     svc.ensure_default_character(brain)
+    closed_flag = {"done": False}
+
+    def _close_brain() -> None:
+        if not closed_flag["done"]:
+            closed_flag["done"] = True
+            brain.close()
 
     def _drain(row: dict[str, Any]) -> dict[str, Any]:
         payload = row.get("payload")
@@ -287,6 +357,7 @@ def _build_default_drain_fn(db_path: Path):
             turn_meta=meta or None,
         )
 
+    _drain._close_brain = _close_brain  # type: ignore[attr-defined]
     return brain, _drain
 
 
@@ -330,7 +401,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     finally:
         if brain is not None:
-            brain.close()
+            try:
+                closer = getattr(drain_fn, "_close_brain", None)
+                if callable(closer):
+                    closer()
+                else:
+                    brain.close()
+            except Exception:
+                pass
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok") else 1

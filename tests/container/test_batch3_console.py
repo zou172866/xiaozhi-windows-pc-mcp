@@ -1330,6 +1330,157 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
             gsv_mod._active_gsv_loaded = orig_loaded
             gsv_mod._set_voice_dirty(None, "")
 
+    def test_p2_console_hardening_allowlists_redaction_boot_id_lock_and_facade_broadcast(self):
+        """4.1 #2 & H-1: malformed headers, /api/relationship allowlist, /api/audio-test volume, boot_id/app.js refresh, redaction, facade broadcast."""
+        import io
+        import math
+        import console.routes.anima as anima_mod
+        import console.routes.config as cfg_mod
+        import console.routes.gsv as gsv_mod
+        import console.routes.state as state_mod
+        import console.server as srv_mod
+        import console.shared as shared_mod
+        import console_server as cs
+        import start_with_env as swe
+        import boot as boot_mod
+        from patches import asr as asr_patch_mod
+
+        class _FakeH:
+            def __init__(self, body_dict=None):
+                self._body = body_dict or {}
+                self.status = None
+                self.wfile = io.BytesIO()
+                self.sent_headers = []
+
+            def _read_body_json(self):
+                return self._body
+
+            def _send_json(self, obj, status=200):
+                self.status = int(status)
+                raw = json.dumps(shared_mod._redact_json_payload(obj), ensure_ascii=False).encode("utf-8")
+                self.wfile = io.BytesIO(raw)
+
+            def send_header(self, k, v):
+                self.sent_headers.append((k, v))
+
+        # 1. Malformed HTTP request before self.headers exists must NOT raise AttributeError in end_headers()
+        raw_handler = srv_mod.ConsoleHandler.__new__(srv_mod.ConsoleHandler)
+        sent_hdrs = []
+        raw_handler.send_header = lambda k, v: sent_hdrs.append((k, v))
+        with patch("http.server.BaseHTTPRequestHandler.end_headers", return_value=None):
+            raw_handler.end_headers()
+        hdr_keys = {k.lower() for k, _ in sent_hdrs}
+        self.assertIn("x-frame-options", hdr_keys)
+        self.assertIn("content-security-policy", hdr_keys)
+        self.assertIn("x-content-type-options", hdr_keys)
+
+        # 2. /api/relationship rejects unknown fields & character_id override with 400, and forces configured character_id
+        h_rel_bad = _FakeH({"character_id": "hijacked_char", "preset": "warm"})
+        anima_mod.handle_post_relationship(h_rel_bad)
+        self.assertEqual(h_rel_bad.status, 400)
+
+        h_rel_nan = _FakeH({"warmth": float("nan")})
+        anima_mod.handle_post_relationship(h_rel_nan)
+        self.assertEqual(h_rel_nan.status, 400)
+
+        posted_rel = []
+
+        class _FakeRelResp:
+            status_code = 200
+
+            def json(self):
+                return {"character_id": "xiaozhi", "preset": "warm"}
+
+        class _FakeRelCli:
+            def post(self, url, **kwargs):
+                posted_rel.append(kwargs.get("json"))
+                return _FakeRelResp()
+
+        h_rel_ok = _FakeH({"preset": "warm", "warmth": 0.6})
+        with (
+            patch.object(anima_mod, "_read_anima_token", return_value="tok-test-123456"),
+            patch.object(anima_mod, "_get_anima_character_id", return_value="xiaozhi"),
+            patch.object(anima_mod.shared, "_get_console_http_client", return_value=_FakeRelCli()),
+        ):
+            anima_mod.handle_post_relationship(h_rel_ok)
+        self.assertEqual(h_rel_ok.status, 200)
+        self.assertEqual(posted_rel[0]["character_id"], "xiaozhi")
+        self.assertEqual(posted_rel[0]["warmth"], 0.6)
+
+        # 3. /api/audio-test rejects NaN, Inf, bool, string, and out-of-range volume with 400
+        for bad_vol in (float("nan"), float("inf"), -0.1, 1.5, True, "loud"):
+            h_vol = _FakeH({"volume": bad_vol})
+            gsv_mod.handle_post_audio_test(h_vol)
+            self.assertEqual(h_vol.status, 400, f"volume={bad_vol!r} must be rejected with 400")
+
+        # 4. Expanded secret redaction covers Token auth, auth_key, PC_MCP_TOKEN, ANIMA_STUDIO_TOKEN, URL creds, degraded_reasons & security_failures
+        samples = [
+            ("Authorization: Token mysecretToken999", "mysecretToken999"),
+            ("auth_key=super_secret_esp32_key", "super_secret_esp32_key"),
+            ("PC_MCP_TOKEN=pc_secret_987654", "pc_secret_987654"),
+            ("ANIMA_STUDIO_TOKEN=anima_secret_654321", "anima_secret_654321"),
+            ("https://alice:topsecretpass@example.com/api", "topsecretpass"),
+        ]
+        for raw_s, leak in samples:
+            red = shared_mod._redact_secrets(raw_s)
+            self.assertNotIn(leak, red, f"Secret leaked in redacted output: {red!r}")
+
+        red_json = shared_mod._redact_json_payload(
+            {
+                "ok": False,
+                "degraded_reasons": ["failed auth_key=leak_key_123"],
+                "security_failures": ["Bearer leak_tok_456"],
+            }
+        )
+        self.assertNotIn("leak_key_123", json.dumps(red_json))
+        self.assertNotIn("leak_tok_456", json.dumps(red_json))
+
+        # 5. boot_id exposed in /api/health, and app.js implements refreshConsoleToken + boot_id restart tracking
+        h_hlth = _FakeH()
+        state_mod.handle_get_health(h_hlth)
+        hlth_body = json.loads(h_hlth.wfile.getvalue().decode("utf-8"))
+        self.assertEqual(hlth_body.get("boot_id"), shared_mod.get_console_boot_id())
+        app_js = open(os.path.join(os.path.dirname(srv_mod.__file__), "static", "app.js"), encoding="utf-8").read()
+        self.assertIn("refreshConsoleToken", app_js)
+        self.assertIn("restartTargetBootId", app_js)
+        self.assertIn("data.boot_id", app_js)
+
+        # 6. handle_post_config holds _config_write_lock during _hot_reload_runtime_config
+        lock_held_in_reload = {"held": False}
+
+        def _spy_reload(changed):
+            other_res = []
+
+            def _probe():
+                got = cfg_mod._config_write_lock.acquire(blocking=False)
+                if got:
+                    cfg_mod._config_write_lock.release()
+                other_res.append(got)
+
+            t = threading.Thread(target=_probe)
+            t.start()
+            t.join(timeout=2.0)
+            lock_held_in_reload["held"] = (other_res == [False])
+            return True, "hot_reloaded"
+
+        h_cfg = _FakeH({"prompt": "新角色人设测试", "restart": False})
+        with (
+            patch.object(cfg_mod, "_write_updated_yaml", return_value={"changed_fields": ["prompt"], "written": True, "voice_recovered": False}),
+            patch.object(cfg_mod, "_hot_reload_runtime_config", side_effect=_spy_reload),
+        ):
+            cfg_mod.handle_post_config(h_cfg, shutdown_flush_fn=lambda: None)
+        self.assertTrue(lock_held_in_reload["held"], "_config_write_lock must remain held during _hot_reload_runtime_config")
+
+        # 7. H-1 facade broadcast setattr syncs ALL submodules holding the same attribute (e.g. start_with_env.ROOT_DIR)
+        orig_root = boot_mod.ROOT_DIR
+        try:
+            with patch.object(swe, "ROOT_DIR", "/tmp/h1_broadcast_test"):
+                self.assertEqual(boot_mod.ROOT_DIR, "/tmp/h1_broadcast_test")
+                self.assertEqual(asr_patch_mod.ROOT_DIR, "/tmp/h1_broadcast_test")
+        finally:
+            self.assertEqual(boot_mod.ROOT_DIR, orig_root)
+            self.assertEqual(asr_patch_mod.ROOT_DIR, orig_root)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

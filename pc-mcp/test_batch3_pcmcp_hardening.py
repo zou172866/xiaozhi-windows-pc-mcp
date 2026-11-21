@@ -1204,6 +1204,174 @@ class TestBatch3PcMcpHardening(unittest.TestCase):
         self.assertTrue(wb_cmd2[p_idx2 + 1].startswith("[追问] "))
         self.assertIn("--help", wb_cmd2[p_idx2 + 1])
 
+    def test_p1_11_l3_file_backed_logs_queued_reap_antigravity_lock_and_spawn_cancel_race(self):
+        """P1-11: File-backed child logs (no broken pipe), dead-parent queued reap, Antigravity lock, _on_spawn cancel race."""
+        from l3_backends.antigravity import AntigravityBackend
+
+        # 1. run_subprocess_with_tree_kill with log file paths captures stdout/stderr without PIPE & cleans up logs
+        out_log = self.tmp_root / "task_p111.stdout.log"
+        err_log = self.tmp_root / "task_p111.stderr.log"
+        res = l3_backends.run_subprocess_with_tree_kill(
+            [sys.executable, "-c", "import sys; print('hello_file_log'); print('err_line', file=sys.stderr)"],
+            stdout_log_path=out_log,
+            stderr_log_path=err_log,
+            timeout=15.0,
+        )
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("hello_file_log", res.stdout)
+        self.assertIn("err_line", res.stderr)
+        self.assertFalse(out_log.exists(), "Temp stdout log should be cleaned up after completion")
+        self.assertFalse(err_log.exists(), "Temp stderr log should be cleaned up after completion")
+
+        # 2. Abandoned `status == 'queued'` record from dead owner_pid is reaped cleanly (not permanent zombie)
+        zombie_q = self.active / "z_queued_dead_owner.json"
+        zombie_q.write_text(
+            json.dumps(
+                {
+                    "id": "z_queued_dead_owner",
+                    "backend": "dsh",
+                    "workdir": str(self.tmp_root),
+                    "status": "queued",
+                    "owner_pid": 99999991,
+                    "owner_create_time": 12345.0,
+                    "started_ts": time.time() - 60.0,
+                    "timeout_seconds": 300,
+                }
+            ),
+            encoding="utf-8",
+        )
+        reaped = l3_backends.reap_stale_running_tasks()
+        self.assertGreaterEqual(reaped, 1)
+        z_after = json.loads(zombie_q.read_text(encoding="utf-8"))
+        self.assertEqual(z_after["status"], "error")
+        self.assertTrue(z_after.get("reaped_zombie"))
+
+        # 3. register_spawned_task_pid immediately kills child and does NOT overwrite 'cancelled' back to 'running'
+        rec_cancel = {
+            "id": "t_cancel_race",
+            "backend": "dsh",
+            "workdir": str(self.tmp_root),
+            "status": "running",
+            "pid": None,
+        }
+        cancel_file = self.active / "t_cancel_race.json"
+        cancel_file.write_text(json.dumps({"id": "t_cancel_race", "status": "cancelled"}), encoding="utf-8")
+        l3_backends._mark_task_cancelled_id("t_cancel_race")
+        killed_pids: list[int] = []
+        with patch.object(l3_backends, "kill_process_tree", side_effect=lambda pid, **kw: killed_pids.append(pid) or True):
+            allowed = l3_backends.register_spawned_task_pid("t_cancel_race", rec_cancel, 54321, child_ct=100.0)
+        self.assertFalse(allowed)
+        self.assertEqual(killed_pids, [54321])
+        self.assertEqual(json.loads(cancel_file.read_text(encoding="utf-8"))["status"], "cancelled")
+
+        # 4. Concurrent AntigravityBackend.dispatch on same workspace under _workspace_guard_lock allows ONLY 1 pending task
+        ag_backend = AntigravityBackend()
+        cfg_ag = {"backend": "antigravity", "workdir": str(self.tmp_root), "queue_mode": False}
+        barrier = threading.Barrier(2)
+        msgs: list[str] = []
+
+        def _dispatch_one(tid: str) -> None:
+            barrier.wait(timeout=3.0)
+            with patch("l3_backends.antigravity._is_worker_alive", return_value=False):
+                msgs.append(ag_backend.dispatch(tid, f"并发任务 {tid}", False, cfg_ag))
+
+        t1 = threading.Thread(target=_dispatch_one, args=("ag_race_1",))
+        t2 = threading.Thread(target=_dispatch_one, args=("ag_race_2",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+        self.assertEqual(len(msgs), 2)
+        pending_files = list(self.pending.glob("*.json"))
+        self.assertEqual(len(pending_files), 1, f"Expected exactly 1 pending task under lock, got {pending_files}")
+        self.assertTrue(any("已有任务进行中" in m for m in msgs), f"Second dispatch should be rejected as busy: {msgs}")
+
+    def test_p2_watchdog_identity_hung_cleanup_sidecar_atomic_claim_and_vision_phash(self):
+        """4.1 #3: Watchdog port-owner verify + hung spawn kill, sidecar atomic claim, vision UIA hash & cursor-tolerant phash."""
+        import agy_sidecar_worker
+        import pc_mcp_watchdog as wd
+
+        # 1. find_pc_mcp_pids ignores unrelated process listening on 18900
+        fake_conn = MagicMock(status=wd.psutil.CONN_LISTEN, laddr=MagicMock(port=18900), pid=77777)
+        fake_proc_other = MagicMock()
+        fake_proc_other.name.return_value = "nginx.exe"
+        fake_proc_other.cmdline.return_value = ["nginx.exe", "-g", "daemon off;"]
+        with (
+            patch.object(wd.psutil, "net_connections", return_value=[fake_conn]),
+            patch.object(wd.psutil, "Process", return_value=fake_proc_other),
+            patch.object(wd.psutil, "process_iter", return_value=[]),
+        ):
+            self.assertEqual(wd.find_pc_mcp_pids(port=18900), [])
+
+        # 2. restart_pc_mcp_server terminates newly spawned hung process if health check times out
+        fake_spawned = MagicMock()
+        fake_spawned.pid = 88888
+        fake_spawned.poll.return_value = None
+        with (
+            patch.object(wd, "stop_pc_mcp_only"),
+            patch.object(wd, "spawn_pc_mcp_server", return_value=fake_spawned),
+            patch.object(wd.l3_backends, "get_process_create_time", return_value=None),
+            patch.object(wd, "probe_pc_mcp_health", return_value=(False, "timeout")),
+            patch.object(wd.time, "sleep"),
+        ):
+            ok_r = wd.restart_pc_mcp_server(port=18900, health_wait_steps=2)
+        self.assertFalse(ok_r)
+        fake_spawned.terminate.assert_called_once()
+
+        # 3. Sidecar _process_task atomically claims pending file BEFORE running agentapi (no double dispatch)
+        tf = self.pending / "sidecar_atomic_1.json"
+        tf.write_text(json.dumps({"id": "sidecar_atomic_1", "prompt": "测试原子认领"}), encoding="utf-8")
+        seen_pending_during_popen: list[bool] = []
+
+        class _FakeProc:
+            pid = 12345
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                seen_pending_during_popen.append(tf.exists())
+                return ("11111111-2222-3333-4444-555555555555", "")
+
+        with (
+            patch.object(agy_sidecar_worker, "PENDING_DIR", self.pending),
+            patch.object(agy_sidecar_worker, "ACTIVE_DIR", self.active),
+            patch.object(agy_sidecar_worker, "_build_agentapi_prefix", return_value=["agentapi"]),
+            patch.object(agy_sidecar_worker, "_prepare_cmd", side_effect=lambda c: c),
+            patch.object(agy_sidecar_worker.subprocess, "Popen", return_value=_FakeProc()),
+        ):
+            self.assertTrue(agy_sidecar_worker._process_task(tf))
+            # Second concurrent attempt on same path immediately returns False
+            self.assertFalse(agy_sidecar_worker._process_task(tf))
+        self.assertEqual(seen_pending_during_popen, [False], "Pending .json must be claimed/renamed before agentapi runs")
+
+        # 4. Vision: Stage-1 UIA hit populates region_hash; perceptual hash tolerates 1-2px blinking cursor
+        base_img = Image.new("RGB", (200, 120), color=(240, 240, 240))
+        d1 = ImageDraw.Draw(base_img)
+        d1.rectangle((40, 30, 160, 90), fill=(255, 255, 255), outline=(60, 60, 60))
+        d1.rectangle((55, 50, 90, 65), fill=(30, 30, 30))
+
+        cursor_img = base_img.copy()
+        d2 = ImageDraw.Draw(cursor_img)
+        # Draw a thin 1px blinking text caret at x=100
+        d2.line((100, 48, 100, 68), fill=(0, 0, 0), width=1)
+
+        popup_img = Image.new("RGB", (200, 120), color=(20, 20, 40))
+
+        h_base, box_b = vision._compute_region_hash(base_img, 100, 60)
+        h_cursor, _ = vision._compute_region_hash(cursor_img, 100, 60, box=box_b)
+        h_popup, _ = vision._compute_region_hash(popup_img, 100, 60, box=box_b)
+        self.assertTrue(h_base.startswith("phash:"))
+        self.assertTrue(vision._region_hashes_match(h_base, h_cursor), "Perceptual hash must tolerate 1px blinking cursor")
+        self.assertFalse(vision._region_hashes_match(h_base, h_popup), "Perceptual hash must reject popup/window switch")
+
+        fake_uia = [{"id": 1, "type": "Button", "name": "发送", "left": 80, "top": 40, "right": 120, "bottom": 80, "cx": 100, "cy": 60}]
+        with (
+            patch.object(pcm, "_collect_uia_elements", return_value=fake_uia),
+            patch.object(pcm.ImageGrab, "grab", return_value=base_img),
+        ):
+            uia_loc = vision._smart_locate_target("发送")
+        self.assertIsNotNone(uia_loc)
+        self.assertTrue(bool(uia_loc.region_hash), "Stage-1 UIA hit must also populate region_hash")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

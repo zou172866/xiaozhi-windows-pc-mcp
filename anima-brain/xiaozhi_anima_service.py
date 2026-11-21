@@ -245,8 +245,27 @@ def get_backup_status(
     return st
 
 
+_BACKUP_VERIFIED_SIGS: dict[str, dict[str, tuple[str, int, int]]] = {}
+
+
+def _file_stat_sig(path: Path) -> tuple[str, int, int] | None:
+    try:
+        st = path.stat()
+        if st.st_size <= 0:
+            return None
+        return (path.name, int(st.st_size), int(st.st_mtime_ns))
+    except OSError:
+        return None
+
+
 def _verify_sqlite_integrity(db_file: Path) -> tuple[bool, str]:
-    conn = sqlite3.connect(str(db_file), timeout=10.0)
+    try:
+        if not db_file.is_file() or db_file.stat().st_size <= 0:
+            return False, "empty_or_missing_file"
+    except OSError as exc:
+        return False, str(exc)
+    uri = db_file.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
     try:
         rows = conn.execute("PRAGMA integrity_check").fetchall()
         ok = len(rows) == 1 and str(rows[0][0]).strip().lower() == "ok"
@@ -254,6 +273,65 @@ def _verify_sqlite_integrity(db_file: Path) -> tuple[bool, str]:
         return ok, detail
     finally:
         conn.close()
+
+
+def _resolve_sqlite_main_file(engine) -> Path | None:
+    """Resolve the backing filesystem path of engine.db without holding engine._lock long-term (P1-9)."""
+    db_file_str = ""
+    with engine._lock:
+        try:
+            for row in engine.db.execute("PRAGMA database_list").fetchall():
+                if len(row) >= 3 and str(row[1]) == "main":
+                    db_file_str = str(row[2] or "").strip()
+                    break
+        except Exception:
+            db_file_str = ""
+    if not db_file_str or db_file_str == ":memory:":
+        return None
+    p = Path(db_file_str)
+    return p if p.is_file() else None
+
+
+def _snapshot_sqlite_to_file(engine, tmp_path: Path) -> None:
+    """Create a consistent backup into tmp_path via an independent read-only WAL connection (P1-9).
+
+    Never holds engine._lock during VACUUM INTO / backup() so /xiaozhi/recall (300ms budget),
+    /xiaozhi/ingest, and /health stay completely unblocked during large backups.
+    """
+    src_file = _resolve_sqlite_main_file(engine)
+    if src_file is not None:
+        src_uri = src_file.resolve().as_uri() + "?mode=ro"
+        src_conn: sqlite3.Connection | None = None
+        try:
+            try:
+                src_conn = sqlite3.connect(src_uri, uri=True, timeout=15.0)
+            except sqlite3.OperationalError:
+                src_conn = sqlite3.connect(str(src_file), timeout=15.0)
+            used_vacuum = False
+            try:
+                src_conn.execute("VACUUM INTO ?", (str(tmp_path),))
+                used_vacuum = True
+            except sqlite3.OperationalError:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            if not used_vacuum:
+                dst = sqlite3.connect(str(tmp_path), timeout=15.0)
+                try:
+                    src_conn.backup(dst, pages=64, sleep=0.005)
+                finally:
+                    dst.close()
+            return
+        finally:
+            if src_conn is not None:
+                src_conn.close()
+
+    # Fallback for :memory: or synthetic DB handles without an on-disk path
+    with engine._lock:
+        dst = sqlite3.connect(str(tmp_path), timeout=15.0)
+        try:
+            engine.db.backup(dst)
+        finally:
+            dst.close()
 
 
 def _prune_backup_dir(bdir: Path, keep_daily: int, keep_weekly: int) -> tuple[list[Path], list[Path]]:
@@ -301,18 +379,18 @@ def run_online_backup(
     weekly_tmp = bdir / f".{weekly_name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
 
     if not force and daily_path.is_file():
-        existing_size = 0
-        try:
-            existing_size = daily_path.stat().st_size
-        except OSError:
-            existing_size = 0
-        if existing_size > 0:
+        daily_sig = _file_stat_sig(daily_path)
+        weekly_sig = _file_stat_sig(weekly_path) if weekly_path.is_file() else None
+        if daily_sig is not None:
             with _BACKUP_STATE_LOCK:
                 prev_st = dict(_BACKUP_STATE_BY_DIR.get(dir_key) or _default_backup_state())
+                prev_sigs = dict(_BACKUP_VERIFIED_SIGS.get(dir_key) or {})
             already_verified = (
                 prev_st.get("integrity_ok") is True
                 and prev_st.get("last_backup_file") == daily_name
-                and weekly_path.is_file()
+                and prev_sigs.get("daily") == daily_sig
+                and weekly_sig is not None
+                and prev_sigs.get("weekly") == weekly_sig
             )
             if already_verified:
                 st = get_backup_status(brain, bdir)
@@ -322,16 +400,31 @@ def run_online_backup(
             except Exception as exc:
                 ok_exist, det_exist = False, str(exc)
             if ok_exist:
-                if not weekly_path.is_file():
+                # P1-9: Verify weekly backup integrity too; self-heal 0-byte or corrupted weekly backups
+                weekly_ok = False
+                if weekly_sig is not None:
+                    try:
+                        weekly_ok, det_weekly = _verify_sqlite_integrity(weekly_path)
+                    except Exception as w_chk_exc:
+                        weekly_ok, det_weekly = False, str(w_chk_exc)
+                    if not weekly_ok:
+                        log.warning(
+                            "Existing weekly backup %s failed integrity check (%s); repairing from verified daily backup",
+                            weekly_name,
+                            det_weekly,
+                        )
+                if not weekly_ok:
                     try:
                         shutil.copy2(daily_path, weekly_tmp)
                         os.replace(weekly_tmp, weekly_path)
+                        weekly_ok, _ = _verify_sqlite_integrity(weekly_path)
+                        weekly_sig = _file_stat_sig(weekly_path) if weekly_ok else None
                     except OSError as w_exc:
                         try:
                             weekly_tmp.unlink(missing_ok=True)
                         except OSError:
                             pass
-                        log.warning("Failed to backfill weekly backup %s: %s", weekly_name, w_exc)
+                        log.warning("Failed to backfill/repair weekly backup %s: %s", weekly_name, w_exc)
                 dailies, weeklies = _prune_backup_dir(bdir, keep_d, keep_w)
                 newest = dailies[0] if dailies else daily_path
                 try:
@@ -347,14 +440,20 @@ def run_online_backup(
                             "last_backup_at": formatted,
                             "last_backup_ts": float(mtime),
                             "last_backup_file": newest.name,
-                            "integrity_ok": True,
+                            "integrity_ok": bool(weekly_ok),
                             "daily_count": len(dailies),
                             "weekly_count": len(weeklies),
-                            "last_error": "",
+                            "last_error": "" if weekly_ok else f"weekly backup integrity failed: {weekly_name}",
                         }
                     )
                     _BACKUP_STATE_BY_DIR[dir_key] = cur
+                    if weekly_ok and weekly_sig is not None:
+                        _BACKUP_VERIFIED_SIGS[dir_key] = {"daily": daily_sig, "weekly": weekly_sig}
+                    else:
+                        _BACKUP_VERIFIED_SIGS.pop(dir_key, None)
                     snap = dict(cur)
+                if not weekly_ok:
+                    return {"ok": False, "error": cur["last_error"], **snap}
                 return {"ok": True, "skipped": "already_exists", **snap}
             log.warning(
                 "Existing daily backup %s failed integrity check (%s); recreating fresh backup",
@@ -368,21 +467,7 @@ def run_online_backup(
         if tmp_path.exists():
             tmp_path.unlink()
 
-        with engine._lock:
-            used_vacuum = False
-            if not engine.db.in_transaction:
-                try:
-                    engine.db.execute("VACUUM INTO ?", (str(tmp_path),))
-                    used_vacuum = True
-                except sqlite3.OperationalError:
-                    if tmp_path.exists():
-                        tmp_path.unlink()
-            if not used_vacuum:
-                dst = sqlite3.connect(str(tmp_path), timeout=15.0)
-                try:
-                    engine.db.backup(dst)
-                finally:
-                    dst.close()
+        _snapshot_sqlite_to_file(engine, tmp_path)
 
         integrity_ok, integrity_detail = _verify_sqlite_integrity(tmp_path)
         if not integrity_ok:
@@ -396,14 +481,28 @@ def run_online_backup(
                 cur["integrity_ok"] = False
                 cur["last_error"] = err_msg
                 _BACKUP_STATE_BY_DIR[dir_key] = cur
+                _BACKUP_VERIFIED_SIGS.pop(dir_key, None)
             log.error("Anima SQLite backup failed integrity check: %s", integrity_detail)
             return {"ok": False, "error": err_msg, **get_backup_status(brain, bdir)}
 
         os.replace(tmp_path, daily_path)
+        daily_sig = _file_stat_sig(daily_path)
 
-        if force or not weekly_path.is_file():
+        # P1-9: Always verify weekly backup non-empty & integrity; repair automatically if corrupt/empty
+        need_weekly = force
+        if not need_weekly:
+            try:
+                w_ok, _ = _verify_sqlite_integrity(weekly_path)
+            except Exception:
+                w_ok = False
+            need_weekly = not w_ok
+        if need_weekly:
             shutil.copy2(daily_path, weekly_tmp)
             os.replace(weekly_tmp, weekly_path)
+            w_post_ok, w_post_det = _verify_sqlite_integrity(weekly_path)
+            if not w_post_ok:
+                raise RuntimeError(f"weekly backup integrity_check failed: {w_post_det}")
+        weekly_sig = _file_stat_sig(weekly_path)
 
         dailies, weeklies = _prune_backup_dir(bdir, keep_d, keep_w)
         newest_name = dailies[0].name if dailies else daily_name
@@ -424,6 +523,8 @@ def run_online_backup(
                 }
             )
             _BACKUP_STATE_BY_DIR[dir_key] = cur
+            if daily_sig is not None and weekly_sig is not None:
+                _BACKUP_VERIFIED_SIGS[dir_key] = {"daily": daily_sig, "weekly": weekly_sig}
             snap = dict(cur)
         log.info(
             "Online SQLite backup verified OK: %s (daily=%d/%d weekly=%d/%d)",
@@ -1549,6 +1650,25 @@ def enqueue_inbox_turn(
             if existing is None:
                 return {"accepted": False, "reason": "insert_failed", "request_id": req_id}
 
+            # 4.1 #4: Refuse cross-character overwrite on existing request_id
+            existing_cid = str(existing["character_id"] or "").strip() or DEFAULT_CHARACTER_ID
+            if existing_cid != cid:
+                log.warning(
+                    "Inbox request_id %s belongs to character %s; refusing cross-character overwrite by %s",
+                    req_id,
+                    existing_cid,
+                    cid,
+                )
+                return {
+                    "accepted": False,
+                    "inserted": False,
+                    "updated": False,
+                    "conflict": True,
+                    "reason": "character_id_conflict",
+                    "replayed": False,
+                    "request_id": req_id,
+                }
+
             try:
                 prev_payload = json.loads(existing["payload"])
                 if not isinstance(prev_payload, dict):
@@ -1576,9 +1696,9 @@ def enqueue_inbox_turn(
             if prev_status == "dead":
                 engine.db.execute(
                     "UPDATE xiaozhi_inbox "
-                    "SET character_id=?, payload=?, status='pending', attempts=0, last_error='', updated_at=? "
-                    "WHERE request_id=?",
-                    (cid, merged_json, ts, req_id),
+                    "SET payload=?, status='pending', attempts=0, last_error='', updated_at=? "
+                    "WHERE request_id=? AND character_id=?",
+                    (merged_json, ts, req_id, existing_cid),
                 )
                 return {
                     "accepted": True,
@@ -1593,25 +1713,25 @@ def enqueue_inbox_turn(
                 if prev_status == "done":
                     engine.db.execute(
                         "UPDATE xiaozhi_inbox "
-                        "SET character_id=?, payload=?, status='pending', attempts=0, last_error='', updated_at=? "
-                        "WHERE request_id=?",
-                        (cid, merged_json, ts, req_id),
+                        "SET payload=?, status='pending', attempts=0, last_error='', updated_at=? "
+                        "WHERE request_id=? AND character_id=?",
+                        (merged_json, ts, req_id, existing_cid),
                     )
                 elif prev_status == "pending":
                     # Upgraded continuation while pending: reset retry state so fuller turn is immediately eligible
                     engine.db.execute(
                         "UPDATE xiaozhi_inbox "
-                        "SET character_id=?, payload=?, attempts=0, last_error='', updated_at=0.0 "
-                        "WHERE request_id=?",
-                        (cid, merged_json, req_id),
+                        "SET payload=?, attempts=0, last_error='', updated_at=0.0 "
+                        "WHERE request_id=? AND character_id=?",
+                        (merged_json, req_id, existing_cid),
                     )
                 else:
                     # processing: update payload in-place while preserving active heartbeat lease; worker verifies payload before marking done
                     engine.db.execute(
                         "UPDATE xiaozhi_inbox "
-                        "SET character_id=?, payload=?, updated_at=? "
-                        "WHERE request_id=?",
-                        (cid, merged_json, ts, req_id),
+                        "SET payload=?, updated_at=? "
+                        "WHERE request_id=? AND character_id=?",
+                        (merged_json, ts, req_id, existing_cid),
                     )
                 return {
                     "accepted": True,
@@ -2687,13 +2807,18 @@ def create_combined_asgi_app(
             if db_ok:
                 inbox_snap = get_inbox_stats(brain)
         except Exception as exc:
-            db_ok, db_err = False, str(exc)
+            db_ok, db_err = False, _sanitize_inbox_error(exc)
         obs_public = dict(obsidian_exporter.status())
         obs_public.pop("host_export_dir", None)
-        backup_snap = get_backup_status(brain, backup_dir)
+        obs_public.pop("export_dir", None)
+        if obs_public.get("last_error"):
+            obs_public["last_error"] = "obsidian_sync_error"
+        backup_snap = dict(get_backup_status(brain, backup_dir))
+        if backup_snap.get("last_error"):
+            backup_snap["last_error"] = "backup_error"
         return db_ok, db_err, inbox_snap, backup_snap, obs_public
 
-    async def _build_health_response() -> tuple[dict[str, Any], int]:
+    async def _build_health_response(*, authenticated: bool = False) -> tuple[dict[str, Any], int]:
         # Snapshot event-loop-owned asyncio state on the loop thread before offloading blocking DB/FS checks
         worker_alive = (worker_task is not None) and (not worker_task.done()) and (not shutting_down)
         stats_snap = dict(ingest_stats)
@@ -2713,22 +2838,33 @@ def create_combined_asgi_app(
             else max(1, int(INGEST_QUEUE_MAXSIZE * 0.8))
         )
         backlog_ok = inbox_pending < backlog_limit
+        backup_integrity_failed = bool(backup_snap.get("enabled")) and (backup_snap.get("integrity_ok") is False)
 
         reasons: list[str] = []
         if not db_ok:
-            reasons.append(f"db_check_failed: {db_err or 'SELECT 1 failed'}")
+            reasons.append(f"db_check_failed: {db_err}" if (authenticated and db_err) else "db_check_failed")
         if not worker_alive:
             reasons.append("ingest_worker_not_running")
         if not backlog_ok:
             reasons.append(f"ingest_backlog_high: {inbox_pending} >= {backlog_limit}")
+        if backup_integrity_failed:
+            reasons.append("backup_integrity_failed")
+
+        degraded_reasons: list[str] = []
+        if inbox_dead > 0:
+            degraded_reasons.append(f"inbox_dead_nonzero: {inbox_dead}")
 
         healthy = len(reasons) == 0
+        status_str = "unhealthy" if not healthy else ("degraded" if degraded_reasons else "ok")
         payload = {
-            "status": "ok" if healthy else "unhealthy",
+            "status": status_str,
             "build_version": BUILD_VERSION,
             "db_ok": db_ok,
             "worker_alive": worker_alive,
             "backlog_ok": backlog_ok,
+            "backup_ok": not backup_integrity_failed,
+            "degraded": bool(degraded_reasons) and healthy,
+            "degraded_reasons": degraded_reasons,
             "inbox_pending": inbox_pending,
             "inbox_dead": inbox_dead,
             "unhealthy_reasons": reasons,
@@ -2806,273 +2942,307 @@ def create_combined_asgi_app(
             return
 
         orig_send = send
+        response_started = False
 
         async def _send_with_clickjacking_headers(message):
+            nonlocal response_started
             if scope["type"] == "http" and message.get("type") == "http.response.start":
+                response_started = True
                 raw_hdrs = list(message.get("headers") or [])
                 keys = {k.lower() for k, _ in raw_hdrs}
                 if b"x-frame-options" not in keys:
                     raw_hdrs.append((b"x-frame-options", b"DENY"))
                 if b"content-security-policy" not in keys:
                     raw_hdrs.append((b"content-security-policy", b"frame-ancestors 'none'"))
+                if b"x-content-type-options" not in keys:
+                    raw_hdrs.append((b"x-content-type-options", b"nosniff"))
                 message = dict(message, headers=raw_hdrs)
             await orig_send(message)
 
         if scope["type"] == "http":
             send = _send_with_clickjacking_headers
 
-        if scope["type"] in ("http", "websocket"):
-            path = scope.get("path", "")
-            headers_list = list(scope.get("headers", []))
-            headers_dict = {k.decode("latin1").lower(): v.decode("latin1") for k, v in headers_list}
+        try:
+            if scope["type"] in ("http", "websocket"):
+                path = scope.get("path", "")
+                headers_list = list(scope.get("headers", []))
+                headers_dict = {k.decode("latin1").lower(): v.decode("latin1") for k, v in headers_list}
 
-            # Unauthenticated health probe alias (/health and /xiaozhi/health, H-3)
-            if scope["type"] == "http" and path in ("/health", "/xiaozhi/health"):
-                health_body, health_code = await _build_health_response()
-                resp = JSONResponse(health_body, status_code=health_code)
-                await resp(scope, receive, send)
-                return
-
-            # Handle XiaoZhi fast bridge endpoints directly
-            if scope["type"] == "http" and path.startswith("/xiaozhi/"):
-                req = Request(scope, receive=receive)
-
-                auth = headers_dict.get("authorization", "")
-                if not secrets.compare_digest(
-                    auth.encode("utf-8", errors="replace"),
-                    f"Bearer {token}".encode("utf-8"),
-                ):
-                    resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
+                # Unauthenticated health probe alias (/health and /xiaozhi/health, H-3)
+                if scope["type"] == "http" and path in ("/health", "/xiaozhi/health"):
+                    auth_hdr = headers_dict.get("authorization", "")
+                    is_authed = secrets.compare_digest(
+                        auth_hdr.encode("utf-8", errors="replace"),
+                        f"Bearer {token}".encode("utf-8"),
+                    )
+                    health_body, health_code = await _build_health_response(authenticated=is_authed)
+                    resp = JSONResponse(health_body, status_code=health_code)
                     await resp(scope, receive, send)
                     return
 
-                raw_bytes = await req.body()
-                if not raw_bytes or not raw_bytes.strip():
-                    raw_body: Any = {}
-                else:
-                    try:
-                        raw_body = json.loads(raw_bytes)
-                    except (ValueError, UnicodeDecodeError):
+                # Handle XiaoZhi fast bridge endpoints directly
+                if scope["type"] == "http" and path.startswith("/xiaozhi/"):
+                    req = Request(scope, receive=receive)
+
+                    auth = headers_dict.get("authorization", "")
+                    if not secrets.compare_digest(
+                        auth.encode("utf-8", errors="replace"),
+                        f"Bearer {token}".encode("utf-8"),
+                    ):
+                        resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
+                        await resp(scope, receive, send)
+                        return
+
+                    raw_bytes = await req.body()
+                    if not raw_bytes or not raw_bytes.strip():
+                        raw_body: Any = {}
+                    else:
+                        try:
+                            raw_body = json.loads(raw_bytes)
+                        except (ValueError, UnicodeDecodeError):
+                            if req.method == "POST":
+                                resp = JSONResponse(
+                                    {"error": "Invalid JSON request body"},
+                                    status_code=400,
+                                )
+                                await resp(scope, receive, send)
+                                return
+                            raw_body = {}
+                    if not isinstance(raw_body, dict):
                         if req.method == "POST":
                             resp = JSONResponse(
-                                {"error": "Invalid JSON request body"},
+                                {"error": "Request body must be a JSON object"},
                                 status_code=400,
                             )
                             await resp(scope, receive, send)
                             return
-                        raw_body = {}
-                if not isinstance(raw_body, dict):
-                    if req.method == "POST":
-                        resp = JSONResponse(
-                            {"error": "Request body must be a JSON object"},
-                            status_code=400,
-                        )
-                        await resp(scope, receive, send)
-                        return
-                    body = {}
-                else:
-                    body = raw_body
+                        body = {}
+                    else:
+                        body = raw_body
 
-                char_id = str(
-                    body.get("character_id")
-                    or req.query_params.get("character_id")
-                    or DEFAULT_CHARACTER_ID
-                ).strip()
+                    char_id = str(
+                        body.get("character_id")
+                        or req.query_params.get("character_id")
+                        or DEFAULT_CHARACTER_ID
+                    ).strip()
 
-                if path == "/xiaozhi/relationship":
-                    if req.method == "GET":
-                        data = await asyncio.to_thread(get_relationship_snapshot, brain, char_id)
-                        resp = JSONResponse(data)
-                        await resp(scope, receive, send)
-                        return
-                    if req.method == "POST":
-                        data = await asyncio.to_thread(update_relationship_settings, brain, char_id, body)
-                        obsidian_runner.notify_db_change()
-                        resp = JSONResponse(data)
+                    if path == "/xiaozhi/relationship":
+                        if req.method == "GET":
+                            data = await asyncio.to_thread(get_relationship_snapshot, brain, char_id)
+                            resp = JSONResponse(data)
+                            await resp(scope, receive, send)
+                            return
+                        if req.method == "POST":
+                            data = await asyncio.to_thread(update_relationship_settings, brain, char_id, body)
+                            obsidian_runner.notify_db_change()
+                            resp = JSONResponse(data)
+                            await resp(scope, receive, send)
+                            return
+
+                    if path == "/xiaozhi/obsidian/status" and req.method == "GET":
+                        resp = JSONResponse(obsidian_exporter.status())
                         await resp(scope, receive, send)
                         return
 
-                if path == "/xiaozhi/obsidian/status" and req.method == "GET":
-                    resp = JSONResponse(obsidian_exporter.status())
-                    await resp(scope, receive, send)
-                    return
-
-                if path == "/xiaozhi/obsidian/config" and req.method == "POST":
-                    if "enabled" not in body or not isinstance(body.get("enabled"), bool):
-                        resp = JSONResponse(
-                            {"error": "Field 'enabled' (boolean) is required"},
-                            status_code=400,
-                        )
-                        await resp(scope, receive, send)
-                        return
-                    status_data = await obsidian_runner.set_enabled_async(bool(body["enabled"]))
-                    resp = JSONResponse({"ok": True, "obsidian": status_data, **status_data})
-                    await resp(scope, receive, send)
-                    return
-
-                if path == "/xiaozhi/obsidian/rebuild" and req.method == "POST":
-                    result = await obsidian_runner.rebuild_now()
-                    status_data = obsidian_exporter.status()
-                    code = 200 if result.get("ok") else 500
-                    resp = JSONResponse(
-                        {"result": result, "obsidian": status_data, **result},
-                        status_code=code,
-                    )
-                    await resp(scope, receive, send)
-                    return
-
-                if path == "/xiaozhi/recall" and req.method == "POST":
-                    query = str(body.get("query") or "")
-                    data = await asyncio.to_thread(build_fast_recall_context, brain, char_id, query)
-                    resp = JSONResponse(data)
-                    await resp(scope, receive, send)
-                    return
-
-                if path == "/xiaozhi/ingest" and req.method == "POST":
-                    turns = body.get("turns")
-                    if not isinstance(turns, list):
-                        turns = [body]
-                    if shutting_down:
-                        rej_ids = [
-                            str(item.get("request_id") or "").strip() or _new_request_id()
-                            for item in turns
-                            if isinstance(item, dict)
-                            and str(item.get("user_message") or "").strip()
-                            and str(item.get("assistant_reply") or "").strip()
-                        ]
-                        resp = JSONResponse(
-                            {
-                                "queued": 0,
-                                "accepted_ids": [],
-                                "rejected_ids": rej_ids,
-                                "error": "shutting_down",
-                            },
-                            status_code=503,
-                        )
-                        await resp(scope, receive, send)
-                        return
-                    enqueued = 0
-                    accepted_ids: list[str] = []
-                    rejected_ids: list[str] = []
-                    max_pending_cap = max(1, int(INGEST_QUEUE_MAXSIZE) + max(0, int(INGEST_OVERFLOW_MAX_TASKS)))
-                    for item in turns:
-                        if not isinstance(item, dict):
-                            continue
-                        u_msg = str(item.get("user_message") or "").strip()
-                        a_msg = str(item.get("assistant_reply") or "").strip()
-                        r_id = str(item.get("request_id") or "").strip() or _new_request_id()
-                        if not (u_msg and a_msg):
-                            continue
-                        item_meta: dict[str, Any] = {}
-                        if "occurred_at" in item and item["occurred_at"] is not None:
-                            item_meta["occurred_at"] = item["occurred_at"]
-                        if "source" in item and item["source"]:
-                            item_meta["source"] = str(item["source"])
-                        if "device_id" in item and item["device_id"]:
-                            item_meta["device_id"] = str(item["device_id"])
-                        if "used_tools" in item and item["used_tools"] is not None:
-                            item_meta["used_tools"] = bool(item["used_tools"])
-
-                        enq_res = await asyncio.to_thread(
-                            enqueue_inbox_turn,
-                            brain,
-                            char_id,
-                            r_id,
-                            u_msg,
-                            a_msg,
-                            turn_meta=item_meta,
-                            max_pending=max_pending_cap,
-                        )
-                        if not enq_res.get("accepted") and enq_res.get("reason") == "queue_full":
-                            deadline = time.monotonic() + INGEST_ENQUEUE_WAIT_SECONDS
-                            while time.monotonic() < deadline and not shutting_down:
-                                rem = max(0.005, deadline - time.monotonic())
-                                if inbox_slot_freed is not None:
-                                    inbox_slot_freed.clear()
-                                    try:
-                                        await asyncio.wait_for(inbox_slot_freed.wait(), timeout=rem)
-                                    except asyncio.TimeoutError:
-                                        break
-                                else:
-                                    await asyncio.sleep(min(0.02, rem))
-                                enq_res = await asyncio.to_thread(
-                                    enqueue_inbox_turn,
-                                    brain,
-                                    char_id,
-                                    r_id,
-                                    u_msg,
-                                    a_msg,
-                                    turn_meta=item_meta,
-                                    max_pending=max_pending_cap,
-                                )
-                                if enq_res.get("accepted"):
-                                    break
-
-                        if enq_res.get("accepted"):
-                            enqueued += 1
-                            accepted_ids.append(r_id)
-                            if enq_res.get("inserted") or enq_res.get("updated"):
-                                ingest_stats["enqueued_total"] += 1
-                                if inbox_wake is not None:
-                                    inbox_wake.set()
-                        else:
-                            ingest_stats["dropped_total"] += 1
-                            ingest_stats["dropped_queue_full"] += 1
-                            rejected_ids.append(r_id)
-                            log.warning(
-                                "Persistent inbox backlog full (limit=%d); rejecting turn %s",
-                                max_pending_cap,
-                                r_id,
+                    if path == "/xiaozhi/obsidian/config" and req.method == "POST":
+                        if "enabled" not in body or not isinstance(body.get("enabled"), bool):
+                            resp = JSONResponse(
+                                {"error": "Field 'enabled' (boolean) is required"},
+                                status_code=400,
                             )
+                            await resp(scope, receive, send)
+                            return
+                        status_data = await obsidian_runner.set_enabled_async(bool(body["enabled"]))
+                        resp = JSONResponse({"ok": True, "obsidian": status_data, **status_data})
+                        await resp(scope, receive, send)
+                        return
 
-                    status_code = 503 if (rejected_ids and enqueued == 0) else 200
-                    payload: dict[str, Any] = {
-                        "queued": enqueued,
-                        "accepted_ids": accepted_ids,
-                        "rejected_ids": rejected_ids,
-                    }
-                    if status_code == 503:
-                        payload["error"] = "ingest_queue_full"
-                    resp = JSONResponse(payload, status_code=status_code)
+                    if path == "/xiaozhi/obsidian/rebuild" and req.method == "POST":
+                        result = await obsidian_runner.rebuild_now()
+                        status_data = obsidian_exporter.status()
+                        code = 200 if result.get("ok") else 500
+                        resp = JSONResponse(
+                            {"result": result, "obsidian": status_data, **result},
+                            status_code=code,
+                        )
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/recall" and req.method == "POST":
+                        query = str(body.get("query") or "")
+                        data = await asyncio.to_thread(build_fast_recall_context, brain, char_id, query)
+                        resp = JSONResponse(data)
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/ingest" and req.method == "POST":
+                        turns = body.get("turns")
+                        if not isinstance(turns, list):
+                            turns = [body]
+                        if shutting_down:
+                            rej_ids = [
+                                str(item.get("request_id") or "").strip() or _new_request_id()
+                                for item in turns
+                                if isinstance(item, dict)
+                                and str(item.get("user_message") or "").strip()
+                                and str(item.get("assistant_reply") or "").strip()
+                            ]
+                            resp = JSONResponse(
+                                {
+                                    "queued": 0,
+                                    "accepted_ids": [],
+                                    "rejected_ids": rej_ids,
+                                    "error": "shutting_down",
+                                },
+                                status_code=503,
+                            )
+                            await resp(scope, receive, send)
+                            return
+                        enqueued = 0
+                        accepted_ids: list[str] = []
+                        rejected_ids: list[str] = []
+                        conflict_ids: list[str] = []
+                        max_pending_cap = max(1, int(INGEST_QUEUE_MAXSIZE) + max(0, int(INGEST_OVERFLOW_MAX_TASKS)))
+                        for item in turns:
+                            if not isinstance(item, dict):
+                                continue
+                            u_msg = str(item.get("user_message") or "").strip()
+                            a_msg = str(item.get("assistant_reply") or "").strip()
+                            r_id = str(item.get("request_id") or "").strip() or _new_request_id()
+                            if not (u_msg and a_msg):
+                                continue
+                            item_meta: dict[str, Any] = {}
+                            if "occurred_at" in item and item["occurred_at"] is not None:
+                                item_meta["occurred_at"] = item["occurred_at"]
+                            if "source" in item and item["source"]:
+                                item_meta["source"] = str(item["source"])
+                            if "device_id" in item and item["device_id"]:
+                                item_meta["device_id"] = str(item["device_id"])
+                            if "used_tools" in item and item["used_tools"] is not None:
+                                item_meta["used_tools"] = bool(item["used_tools"])
+
+                            enq_res = await asyncio.to_thread(
+                                enqueue_inbox_turn,
+                                brain,
+                                char_id,
+                                r_id,
+                                u_msg,
+                                a_msg,
+                                turn_meta=item_meta,
+                                max_pending=max_pending_cap,
+                            )
+                            if not enq_res.get("accepted") and enq_res.get("reason") == "queue_full":
+                                deadline = time.monotonic() + INGEST_ENQUEUE_WAIT_SECONDS
+                                while time.monotonic() < deadline and not shutting_down:
+                                    rem = max(0.005, deadline - time.monotonic())
+                                    if inbox_slot_freed is not None:
+                                        inbox_slot_freed.clear()
+                                        try:
+                                            await asyncio.wait_for(inbox_slot_freed.wait(), timeout=rem)
+                                        except asyncio.TimeoutError:
+                                            break
+                                    else:
+                                        await asyncio.sleep(min(0.02, rem))
+                                    enq_res = await asyncio.to_thread(
+                                        enqueue_inbox_turn,
+                                        brain,
+                                        char_id,
+                                        r_id,
+                                        u_msg,
+                                        a_msg,
+                                        turn_meta=item_meta,
+                                        max_pending=max_pending_cap,
+                                    )
+                                    if enq_res.get("accepted"):
+                                        break
+
+                            if enq_res.get("accepted"):
+                                enqueued += 1
+                                accepted_ids.append(r_id)
+                                if enq_res.get("inserted") or enq_res.get("updated"):
+                                    ingest_stats["enqueued_total"] += 1
+                                    if inbox_wake is not None:
+                                        inbox_wake.set()
+                            elif enq_res.get("reason") == "character_id_conflict":
+                                conflict_ids.append(r_id)
+                                rejected_ids.append(r_id)
+                            else:
+                                ingest_stats["dropped_total"] += 1
+                                ingest_stats["dropped_queue_full"] += 1
+                                rejected_ids.append(r_id)
+                                log.warning(
+                                    "Persistent inbox backlog full (limit=%d); rejecting turn %s",
+                                    max_pending_cap,
+                                    r_id,
+                                )
+
+                        if rejected_ids and enqueued == 0:
+                            status_code = 409 if conflict_ids and len(conflict_ids) == len(rejected_ids) else 503
+                        else:
+                            status_code = 200
+                        payload: dict[str, Any] = {
+                            "queued": enqueued,
+                            "accepted_ids": accepted_ids,
+                            "rejected_ids": rejected_ids,
+                        }
+                        if conflict_ids:
+                            payload["conflict_ids"] = conflict_ids
+                        if status_code == 409:
+                            payload["error"] = "character_id_conflict"
+                        elif status_code == 503:
+                            payload["error"] = "ingest_queue_full"
+                        resp = JSONResponse(payload, status_code=status_code)
+                        await resp(scope, receive, send)
+                        return
+
+                    resp = JSONResponse({"error": "Not found"}, status_code=404)
                     await resp(scope, receive, send)
                     return
 
-                resp = JSONResponse({"error": "Not found"}, status_code=404)
+                # Normalize trusted LAN/Docker Host & Origin headers for Companion Studio UI,
+                # and sanitize non-ASCII Authorization bytes so http_server.py's compare_digest never 500s.
+                host_val = headers_dict.get("host", "")
+                needs_host_norm = host_val in allowed_hosts and host_val not in (
+                    f"127.0.0.1:{PORT}",
+                    f"localhost:{PORT}",
+                )
+                raw_auth = headers_dict.get("authorization", "")
+                has_non_ascii_auth = any(ord(ch) >= 128 for ch in raw_auth)
+                if needs_host_norm or has_non_ascii_auth:
+                    new_headers = []
+                    for k, v in headers_list:
+                        kl = k.lower()
+                        if needs_host_norm and kl == b"host":
+                            new_headers.append((b"host", f"localhost:{PORT}".encode("latin1")))
+                        elif needs_host_norm and kl == b"origin" and v.decode("latin1") == f"http://{host_val}":
+                            new_headers.append((b"origin", f"http://localhost:{PORT}".encode("latin1")))
+                        elif has_non_ascii_auth and kl == b"authorization":
+                            new_headers.append((b"authorization", b"Bearer invalid-non-ascii"))
+                        else:
+                            new_headers.append((k, v))
+                    scope = dict(scope, headers=new_headers)
+
+            is_studio_write = (
+                scope["type"] == "http"
+                and scope.get("method") == "POST"
+                and scope.get("path", "") in _STUDIO_WRITE_ACTIONS
+            )
+
+            await studio_app(scope, receive, send)
+            if is_studio_write:
+                obsidian_runner.notify_db_change()
+        except Exception as exc:
+            log.error(
+                "Unhandled error on %s %s: %s",
+                scope.get("method", scope.get("type", "?")),
+                scope.get("path", ""),
+                _sanitize_inbox_error(exc),
+            )
+            if scope.get("type") == "http" and not response_started:
+                resp = JSONResponse({"error": "Internal server error"}, status_code=500)
                 await resp(scope, receive, send)
                 return
-
-            # Normalize trusted LAN/Docker Host & Origin headers for Companion Studio UI,
-            # and sanitize non-ASCII Authorization bytes so http_server.py's compare_digest never 500s.
-            host_val = headers_dict.get("host", "")
-            needs_host_norm = host_val in allowed_hosts and host_val not in (
-                f"127.0.0.1:{PORT}",
-                f"localhost:{PORT}",
-            )
-            raw_auth = headers_dict.get("authorization", "")
-            has_non_ascii_auth = any(ord(ch) >= 128 for ch in raw_auth)
-            if needs_host_norm or has_non_ascii_auth:
-                new_headers = []
-                for k, v in headers_list:
-                    kl = k.lower()
-                    if needs_host_norm and kl == b"host":
-                        new_headers.append((b"host", f"localhost:{PORT}".encode("latin1")))
-                    elif needs_host_norm and kl == b"origin" and v.decode("latin1") == f"http://{host_val}":
-                        new_headers.append((b"origin", f"http://localhost:{PORT}".encode("latin1")))
-                    elif has_non_ascii_auth and kl == b"authorization":
-                        new_headers.append((b"authorization", b"Bearer invalid-non-ascii"))
-                    else:
-                        new_headers.append((k, v))
-                scope = dict(scope, headers=new_headers)
-
-        is_studio_write = (
-            scope["type"] == "http"
-            and scope.get("method") == "POST"
-            and scope.get("path", "") in _STUDIO_WRITE_ACTIONS
-        )
-
-        await studio_app(scope, receive, send)
-        if is_studio_write:
-            obsidian_runner.notify_db_change()
+            raise
 
     return combined_app
 

@@ -28,11 +28,12 @@ TASKS_ROOT = STATE_DIR / "agy_tasks"
 PENDING_DIR = TASKS_ROOT / "pending"
 ACTIVE_DIR = TASKS_ROOT / "active"
 ARCHIVE_DIR = TASKS_ROOT / "archive"
+LOGS_DIR = TASKS_ROOT / "logs"
 HEARTBEAT_FILE = TASKS_ROOT / "worker_heartbeat.json"
 L3_CONFIG_FILE = STATE_DIR / "l3_backend_config.json"
 MAX_ACTIVE_TASK_RECORDS = _pc_common.MAX_ACTIVE_TASK_RECORDS
 
-for _d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR):
+for _d in (STATE_DIR, PENDING_DIR, ACTIVE_DIR, LOGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 VALID_BACKENDS = ("antigravity", "dsh", "workbuddy", "none")
@@ -251,6 +252,14 @@ def kill_process_tree(
     )
 
 
+def get_task_log_paths(task_id: str) -> tuple[Path, Path]:
+    """Return safe (stdout_log_path, stderr_log_path) inside LOGS_DIR for a validated task_id (P1-11)."""
+    safe_id = validate_task_id(task_id)
+    base = ACTIVE_DIR.parent / "logs"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{safe_id}.stdout.log", base / f"{safe_id}.stderr.log"
+
+
 def run_subprocess_with_tree_kill(
     cmd: List[str],
     *,
@@ -259,6 +268,9 @@ def run_subprocess_with_tree_kill(
     timeout: float = 300.0,
     creationflags: int = 0,
     on_spawn: Optional[Callable[[int], None]] = None,
+    stdout_log_path: Optional[Path] = None,
+    stderr_log_path: Optional[Path] = None,
+    cleanup_log_files: bool = True,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess with Windows .cmd shim unwrapping and guaranteed descendant tree kill on timeout."""
     return _pc_common.run_subprocess_with_tree_kill(
@@ -270,6 +282,9 @@ def run_subprocess_with_tree_kill(
         on_spawn=on_spawn,
         prepare_fn=prepare_subprocess_command,
         kill_fn=kill_process_tree,
+        stdout_log_path=stdout_log_path,
+        stderr_log_path=stderr_log_path,
+        cleanup_log_files=cleanup_log_files,
     )
 
 
@@ -514,11 +529,42 @@ def _task_recency_key(fp: Path, obj: Dict[str, Any], st_mtime_ns: int) -> tuple[
     return _pc_common.task_recency_key(fp, obj, st_mtime_ns)
 
 
+def _is_task_in_memory_queue(task_id: str) -> bool:
+    if not task_id:
+        return False
+    with _workspace_guard_lock:
+        for items in _workspace_queues.values():
+            for item in items:
+                if str(item.get("task_id") or "") == task_id:
+                    return True
+    return False
+
+
+def _salvage_and_clean_task_logs(obj: Dict[str, Any]) -> None:
+    """Salvage tail output from surviving child task log files after MCP restart and clean up temp logs (P1-11)."""
+    for field, key in (("stdout_log", "stdout"), ("stderr_log", "stderr")):
+        raw_p = str(obj.get(field) or "").strip()
+        if not raw_p:
+            continue
+        p = Path(raw_p)
+        try:
+            if p.is_file():
+                limit = 4000 if key == "stdout" else 2000
+                tail = p.read_bytes()[-65536:].decode("utf-8", errors="replace").strip()
+                if tail and not obj.get(key):
+                    obj[key] = tail[-limit:]
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def reap_stale_running_tasks(now: Optional[float] = None) -> int:
-    """Recover zombie `status == 'running'` task records whose worker/subprocess died or exceeded timeout.
+    """Recover zombie `status == 'running'` and orphaned `status == 'queued'` task records (P1-17, P1-11).
 
     P1-17: Every file is isolated in its own try/except so one corrupt task JSON can NEVER crash 18900
     startup, and every PID kill verifies psutil create_time() to prevent killing a reused PID.
+    P1-11: Also reaps in-memory `queued` records abandoned by a dead/restarted MCP parent so they
+    cannot become permanent zombies that escape `prune_active_tasks()`.
     """
     try:
         if not ACTIVE_DIR.exists():
@@ -538,7 +584,10 @@ def reap_stale_running_tasks(now: Optional[float] = None) -> int:
                 continue
             orig_stat = fp.stat()
             obj = json.loads(fp.read_text(encoding="utf-8"))
-            if not isinstance(obj, dict) or obj.get("status") != "running":
+            if not isinstance(obj, dict):
+                continue
+            st = str(obj.get("status") or "").strip().lower()
+            if st not in ("running", "queued"):
                 continue
 
             task_id = str(obj.get("id") or fp.stem)
@@ -551,11 +600,13 @@ def reap_stale_running_tasks(now: Optional[float] = None) -> int:
             child_ct = _safe_float(obj.get("pid_create_time"), 0.0) or None
 
             worker_alive_here = is_worker_thread_alive(task_id)
+            in_mem_queue_here = _is_task_in_memory_queue(task_id) if st == "queued" else False
             same_owner_here = (
                 owner_pid is not None
                 and owner_pid == cur_pid
                 and (
                     worker_alive_here
+                    or in_mem_queue_here
                     or (owner_ct is not None and (cur_pid_ct is None or abs(cur_pid_ct - owner_ct) <= 2.0))
                     or (
                         owner_ct is None
@@ -574,41 +625,50 @@ def reap_stale_running_tasks(now: Optional[float] = None) -> int:
                         owner_pid, owner_ct, started_ts=started_ts, role="owner"
                     )
 
-            child_verified_alive = (
-                is_same_process(child_pid, child_ct, started_ts=started_ts, role="child")
-                if child_pid is not None
-                else False
-            )
-            verified_child_ct = (
-                child_ct
-                if child_ct is not None
-                else (get_process_create_time(child_pid) if child_verified_alive else None)
-            )
-
             reason = ""
-            if elapsed > timeout_sec + 30:
-                if child_pid and child_verified_alive:
-                    kill_process_tree(child_pid, expected_create_time=verified_child_ct)
-                reason = f"后台任务超过 {timeout_sec} 秒仍未结束，已自动回收清理"
-            elif owner_pid is not None and not same_owner_here and not owner_alive:
-                if child_pid and child_verified_alive:
-                    # E-1: Running L3 child processes survive MCP restarts independently until finished or timed out.
-                    continue
-                reason = "原宿主机服务已重启或退出，遗留运行中任务已自动回收"
-            elif (
-                child_pid is not None
-                and elapsed > 5.0
-                and not worker_alive_here
-                and not child_verified_alive
-            ):
-                reason = "后台任务子进程已提前退出，僵尸状态已自动回收"
-            elif owner_pid is None and child_pid is None and elapsed > timeout_sec:
-                reason = "历史遗留运行中任务已超时失联，已自动回收"
+            if st == "queued":
+                if not owner_alive:
+                    reason = "原宿主机服务已重启或退出，内存排队任务已失效并自动回收"
+                elif same_owner_here and not in_mem_queue_here and elapsed > 5.0:
+                    reason = "排队任务已不在当前内存队列中，僵尸排队状态已自动回收"
+                elif owner_pid is None and elapsed > timeout_sec:
+                    reason = "历史遗留排队任务已超时失联，已自动回收"
+            else:
+                child_verified_alive = (
+                    is_same_process(child_pid, child_ct, started_ts=started_ts, role="child")
+                    if child_pid is not None
+                    else False
+                )
+                verified_child_ct = (
+                    child_ct
+                    if child_ct is not None
+                    else (get_process_create_time(child_pid) if child_verified_alive else None)
+                )
+
+                if elapsed > timeout_sec + 30:
+                    if child_pid and child_verified_alive:
+                        kill_process_tree(child_pid, expected_create_time=verified_child_ct)
+                    reason = f"后台任务超过 {timeout_sec} 秒仍未结束，已自动回收清理"
+                elif owner_pid is not None and not same_owner_here and not owner_alive:
+                    if child_pid and child_verified_alive:
+                        # E-1: Running L3 child processes survive MCP restarts independently until finished or timed out.
+                        continue
+                    reason = "原宿主机服务已重启或退出，遗留运行中任务已自动回收"
+                elif (
+                    child_pid is not None
+                    and elapsed > 5.0
+                    and not worker_alive_here
+                    and not child_verified_alive
+                ):
+                    reason = "后台任务子进程已提前退出，僵尸状态已自动回收"
+                elif owner_pid is None and child_pid is None and elapsed > timeout_sec:
+                    reason = "历史遗留运行中任务已超时失联，已自动回收"
 
             if reason:
+                _salvage_and_clean_task_logs(obj)
                 obj["status"] = "error"
                 obj["stderr"] = reason
-                obj["summary"] = reason
+                obj["summary"] = obj.get("stdout") and summarize_text_for_voice(str(obj["stdout"]), 280) or reason
                 obj["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 obj["reaped_zombie"] = True
                 atomic_write_json(fp, obj)
@@ -725,6 +785,33 @@ def _mark_task_cancelled_id(task_id: str) -> None:
         if len(_cancelled_task_ids) >= 256:
             _cancelled_task_ids.clear()
         _cancelled_task_ids.add(task_id)
+
+
+def register_spawned_task_pid(
+    task_id: str,
+    task_record: Dict[str, Any],
+    child_pid: int,
+    child_ct: Optional[float] = None,
+) -> bool:
+    """Atomically record spawned child PID or immediately kill it if task was already cancelled (P1-11).
+
+    Serialized under `_workspace_guard_lock` with `cancel_active_task()` so `_on_spawn` can NEVER
+    overwrite a `cancelled` task back to `running` or leak an unkilled child process.
+    Returns True if the child is allowed to keep running, False if killed due to cancellation.
+    """
+    verified_ct = child_ct if child_ct is not None else get_process_create_time(child_pid)
+    cancelled = False
+    with _workspace_guard_lock:
+        if task_id in _cancelled_task_ids:
+            cancelled = True
+        else:
+            task_record["pid"] = child_pid
+            task_record["pid_create_time"] = verified_ct
+            save_active_task(task_id, task_record)
+    if cancelled:
+        kill_process_tree(child_pid, grace_seconds=1.0, expected_create_time=verified_ct)
+        return False
+    return True
 
 
 def _find_active_workspace_task_locked(ws_key: str) -> Optional[Dict[str, Any]]:

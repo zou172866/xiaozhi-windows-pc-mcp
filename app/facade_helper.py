@@ -30,29 +30,36 @@ class DelegatingModule(types.ModuleType):
         subs = list(submodules)
         object.__setattr__(self, "_facade_submodules", subs)
         owners: Dict[str, types.ModuleType] = {}
+        targets: Dict[str, list[types.ModuleType]] = {}
         if explicit_owners:
             for k, sub in explicit_owners.items():
                 owners[k] = sub
+                targets.setdefault(k, []).append(sub)
                 if hasattr(sub, k):
                     self.__dict__[k] = getattr(sub, k)
         for sub in subs:
             for k, v in vars(sub).items():
                 if k.startswith("__") and k.endswith("__"):
                     continue
+                tlist = targets.setdefault(k, [])
+                if sub not in tlist:
+                    tlist.append(sub)
                 if k not in owners:
                     owners[k] = sub
                     self.__dict__[k] = v
         for k, v in own_dict.items():
-            if k in ("_facade_owners", "_facade_submodules"):
+            if k in ("_facade_owners", "_facade_targets", "_facade_submodules"):
                 continue
             self.__dict__[k] = v
         object.__setattr__(self, "_facade_owners", owners)
+        object.__setattr__(self, "_facade_targets", targets)
 
     def __getattribute__(self, name: str) -> Any:
         if name in (
             "__dict__",
             "__class__",
             "_facade_owners",
+            "_facade_targets",
             "_facade_submodules",
             "__name__",
             "__doc__",
@@ -70,17 +77,32 @@ class DelegatingModule(types.ModuleType):
         return object.__getattribute__(self, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        owners = object.__getattribute__(self, "_facade_owners")
-        owner = owners.get(name)
-        if owner is not None:
-            setattr(owner, name, value)
+        # H-1: Broadcast writes/monkeypatches to ALL submodules holding a binding for `name`
+        # (e.g. start_with_env.ROOT_DIR shared by boot & patches.asr, or shared imports across console routes).
+        targets = object.__getattribute__(self, "_facade_targets")
+        tlist = targets.get(name)
+        if tlist:
+            for sub in tlist:
+                setattr(sub, name, value)
+        else:
+            owners = object.__getattribute__(self, "_facade_owners")
+            owner = owners.get(name)
+            if owner is not None:
+                setattr(owner, name, value)
         object.__setattr__(self, name, value)
 
     def __delattr__(self, name: str) -> None:
-        owners = object.__getattribute__(self, "_facade_owners")
-        owner = owners.get(name)
-        if owner is not None and hasattr(owner, name):
-            delattr(owner, name)
+        targets = object.__getattribute__(self, "_facade_targets")
+        tlist = targets.get(name)
+        if tlist:
+            for sub in tlist:
+                if hasattr(sub, name):
+                    delattr(sub, name)
+        else:
+            owners = object.__getattribute__(self, "_facade_owners")
+            owner = owners.get(name)
+            if owner is not None and hasattr(owner, name):
+                delattr(owner, name)
         if name in object.__getattribute__(self, "__dict__"):
             object.__delattr__(self, name)
 

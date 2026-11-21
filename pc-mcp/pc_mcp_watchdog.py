@@ -153,12 +153,18 @@ def _is_pc_mcp_python_cmdline(proc_name: str, cmd: list[str], script_path: Path 
 
 
 def find_pc_mcp_pids(port: int = 18900, script_path: Path = MCP_SCRIPT) -> list[int]:
-    """Locate listening 18900 MCP server PID(s) without touching user shells, editors, or browsers."""
+    """Locate verified 18900 MCP server PID(s) without touching unrelated port owners, shells, editors, or browsers (4.1)."""
     pids: set[int] = set()
     try:
         for conn in psutil.net_connections(kind="tcp"):
             if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == int(port) and conn.pid:
-                pids.add(int(conn.pid))
+                cand_pid = int(conn.pid)
+                try:
+                    p_obj = psutil.Process(cand_pid)
+                    if _is_pc_mcp_python_cmdline(p_obj.name(), p_obj.cmdline(), script_path=script_path):
+                        pids.add(cand_pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
     except Exception:
         pass
     try:
@@ -325,8 +331,31 @@ def restart_pc_mcp_server(
         if log:
             log.error("Failed to respawn pc_control_mcp.py: %s", exc)
         return False
+    proc_ct = l3_backends.get_process_create_time(getattr(proc, "pid", None))
+
+    def _cleanup_hung_spawn() -> None:
+        try:
+            if proc.poll() is not None:
+                return
+            pid_val = getattr(proc, "pid", None)
+            if pid_val and proc_ct is not None:
+                if not l3_backends.is_same_process(pid_val, proc_ct, role="child"):
+                    return
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                proc.kill()
+                try:
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     for _ in range(max(1, int(health_wait_steps))):
         if should_stop_fn and should_stop_fn():
+            _cleanup_hung_spawn()
             return False
         rc = proc.poll()
         if rc is not None:
@@ -344,9 +373,10 @@ def restart_pc_mcp_server(
                 log.info("18900 PC MCP respawned and passed /audio/status health check.")
             return True
         time.sleep(0.5)
+    _cleanup_hung_spawn()
     tail = read_log_tail(boot_log_path, 30) or read_log_tail(mcp_log_path, 30)
     if log:
-        log.error("18900 failed health verification after respawn. boot.log tail:\n%s", tail)
+        log.error("18900 failed health verification after respawn; terminated hung child. boot.log tail:\n%s", tail)
     return False
 
 

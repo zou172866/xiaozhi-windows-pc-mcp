@@ -29,7 +29,7 @@
 - **高位端口（`>15000`）**：`18000`（WS）、`18003`（OTA/Vision）、`18080`（控制台）、`18787`（Anima Brain）、`18900`（PC MCP + 48kHz 音频）、`19880`（可选 GPU `GPT-SoVITS`），彻底避开 Windows Hyper-V 保留段冲突；
 - **低延迟与防抢话**：`SileroVAD` `1100ms` 防抢话上限 + 可热关投机性句末早判（实测 34 条句中换气零误截断、完整句平均省 `~0.48s` 尾延迟）+ ESP32-S3 离线唤醒/打断词；
 - **轻量内存与免 Key 天气**：默认 `SherpaASR`（int8 ONNX）+ 异步独立 ASR 线程 + 空闲冷内存回收，实测双容器合计常驻 `~480–500 MiB`（`xiaozhi-esp32-server ~415 MiB` + `xiaozhi-anima-brain ~67–84 MiB`，较 PyTorch `FunASR` `3.54 GB` 压降约 88%）；内置中央气象台 `nmc.cn` 免 Key 全国实时与 7 天天气；
-- **可复现构建与自动化 CI**：`anima-brain` 锁定双阶段镜像 digest、Py3.12 依赖约束与非 root `USER app`，宿主机 `pc-mcp` 使用 `requirements.in` + SHA-256 哈希锁依赖，自带 GitHub Actions CI 与三层 211 项自动化测试套件。
+- **可复现构建与自动化 CI**：`anima-brain` 锁定双阶段镜像 digest、Py3.12 依赖约束与非 root `USER app`，宿主机 `pc-mcp` 使用 `requirements.in` + SHA-256 哈希锁依赖，自带 GitHub Actions CI 与三层 220 项自动化测试套件。
 
 ---
 
@@ -80,7 +80,7 @@ xiaozhi-server/
 ```powershell
 python scripts/run_tests.py --layer unit       # 离线单元测试（含临时 docker run --rm，不依赖运行中容器）
 python scripts/run_tests.py --layer contract   # 上游镜像契约校验（升级镜像必跑）
-python scripts/run_tests.py --layer all        # 全链路三层回归（211 项）
+python scripts/run_tests.py --layer all        # 全链路三层回归（220 项）
 python scripts/generate_patches_doc.py --check # 校验 docs/patches.md 与代码同步
 ```
 

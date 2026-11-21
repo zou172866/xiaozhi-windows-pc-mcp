@@ -323,6 +323,20 @@ def kill_process_tree(
     return True
 
 
+def _read_tail_utf8(path: Path, max_bytes: int = 256 * 1024) -> str:
+    try:
+        if not path.is_file():
+            return ""
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            raw = f.read()
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
 def run_subprocess_with_tree_kill(
     cmd: List[str],
     *,
@@ -333,35 +347,114 @@ def run_subprocess_with_tree_kill(
     on_spawn: Optional[Callable[[int], None]] = None,
     prepare_fn: Callable[[List[str]], List[str]] = prepare_subprocess_command,
     kill_fn: Callable[..., bool] = kill_process_tree,
+    stdout_log_path: Optional[Path] = None,
+    stderr_log_path: Optional[Path] = None,
+    cleanup_log_files: bool = True,
+    max_output_bytes: int = 256 * 1024,
 ) -> subprocess.CompletedProcess:
-    """Run a subprocess with Windows .cmd shim unwrapping and guaranteed descendant tree kill on timeout."""
-    prepared = prepare_fn(cmd)
-    kwargs: Dict[str, Any] = {
-        "cwd": cwd,
-        "env": env,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
-    }
-    if os.name == "nt" and creationflags:
-        kwargs["creationflags"] = creationflags
+    """Run a subprocess with Windows .cmd shim unwrapping and guaranteed descendant tree kill on timeout.
 
-    proc = subprocess.Popen(prepared, **kwargs)
+    P1-11: When `stdout_log_path` / `stderr_log_path` are provided, redirects child stdout/stderr directly
+    to disk files (and immediately closes parent write handles after Popen) so L3 child processes that
+    survive an MCP restart NEVER hit ERROR_BROKEN_PIPE when the old parent exits.
+    """
+    prepared = prepare_fn(cmd)
+    use_file_logs = stdout_log_path is not None or stderr_log_path is not None
+
+    if not use_file_logs:
+        kwargs: Dict[str, Any] = {
+            "cwd": cwd,
+            "env": env,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if os.name == "nt" and creationflags:
+            kwargs["creationflags"] = creationflags
+
+        proc = subprocess.Popen(prepared, **kwargs)
+        proc_create_time = get_process_create_time(proc.pid)
+        if on_spawn is not None:
+            try:
+                on_spawn(proc.pid)
+            except Exception:
+                pass
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return subprocess.CompletedProcess(prepared, proc.returncode, stdout=stdout, stderr=stderr)
+        except subprocess.TimeoutExpired:
+            kill_fn(proc.pid, expected_create_time=proc_create_time)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout, stderr = "", ""
+            raise subprocess.TimeoutExpired(prepared, timeout, output=stdout, stderr=stderr)
+
+    out_path = Path(stdout_log_path) if stdout_log_path is not None else None
+    err_path = Path(stderr_log_path) if stderr_log_path is not None else None
+    out_fp = None
+    err_fp = None
+    try:
+        if out_path is not None:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_fp = open(out_path, "wb")
+        if err_path is not None:
+            err_path.parent.mkdir(parents=True, exist_ok=True)
+            err_fp = open(err_path, "wb")
+
+        kwargs = {
+            "cwd": cwd,
+            "env": env,
+            "stdin": subprocess.DEVNULL,
+            "stdout": out_fp if out_fp is not None else subprocess.DEVNULL,
+            "stderr": err_fp if err_fp is not None else subprocess.DEVNULL,
+        }
+        if os.name == "nt" and creationflags:
+            kwargs["creationflags"] = creationflags
+
+        proc = subprocess.Popen(prepared, **kwargs)
+    finally:
+        # Parent closes its copies immediately; child owns inherited file handles independently of parent lifetime.
+        if out_fp is not None:
+            try:
+                out_fp.close()
+            except OSError:
+                pass
+        if err_fp is not None:
+            try:
+                err_fp.close()
+            except OSError:
+                pass
+
     proc_create_time = get_process_create_time(proc.pid)
     if on_spawn is not None:
         try:
             on_spawn(proc.pid)
         except Exception:
             pass
+
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(prepared, proc.returncode, stdout=stdout, stderr=stderr)
-    except subprocess.TimeoutExpired:
-        kill_fn(proc.pid, expected_create_time=proc_create_time)
         try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except Exception:
-            stdout, stderr = "", ""
-        raise subprocess.TimeoutExpired(prepared, timeout, output=stdout, stderr=stderr)
+            rc = proc.wait(timeout=timeout)
+            stdout = _read_tail_utf8(out_path, max_output_bytes) if out_path is not None else ""
+            stderr = _read_tail_utf8(err_path, max_output_bytes) if err_path is not None else ""
+            return subprocess.CompletedProcess(prepared, rc, stdout=stdout, stderr=stderr)
+        except subprocess.TimeoutExpired:
+            kill_fn(proc.pid, expected_create_time=proc_create_time)
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            stdout = _read_tail_utf8(out_path, max_output_bytes) if out_path is not None else ""
+            stderr = _read_tail_utf8(err_path, max_output_bytes) if err_path is not None else ""
+            raise subprocess.TimeoutExpired(prepared, timeout, output=stdout, stderr=stderr)
+    finally:
+        if cleanup_log_files:
+            for p in (out_path, err_path):
+                if p is not None:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass

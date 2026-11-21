@@ -700,6 +700,82 @@ class TestBatch3AnimaOutboxAndRecall(unittest.TestCase):
             finally:
                 ob2.close()
 
+    def test_p2_uniq_id_none_stale_mood_guard_and_warm_timeout_no_circuit_trip(self):
+        """4.1 #4b: uniq_id=None never produces 'xz-None'; stale recall gen skips mood write; 300ms warm timeout doesn't trip global CB."""
+        from types import SimpleNamespace
+        import anima_memory_provider as amp
+        import mei_emotion_router as mer
+
+        # 1. uniq_id=None MUST fall back to generated unique ID, NEVER literal 'xz-None'
+        m_user = SimpleNamespace(role="user", content="你好呀", uniq_id=None, is_temporary=False)
+        m_asst = SimpleNamespace(role="assistant", content="你好！", is_temporary=False)
+        pairs = amp.extract_clean_pairs([m_user, m_asst], device_id="dev-null-uid")
+        self.assertEqual(len(pairs), 1)
+        self.assertNotEqual(pairs[0]["request_id"], "xz-None")
+        self.assertNotIn("None", pairs[0]["request_id"])
+        self.assertTrue(pairs[0]["request_id"].startswith("xz-"))
+
+        # 2. Stale recall generation returning late must NOT overwrite newer device Anima mood
+        prov = amp.MemoryProvider({"role_id": "dev-mood-gen"}, summary_memory=None)
+        prov._recall_gen["dev-mood-gen"] = 5
+        mood_writes = []
+
+        class _FakeResp:
+            status_code = 200
+
+            def json(self):
+                return {"context_text": "旧记忆", "mood": "angry_stale", "facts_count": 1, "open_loops_count": 0}
+
+        class _FakeAsyncCli:
+            async def post(self, *a, **kw):
+                return _FakeResp()
+
+        async def _run_mood_and_warm():
+            with (
+                patch.object(prov, "_get_async_client", return_value=_FakeAsyncCli()),
+                patch.object(mer, "set_anima_mood", side_effect=lambda m, **kw: mood_writes.append((m, kw))),
+            ):
+                # Stale gen=2 < current gen=5 -> mood MUST NOT be updated
+                await prov._fetch_recall_once("q_old", "tok", "dev-mood-gen", gen=2)
+                self.assertEqual(mood_writes, [], "Stale recall gen must NOT mutate device Anima mood")
+                # Fresh gen=5 >= current gen=5 -> mood IS updated
+                await prov._fetch_recall_once("q_new", "tok", "dev-mood-gen", gen=5)
+                self.assertEqual(len(mood_writes), 1)
+                self.assertEqual(mood_writes[0][0], "angry_stale")
+
+            # 3. Repeated 300ms warm-budget timeouts must fall back to cache WITHOUT tripping global 30s circuit breaker
+            prov_w = amp.MemoryProvider(
+                {
+                    "role_id": "dev-warm",
+                    "recall_warm_budget_seconds": 0.05,
+                    "recall_budget_seconds": 1.0,
+                    "recall_cb_threshold": 2,
+                    "recall_cb_cooldown_seconds": 30.0,
+                },
+                summary_memory=None,
+            )
+            prov_w._recall_cache["dev-warm"] = ("缓存记忆内容", time.monotonic())
+
+            async def _slow_fetch(*a, **kw):
+                await asyncio.sleep(0.25)
+                return "慢返回"
+
+            with (
+                patch.object(amp, "_read_token", return_value="tok-warm"),
+                patch.object(prov_w, "_fetch_recall_once", side_effect=_slow_fetch),
+                patch.object(prov_w, "_schedule_bg_refresh") as m_bg,
+            ):
+                for _ in range(4):
+                    ctx = await prov_w.query_memory("hello", device_id="dev-warm")
+                    self.assertEqual(ctx, "缓存记忆内容")
+                st = prov_w.get_recall_stats("dev-warm")
+                self.assertFalse(st["circuit_open"], "300ms warm budget timeouts must NOT trip global 30s circuit breaker")
+                self.assertEqual(st["consecutive_failures"], 0)
+                self.assertEqual(st["warm_fallback_hits"], 4)
+                self.assertEqual(m_bg.call_count, 4)
+
+        asyncio.run(_run_mood_and_warm())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -150,25 +150,65 @@
     lastSeenText: document.getElementById("lastSeenText"),
   };
 
-  const CONSOLE_TOKEN = (
+  let consoleToken = (
     document.querySelector('meta[name="console-token"]')?.getAttribute("content") || ""
   ).trim();
+  let knownBootId = "";
+  let restartTargetBootId = "";
+  let tokenRefreshPromise = null;
+
+  async function refreshConsoleToken() {
+    if (tokenRefreshPromise) return tokenRefreshPromise;
+    tokenRefreshPromise = (async () => {
+      try {
+        const r = await fetch("/", { cache: "no-store" });
+        if (!r.ok) return false;
+        const html = await r.text();
+        const m = html.match(/<meta\s+name=["']console-token["']\s+content=["']([^"']+)["']/i);
+        if (m && m[1] && m[1].trim()) {
+          const nextTok = m[1].trim();
+          const changed = nextTok !== consoleToken;
+          consoleToken = nextTok;
+          const metaEl = document.querySelector('meta[name="console-token"]');
+          if (metaEl) metaEl.setAttribute("content", nextTok);
+          return changed || Boolean(nextTok);
+        }
+      } catch (_) {}
+      return false;
+    })();
+    try {
+      return await tokenRefreshPromise;
+    } finally {
+      tokenRefreshPromise = null;
+    }
+  }
 
   function consolePostHeaders(extra = {}) {
     const h = { "Content-Type": "application/json", ...extra };
-    if (CONSOLE_TOKEN) h["X-Console-Token"] = CONSOLE_TOKEN;
+    if (consoleToken) h["X-Console-Token"] = consoleToken;
     return h;
   }
 
   async function consolePost(url, bodyObjOrStr) {
     const body = typeof bodyObjOrStr === "string" ? bodyObjOrStr : JSON.stringify(bodyObjOrStr ?? {});
-    const resp = await fetch(url, {
+    let resp = await fetch(url, {
       method: "POST",
       headers: consolePostHeaders(),
       body
     });
     if (resp.status === 401) {
-      showBanner("err", "控制台会话令牌已失效（服务端可能已重启），请刷新页面后重试。");
+      const prevTok = consoleToken;
+      await refreshConsoleToken();
+      if (consoleToken && consoleToken !== prevTok) {
+        resp = await fetch(url, {
+          method: "POST",
+          headers: consolePostHeaders(),
+          body
+        });
+      }
+      if (resp.status === 401) {
+        showBanner("err", "控制台会话令牌已失效（服务端可能已重启），请刷新页面后重试。");
+      }
     }
     return resp;
   }
@@ -1617,6 +1657,7 @@
       };
       if (res.restarting) {
         isSaving = false;
+        restartTargetBootId = knownBootId;
         isRestarting = true;
         els.saveBtnLabel.textContent = "正在重启生效…";
         els.statusPill.className = "status-pill restarting";
@@ -1851,11 +1892,26 @@
       els.deviceIdText.textContent = `设备 MAC: ${dev.device_id || "--"}`;
       els.lastSeenText.textContent = `最近活跃: ${dev.last_seen || "等待唤醒"}`;
 
+      const incomingBootId = typeof data.boot_id === "string" ? data.boot_id.trim() : "";
+      if (incomingBootId) {
+        if (knownBootId && incomingBootId !== knownBootId) {
+          knownBootId = incomingBootId;
+          await refreshConsoleToken();
+        } else if (!knownBootId) {
+          knownBootId = incomingBootId;
+        }
+      }
+
       if (isRestarting && dev.server_ready) {
-        isRestarting = false;
-        checkDirty();
-        showBanner("info", "新配置已成功生效！");
-        scheduleHideBanner(3600);
+        const bootChanged = !restartTargetBootId || (incomingBootId && incomingBootId !== restartTargetBootId);
+        if (bootChanged) {
+          isRestarting = false;
+          restartTargetBootId = "";
+          await refreshConsoleToken();
+          checkDirty();
+          showBanner("info", "新配置已成功生效！");
+          scheduleHideBanner(3600);
+        }
       }
 
       const hlth = data.health || {};

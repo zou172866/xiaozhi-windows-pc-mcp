@@ -337,7 +337,7 @@ def _apply_tts_attrs_in_place(tts_obj, tts_module_name: str, tts_cfg: dict) -> b
         return False
     cls_mod = str(getattr(type(tts_obj), "__module__", "") or "")
     if tts_module_name == "GPT_SOVITS_V2" and "gpt_sovits" in cls_mod:
-        for attr in ("ref_audio_path", "prompt_text", "prompt_lang", "text_split_method", "url"):
+        for attr in ("ref_audio_path", "prompt_text", "prompt_lang", "text_split_method", "url", "voice_id"):
             if attr in tts_cfg and tts_cfg[attr] is not None:
                 setattr(tts_obj, attr, tts_cfg[attr])
         if "aux_ref_audio_paths" in tts_cfg:
@@ -361,6 +361,8 @@ def _apply_tts_attrs_in_place(tts_obj, tts_module_name: str, tts_cfg: dict) -> b
     if tts_module_name == "EdgeTTS" and "edge" in cls_mod:
         if tts_cfg.get("voice"):
             tts_obj.voice = tts_cfg["voice"]
+        if tts_cfg.get("voice_id"):
+            tts_obj.voice_id = tts_cfg["voice_id"]
         if isinstance(getattr(tts_obj, "config", None), dict):
             tts_obj.config.update(tts_cfg)
         return True
@@ -468,7 +470,7 @@ def _hot_reload_runtime_config(changed_fields: list[str]) -> tuple[bool, str]:
                     if not _apply_tts_attrs_in_place(conn.tts, tts_mod_name, tts_cfg):
                         tts_class_mismatch = True
             except Exception as conn_exc:
-                print(f"[WebConsole] 单连接热更新跳过: {conn_exc}", flush=True)
+                print(shared._redact_secrets(f"[WebConsole] 单连接热更新跳过: {conn_exc}"), flush=True)
 
         if tts_class_mismatch:
             print(
@@ -480,8 +482,8 @@ def _hot_reload_runtime_config(changed_fields: list[str]) -> tuple[bool, str]:
         print(f"[WebConsole] 配置已热更新生效（免重启）: {', '.join(changed_fields)}", flush=True)
         return True, "hot_reloaded"
     except Exception as exc:
-        print(f"[WebConsole] 配置热更新失败，回退重启动作: {exc}", flush=True)
-        return False, str(exc)
+        print(shared._redact_secrets(f"[WebConsole] 配置热更新失败，回退重启动作: {exc}"), flush=True)
+        return False, shared._redact_secrets(str(exc))
 
 
 _DEFAULT_VAD_SPECULATIVE = {
@@ -754,15 +756,18 @@ def handle_post_config(handler, *, shutdown_flush_fn) -> None:
             handler._send_json({"ok": False, "error": "角色提示词不能为空"}, HTTPStatus.BAD_REQUEST)
             return
 
-        write_res = _write_updated_yaml(
-            prompt=prompt,
-            llm_provider=llm_provider,
-            model_name=model_name,
-            voice=voice,
-        )
-        changed_fields = list(write_res.get("changed_fields") or [])
-        voice_recovered = bool(write_res.get("voice_recovered", False))
-        hot_ok, hot_detail = _hot_reload_runtime_config(changed_fields)
+        # 4.1 #2: Keep _config_write_lock (RLock) held across YAML write AND runtime hot-reload
+        # so concurrent POST /api/config saves can never apply stale config into active connections.
+        with _config_write_lock:
+            write_res = _write_updated_yaml(
+                prompt=prompt,
+                llm_provider=llm_provider,
+                model_name=model_name,
+                voice=voice,
+            )
+            changed_fields = list(write_res.get("changed_fields") or [])
+            voice_recovered = bool(write_res.get("voice_recovered", False))
+            hot_ok, hot_detail = _hot_reload_runtime_config(changed_fields)
         if voice_recovered and hot_detail == "no_changes":
             hot_detail = "voice_weights_recovered"
         will_restart = bool(force_restart or (allow_restart and not hot_ok))

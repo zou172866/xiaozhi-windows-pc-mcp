@@ -13,9 +13,11 @@ from . import (
     L3Backend,
     claim_workspace_or_enqueue,
     get_process_create_time,
+    get_task_log_paths,
     guard_leading_dash_prompt,
     is_task_cancelled,
     load_last_active_task,
+    register_spawned_task_pid,
     release_workspace_slot,
     resolve_workdir,
     run_subprocess_with_tree_kill,
@@ -135,17 +137,32 @@ class WorkBuddyBackend(L3Backend):
         }
 
         def _start_now() -> None:
+            if is_task_cancelled(task_id):
+                release_workspace_slot(workdir, task_id)
+                return
+
+            stdout_log, stderr_log = get_task_log_paths(task_id)
             task_record["status"] = "running"
             task_record["started_ts"] = time.time()
+            task_record["stdout_log"] = str(stdout_log)
+            task_record["stderr_log"] = str(stderr_log)
             task_record.pop("queue_position", None)
             save_active_task(task_id, task_record)
 
             def _on_spawn(child_pid: int) -> None:
-                task_record["pid"] = child_pid
-                task_record["pid_create_time"] = get_process_create_time(child_pid)
-                save_active_task(task_id, task_record)
+                # P1-11: Check cancellation atomically under _workspace_guard_lock; kill child immediately if cancelled.
+                register_spawned_task_pid(task_id, task_record, child_pid)
 
             def _worker():
+                if is_task_cancelled(task_id):
+                    task_record["status"] = "cancelled"
+                    task_record["stderr"] = "任务已被用户取消"
+                    task_record["summary"] = "任务已被用户取消"
+                    task_record["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    save_active_task(task_id, task_record)
+                    release_workspace_slot(workdir, task_id)
+                    return
+
                 env = os.environ.copy()
                 env["PYTHONUTF8"] = "1"
                 try:
@@ -156,6 +173,8 @@ class WorkBuddyBackend(L3Backend):
                         timeout=timeout_sec,
                         creationflags=_CREATE_NO_WINDOW,
                         on_spawn=_on_spawn,
+                        stdout_log_path=stdout_log,
+                        stderr_log_path=stderr_log,
                     )
                     stdout = (proc.stdout or "").strip()
                     stderr = (proc.stderr or "").strip()

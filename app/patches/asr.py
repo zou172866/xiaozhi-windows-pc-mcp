@@ -332,6 +332,37 @@ def _install_memory_optimizations(*, start_trimmer: bool = True):
         )
         print(f"[MemOpt] SherpaASR 异步补丁跳过: {_s_exc}", flush=True)
 
+    # 6b-2. Universal post-ASR homophone corrections hook on ASRProviderBase.speech_to_text_wrapper (G-4)
+    #       Ensures FunASR (dict {"content": ...}) and all non-Sherpa ASR providers also get hot-reloaded corrections.
+    try:
+        from core.providers.asr.base import ASRProviderBase
+
+        if not getattr(ASRProviderBase, "_asr_corrections_wrapper_patched", False):
+            _orig_base_stt_wrapper = ASRProviderBase.speech_to_text_wrapper
+
+            @functools.wraps(_orig_base_stt_wrapper)
+            async def _asr_corrections_stt_wrapper(self, pcm_data, session_id, *args, **kwargs):
+                res = await _orig_base_stt_wrapper(self, pcm_data, session_id, *args, **kwargs)
+                if not isinstance(res, tuple) or len(res) < 2:
+                    return res
+                text, file_path = res[0], res[1]
+                # Patched SherpaASR already applied corrections inside speech_to_text(); avoid double-applying on chained rules.
+                already_corrected = bool(
+                    isinstance(text, str) and getattr(type(self), "_sherpa_async_patched", False)
+                )
+                if not already_corrected:
+                    if isinstance(text, str) and text:
+                        text = asr_corrections.apply_asr_corrections(text)
+                    elif isinstance(text, dict) and isinstance(text.get("content"), str) and text["content"]:
+                        text = dict(text)
+                        text["content"] = asr_corrections.apply_asr_corrections(text["content"])
+                return (text, file_path, *res[2:]) if len(res) > 2 else (text, file_path)
+
+            ASRProviderBase.speech_to_text_wrapper = _asr_corrections_stt_wrapper
+            ASRProviderBase._asr_corrections_wrapper_patched = True
+    except Exception as _u_exc:
+        print(f"[MemOpt] 通用 ASR 同音纠错补丁跳过: {_u_exc}", flush=True)
+
     # 6c. Idle-triggered gc.collect() + glibc malloc_trim(0) 25s after completed turns (G-1)
     try:
         if _idle_memory_trimmer is None:

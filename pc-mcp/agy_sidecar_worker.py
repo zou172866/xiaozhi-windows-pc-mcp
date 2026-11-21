@@ -238,97 +238,105 @@ def _process_task(task_file: Path) -> bool:
     except Exception:
         return False
 
+    # 4.1 #3: Atomically claim pending file via rename BEFORE launching 30s agentapi call
+    # so worker handoff / dual-instance scan can never dispatch the same task twice.
+    claim_path = pending_root / f".{resolved_tf.stem}.claimed.{MY_PID}.{int(time.time() * 1000)}.tmp"
     try:
-        data = json.loads(resolved_tf.read_text(encoding="utf-8"))
-    except Exception:
-        resolved_tf.unlink(missing_ok=True)
+        os.replace(resolved_tf, claim_path)
+    except FileNotFoundError:
+        return False
+    except OSError:
         return False
 
-    if not isinstance(data, dict):
-        print(f"[xiaozhi-agy-bridge] Rejected non-object task payload: {resolved_tf.name}", file=sys.stderr, flush=True)
-        resolved_tf.unlink(missing_ok=True)
-        return False
-
-    raw_task_id = data["id"] if "id" in data else resolved_tf.stem
     try:
-        task_id = validate_task_id(raw_task_id)
-        out_file = _resolve_task_file(ACTIVE_DIR, task_id)
-    except ValueError as exc:
-        print(f"[xiaozhi-agy-bridge] Rejected invalid task_id in {resolved_tf.name}: {exc}", file=sys.stderr, flush=True)
-        resolved_tf.unlink(missing_ok=True)
-        return False
+        try:
+            data = json.loads(claim_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
 
-    data["id"] = task_id
-    raw_prompt = str(data.get("prompt") or "").strip()
-    title = str(data.get("title") or f"[小智派单] {raw_prompt[:22]}").strip()
-    target_conv = str(data.get("conversation_id") or "").strip()
-    if target_conv and not UUID_RE.fullmatch(target_conv):
-        print(
-            f"[xiaozhi-agy-bridge] Rejected invalid conversation_id in {resolved_tf.name}: {target_conv!r}",
-            file=sys.stderr,
-            flush=True,
-        )
-        data["status"] = "error"
-        data["stderr"] = "invalid conversation_id format"
+        if not isinstance(data, dict):
+            print(f"[xiaozhi-agy-bridge] Rejected non-object task payload: {resolved_tf.name}", file=sys.stderr, flush=True)
+            return False
+
+        raw_task_id = data["id"] if "id" in data else resolved_tf.stem
+        try:
+            task_id = validate_task_id(raw_task_id)
+            out_file = _resolve_task_file(ACTIVE_DIR, task_id)
+        except ValueError as exc:
+            print(f"[xiaozhi-agy-bridge] Rejected invalid task_id in {resolved_tf.name}: {exc}", file=sys.stderr, flush=True)
+            return False
+
+        data["id"] = task_id
+        raw_prompt = str(data.get("prompt") or "").strip()
+        title = str(data.get("title") or f"[小智派单] {raw_prompt[:22]}").strip()
+        target_conv = str(data.get("conversation_id") or "").strip()
+        if target_conv and not UUID_RE.fullmatch(target_conv):
+            print(
+                f"[xiaozhi-agy-bridge] Rejected invalid conversation_id in {resolved_tf.name}: {target_conv!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            data["status"] = "error"
+            data["stderr"] = "invalid conversation_id format"
+            _atomic_write_json(out_file, data, indent=2)
+            _prune_active_tasks()
+            return False
+
+        prefix = _build_agentapi_prefix()
+        if target_conv:
+            safe_prompt = _guard_leading_dash_prompt(raw_prompt, prefix_tag="[追问]")
+            cmd = prefix + ["send-message", f"--title={title}", target_conv, safe_prompt]
+        else:
+            default_wd = _resolve_default_workdir()
+            enriched_prompt = _guard_leading_dash_prompt(f"[默认工作目录：{default_wd}]\n{raw_prompt}")
+            cmd = prefix + ["new-conversation", f"--title={title}", enriched_prompt]
+
+        prepared_cmd = _prepare_cmd(cmd)
+        try:
+            popen_kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = _CREATE_NO_WINDOW
+            proc = subprocess.Popen(prepared_cmd, **popen_kwargs)
+            proc_create_time = _pc_common.get_process_create_time(proc.pid)
+            try:
+                stdout_raw, stderr_raw = proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(proc.pid, expected_create_time=proc_create_time)
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                raise TimeoutError("agentapi 派单超过 30 秒已中止并清理子进程树")
+
+            stdout = (stdout_raw or "").strip()
+            stderr = (stderr_raw or "").strip()
+            conv_id = target_conv
+            if not conv_id:
+                m = UUID_RE.search(stdout) or UUID_RE.search(stderr)
+                if m:
+                    conv_id = m.group(0)
+
+            data["dispatched_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            data["returncode"] = proc.returncode
+            data["conversation_id"] = conv_id
+            data["stdout"] = stdout[:800]
+            data["stderr"] = stderr[:800]
+            data["status"] = "dispatched" if proc.returncode == 0 else "error"
+        except Exception as exc:
+            data["status"] = "error"
+            data["stderr"] = str(exc)
+
         _atomic_write_json(out_file, data, indent=2)
         _prune_active_tasks()
-        resolved_tf.unlink(missing_ok=True)
-        return False
-
-    prefix = _build_agentapi_prefix()
-    if target_conv:
-        safe_prompt = _guard_leading_dash_prompt(raw_prompt, prefix_tag="[追问]")
-        cmd = prefix + ["send-message", f"--title={title}", target_conv, safe_prompt]
-    else:
-        default_wd = _resolve_default_workdir()
-        enriched_prompt = _guard_leading_dash_prompt(f"[默认工作目录：{default_wd}]\n{raw_prompt}")
-        cmd = prefix + ["new-conversation", f"--title={title}", enriched_prompt]
-
-    prepared_cmd = _prepare_cmd(cmd)
-    try:
-        popen_kwargs = {
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "text": True,
-            "encoding": "utf-8",
-            "errors": "replace",
-        }
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = _CREATE_NO_WINDOW
-        proc = subprocess.Popen(prepared_cmd, **popen_kwargs)
-        proc_create_time = _pc_common.get_process_create_time(proc.pid)
-        try:
-            stdout_raw, stderr_raw = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            _kill_process_tree(proc.pid, expected_create_time=proc_create_time)
-            try:
-                proc.communicate(timeout=5)
-            except Exception:
-                pass
-            raise TimeoutError("agentapi 派单超过 30 秒已中止并清理子进程树")
-
-        stdout = (stdout_raw or "").strip()
-        stderr = (stderr_raw or "").strip()
-        conv_id = target_conv
-        if not conv_id:
-            m = UUID_RE.search(stdout) or UUID_RE.search(stderr)
-            if m:
-                conv_id = m.group(0)
-
-        data["dispatched_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        data["returncode"] = proc.returncode
-        data["conversation_id"] = conv_id
-        data["stdout"] = stdout[:800]
-        data["stderr"] = stderr[:800]
-        data["status"] = "dispatched" if proc.returncode == 0 else "error"
-    except Exception as exc:
-        data["status"] = "error"
-        data["stderr"] = str(exc)
-
-    _atomic_write_json(out_file, data, indent=2)
-    _prune_active_tasks()
-    resolved_tf.unlink(missing_ok=True)
-    return True
+        return True
+    finally:
+        claim_path.unlink(missing_ok=True)
 
 
 def main():

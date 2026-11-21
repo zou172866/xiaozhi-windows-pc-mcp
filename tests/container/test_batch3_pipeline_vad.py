@@ -1434,6 +1434,136 @@ class TestBatch3ContainerPipeline(unittest.TestCase):
             )
             self.assertFalse(vsr.is_story_or_dictation_mode(conn_st))
 
+    def test_p2_turn_context_anchors_stream_options_and_parity_d7_f4_g4(self):
+        """4.1 #4c & 4.2 D-7/F-4/G-4: line-anchored tags, generic 400 stream_options retry, voice_id priority, F-4 dead keys removed, G-4 FunASR corrections."""
+        import asr_corrections
+        import turn_context_router as tcr
+        from patches import asr as asr_patch
+        from patches.emotion import tags as emo_tags
+        from patches.emotion import tts_route
+
+        # 1. Line-anchored <turn_context> and <memory> preserve inline prose references
+        inline_tc = "用户可以引用 <turn_context>示例内容</turn_context> 而不被误删。"
+        self.assertEqual(tcr.strip_turn_context_from_text(inline_tc), inline_tc)
+
+        wrapped_tc = "<turn_context>\n<memory>\n旧记忆\n</memory>\n</turn_context>\n\n真正用户问题"
+        self.assertEqual(tcr.strip_turn_context_from_text(wrapped_tc), "真正用户问题")
+
+        inline_mem_sys = "你的人设：请参考 <memory>标签说明</memory> 中的格式来回答。"
+        out_msgs = tcr.apply_turn_context_to_messages(
+            [{"role": "system", "content": inline_mem_sys}, {"role": "user", "content": "你好"}],
+            memory_str="长期事实A",
+            mode="split",
+        )
+        self.assertIn("<memory>标签说明</memory>", out_msgs[0]["content"])
+
+        # 2. Generic HTTP 400/422 unknown-field rejection triggers stream_options fallback even without literal 'stream_options'
+        calls = []
+
+        class _Err400(RuntimeError):
+            status_code = 400
+
+        class _FakeCompletions:
+            def create(self, *args, **kwargs):
+                calls.append(dict(kwargs))
+                if "stream_options" in kwargs:
+                    raise _Err400("400 Bad Request: unknown field in request payload")
+                return iter([])
+
+        fake_llm = SimpleNamespace(
+            model_name="proxy-model",
+            client=SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions())),
+        )
+        self.assertTrue(tcr.wrap_llm_client_for_usage(fake_llm))
+        list(fake_llm.client.chat.completions.create(model="proxy-model", messages=[], stream=True))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("stream_options", calls[0])
+        self.assertNotIn("stream_options", calls[1])
+
+        # 3. D-7: is_raiden_mei_voice prioritizes explicit voice_id over ref_audio_path substring
+        tts_non_mei = SimpleNamespace(
+            voice_id="__gsv_xiaozhi_tw__",
+            ref_audio_path="/voices/raiden_mei/copied_ref.wav",
+            config={"voice_id": "__gsv_xiaozhi_tw__"},
+        )
+        self.assertFalse(emo_tags.is_raiden_mei_voice(tts_non_mei.ref_audio_path, tts=tts_non_mei))
+
+        tts_explicit_mei = SimpleNamespace(
+            voice_id="__gsv_raiden_mei__",
+            ref_audio_path="/voices/custom_renamed/ref.wav",
+            config={"voice_id": "__gsv_raiden_mei__"},
+        )
+        self.assertTrue(emo_tags.is_raiden_mei_voice(tts_explicit_mei.ref_audio_path, tts=tts_explicit_mei))
+        # Legacy fallback without voice_id still inspects ref_audio_path
+        tts_legacy = SimpleNamespace(ref_audio_path="/voices/raiden_mei/mei_calm_ref.wav", config={})
+        self.assertTrue(emo_tags.is_raiden_mei_voice(tts_legacy.ref_audio_path, tts=tts_legacy))
+
+        # 4. F-4: build_gsv_request_snapshot omits dead keys split_bucket & batch_threshold
+        fake_provider = SimpleNamespace(
+            url="http://host.docker.internal:19880/tts",
+            ref_audio_path="/voices/custom/ref.wav",
+            prompt_text="你好",
+            prompt_lang="zh",
+            text_lang="zh",
+            top_k=12,
+            top_p=1.0,
+            temperature=0.98,
+            speed_factor=1.0,
+            text_split_method="cut0",
+            batch_size=1,
+            batch_threshold=0.75,
+            split_bucket=True,
+            return_fragment=False,
+            streaming_mode=False,
+            seed=-1,
+            parallel_infer=True,
+            repetition_penalty=1.35,
+            config={"voice_id": "__gsv_xiaozhi_tw__"},
+        )
+        _, req_json, _, _ = tts_route.build_gsv_request_snapshot(fake_provider, "测试语音")
+        self.assertNotIn("split_bucket", req_json)
+        self.assertNotIn("batch_threshold", req_json)
+
+        # 5. G-4: ASRProviderBase.speech_to_text_wrapper applies homophone corrections to FunASR dict & non-Sherpa ASR outputs
+        asr_patch.install_memory_optimizations(start_trimmer=False)
+        from core.providers.asr.base import ASRProviderBase
+
+        class _FakeFunASR(ASRProviderBase):
+            def __init__(self):
+                self.output_dir = "/tmp"
+                self.delete_audio_file = True
+
+            def requires_file(self):
+                return False
+
+            async def speech_to_text(self, opus_data, session_id, artifacts=None):
+                return {"content": "你好雷电牙医", "language": "zh", "emotion": "NEUTRAL"}, None
+
+        class _FakeGenericASR(ASRProviderBase):
+            def __init__(self):
+                self.output_dir = "/tmp"
+                self.delete_audio_file = True
+
+            def requires_file(self):
+                return False
+
+            async def speech_to_text(self, opus_data, session_id, artifacts=None):
+                return "牙医帮我查天气", None
+
+        async def _run_g4():
+            with patch.object(
+                asr_corrections,
+                "apply_asr_corrections",
+                side_effect=lambda t: t.replace("雷电牙医", "雷电芽衣").replace("牙医", "芽衣"),
+            ):
+                fun_res, _ = await _FakeFunASR().speech_to_text_wrapper([b"\x00\x00" * 160], "sess-fun")
+                gen_res, _ = await _FakeGenericASR().speech_to_text_wrapper([b"\x00\x00" * 160], "sess-gen")
+            self.assertEqual(fun_res["content"], "你好雷电芽衣")
+            self.assertEqual(fun_res["emotion"], "NEUTRAL")
+            self.assertEqual(gen_res, "芽衣帮我查天气")
+
+        asyncio.run(_run_g4())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1365,6 +1365,65 @@ class TestL2GuardrailsAndL3Gate(unittest.TestCase):
             )
         )
 
+    def test_p2_extra_hotkey_click_guard_and_clipboard_failure_safety(self):
+        """4.1 #3: Block Win+1..9, Explorer Tab/Shift+F10/Apps & right-click, fail-closed on target_info=None, preserve clipboard on copy() error."""
+        self._set_mode("full")
+
+        # 1. Global hotkey blacklist blocks Win+1..9 (taskbar terminal launch)
+        for digit in ("1", "5", "9"):
+            with patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG):
+                res = pcm.pc_ui_action(action="hotkey", hotkey=f"win+{digit}")
+            self.assertIn("安全护栏已拦截", res, f"win+{digit} must be blocked")
+
+        # 2. Explorer foreground blocks Tab, Shift+Tab, Shift+F10, Apps/Menu, while still allowing Alt+Tab
+        exp_fg = {"hwnd": 601, "pid": 999, "process": "explorer.exe", "class": "CabinetWClass", "title": "文档"}
+        for hk in ("tab", "shift+tab", "shift+f10", "apps", "menu"):
+            with patch.object(pcm, "_get_foreground_window_info", return_value=exp_fg):
+                res = pcm.pc_ui_action(action="hotkey", hotkey=hk)
+            self.assertIn("安全护栏已拦截", res, f"{hk} in Explorer must be blocked")
+
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=exp_fg),
+            patch.object(pcm.pyautogui, "hotkey") as m_hk,
+        ):
+            res_alt_tab = pcm.pc_ui_action(action="hotkey", hotkey="alt+tab")
+        self.assertIn("已按下快捷键", res_alt_tab)
+        m_hk.assert_called_once()
+
+        # 3. Right-click on Explorer or #32770 is blocked (prevents 'Open in Terminal' context menu)
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=exp_fg),
+            patch.object(pcm, "_get_window_info_at_point", return_value=exp_fg),
+            patch.object(pcm.pyautogui, "rightClick") as m_rc,
+        ):
+            res_rc = pcm.pc_ui_action(action="right_click", x=300, y=300)
+        self.assertIn("安全护栏已拦截", res_rc)
+        m_rc.assert_not_called()
+
+        # 4. _check_click_guard fails closed when target_info is None even on benign foreground
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+            patch.object(pcm, "_get_window_info_at_point", return_value=None),
+            patch.object(pcm.pyautogui, "click") as m_clk,
+        ):
+            res_none = pcm.pc_ui_action(action="click", x=200, y=200)
+        self.assertIn("安全护栏已拦截", res_none)
+        m_clk.assert_not_called()
+
+        # 5. If clip.copy(text) raises before writing, original clipboard is NOT wiped!
+        fake_clip = MagicMock()
+        fake_clip.paste.return_value = "precious-user-clip"
+        fake_clip.copy.side_effect = RuntimeError("clipboard unavailable")
+        with (
+            patch.object(pcm, "_get_foreground_window_info", return_value=_BENIGN_FG),
+            patch.object(pcm, "pyperclip", fake_clip),
+            patch.object(pcm, "_clear_clipboard") as m_clear,
+        ):
+            with self.assertRaises(RuntimeError):
+                pcm.pc_ui_action(action="type_text", text="hello")
+        m_clear.assert_not_called()
+        self.assertEqual(fake_clip.copy.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

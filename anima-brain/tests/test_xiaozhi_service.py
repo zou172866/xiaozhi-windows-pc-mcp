@@ -1721,6 +1721,212 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
         finally:
             svc.INBOX_PROCESSING_TIMEOUT_SECONDS = orig_timeout
 
+    def test_p1_8_rollback_inbox_exclusive_wal_busy_conflict_and_settings_from_env(self):
+        import importlib.util
+        import sqlite3
+
+        script_path = ANIMA_ROOT / "scripts" / "rollback_inbox.py"
+        spec = importlib.util.spec_from_file_location("rollback_inbox_p18", str(script_path))
+        rb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rb)
+
+        # 1. Conflict result (committed=True, conflict=True) MUST NOT be marked done or drop table
+        conflict_db = Path(self._tmp.name) / "p18_conflict.sqlite3"
+        b1 = CompanionBrain(conflict_db, user_id="local", settings=self.settings, config=BrainConfig(start_worker=False))
+        try:
+            svc.ensure_default_character(b1)
+            svc.ensure_xiaozhi_inbox_table(b1.engine)
+            svc.enqueue_inbox_turn(b1, svc.DEFAULT_CHARACTER_ID, "p18-conf-1", "问题A", "回复A")
+        finally:
+            b1.close()
+
+        exp_conf = Path(self._tmp.name) / "p18_conf_export.json"
+        res_conf = rb.rollback_inbox(
+            conflict_db,
+            export_path=exp_conf,
+            drain_fn=lambda row: {"committed": True, "conflict": True},
+            drop_table=True,
+        )
+        self.assertFalse(res_conf["ok"])
+        self.assertEqual(res_conf["drained"], 0)
+        self.assertEqual(res_conf["drain_failed"], 1)
+        self.assertFalse(res_conf["dropped"])
+        c1 = sqlite3.connect(str(conflict_db))
+        try:
+            st = c1.execute("SELECT status FROM xiaozhi_inbox WHERE request_id='p18-conf-1'").fetchone()[0]
+            self.assertEqual(st, "pending")
+        finally:
+            c1.close()
+
+        # 2. PRAGMA wal_checkpoint(TRUNCATE) returning busy!=0 MUST fail ok=False instead of silent ok=True
+        wal_db = Path(self._tmp.name) / "p18_wal_busy.sqlite3"
+        b2 = CompanionBrain(wal_db, user_id="local", settings=self.settings, config=BrainConfig(start_worker=False))
+        try:
+            svc.configure_sqlite_wal(b2)
+            svc.ensure_default_character(b2)
+            svc.ensure_xiaozhi_inbox_table(b2.engine)
+            svc.enqueue_inbox_turn(b2, svc.DEFAULT_CHARACTER_ID, "p18-wal-1", "WAL问题", "WAL回复")
+        finally:
+            b2.close()
+
+        # Hold an open read transaction on a second connection so wal_checkpoint(TRUNCATE) reports busy=1
+        reader = sqlite3.connect(str(wal_db), timeout=5.0)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM xiaozhi_inbox").fetchone()
+            exp_wal = Path(self._tmp.name) / "p18_wal_export.json"
+            res_wal = rb.rollback_inbox(wal_db, export_path=exp_wal, drop_table=True)
+            self.assertTrue(res_wal["dropped"])
+            self.assertFalse(res_wal["wal_checkpoint_ok"])
+            self.assertFalse(res_wal["ok"])
+            self.assertIn("wal_checkpoint_busy", res_wal.get("error", ""))
+            self.assertGreater(res_wal["wal_checkpoint"]["busy"], 0)
+        finally:
+            reader.rollback()
+            reader.close()
+
+        # 3. _build_default_drain_fn uses Settings.from_env() instead of Settings()
+        env_db = Path(self._tmp.name) / "p18_env.sqlite3"
+        from companion_engine import Settings as _RealSettings
+        with patch.object(_RealSettings, "from_env", wraps=_RealSettings.from_env) as mock_from_env:
+            brain_env, drain_fn_env = rb._build_default_drain_fn(env_db)
+            try:
+                self.assertGreaterEqual(mock_from_env.call_count, 1)
+            finally:
+                drain_fn_env._close_brain()
+
+    def test_p1_9_online_backup_lock_free_and_weekly_integrity_self_heal(self):
+        import sqlite3
+
+        bdir = Path(self._tmp.name) / "p19_backups"
+        svc.configure_sqlite_wal(self.brain)
+        svc.extract_and_commit_turn(self.brain, svc.DEFAULT_CHARACTER_ID, "p19-turn-1", "测试锁无关备份", "收到")
+
+        # 1. Verify _snapshot_sqlite_to_file does NOT hold engine._lock during VACUUM INTO / backup I/O
+        lock_free_observed = []
+        orig_connect = sqlite3.connect
+
+        def _spy_connect(database, *args, **kwargs):
+            conn = orig_connect(database, *args, **kwargs)
+            if isinstance(database, str) and "mode=ro" in database:
+                # Try acquiring engine._lock non-blocking: must succeed!
+                acquired = self.brain.engine._lock.acquire(blocking=False)
+                lock_free_observed.append(acquired)
+                if acquired:
+                    self.brain.engine._lock.release()
+            return conn
+
+        with patch.object(svc.sqlite3, "connect", side_effect=_spy_connect):
+            res1 = svc.run_online_backup(self.brain, bdir, now=1763600000.0, force=True)
+        self.assertTrue(res1["ok"])
+        self.assertTrue(lock_free_observed and all(lock_free_observed), "engine._lock must NOT be held during backup")
+
+        weeklies = list(bdir.glob("brain-weekly-*.sqlite3"))
+        self.assertEqual(len(weeklies), 1)
+        weekly_file = weeklies[0]
+
+        # 2. Truncate weekly backup to 0 bytes -> next non-force run MUST detect and self-heal it
+        weekly_file.write_bytes(b"")
+        self.assertEqual(weekly_file.stat().st_size, 0)
+        res2 = svc.run_online_backup(self.brain, bdir, now=1763600000.0, force=False)
+        self.assertTrue(res2["ok"])
+        self.assertGreater(weekly_file.stat().st_size, 0)
+        ok_w2, _ = svc._verify_sqlite_integrity(weekly_file)
+        self.assertTrue(ok_w2)
+
+        # 3. Corrupt weekly backup with garbage bytes -> next non-force run MUST detect and self-heal it
+        weekly_file.write_bytes(b"NOT A VALID SQLITE FILE" * 100)
+        res3 = svc.run_online_backup(self.brain, bdir, now=1763600000.0, force=False)
+        self.assertTrue(res3["ok"])
+        ok_w3, _ = svc._verify_sqlite_integrity(weekly_file)
+        self.assertTrue(ok_w3)
+
+    def test_p2_health_sanitization_backup_503_500_headers_and_cross_character_inbox(self):
+        token = "p2-anima-token-" + ("k" * 24)
+        frontend_override = svc.FRONTEND_DIR if (svc.FRONTEND_DIR / "index.html").is_file() else None
+        with patch.object(svc, "FRONTEND_DIR", frontend_override):
+            app = svc.create_combined_asgi_app(self.brain, token)
+            with TestClient(app, base_url="http://127.0.0.1:18787", raise_server_exceptions=False) as client:
+                # 1. Unauthenticated /xiaozhi/health must NOT leak obsidian.export_dir or raw db_err/backup.last_error
+                r_ok = client.get("/xiaozhi/health")
+                self.assertEqual(r_ok.status_code, 200)
+                obs_pub = r_ok.json().get("obsidian") or {}
+                self.assertNotIn("export_dir", obs_pub)
+                self.assertNotIn("host_export_dir", obs_pub)
+
+                orig_db = self.brain.engine.db
+
+                class _LeakyBrokenDB:
+                    def execute(self, *a, **kw):
+                        raise RuntimeError("secret_path=/data/anima/private_secret_file.sqlite3 failed")
+
+                self.brain.engine.db = _LeakyBrokenDB()
+                try:
+                    r_unauth_err = client.get("/xiaozhi/health")
+                    self.assertEqual(r_unauth_err.status_code, 503)
+                    raw_text = r_unauth_err.text
+                    self.assertNotIn("private_secret_file", raw_text)
+                    self.assertIn("db_check_failed", r_unauth_err.json()["unhealthy_reasons"])
+                finally:
+                    self.brain.engine.db = orig_db
+
+                # 2. backup.integrity_ok == False -> HTTP 503 and backup.last_error sanitized
+                fake_bk = {
+                    "enabled": True,
+                    "integrity_ok": False,
+                    "last_error": "corrupt /secret/backup/path.sqlite3",
+                    "daily_count": 1,
+                    "weekly_count": 1,
+                }
+                with patch.object(svc, "get_backup_status", return_value=fake_bk):
+                    r_bk = client.get("/xiaozhi/health")
+                self.assertEqual(r_bk.status_code, 503)
+                bk_body = r_bk.json()
+                self.assertFalse(bk_body["backup_ok"])
+                self.assertIn("backup_integrity_failed", bk_body["unhealthy_reasons"])
+                self.assertNotIn("/secret/backup/path", bk_body["backup"]["last_error"])
+
+                # 3. Unhandled exception in /xiaozhi/* returns 500 JSON WITH clickjacking & nosniff headers
+                headers = {"Authorization": f"Bearer {token}"}
+                with patch.object(svc, "build_fast_recall_context", side_effect=RuntimeError("boom_secret_detail")):
+                    r_500 = client.post("/xiaozhi/recall", headers=headers, json={"query": "hi"})
+                self.assertEqual(r_500.status_code, 500)
+                self.assertEqual(r_500.headers.get("x-frame-options"), "DENY")
+                self.assertIn("frame-ancestors 'none'", r_500.headers.get("content-security-policy", ""))
+                self.assertEqual(r_500.headers.get("x-content-type-options"), "nosniff")
+                self.assertNotIn("boom_secret_detail", r_500.text)
+
+                # 4. Cross-character request_id collision in xiaozhi_inbox is rejected (409) without overwrite
+                r_c1 = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={
+                        "character_id": "char_alpha",
+                        "request_id": "req-cross-char-1",
+                        "user_message": "你好",
+                        "assistant_reply": "Alpha回复",
+                    },
+                )
+                self.assertEqual(r_c1.status_code, 200)
+                r_c2 = client.post(
+                    "/xiaozhi/ingest",
+                    headers=headers,
+                    json={
+                        "character_id": "char_beta",
+                        "request_id": "req-cross-char-1",
+                        "user_message": "你好",
+                        "assistant_reply": "Beta覆写尝试",
+                    },
+                )
+                self.assertEqual(r_c2.status_code, 409)
+                self.assertEqual(r_c2.json().get("error"), "character_id_conflict")
+                row_cc = self.brain.engine.db.execute(
+                    "SELECT character_id, payload FROM xiaozhi_inbox WHERE request_id='req-cross-char-1'"
+                ).fetchone()
+                self.assertEqual(row_cc["character_id"], "char_alpha")
+                self.assertIn("Alpha回复", row_cc["payload"])
+                self.assertNotIn("Beta覆写尝试", row_cc["payload"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

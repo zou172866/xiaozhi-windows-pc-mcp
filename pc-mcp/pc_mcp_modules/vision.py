@@ -150,7 +150,7 @@ def _compute_region_hash(
     half_w: int = 48,
     half_h: int = 32,
 ) -> tuple[str, tuple[int, int, int, int]]:
-    """Compute a jitter-tolerant target-region perceptual hash around `(cx, cy)` for click staleness check (E-3)."""
+    """Compute a blinking-cursor-tolerant perceptual hash (mean RGB + 64-bit dHash) around `(cx, cy)` (E-3, 4.1)."""
     sw, sh = img.size
     if sw <= 0 or sh <= 0:
         return "", (0, 0, 0, 0)
@@ -167,10 +167,54 @@ def _compute_region_hash(
     y2 = max(y1 + 1, min(sh, int(y2)))
     crop = img.crop((x1, y1, x2, y2)).convert("RGB")
     resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR", 2)
-    thumb = crop.resize((16, 16), resample=resample)
-    quantized = bytes(b >> 3 for b in thumb.tobytes())
-    digest = hashlib.sha256(quantized).hexdigest()[:24]
+
+    # Mean RGB color signature (catches solid-color / theme / popup transitions)
+    rgb_small = crop.resize((8, 8), resample=resample)
+    rgb_bytes = rgb_small.tobytes()
+    n_px = max(1, len(rgb_bytes) // 3)
+    r_mean = sum(rgb_bytes[0::3]) // n_px
+    g_mean = sum(rgb_bytes[1::3]) // n_px
+    b_mean = sum(rgb_bytes[2::3]) // n_px
+
+    # 64-bit grayscale horizontal gradient dHash (tolerates 1-2px blinking carets / subpixel anti-aliasing)
+    gray = crop.convert("L").resize((9, 8), resample=resample)
+    g_bytes = gray.tobytes()
+    bits = 0
+    for row in range(8):
+        off = row * 9
+        for col in range(8):
+            bits = (bits << 1) | (1 if g_bytes[off + col] > g_bytes[off + col + 1] else 0)
+
+    digest = f"phash:{r_mean:02x}{g_mean:02x}{b_mean:02x}:{bits:016x}"
     return digest, (x1, y1, x2, y2)
+
+
+def _region_hashes_match(
+    expected_hash: str,
+    fresh_hash: str,
+    *,
+    max_hamming: int = 4,
+    max_rgb_delta: int = 12,
+) -> bool:
+    """Compare two region hashes with perceptual tolerance for blinking cursors while catching layout/popup shifts (4.1)."""
+    if not expected_hash or not fresh_hash:
+        return False
+    if expected_hash == fresh_hash:
+        return True
+    if expected_hash.startswith("phash:") and fresh_hash.startswith("phash:"):
+        p1 = expected_hash.split(":")
+        p2 = fresh_hash.split(":")
+        if len(p1) == 3 and len(p2) == 3 and len(p1[1]) == 6 and len(p2[1]) == 6:
+            try:
+                r1, g1, b1 = int(p1[1][0:2], 16), int(p1[1][2:4], 16), int(p1[1][4:6], 16)
+                r2, g2, b2 = int(p2[1][0:2], 16), int(p2[1][2:4], 16), int(p2[1][4:6], 16)
+                if max(abs(r1 - r2), abs(g1 - g2), abs(b1 - b2)) > max_rgb_delta:
+                    return False
+                hamming = (int(p1[2], 16) ^ int(p2[2], 16)).bit_count()
+                return hamming <= max_hamming
+            except ValueError:
+                return False
+    return False
 
 
 def _prefer_gemini_vision() -> bool:
@@ -405,7 +449,24 @@ def _smart_locate_target(target_desc: str) -> Optional[LocateResult]:
                     partial_hit = el
             hit = exact_hit or partial_hit
             if hit:
-                return LocateResult(hit["cx"], hit["cy"], f"UIA控件「{hit['name'][:30]}」")
+                # 4.1 #3: Capture region hash on Stage-1 UIA hit too so pre-click freshness check runs after unlock.
+                uia_hash = ""
+                uia_box = None
+                uia_screen_size = None
+                try:
+                    uia_img = ig.grab().convert("RGB")
+                    uia_hash, uia_box = _compute_region_hash(uia_img, hit["cx"], hit["cy"])
+                    uia_screen_size = uia_img.size
+                except Exception:
+                    pass
+                return LocateResult(
+                    hit["cx"],
+                    hit["cy"],
+                    f"UIA控件「{hit['name'][:30]}」",
+                    region_hash=uia_hash,
+                    region_box=uia_box,
+                    screen_size=uia_screen_size,
+                )
 
         # 第二阶截图采样在锁内完成，随后立刻释放 _gui_lock，避免 VLM 推理占锁长达 64s
         raw_img = ig.grab().convert("RGB")

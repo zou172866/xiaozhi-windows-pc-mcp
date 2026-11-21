@@ -851,8 +851,40 @@ def get_mei_emotion_profile(emotion_key: str) -> Dict[str, Any]:
     return dict(prof)
 
 
-def is_raiden_mei_voice(ref_audio_path: Optional[str]) -> bool:
-    return "raiden_mei" in str(ref_audio_path or "").replace("\\", "/").lower()
+_RAIDEN_MEI_VOICE_IDS = frozenset({"raiden_mei", "__gsv_raiden_mei__"})
+
+
+def resolve_tts_voice_id(tts: Any) -> str:
+    """Resolve explicit persisted `voice_id` from a TTS provider instance or its config dict (D-7)."""
+    if tts is None:
+        return ""
+    direct = getattr(tts, "voice_id", None)
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    cfg = getattr(tts, "config", None)
+    if isinstance(cfg, dict):
+        cfg_vid = cfg.get("voice_id")
+        if isinstance(cfg_vid, str) and cfg_vid.strip():
+            return cfg_vid.strip()
+    return ""
+
+
+def is_raiden_mei_voice(
+    ref_audio_path: Optional[str] = None,
+    *,
+    voice_id: Optional[str] = None,
+    tts: Any = None,
+) -> bool:
+    """Return True if the active voice is Raiden Mei (D-7: prefer explicit `voice_id`, fallback to `ref_audio_path`)."""
+    eff_vid = str(voice_id or "").strip() if isinstance(voice_id, str) else ""
+    if not eff_vid and tts is not None:
+        eff_vid = resolve_tts_voice_id(tts)
+    if eff_vid:
+        return eff_vid.lower() in _RAIDEN_MEI_VOICE_IDS
+    eff_ref = ref_audio_path
+    if not eff_ref and tts is not None:
+        eff_ref = getattr(tts, "ref_audio_path", "")
+    return "raiden_mei" in str(eff_ref or "").replace("\\", "/").lower()
 
 
 def has_voice_emotion_tag_rule(prompt: str) -> bool:

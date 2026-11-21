@@ -33,7 +33,7 @@ VALID_MODES = frozenset({"split", "legacy"})
 def _make_block_re(tag: str) -> re.Pattern:
     """Match ONLY standalone line-anchored <tag>...</tag> blocks, never inline prose mentions like '请结合 <memory> 中...'."""
     return re.compile(
-        rf"(?im)(?:^|\n)[ \t]*<{tag}>(?:[ \t]*\n(?:(?!<{tag}>).)*?|[^\n<>]*)</{tag}>[ \t]*",
+        rf"(?im)(?:^|\r?\n)[ \t]*<{tag}>(?:[ \t]*\r?\n(?:(?!<{tag}>).)*?|[^\r\n<>]*)</{tag}>[ \t]*(?=\r?\n|$)",
         re.DOTALL,
     )
 
@@ -43,7 +43,8 @@ _MEMORY_BLOCK_RE = _make_block_re("memory")
 _REPLY_LEN_BLOCK_RE = _make_block_re("reply_length_control")
 _SPEAKERS_BLOCK_RE = _make_block_re("speakers_info")
 _TURN_CONTEXT_BLOCK_RE = re.compile(
-    r"\s*<turn_context>.*?</turn_context>\s*", re.DOTALL | re.IGNORECASE
+    r"(?im)(?:^|\r?\n)[ \t]*<turn_context>(?:[ \t]*\r?\n(?:(?!<turn_context>).)*?|[^\r\n<>]*)</turn_context>[ \t]*(?=\r?\n|$)",
+    re.DOTALL,
 )
 
 _stats_lock = threading.Lock()
@@ -94,10 +95,11 @@ def get_turn_context_mode(explicit_mode: Optional[str] = None) -> str:
 
 
 def strip_turn_context_from_text(text: str) -> str:
-    """Remove any embedded <turn_context>...</turn_context> block from a message string."""
+    """Remove any standalone line-anchored <turn_context>...</turn_context> block from a message string."""
     if not text or "<turn_context>" not in text.lower():
         return text
     cleaned = _TURN_CONTEXT_BLOCK_RE.sub("\n\n", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
 
@@ -602,6 +604,29 @@ class _UsageTrackingStream:
         return getattr(self._inner, name)
 
 
+def _is_stream_options_rejection(exc: BaseException) -> bool:
+    """Return True if an LLM API error indicates stream_options/include_usage is rejected by the backend (4.1 #4)."""
+    msg = str(exc).lower()
+    if "stream_options" in msg or "include_usage" in msg:
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code in (400, 422):
+        for pat in (
+            "unknown field",
+            "unrecognized request argument",
+            "extra inputs are not permitted",
+            "extra_forbidden",
+            "unknown parameter",
+            "unsupported parameter",
+            "unexpected keyword",
+            "invalid parameter",
+            "additional properties are not allowed",
+        ):
+            if pat in msg:
+                return True
+    return False
+
+
 def wrap_llm_client_for_usage(llm_provider: Any, *, log_fn=None) -> bool:
     """Idempotently wrap llm_provider.client.chat.completions.create to capture cache hit tokens & TTFT."""
     client = getattr(llm_provider, "client", None)
@@ -628,7 +653,7 @@ def wrap_llm_client_for_usage(llm_provider: Any, *, log_fn=None) -> bool:
         try:
             res = orig_create(*args, **req_kwargs)
         except Exception as exc:
-            if added_stream_opts and "stream_options" in str(exc).lower():
+            if added_stream_opts and _is_stream_options_rejection(exc):
                 state["stream_options_unsupported"] = True
                 req_kwargs.pop("stream_options", None)
                 t0 = time.perf_counter()

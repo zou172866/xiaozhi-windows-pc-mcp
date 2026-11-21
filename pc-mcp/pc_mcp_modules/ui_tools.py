@@ -23,7 +23,7 @@ from .security import (
     redact_secrets,
     trigger_emergency_stop,
 )
-from .vision import _compute_region_hash, _smart_locate_target, _walk_uia_controls
+from .vision import _compute_region_hash, _region_hashes_match, _smart_locate_target, _walk_uia_controls
 from .winapi import _get_foreground_window_info, _get_window_info_at_point, _user32
 
 MAX_STALE_RELOCATE_RETRIES = 2
@@ -171,7 +171,7 @@ def _pc_ui_action_locked(
             pg.click(cx, cy)
 
     def _is_target_region_fresh_locked(loc_obj, cx: int, cy: int) -> bool:
-        """Re-capture screenshot under _gui_lock and compare target-region hash before clicking (E-3)."""
+        """Re-capture screenshot under _gui_lock and compare perceptual region hash before clicking (E-3, 4.1)."""
         expected_hash = str(getattr(loc_obj, "region_hash", "") or "")
         if not expected_hash:
             return True
@@ -181,7 +181,8 @@ def _pc_ui_action_locked(
         if expected_size is not None and fresh_img.size != expected_size:
             return False
         fresh_hash, _ = region_hash_fn(fresh_img, cx, cy, box=expected_box)
-        return bool(fresh_hash and fresh_hash == expected_hash)
+        match_fn = facade_attr("_region_hashes_match", _region_hashes_match)
+        return bool(fresh_hash and match_fn(expected_hash, fresh_hash))
 
     def _type_clipboard_locked(target_label: str) -> str:
         if estop_fn():
@@ -216,8 +217,8 @@ def _pc_ui_action_locked(
             try:
                 if estop_fn():
                     raise InterruptedError("emergency_stop")
-                clip_written = True
                 clip.copy(text)
+                clip_written = True
                 tmod.sleep(0.04)
                 if estop_fn():
                     raise InterruptedError("emergency_stop")

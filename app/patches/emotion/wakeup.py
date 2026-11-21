@@ -71,7 +71,7 @@ def _trim_wav_leading_breath(wav_bytes: bytes) -> bytes:
 
 
 def get_wakeup_responses_for_tts(tts) -> list:
-    if tts is not None and tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
+    if tts is not None and tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts):
         return list(MEI_WAKEUP_RESPONSES)
     return []
 
@@ -112,7 +112,7 @@ def apply_mei_wakeup_responses_patch() -> None:
     @functools.wraps(_orig_wakeup_response)
     async def _mei_aware_wakeup_words_response(conn, *args, **kwargs):
         tts = getattr(conn, "tts", None)
-        if tts is None or not tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
+        if tts is None or not tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts):
             return await _orig_wakeup_response(conn, *args, **kwargs)
 
         # C-4: Run wakeup cache refresh ONLY when GSV is idle and lock is uncontended,
@@ -168,7 +168,7 @@ def apply_mei_wakeup_responses_patch() -> None:
                     break
                 await asyncio.sleep(0.1)
 
-        if tts is None or not tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
+        if tts is None or not tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts):
             matched = await _orig_check_wakeup(conn, text, *args, **kwargs)
             if matched and tts is not None:
                 tts_route.prime_gsv_async(tts, reason="wakeup")

@@ -143,6 +143,7 @@ from pc_mcp_modules.vision import (  # noqa: E402
     _parse_json_obj,
     _parse_mark_id,
     _prefer_gemini_vision,
+    _region_hashes_match,
     _smart_locate_target,
     _walk_uia_controls,
     look_at_screen,

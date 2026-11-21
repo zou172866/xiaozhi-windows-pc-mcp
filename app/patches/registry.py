@@ -223,9 +223,9 @@ PATCH_CATALOG: List[Dict[str, Any]] = [
     {
         "name": "sherpa_async_asr",
         "module": "app/patches/asr.py",
-        "target": "core.providers.asr.sherpa_onnx_local.ASRProvider.speech_to_text",
+        "target": "core.providers.asr.sherpa_onnx_local.ASRProvider.speech_to_text / ASRProviderBase.speech_to_text_wrapper",
         "category": "experience",
-        "contract": "async coroutine speech_to_text(self, opus_data, session_id, artifacts=None); offloads decode_stream to dedicated 1-thread asr executor",
+        "contract": "async coroutine speech_to_text(self, opus_data, session_id, artifacts=None); offloads decode_stream to dedicated 1-thread asr executor and applies G-4 ASR corrections across all ASR providers (incl. FunASR)",
         "failure_behavior": "fail-soft (runs upstream sync decode, marks /api/health degraded)",
         "tests": ["tests/container/test_batch3_pipeline_vad.py", "tests/container/test_upstream_contracts.py"],
     },

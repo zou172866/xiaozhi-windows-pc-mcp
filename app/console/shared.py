@@ -66,6 +66,7 @@ HOST_LAN_IP = (os.environ.get("HOST_LAN_IP") or "").strip() or "127.0.0.1"
 
 # A-4: Per-boot random write token injected into console/static/index.html and required via X-Console-Token on ALL POSTs
 _CONSOLE_WRITE_TOKEN = secrets.token_urlsafe(32)
+_CONSOLE_BOOT_ID = secrets.token_hex(8)
 _CONSOLE_TOKEN_PLACEHOLDER = "__XIAOZHI_CONSOLE_TOKEN__"
 _INTERNAL_READONLY_PATHS = frozenset({"/api/health", "/api/state"})
 
@@ -74,26 +75,38 @@ def get_console_token() -> str:
     return _CONSOLE_WRITE_TOKEN
 
 
+def get_console_boot_id() -> str:
+    return _CONSOLE_BOOT_ID
+
+
 _SECRET_PATTERNS = (
     (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-~+/=]{6,}", re.IGNORECASE), r"\1***"),
     (re.compile(r"(Basic\s+)[A-Za-z0-9+/=]{8,}", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(\bToken\s+)[A-Za-z0-9._\-~+/=]{6,}", re.IGNORECASE), r"\1***"),
     (
         re.compile(
-            r"([?#&](?:access_token|refresh_token|auth_token|token|api_key|apikey|key)=)[^\s&#\"',;)}\]]+",
+            r"((?:https?|wss?|ftp)://)[^/\s:@\"']+:[^/\s@\"']+@",
+            re.IGNORECASE,
+        ),
+        r"\1***:***@",
+    ),
+    (
+        re.compile(
+            r"([?#&](?:access_token|refresh_token|auth_token|token|api_key|apikey|auth_key|key)=)[^\s&#\"',;)}\]]+",
             re.IGNORECASE,
         ),
         r"\1***",
     ),
     (
         re.compile(
-            r"((?:x-goog-api-key|x-api-key|x-console-token|api_key|apikey|access_token|refresh_token|auth_token)\s*[\"']?\s*[:=]\s*[\"']?)[^\s&\"',;)}\]]+",
+            r"((?:x-goog-api-key|x-api-key|x-console-token|api_key|apikey|access_token|refresh_token|auth_token|auth_key|pc_mcp_token|anima_studio_token|esp32_auth_key|deepseek_api_key|gemini_api_key)\s*[\"']?\s*[:=]\s*[\"']?)[^\s&\"',;)}\]]+",
             re.IGNORECASE,
         ),
         r"\1***",
     ),
     (
         re.compile(
-            r"(authorization\s*[\"']?\s*[:=]\s*[\"']?(?:(?:Bearer|Basic)\s+)?)[^\s&\"',;)}\]]+",
+            r"(authorization\s*[\"']?\s*[:=]\s*[\"']?(?:(?:Bearer|Basic|Token)\s+)?)[^\s&\"',;)}\]]+",
             re.IGNORECASE,
         ),
         r"\1***",
@@ -110,6 +123,10 @@ _ERROR_PAYLOAD_KEYS = frozenset(
         "rollback_warning",
         "voice_dirty_error",
         "last_error",
+        "degraded_reasons",
+        "security_failures",
+        "unhealthy_reasons",
+        "warning",
     }
 )
 

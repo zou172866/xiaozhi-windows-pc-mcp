@@ -124,7 +124,7 @@ def build_gsv_request_snapshot(
 
     chosen_prof: Optional[Dict[str, Any]] = None
     emo_key: Optional[str] = None
-    is_mei = tags.is_raiden_mei_voice(ref_audio_path)
+    is_mei = tags.is_raiden_mei_voice(ref_audio_path, tts=provider)
     if is_mei:
         emo_key = tags.resolve_mei_emotion(
             clean_text,
@@ -156,8 +156,6 @@ def build_gsv_request_snapshot(
         "temperature": temperature,
         "text_split_method": split_method,
         "batch_size": getattr(provider, "batch_size", 1),
-        "batch_threshold": getattr(provider, "batch_threshold", 0.75),
-        "split_bucket": getattr(provider, "split_bucket", True),
         "return_fragment": getattr(provider, "return_fragment", False),
         "speed_factor": speed_factor,
         "streaming_mode": getattr(provider, "streaming_mode", False),
@@ -251,7 +249,7 @@ def prime_gsv_async(tts=None, *, reason: str = "wakeup", min_interval_sec: float
     global _gsv_last_prime_ts
     if tts is not None:
         cls_mod = str(getattr(type(tts), "__module__", "") or "").lower()
-        if cls_mod and "gpt_sovits" not in cls_mod and not tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", "")):
+        if cls_mod and "gpt_sovits" not in cls_mod and not tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts):
             return False
 
     now = time.monotonic()
@@ -654,7 +652,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
 
     gsv_mod.TTSProvider.text_to_speak = _patched_gsv_text_to_speak
     gsv_mod.TTSProvider.voice = property(
-        lambda self: "raiden_mei" if tags.is_raiden_mei_voice(getattr(self, "ref_audio_path", "")) else "default"
+        lambda self: "raiden_mei" if tags.is_raiden_mei_voice(getattr(self, "ref_audio_path", ""), tts=self) else "default"
     )
 
     # 3. Subtitle firewall + playback-synchronized ESP32 emotion update + P1-11 ring buffer event

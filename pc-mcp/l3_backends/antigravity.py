@@ -13,6 +13,8 @@ from . import (
     HEARTBEAT_FILE,
     L3Backend,
     PENDING_DIR,
+    _find_active_workspace_task_locked,
+    _workspace_guard_lock,
     atomic_write_json,
     find_busy_workspace_task,
     format_workspace_busy_message,
@@ -21,6 +23,7 @@ from . import (
     load_last_active_task,
     normalize_workspace_key,
     read_env_key,
+    reap_stale_running_tasks,
     resolve_task_file,
     resolve_workdir,
     validate_task_id,
@@ -136,53 +139,61 @@ class AntigravityBackend(L3Backend):
 
         workdir = resolve_workdir(cfg)
         ws_key = normalize_workspace_key(workdir)
-        busy = find_busy_workspace_task(workdir)
-        if busy is not None:
-            return format_workspace_busy_message(workdir, busy)
-        if not follow_up_last and not is_workspace_queue_mode(cfg) and PENDING_DIR.exists():
-            for pfp in sorted(PENDING_DIR.glob("*.json")):
-                if pfp.is_symlink():
-                    continue
-                try:
-                    pobj = json.loads(pfp.read_text(encoding="utf-8"))
-                    if not isinstance(pobj, dict):
+        reap_stale_running_tasks()
+
+        # P1-11: Serialize workspace busy check, pending-queue scan, and pending task file write
+        # under _workspace_guard_lock to prevent concurrent dispatches from bypassing workspace exclusion.
+        with _workspace_guard_lock:
+            busy = _find_active_workspace_task_locked(ws_key)
+            if busy is not None:
+                return format_workspace_busy_message(workdir, busy)
+            if not follow_up_last and not is_workspace_queue_mode(cfg) and PENDING_DIR.exists():
+                pending_candidates = list(sorted(PENDING_DIR.glob("*.json"))) + list(
+                    sorted(PENDING_DIR.glob(".*.claimed.*.tmp"))
+                )
+                for pfp in pending_candidates:
+                    if pfp.is_symlink():
                         continue
-                    pwd = str(pobj.get("workdir") or "").strip()
-                    if not pwd or normalize_workspace_key(pwd) == ws_key:
-                        return format_workspace_busy_message(
-                            workdir,
-                            {
-                                "task_id": str(pobj.get("id") or pfp.stem),
-                                "prompt": str(pobj.get("prompt") or "")[:80],
-                            },
-                        )
-                except Exception:
-                    continue
+                    try:
+                        pobj = json.loads(pfp.read_text(encoding="utf-8"))
+                        if not isinstance(pobj, dict):
+                            continue
+                        pwd = str(pobj.get("workdir") or "").strip()
+                        if not pwd or normalize_workspace_key(pwd) == ws_key:
+                            return format_workspace_busy_message(
+                                workdir,
+                                {
+                                    "task_id": str(pobj.get("id") or pfp.stem),
+                                    "prompt": str(pobj.get("prompt") or "")[:80],
+                                },
+                            )
+                    except Exception:
+                        continue
 
-        conv_id = ""
-        if follow_up_last:
-            last = load_last_active_task(backend="antigravity")
-            if last and last.get("conversation_id"):
-                cand_conv = str(last["conversation_id"]).strip()
-                try:
-                    if not cand_conv.startswith("-"):
-                        conv_id = validate_task_id(cand_conv)
-                except ValueError:
-                    conv_id = ""
+            conv_id = ""
+            if follow_up_last:
+                last = load_last_active_task(backend="antigravity")
+                if last and last.get("conversation_id"):
+                    cand_conv = str(last["conversation_id"]).strip()
+                    try:
+                        if not cand_conv.startswith("-"):
+                            conv_id = validate_task_id(cand_conv)
+                    except ValueError:
+                        conv_id = ""
 
-        safe_prompt = _guard_leading_dash_prompt(instr, prefix_tag="[追问]" if conv_id else "[指令]")
-        task_obj = {
-            "id": safe_task_id,
-            "backend": "antigravity",
-            "workdir": str(workdir),
-            "title": f"[小智派单] {instr[:24]}",
-            "prompt": safe_prompt,
-            "conversation_id": conv_id,
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        PENDING_DIR.mkdir(parents=True, exist_ok=True)
-        pending_file = resolve_task_file(PENDING_DIR, safe_task_id)
-        atomic_write_json(pending_file, task_obj)
+            safe_prompt = _guard_leading_dash_prompt(instr, prefix_tag="[追问]" if conv_id else "[指令]")
+            task_obj = {
+                "id": safe_task_id,
+                "backend": "antigravity",
+                "workdir": str(workdir),
+                "title": f"[小智派单] {instr[:24]}",
+                "prompt": safe_prompt,
+                "conversation_id": conv_id,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            PENDING_DIR.mkdir(parents=True, exist_ok=True)
+            pending_file = resolve_task_file(PENDING_DIR, safe_task_id)
+            atomic_write_json(pending_file, task_obj)
 
         if not _is_worker_alive():
             return (

@@ -283,6 +283,15 @@ def handle_post_audio_test(handler) -> None:
     try:
         body = handler._read_body_json()
         vol = body.get("volume", None)
+        if vol is not None:
+            if isinstance(vol, bool) or not isinstance(vol, (int, float)):
+                handler._send_json({"ok": False, "error": "字段 volume 必须为 0.0~1.0 的数字"}, HTTPStatus.BAD_REQUEST)
+                return
+            vol_f = float(vol)
+            if not math.isfinite(vol_f) or vol_f < 0.0 or vol_f > 1.0:
+                handler._send_json({"ok": False, "error": "字段 volume 超出范围（允许 0.0~1.0）"}, HTTPStatus.BAD_REQUEST)
+                return
+            vol = vol_f
         ref_wav = os.path.join(shared.VOICES_DIR, "raiden_mei", "mei_gentle_ref.wav")
         if not os.path.isfile(ref_wav):
             ref_wav = os.path.join(shared.VOICES_DIR, "wakeup_words_short.wav")

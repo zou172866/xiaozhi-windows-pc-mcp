@@ -615,6 +615,13 @@ _EXPLORER_ADDRESS_BAR_HOTKEYS = frozenset({
     frozenset({"f6"}),
     frozenset({"ctrl", "e"}),
     frozenset({"ctrl", "f"}),
+    frozenset({"shift", "f10"}),
+    frozenset({"apps"}),
+})
+
+_EXPLORER_EXACT_HOTKEYS = frozenset({
+    frozenset({"tab"}),
+    frozenset({"shift", "tab"}),
 })
 
 _DIALOG_ADDRESS_BAR_HOTKEYS = _EXPLORER_ADDRESS_BAR_HOTKEYS | frozenset({
@@ -726,17 +733,31 @@ def _check_foreground_input_guard(fg_info: Optional[dict] = None) -> Optional[st
 
 
 def _check_foreground_hotkey_guard(canon_keys: list[str], fg_info: Optional[dict] = None) -> Optional[str]:
-    """Block hotkeys that focus address/search bars while CabinetWClass or #32770 dialog is in foreground (A-3, P0-2)."""
+    """Block hotkeys that focus address/search bars or context menus while CabinetWClass or #32770 is foreground (A-3, P0-2, 4.1)."""
     info = fg_info if fg_info is not None else _get_foreground_window_info()
     cls = str(info.get("class") or "").strip().lower()
     if cls in _ADDRESS_BAR_GUARDED_WINDOW_CLASSES:
         combos = _DIALOG_ADDRESS_BAR_HOTKEYS if cls == "#32770" else _EXPLORER_ADDRESS_BAR_HOTKEYS
         key_set = frozenset(canon_keys)
+        if key_set in _EXPLORER_EXACT_HOTKEYS:
+            label = "+".join(sorted(key_set))
+            return f"安全护栏已拦截：资源管理器/文件对话框窗口下禁止发送焦点切换快捷键（{label}）以防移入地址栏。"
         for combo in combos:
             if combo.issubset(key_set):
                 label = "+".join(sorted(combo))
-                return f"安全护栏已拦截：资源管理器/文件对话框窗口下禁止发送地址栏/搜索聚焦快捷键（{label}）。"
+                return f"安全护栏已拦截：资源管理器/文件对话框窗口下禁止发送地址栏/搜索/菜单快捷键（{label}）。"
     return None
+
+
+def _is_valid_window_target_info(info: Optional[dict]) -> bool:
+    if not isinstance(info, dict) or not info:
+        return False
+    return bool(
+        info.get("hwnd")
+        or str(info.get("process") or "").strip()
+        or str(info.get("class") or "").strip()
+        or str(info.get("title") or "").strip()
+    )
 
 
 def _check_click_guard(
@@ -744,16 +765,25 @@ def _check_click_guard(
     fg_info: Optional[dict] = None,
     target_info: Optional[dict] = None,
 ) -> Optional[str]:
-    """Guard L2 click / double_click / right_click against terminal right-click paste & sensitive windows (A-3)."""
+    """Guard L2 click / double_click / right_click against terminal right-click paste, Explorer context menus & unknown targets (A-3, 4.1)."""
     fg = fg_info if fg_info is not None else _get_foreground_window_info()
     fg_err = _check_foreground_input_guard(fg)
-    tgt_err = _check_foreground_input_guard(target_info) if target_info else None
+
+    # 4.1 #3: Fail closed when target window identity at click coordinates cannot be resolved.
+    if not _is_valid_window_target_info(target_info):
+        return "安全护栏已拦截：无法识别点击目标坐标所属窗口身份（fail-closed），已拒绝 L2 点击。"
+
+    tgt_err = _check_foreground_input_guard(target_info)
+    fg_cls = str(fg.get("class") or "").strip().lower() if isinstance(fg, dict) else ""
+    tgt_cls = str(target_info.get("class") or "").strip().lower() if isinstance(target_info, dict) else ""
 
     if act == "right_click":
         if fg_err:
             return f"安全护栏已拦截：前台为终端或系统敏感窗口，已拒绝右键点击以防触发右键粘贴（{fg_err}）。"
         if tgt_err:
             return f"安全护栏已拦截：点击目标位于终端或系统敏感窗口，已拒绝右键点击（{tgt_err}）。"
+        if fg_cls in _ADDRESS_BAR_GUARDED_WINDOW_CLASSES or tgt_cls in _ADDRESS_BAR_GUARDED_WINDOW_CLASSES:
+            return "安全护栏已拦截：资源管理器/文件对话框禁止 L2 右键点击，以防触发「在终端中打开」等高危菜单。"
         return None
 
     # For left click / double_click: block clicking onto any sensitive window, or clicking when
@@ -763,7 +793,7 @@ def _check_click_guard(
     if fg_err:
         fg_hwnd = int(fg.get("hwnd") or 0) if isinstance(fg, dict) else 0
         tgt_hwnd = int(target_info.get("hwnd") or 0) if isinstance(target_info, dict) else 0
-        if not target_info or not tgt_hwnd or (fg_hwnd and tgt_hwnd == fg_hwnd):
+        if not tgt_hwnd or (fg_hwnd and tgt_hwnd == fg_hwnd):
             return f"安全护栏已拦截：当前前台为终端或系统敏感窗口，已拒绝 L2 点击（{fg_err}）。"
     return None
 
@@ -834,6 +864,10 @@ _HOTKEY_ALIAS_MAP = {
     "spacebar": "space",
     "bs": "backspace",
     "backspace": "backspace",
+    "apps": "apps",
+    "menu": "apps",
+    "contextmenu": "apps",
+    "applications": "apps",
 }
 
 _BLOCKED_EXACT_HOTKEYS = frozenset({
@@ -847,6 +881,16 @@ _BLOCKED_SUBSET_HOTKEYS = frozenset({
     frozenset({"win", "s"}),
     frozenset({"win", "q"}),
     frozenset({"win", "pause"}),
+    frozenset({"win", "0"}),
+    frozenset({"win", "1"}),
+    frozenset({"win", "2"}),
+    frozenset({"win", "3"}),
+    frozenset({"win", "4"}),
+    frozenset({"win", "5"}),
+    frozenset({"win", "6"}),
+    frozenset({"win", "7"}),
+    frozenset({"win", "8"}),
+    frozenset({"win", "9"}),
     frozenset({"ctrl", "esc"}),
     frozenset({"ctrl", "shift", "esc"}),
     frozenset({"ctrl", "alt", "del"}),

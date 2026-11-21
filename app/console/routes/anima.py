@@ -116,14 +116,74 @@ def _fetch_anima_relationship(force: bool = False, cfg: dict | None = None) -> d
     return _default_offline_relationship(char_id)
 
 
+_RELATIONSHIP_AXIS_KEYS = frozenset({"familiarity", "warmth", "trust", "romance", "tension"})
+_RELATIONSHIP_ALLOWED_KEYS = frozenset({"preset", "relationship_enabled", "romance_enabled", "axes"}) | _RELATIONSHIP_AXIS_KEYS
+_RELATIONSHIP_PRESETS_ALLOWED = frozenset({"restrained", "gentle", "warm", "close", "intimate", "sweet", "default"})
+
+
+def _validate_relationship_payload(payload: dict) -> dict:
+    """Strictly allowlist and validate /api/relationship fields; never allow caller to override character_id (4.1 #2)."""
+    import math
+
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须为 JSON 对象")
+    unknown = sorted(k for k in payload.keys() if k not in _RELATIONSHIP_ALLOWED_KEYS)
+    if unknown:
+        raise ValueError(f"包含未允许的字段: {', '.join(unknown[:6])}")
+
+    cleaned: dict = {}
+    if "preset" in payload and payload["preset"] is not None:
+        if not isinstance(payload["preset"], str):
+            raise ValueError("字段 preset 必须为字符串")
+        p_val = payload["preset"].strip().lower()
+        if p_val and len(p_val) > 32:
+            raise ValueError("字段 preset 长度超出限制")
+        cleaned["preset"] = p_val
+
+    for bkey in ("relationship_enabled", "romance_enabled"):
+        if bkey in payload and payload[bkey] is not None:
+            if not isinstance(payload[bkey], bool):
+                raise ValueError(f"字段 {bkey} 必须为布尔值")
+            cleaned[bkey] = payload[bkey]
+
+    def _check_axis(name: str, val) -> float:
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"维度 {name} 必须为数字")
+        fv = float(val)
+        if not math.isfinite(fv) or fv < -1.0 or fv > 1.0:
+            raise ValueError(f"维度 {name} 必须为 -1.0 到 1.0 之间的有限数字")
+        return fv
+
+    for ax in _RELATIONSHIP_AXIS_KEYS:
+        if ax in payload and payload[ax] is not None:
+            cleaned[ax] = _check_axis(ax, payload[ax])
+
+    if "axes" in payload and payload["axes"] is not None:
+        raw_axes = payload["axes"]
+        if not isinstance(raw_axes, dict):
+            raise ValueError("字段 axes 必须为 JSON 对象")
+        unknown_ax = sorted(k for k in raw_axes.keys() if k not in _RELATIONSHIP_AXIS_KEYS)
+        if unknown_ax:
+            raise ValueError(f"axes 包含未允许的维度: {', '.join(unknown_ax[:6])}")
+        cleaned_axes: dict[str, float] = {}
+        for ax, aval in raw_axes.items():
+            if aval is not None:
+                cleaned_axes[ax] = _check_axis(ax, aval)
+        if cleaned_axes:
+            cleaned["axes"] = cleaned_axes
+
+    return cleaned
+
+
 def _update_anima_relationship(payload: dict) -> tuple[bool, dict | str]:
     global _anima_rel_cache, _anima_rel_ts
+    req_body = _validate_relationship_payload(payload)
     char_id = _get_anima_character_id()
     token = _read_anima_token()
     if not token:
         return False, "未找到 Anima Brain 访问令牌 (studio_token.txt)"
-    req_body = dict(payload or {})
-    req_body.setdefault("character_id", char_id)
+    # 4.1 #2: Always enforce configured character_id (never trust/preserve caller-supplied character_id)
+    req_body["character_id"] = char_id
     try:
         client = shared._get_console_http_client()
         resp = client.post(
@@ -345,7 +405,7 @@ def _sync_persona_to_anima(prompt: str):
             if r.status_code == 200:
                 print(f"[WebConsole] 已自动同步角色设定至 Anima Brain: name={new_name}", flush=True)
     except Exception as exc:
-        print(f"[WebConsole] 同步 Anima Brain 设定跳过: {exc}", flush=True)
+        print(shared._redact_secrets(f"[WebConsole] 同步 Anima Brain 设定跳过: {exc}"), flush=True)
 
 
 def _sanitize_outbox_stats(raw: dict | None) -> dict:
@@ -438,6 +498,8 @@ def handle_post_relationship(handler) -> None:
             handler._send_json({"ok": False, "error": str(result)}, HTTPStatus.BAD_GATEWAY)
     except shared._BadRequestError:
         raise
+    except ValueError as e:
+        handler._send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
     except Exception as e:
         handler._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
 

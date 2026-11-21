@@ -935,7 +935,9 @@ def extract_clean_pairs(messages, *, device_id: str = "", source: str = "esp32")
                 continue
             _emit_current()
             cur_user_msg = m
-            cur_uid = str(getattr(m, "uniq_id", ""))[:64]
+            raw_uid = getattr(m, "uniq_id", None)
+            uid_s = str(raw_uid).strip()[:64] if raw_uid is not None else ""
+            cur_uid = "" if uid_s.lower() in ("none", "null") else uid_s
             cur_user = content
             cur_occurred_at = _read_occurred_at(m)
             cur_used_tools = getattr(m, "_used_tools", False) is True
@@ -1138,7 +1140,6 @@ class MemoryProvider(MemoryProviderBase):
             raise RuntimeError(f"HTTP {resp.status_code}")
         data = resp.json()
         mood_str = str(data.get("mood") or "")
-        self._set_device_anima_mood(mood_str, dev_key)
         ctx = (data.get("context_text") or "").strip()
         # 剥离重复的【角色身份设定】段落，以小智主配置 prompt 为唯一人设权威，避免双倍 Token 与人设冲突
         ctx = re.sub(
@@ -1147,6 +1148,10 @@ class MemoryProvider(MemoryProviderBase):
             ctx,
             flags=re.DOTALL,
         ).strip()
+        # 4.1 #4: Check generation freshness BEFORE mutating device Anima mood so stale recalls never overwrite newer mood
+        is_current_gen = gen is None or gen >= self._recall_gen.get(dev_key, 0)
+        if is_current_gen:
+            self._set_device_anima_mood(mood_str, dev_key)
         self._record_recall_success(dev_key, ctx, elapsed_ms, gen=gen)
         logger.bind(tag=TAG).info(
             f"Anima Brain 极速召回成功 ({elapsed_ms:.0f}ms): 事实={data.get('facts_count', 0)}, "
@@ -1264,7 +1269,9 @@ class MemoryProvider(MemoryProviderBase):
                 self._recall_stats["warm_sync_hits"] += 1
                 return fresh
             except asyncio.TimeoutError:
-                self._record_recall_failure(is_timeout=True)
+                # 4.1 #4: Short 300ms warm-budget timeout is latency jitter, NOT service unavailability;
+                # do NOT trip the global 30s circuit breaker here (let full-budget background refresh judge health).
+                self._recall_stats["timeouts"] += 1
                 self._recall_stats["cache_hits"] += 1
                 self._recall_stats["warm_fallback_hits"] += 1
                 logger.bind(tag=TAG).warning(

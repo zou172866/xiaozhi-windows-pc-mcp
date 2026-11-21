@@ -322,7 +322,9 @@ def _probe_background_services_once() -> dict[str, bool]:
                 else:
                     gsv._set_voice_dirty(None, "")
                 print(
-                    f"[WebConsole] WARNING: 后台重试恢复线上音色权重 ({cur_cfg_on_err or dirty_target}) 仍失败: {rb_exc}",
+                    shared._redact_secrets(
+                        f"[WebConsole] WARNING: 后台重试恢复线上音色权重 ({cur_cfg_on_err or dirty_target}) 仍失败: {rb_exc}"
+                    ),
                     flush=True,
                 )
             finally:
@@ -360,6 +362,7 @@ def handle_get_health(handler) -> None:
         {
             "ok": security_ok and not degraded_list,
             "status": health.get("status", "ok"),
+            "boot_id": shared.get_console_boot_id(),
             "build_version": (os.environ.get("XIAOZHI_BUILD_VERSION") or "dev").strip() or "dev",
             "degraded": degraded_list,
             "security_ok": security_ok,
@@ -466,6 +469,7 @@ def handle_get_state(handler, parsed) -> None:
                 ],
             },
             "device": dev,
+            "boot_id": shared.get_console_boot_id(),
             "health": {
                 "status": health_summary.get("status", "ok"),
                 "degraded": bool(health_summary.get("degraded")),
