@@ -62,6 +62,37 @@
 
 <main class="workspace">
   <section class="panel" aria-label="电脑操控与 AI 模型配置">
+    <!-- Section 0: ESP32 Device Allowlist & One-Click Onboarding -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">ESP32 设备接入白名单（免重启热放行）</h2>
+        <span id="esp32AuthBadge" class="rel-stage-badge num">检测中…</span>
+      </div>
+      <p class="section-desc">开启双因子鉴权后，仅白名单内的 ESP32 可访问 18000 WebSocket 与 18003 OTA。新设备首次连入被拦截时会自动出现在下方，点击「一键放行」即可立即生效。</p>
+
+      <div id="esp32PendingWrap" class="esp32-pending-wrap" style="display:none;">
+        <div class="l3-head" style="margin-bottom:6px;">
+          <strong style="color:var(--warn);">发现待放行的新 ESP32 设备</strong>
+          <span class="num" style="font-size:12px;color:var(--ink-muted);">放行后如未自动重连，按一下开发板 RST 键即可上线</span>
+        </div>
+        <div id="esp32PendingList" class="esp32-device-list"></div>
+      </div>
+
+      <div id="esp32AllowedList" class="esp32-chip-list">
+        <div class="dream-empty">暂未放行任何设备；请让 ESP32 请求一次 OTA，或在下方手动添加 MAC 地址。</div>
+      </div>
+
+      <div class="esp32-add-row">
+        <input type="text" id="esp32MacInput" spellcheck="false" placeholder="手动输入 ESP32 MAC 地址，例如 aa:bb:cc:dd:ee:ff" aria-label="ESP32 MAC 地址">
+        <button type="button" class="btn btn-primary" id="esp32AddMacBtn" style="white-space:nowrap;">加入白名单</button>
+      </div>
+
+      <div class="field-foot">
+        <span id="esp32AuthHint">鉴权采用 fail-closed 默认拒绝策略；控制台放行的设备将自动持久化并实时同步</span>
+        <span>OTA 端口 18003 · WS 端口 18000</span>
+      </div>
+    </div>
+
     <!-- Section 1: 3-Tier PC Control Mode (Instant Switch, No Restart Required) -->
     <div class="config-section">
       <div class="section-head">
@@ -138,7 +169,7 @@
       <div class="section-head">
         <h2 class="section-title">语音播报输出端（点击即刻生效，免重启）</h2>
       </div>
-      <p class="section-desc">ESP32 始终负责麦克风收音与 OLED 表情字幕显示；选择「Windows 电脑音响」将直出 GPT-SoVITS 48kHz 原声，自动与桌面声音混音。</p>
+      <p class="section-desc">ESP32 始终负责麦克风收音与 OLED 表情字幕显示；选择「Windows 电脑音响」将直出高保真 48kHz 原声（兼容云端 TTS、EdgeTTS 与本机 GPU），自动与桌面声音混音。</p>
 
       <div class="mode-grid-2" id="audioOutGrid">
         <button type="button" class="mode-btn" data-target="esp32">
@@ -244,8 +275,8 @@
         <textarea id="idleFarewellPromptInput" spellcheck="false" style="min-height:76px;" placeholder="描述你希望她如何总结本轮对话并表达不舍…"></textarea>
       </div>
 
-      <label class="field-label" id="idleFarewellInputLabel" for="idleFarewellInput" style="margin-top:10px;">自定义告别台词（每行一句，超时随机播报；芽衣默认温柔声线，也支持 [tender] / [shy] 等标签）</label>
-      <textarea id="idleFarewellInput" spellcheck="false" style="min-height:84px;" placeholder="每行写一句告别台词，例如：&#10;哥哥先去忙吧，有事随时叫我。&#10;[tender] 那我先安静陪在一旁了，记得早点休息哦。"></textarea>
+      <label class="field-label" id="idleFarewellInputLabel" for="idleFarewellInput" style="margin-top:10px;">自定义告别台词（每行一句，超时随机播报；多情绪音色支持 [tender] / [shy] 等情绪标签）</label>
+      <textarea id="idleFarewellInput" spellcheck="false" style="min-height:84px;" placeholder="每行写一句告别台词，例如：&#10;先去忙吧，有事随时叫我。&#10;[tender] 那我先安静待在一旁啦，需要的时候再叫我哦。"></textarea>
 
       <div class="field-foot" style="margin-top:8px;align-items:center;">
         <span id="idleFarewellMeta" class="num">已配置 2 句 · 修改后点右侧按钮立即生效</span>
@@ -262,7 +293,7 @@
         <h2 class="section-title">亲密度与关系热度（拖动即刻生效，免重启）</h2>
         <span id="relStageBadge" class="rel-stage-badge num">检测中…</span>
       </div>
-      <p class="section-desc">实时调节 Anima Brain 中雷电芽衣对你的熟悉、温暖、信任与浪漫尺度；点选预设、开关浪漫模式或拖动滑块后，下一句话立刻按新关系注入。</p>
+      <p class="section-desc">实时调节 Anima Brain 中 AI 伙伴对你的熟悉、温暖、信任与浪漫尺度；点选预设、开关浪漫模式或拖动滑块后，下一句话立刻按新关系注入。</p>
 
       <div class="preset-bar" id="relPresetBar" style="margin-bottom:10px;">
         <button type="button" class="preset-pill" data-rel-preset="restrained">克制助手（礼貌分寸 · 无浪漫）</button>
@@ -303,6 +334,20 @@
         <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">浪漫值（Romance）</span>
         <input type="range" id="relRomRange" min="0" max="100" step="1" value="20" aria-label="浪漫值">
         <strong id="relRomVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">20% · 已解锁</strong>
+      </div>
+
+      <div class="l3-box" style="margin-top:11px;">
+        <div class="l3-head" style="margin-bottom:6px;">
+          <strong>Anima 多向量空间与检索状态（Multi-Space · 降级显式提示）</strong>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span id="animaSemanticBadge" class="rel-stage-badge num">检测中…</span>
+            <button type="button" class="btn" id="animaResetEmbedBreakerBtn" style="padding:4px 11px;font-size:12px;display:none;">重置向量熔断</button>
+          </div>
+        </div>
+        <div class="field-foot" style="margin-top:2px;">
+          <span id="animaSemanticText">活动空间：检测中…</span>
+          <span id="animaSemanticSpacesText" class="num" style="color:var(--ink-muted);">共存空间：0</span>
+        </div>
       </div>
 
       <div class="l3-box" style="margin-top:11px;">
@@ -398,12 +443,88 @@
         </label>
       </div>
 
-      <label class="field-label" for="asrCorrInput" style="margin-top:8px;">纠错映射表（每行一条，格式：错词-&gt;正词，例如 牙医-&gt;芽衣）</label>
-      <textarea id="asrCorrInput" spellcheck="false" style="min-height:84px;font-family:var(--font-mono);font-size:12.5px;" placeholder="雷电牙医->雷电芽衣&#10;牙医->芽衣"></textarea>
+      <label class="field-label" for="asrCorrInput" style="margin-top:8px;">纠错映射表（每行一条，格式：错词-&gt;正词，例如 小志-&gt;小智）</label>
+      <textarea id="asrCorrInput" spellcheck="false" style="min-height:84px;font-family:var(--font-mono);font-size:12.5px;" placeholder="你好小志->你好小智&#10;小志->小智"></textarea>
 
       <div class="field-foot" style="margin-top:8px;align-items:center;">
         <span id="asrCorrMeta" class="num">已配置 0 条规则 · 最多 500 条</span>
         <button type="button" class="btn" id="asrCorrSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存纠错词表</button>
+      </div>
+    </div>
+
+    <!-- Section 1h: Recall Sensitive Filter & Lightweight Spoken Style Rules -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">召回隐私拦截与口语短规则（与人设解耦 · 免重启热开关）</h2>
+        <span id="recallStyleBadge" class="rel-stage-badge num">检测中…</span>
+      </div>
+      <p class="section-desc">在记忆自动召回链路默认拦截密钥、手机号、银行卡、证件号与验证码防语音外放泄密；同时用独立短规则控制「记忆无声参与」与去书面 AI 味，不修改人设正文、不破坏前缀缓存。</p>
+
+      <div class="switch-row">
+        <div class="switch-row-label">
+          <strong>召回层敏感实体自动拦截（默认开启）</strong>
+          <span>自动屏蔽记忆上下文中的 API Key/密码、手机号、银行卡号、身份证/护照号与验证码</span>
+        </div>
+        <label class="toggle-switch" aria-label="召回层敏感实体自动拦截开关">
+          <input type="checkbox" id="rsSensitiveToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="switch-row">
+        <div class="switch-row-label">
+          <strong>记忆无声参与短规则</strong>
+          <span>自然融入已知信息，禁止机械说出“我记得你上次说过…”“根据记忆…”等播报式句式</span>
+        </div>
+        <label class="toggle-switch" aria-label="记忆无声参与短规则开关">
+          <input type="checkbox" id="rsSilentMemToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="switch-row" style="margin-bottom:0;">
+        <div class="switch-row-label">
+          <strong>去书面 AI 味口语短规则</strong>
+          <span>禁止“总而言之”“综上所述”“首先…其次…最后…”等公文或客服套话，保持真人聊天节奏</span>
+        </div>
+        <label class="toggle-switch" aria-label="去书面 AI 味口语短规则开关">
+          <input type="checkbox" id="rsAntiAiToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="field-foot">
+        <span id="recallGuardStatsText" class="num">本轮进程已扫描 0 次召回 · 拦截敏感实体 0 次</span>
+        <span>切换后下一句话立即生效</span>
+      </div>
+    </div>
+
+    <!-- Section 1i: AutoDream Read-Only Reflection Proposals (Human Approval Required) -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">AutoDream 离线反思提案（只读分析 · 零自动发布 · 人工审批）</h2>
+        <span id="dreamPendingBadge" class="rel-stage-badge num">待审 0</span>
+      </div>
+      <p class="section-desc">严格在只读边界下仅基于一手用户原话（排除摘要与自我输出防递归污染）定期/手动梳理 ASR 纠错词条、冲突旧记忆合并与相处习惯建议；展示 Diff、证据出处与基线校验，经你批准后才写入生效。</p>
+
+      <div class="switch-row">
+        <div class="switch-row-label">
+          <strong>启用定期离线只读梳理（AutoDream）</strong>
+          <span id="dreamMetaText">上次梳理：尚未运行 · 仅产出待审批提案</span>
+        </div>
+        <label class="toggle-switch" aria-label="启用 AutoDream 离线反思开关">
+          <input type="checkbox" id="dreamEnabledToggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+        <button type="button" class="btn" id="dreamRunBtn" style="padding:5px 13px;font-size:12.5px;">立即离线梳理提案</button>
+        <button type="button" class="btn" id="dreamRefreshBtn" style="padding:5px 13px;font-size:12.5px;">刷新待审批列表</button>
+      </div>
+
+      <div id="dreamProposalList" class="dream-list">
+        <div class="dream-empty">点击「刷新待审批列表」或「立即离线梳理提案」查看当前待人工审核的离线建议。</div>
       </div>
     </div>
 
@@ -413,7 +534,7 @@
         <h2 class="section-title">Obsidian 同步（单向记忆与对话导出 · 免重启）</h2>
         <span id="obsStatusBadge" class="rel-stage-badge num">检测中…</span>
       </div>
-      <p class="section-desc">由 Anima Brain 自动将对话流水、芽衣记得的事、未完待续与关系状态单向导出为 Markdown（已自动脱敏 API Key 与密码）；平时冻结历史日，点「立即全量重建」可按最新模板重刷全部日期。</p>
+      <p class="section-desc">由 Anima Brain 自动将对话流水、长期记忆、未完待续与关系状态单向导出为 Markdown（已自动脱敏 API Key 与密码）；平时冻结历史日，点「立即全量重建」可按最新模板重刷全部日期。</p>
 
       <div class="switch-row">
         <div class="switch-row-label">
@@ -426,12 +547,27 @@
         </label>
       </div>
 
-      <div class="audio-vol-bar" style="margin-top:0;justify-content:space-between;">
+      <div class="switch-row">
+        <div class="switch-row-label">
+          <strong>启用每日/每周离线待跟进简报（低成本 · 零语音打扰）</strong>
+          <span id="obsBriefingHint">按日/周离线梳理待跟进事项与近期摘要写入 Obsidian「简报/」目录，不触发主动语音推送</span>
+        </div>
+        <label class="toggle-switch" aria-label="启用每日每周离线简报开关">
+          <input type="checkbox" id="obsBriefingToggle" disabled>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="audio-vol-bar" style="margin-top:0;justify-content:space-between;gap:8px;">
         <div style="display:flex;flex-direction:column;gap:2px;min-width:0;flex:1;">
           <span style="font-size:12px;color:var(--ink-secondary);">导出目录：<strong id="obsExportDirText" style="font-family:var(--font-mono);color:var(--ink);">--</strong></span>
           <span style="font-size:12px;color:var(--ink-secondary);">上次导出：<strong id="obsLastExportText" class="num" style="color:var(--ink);">尚未导出</strong></span>
+          <span style="font-size:12px;color:var(--ink-secondary);">最近简报：<strong id="obsBriefingStatusText" class="num" style="color:var(--ink-muted);">等待离线梳理</strong></span>
         </div>
-        <button type="button" class="btn" id="obsRebuildBtn" style="padding:6px 13px;font-size:12.5px;white-space:nowrap;" disabled>立即全量重建</button>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button type="button" class="btn" id="obsBriefingBtn" style="padding:6px 11px;font-size:12.5px;white-space:nowrap;" disabled>立即生成简报</button>
+          <button type="button" class="btn" id="obsRebuildBtn" style="padding:6px 13px;font-size:12.5px;white-space:nowrap;" disabled>立即全量重建</button>
+        </div>
       </div>
 
       <div class="field-foot">
@@ -469,29 +605,71 @@
       </div>
     </div>
 
-    <!-- Section 3: Voice Selection -->
+    <!-- Section 2b: ASR Engine Selection (Cloud Low-Spec API / Local Offline) -->
     <div class="config-section">
-      <h2 class="section-title" style="margin-bottom:6px;">语音合成音色（本机 5070 Ti 专精模型 / EdgeTTS）</h2>
-      <p class="section-desc">雷电芽衣已启用 7 组《崩坏3》原声参考音频动态情绪路由与防碎句连贯韵律，可在下方点击不同情绪挡位直接试听。</p>
+      <div class="section-head">
+        <h2 class="section-title">语音识别引擎（ASR · 云端低配 API / 本地离线）</h2>
+        <span id="asrEngineBadge" class="rel-stage-badge num">检测中…</span>
+      </div>
+      <p class="section-desc">低配/无独显电脑可一键切换云端 ASR（零本地模型、内存压降至 ~120–160 MiB，且自动休眠投机早判避免双倍计费）；也可随时切回本地离线 SherpaASR。API Key 仅通过系统环境变量注入，绝不落盘明文。</p>
 
-      <label class="field-label" for="voiceSelect">播报音色</label>
+      <div id="lowspecPresetBar" class="lowspec-bar" aria-label="低配云端一键预设"></div>
+
+      <label class="field-label" for="asrProviderSelect">识别引擎</label>
       <div class="voice-row">
-        <select id="voiceSelect">
-          <option value="__gsv_raiden_mei__">崩坏三 · 雷电芽衣（本机 5070 Ti 满血 V4 · 7 情绪动态声线）</option>
-          <option value="__gsv_xiaozhi_tw__">小智原版台湾腔 · 湾湾小何（本机 5070 Ti 复刻）</option>
-          <option value="zh-TW-HsiaoChenNeural">晓辰 · 微软台湾腔甜美女声（免显存）</option>
-          <option value="zh-TW-YunJheNeural">云哲 · 微软台湾腔温和男声（免显存）</option>
-          <option value="zh-CN-XiaoxiaoNeural">晓晓 · 自然温柔女声</option>
-          <option value="zh-CN-XiaoyiNeural">晓伊 · 活泼甜美少女音</option>
-          <option value="zh-CN-YunxiNeural">云希 · 清朗阳光少年音</option>
-          <option value="zh-CN-YunjianNeural">云健 · 沉稳磁性男声</option>
-          <option value="zh-CN-YunxiaNeural">云夏 · 元气可爱童声</option>
-          <option value="zh-HK-HiuGaaiNeural">晓佳 · 粤语自然女声</option>
-          <option value="zh-CN-liaoning-XiaobeiNeural">晓北 · 幽默东北话女声</option>
-          <option value="zh-CN-shaanxi-XiaoniNeural">晓妮 · 亲切陕西话女声</option>
+        <select id="asrProviderSelect">
+          <optgroup label="云端低配 API（0 显存 · 无需本地模型）">
+            <option value="SiliconFlowASR">硅基流动 SenseVoiceSmall（云端低配推荐 · 国内直连）</option>
+            <option value="OpenaiASR">通用 OpenAI 兼容 ASR（OpenAI / Groq / One-API / 自建）</option>
+            <option value="Qwen3ASRFlash">阿里云百炼 Qwen3-ASR-Flash（国内直连 HTTP）</option>
+            <option value="AliyunBLStreamASR">阿里云百炼 Paraformer 实时流式（国内直连 WS）</option>
+            <option value="DoubaoASR">火山引擎豆包语音识别（中文高精度）</option>
+            <option value="DoubaoStreamASR">火山引擎豆包大模型流式识别（低延迟 WS）</option>
+          </optgroup>
+          <optgroup label="本地离线识别模型">
+            <option value="SherpaASR">本地 Sherpa-ONNX SenseVoice（int8 轻量离线 · ~350MB）</option>
+            <option value="FunASR">本地 FunASR PyTorch（旧版重型 · ~3.5GB）</option>
+          </optgroup>
         </select>
+        <button type="button" class="btn" id="asrTestBtn" style="white-space:nowrap;">测试识别接口</button>
+      </div>
 
-        <button type="button" class="btn" id="previewBtn">
+      <div id="asrFieldsGrid" class="audio-fields-grid" style="display:none;"></div>
+
+      <div class="field-foot">
+        <span>环境变量：<strong id="asrEnvBadge">--</strong></span>
+        <span id="asrHintText">切换本地与云端 ASR 时将平滑重启以释放或加载模型内存</span>
+      </div>
+    </div>
+
+    <!-- Section 3: Voice & TTS Engine Selection -->
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">语音合成引擎与音色（TTS · 云端 API / EdgeTTS / 本机 GPU）</h2>
+        <span id="ttsEngineBadge" class="rel-stage-badge num">检测中…</span>
+      </div>
+      <p class="section-desc" id="ttsSectionDesc">全部 7 家云端 TTS、EdgeTTS 与本机 GPU GPT-SoVITS 均支持在线试听与电脑高保真（48kHz / 44.1kHz）音响直通；若配置了本地自定义多情绪模型，同步支持 7 情绪动态路由。</p>
+
+      <label class="field-label" for="ttsProviderSelect">合成引擎</label>
+      <div class="voice-row" style="margin-bottom:10px;">
+        <select id="ttsProviderSelect">
+          <optgroup label="免显存免费">
+            <option value="EdgeTTS">微软 EdgeTTS（免费免显存 · 开箱即用）</option>
+          </optgroup>
+          <optgroup label="云端高拟真音频 API（零显存 · 全兼容电脑高保真音响直通）">
+            <option value="CosyVoiceSiliconflow">硅基流动 CosyVoice2（国内直连推荐 · 48kHz）</option>
+            <option value="OpenAITTS">通用 OpenAI 兼容 TTS（OpenAI / One-API / 自建 · 48kHz）</option>
+            <option value="AliBLTTS">阿里云百炼 CosyVoice 双向流式（国内直连 · 48kHz）</option>
+            <option value="DoubaoTTS">火山引擎豆包 HTTP TTS（中文自然 · 48kHz）</option>
+            <option value="HuoshanDoubleStreamTTS">火山引擎豆包大模型双流式 V3（高拟人 · 48kHz）</option>
+            <option value="FishSpeech">Fish Audio / FishSpeech（高拟真克隆 · 48kHz）</option>
+            <option value="MinimaxTTSHTTPStream">MiniMax 海螺语音 T2A V2（多情绪流式 · 44.1kHz）</option>
+          </optgroup>
+          <optgroup label="本机独显专精引擎">
+            <option value="GPT_SOVITS_V2">本机 RTX GPU GPT-SoVITS V4（需独显 19880）</option>
+          </optgroup>
+        </select>
+        <button type="button" class="btn" id="previewBtn" style="white-space:nowrap;">
           <svg class="icon" viewBox="0 0 24 24">
             <polygon points="6 4 20 12 6 20 6 4"/>
           </svg>
@@ -499,19 +677,46 @@
         </button>
       </div>
 
-      <div id="meiEmotionBar" class="preset-bar" style="margin-top:10px;margin-bottom:0;">
-        <button type="button" class="preset-pill active" data-emotion="auto">自动情绪识别</button>
-        <button type="button" class="preset-pill" data-emotion="gentle">温柔关怀</button>
-        <button type="button" class="preset-pill" data-emotion="happy">欣喜明朗</button>
-        <button type="button" class="preset-pill" data-emotion="playful">俏皮打趣</button>
-        <button type="button" class="preset-pill" data-emotion="shy">羞赧微嗔</button>
-        <button type="button" class="preset-pill" data-emotion="serious">沉稳认真</button>
-        <button type="button" class="preset-pill" data-emotion="tender">轻柔抚慰</button>
-        <button type="button" class="preset-pill" data-emotion="calm">平静默认</button>
+      <div id="legacyVoiceWrap">
+        <label class="field-label" for="voiceSelect">播报音色</label>
+        <div class="voice-row">
+          <select id="voiceSelect">
+            <option value="__gsv_raiden_mei__">崩坏三 · 雷电芽衣（本机 GPU 满血 V4 · 7 情绪动态声线）</option>
+            <option value="__gsv_xiaozhi_tw__">小智原版台湾腔 · 湾湾小何（本机 GPU 复刻）</option>
+            <option value="zh-TW-HsiaoChenNeural">晓辰 · 微软台湾腔甜美女声（免显存）</option>
+            <option value="zh-TW-YunJheNeural">云哲 · 微软台湾腔温和男声（免显存）</option>
+            <option value="zh-CN-XiaoxiaoNeural" selected>晓晓 · 自然温柔女声</option>
+            <option value="zh-CN-XiaoyiNeural">晓伊 · 活泼甜美少女音</option>
+            <option value="zh-CN-YunxiNeural">云希 · 清朗阳光少年音</option>
+            <option value="zh-CN-YunjianNeural">云健 · 沉稳磁性男声</option>
+            <option value="zh-CN-YunxiaNeural">云夏 · 元气可爱童声</option>
+            <option value="zh-HK-HiuGaaiNeural">晓佳 · 粤语自然女声</option>
+            <option value="zh-CN-liaoning-XiaobeiNeural">晓北 · 幽默东北话女声</option>
+            <option value="zh-CN-shaanxi-XiaoniNeural">晓妮 · 亲切陕西话女声</option>
+          </select>
+        </div>
+
+        <div id="meiEmotionBar" class="preset-bar" style="display:none;margin-top:10px;margin-bottom:0;">
+          <button type="button" class="preset-pill active" data-emotion="auto">自动情绪识别</button>
+          <button type="button" class="preset-pill" data-emotion="gentle">温柔关怀</button>
+          <button type="button" class="preset-pill" data-emotion="happy">欣喜明朗</button>
+          <button type="button" class="preset-pill" data-emotion="playful">俏皮打趣</button>
+          <button type="button" class="preset-pill" data-emotion="shy">羞赧微嗔</button>
+          <button type="button" class="preset-pill" data-emotion="serious">沉稳认真</button>
+          <button type="button" class="preset-pill" data-emotion="tender">轻柔抚慰</button>
+          <button type="button" class="preset-pill" data-emotion="calm">平静默认</button>
+        </div>
       </div>
 
+      <div id="cloudTtsFieldsWrap" class="audio-fields-grid" style="display:none;"></div>
+
       <div class="preview-text-row">
-        <input type="text" id="previewTextInput" value="嗯，哥哥欢迎回来，今天累不累？我已经为你泡好了热茶。" aria-label="试听台词">
+        <input type="text" id="previewTextInput" value="你好呀，我是小智，今天过得怎么样？有什么需要我帮忙的随时告诉我。" aria-label="试听台词">
+      </div>
+
+      <div class="field-foot">
+        <span>环境变量：<strong id="ttsEnvBadge">--</strong></span>
+        <span id="ttsCompatNote">已支持 ESP32 喇叭与电脑 48kHz 音响直通</span>
       </div>
     </div>
 
@@ -519,9 +724,12 @@
     <div class="config-section">
       <div class="section-head">
         <h2 class="section-title">角色人设提示词（Prompt）</h2>
-        <span class="num" style="font-size:12px;color:var(--ink-muted);" id="charCount">0 字</span>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span id="personaRevBadge" class="rel-stage-badge num">rev.0</span>
+          <span class="num" style="font-size:12px;color:var(--ink-muted);" id="charCount">0 字</span>
+        </div>
       </div>
-      <p class="section-desc">决定小智的性格口吻与工具调度习惯。点击预设胶囊会自动保留电脑操控与记忆协同提示。</p>
+      <p class="section-desc">决定小智的性格口吻与交流风格；保存时强制 CAS 版本与摘要校验并留存快照，<strong>人设绝不授予工具权限、不替代宿主机电脑操控挡位策略</strong>。</p>
 
       <div class="preset-bar" id="presetBar">
         <button type="button" class="preset-pill" data-preset="mei">崩坏三 · 雷电芽衣</button>
@@ -532,6 +740,14 @@
       </div>
 
       <textarea id="promptInput" spellcheck="false"></textarea>
+
+      <details class="l3-adv" id="personaHistoryDetails" style="margin-top:10px;">
+        <summary>人设版本快照（CAS 摘要校验 · Diff 对比 · 一键回滚）<span id="personaSyncTag" class="num" style="margin-left:6px;color:var(--ink-muted);"></span></summary>
+        <div id="personaHistoryList" class="persona-snap-list" style="margin-top:8px;">
+          <div class="dream-empty">暂无历史快照。</div>
+        </div>
+        <pre id="personaDiffViewer" class="diff-pre" style="display:none;"></pre>
+      </details>
     </div>
   </section>
 

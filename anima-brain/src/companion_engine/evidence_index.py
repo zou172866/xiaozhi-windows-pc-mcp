@@ -9,7 +9,7 @@ import heapq
 import json
 from datetime import datetime, timezone
 
-from .memory import checked_vector
+from .memory import checked_vector, parse_namespace_dim
 
 
 def serialize(value):
@@ -153,7 +153,7 @@ class EvidenceIndex:
     def store(self, character_id, chunk_id, lane, model, vector, text):
         from .engine import Conflict
 
-        values = checked_vector(vector)
+        values = checked_vector(vector, expected_dim=parse_namespace_dim(model))
         with self.engine._transaction():
             if self.representation(character_id, chunk_id, lane) != text:
                 raise Conflict("Context/note changed while indexing; stale vector discarded")
@@ -186,7 +186,7 @@ class EvidenceIndex:
         )
 
     def rankings(self, character_id, vector, model, lo, hi, before_id=None):
-        q = checked_vector(vector)
+        q = checked_vector(vector, expected_dim=parse_namespace_dim(model))
         cutoff = self.order(before_id) if before_id else None
         ranks, hits = [], {}
         for lane, limit in (("raw", 32), ("note", 16)):

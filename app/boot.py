@@ -95,6 +95,12 @@ def _install_vad_speculative() -> None:
     vad_speculative_router.apply_vad_speculative_patch()
 
 
+def _install_cloud_audio() -> None:
+    from patches import cloud_audio
+
+    cloud_audio.apply_cloud_audio_patches()
+
+
 def install_all(
     *,
     chdir: bool = True,
@@ -151,6 +157,12 @@ def install_all(
                 _install_vad_speculative,
                 "ASRProviderBase/ConnectionHandler/receiveAudioHandle",
                 "[SpeculativeVAD]",
+            ),
+            (
+                "cloud_audio_api",
+                _install_cloud_audio,
+                "Cloud ASR/TTS providers (12 modules + 3 streaming PC audio)",
+                "[CloudAudio]",
             ),
         ):
             patch_registry.run_patch_installer(

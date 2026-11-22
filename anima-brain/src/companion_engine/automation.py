@@ -146,6 +146,16 @@ class Automation:
             s.embedding_base_url and s.embedding_model
         ):
             issues.append("embedding_provider_missing")
+        elif policy.embedding or policy.semantic_retrieval:
+            from .media import embedding_breaker
+
+            circuit_open, binfo = embedding_breaker.is_circuit_open(s)
+            if circuit_open:
+                issues.append(
+                    "embedding_auth_failed"
+                    if binfo.get("auth_breaker_open")
+                    else "embedding_circuit_open"
+                )
         if s.summary_base_url or s.summary_model:
             summary_ready = bool(s.summary_base_url and s.summary_model)
         elif self.runtime._provider is not None:
@@ -171,7 +181,9 @@ class Automation:
             from .media import Embeddings
 
             namespace = (
-                Embeddings(self.runtime.settings, self.runtime.transport).namespace
+                Embeddings(self.runtime.settings, self.runtime.transport).resolve_namespace(
+                    self.engine.db
+                )
                 if self.runtime.settings.embedding_base_url
                 and self.runtime.settings.embedding_model
                 else ""
@@ -264,7 +276,8 @@ class Automation:
                     if now - last_logged >= 600:
                         self._daily_cap_logged[cid] = now
                         _log.warning(
-                            "Memory automation daily cap reached for character=%s (%d/%d jobs in 24h); pausing claims",
+                            "Memory automation daily cap reached for character=%s "
+                            "(%d/%d jobs in 24h); pausing claims",
                             cid,
                             used,
                             p.daily_jobs,
@@ -298,11 +311,18 @@ class Automation:
                     ):
                         if self.engine.memory.maintenance_sources(cid, p):
                             kind = "maintenance"
-                if not kind and p.embedding and "embedding_provider_missing" not in issues:
+                if (
+                    not kind
+                    and p.embedding
+                    and "embedding_provider_missing" not in issues
+                    and "embedding_auth_failed" not in issues
+                    and "embedding_circuit_open" not in issues
+                ):
                     embed = Embeddings(self.runtime.settings, self.runtime.transport)
+                    active_ns = embed.resolve_namespace(self.engine.db)
                     if self.engine.evidence_index.candidates(
-                        cid, embed.namespace, limit=1
-                    ) or self.engine.retrieval.candidates(cid, embed.namespace, limit=1):
+                        cid, active_ns, limit=1
+                    ) or self.engine.retrieval.candidates(cid, active_ns, limit=1):
                         kind = "index"
                 if kind:
                     jid = str(uuid4())

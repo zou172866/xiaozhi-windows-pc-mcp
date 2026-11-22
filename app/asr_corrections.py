@@ -2,7 +2,7 @@
 
 Persists user-editable homophone corrections at `config/runtime/asr_corrections.json`
 (mounted inside container at `/opt/xiaozhi-esp32-server/data/asr_corrections.json`),
-seeded with defaults such as `牙医 -> 芽衣` and `雷电牙医 -> 雷电芽衣`.
+seeded with generic XiaoZhi defaults such as `小志 -> 小智` and `你好小志 -> 你好小智`.
 
 Applies longest-key-first single-pass regex replacement so multi-character entries
 take precedence without cascading double-replacements.
@@ -23,16 +23,12 @@ MAX_CORRECTION_RULES = 500
 MAX_RULE_TOKEN_LEN = 64
 
 DEFAULT_CORRECTIONS: Dict[str, str] = {
-    "雷电牙医": "雷电芽衣",
-    "雷电亚衣": "雷电芽衣",
-    "雷电雅衣": "雷电芽衣",
-    "你好牙医": "你好芽衣",
-    "牙医": "芽衣",
-    "芽一": "芽衣",
-    "亚衣": "芽衣",
-    "雅衣": "芽衣",
+    "你好小志": "你好小智",
+    "你好小治": "你好小智",
     "小志": "小智",
     "小治": "小智",
+    "小纸": "小智",
+    "小至": "小智",
 }
 
 

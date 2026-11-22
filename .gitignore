@@ -59,6 +59,9 @@ tmp/
 # Local development compose override (H-3: copy from docker-compose.override.yml.example)
 docker-compose.override.yml
 
+# Clean release packaging output directory
+dist/
+
 # Build artifacts generated inside anima-brain Dockerfile node stage (H-4)
 anima-brain/src/companion_engine/static/memory-panel.html
 anima-brain/src/companion_engine/static/provider-settings.html

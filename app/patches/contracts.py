@@ -82,34 +82,67 @@ def run_lightweight_contract_checks() -> Dict[str, Any]:
         from core.api.vision_handler import VisionHandler
         from core.connection import ConnectionHandler
         from core.handle.receiveAudioHandle import no_voice_close_connect
+        from core.providers.asr.aliyunbl_stream import ASRProvider as AliyunBLStreamASR
+        from core.providers.asr.doubao import ASRProvider as DoubaoASR
+        from core.providers.asr.doubao_stream import ASRProvider as DoubaoStreamASR
+        from core.providers.asr.openai import ASRProvider as OpenaiASR
+        from core.providers.asr.qwen3_asr_flash import ASRProvider as Qwen3ASR
         from core.providers.asr.sherpa_onnx_local import ASRProvider as SherpaASR
         from core.providers.llm.openai.openai import LLMProvider as OpenAILLM
+        from core.providers.tts.alibl_stream import TTSProvider as AliBLTTS
+        from core.providers.tts.doubao import TTSProvider as DoubaoTTS
+        from core.providers.tts.fishspeech import TTSProvider as FishSpeechTTS
+        from core.providers.tts.huoshan_double_stream import TTSProvider as HuoshanTTS
+        from core.providers.tts.minimax_httpstream import TTSProvider as MinimaxTTS
+        from core.providers.tts.openai import TTSProvider as OpenAITTS
+        from core.providers.tts.siliconflow import TTSProvider as SiliconFlowTTS
         from core.websocket_server import WebSocketServer
 
-        for label, fn in (
+        coro_checks = (
             ("OTAHandler.handle_post", OTAHandler.handle_post),
             ("WebSocketServer._handle_auth", WebSocketServer._handle_auth),
             ("VisionHandler.handle_post", VisionHandler.handle_post),
             ("SherpaASR.speech_to_text", SherpaASR.speech_to_text),
             ("no_voice_close_connect", no_voice_close_connect),
-        ):
+            ("OpenaiASR.speech_to_text", OpenaiASR.speech_to_text),
+            ("Qwen3ASR.speech_to_text", Qwen3ASR.speech_to_text),
+            ("DoubaoASR.speech_to_text", DoubaoASR.speech_to_text),
+            ("DoubaoStreamASR.receive_audio", DoubaoStreamASR.receive_audio),
+            ("OpenAITTS.text_to_speak", OpenAITTS.text_to_speak),
+            ("SiliconFlowTTS.text_to_speak", SiliconFlowTTS.text_to_speak),
+            ("DoubaoTTS.text_to_speak", DoubaoTTS.text_to_speak),
+            ("FishSpeechTTS.text_to_speak", FishSpeechTTS.text_to_speak),
+            ("AliBLTTS.text_to_speak", AliBLTTS.text_to_speak),
+            ("AliBLTTS.start_session", AliBLTTS.start_session),
+            ("HuoshanTTS.text_to_speak", HuoshanTTS.text_to_speak),
+            ("HuoshanTTS.start_session", HuoshanTTS.start_session),
+            ("MinimaxTTS.text_to_speak", MinimaxTTS.text_to_speak),
+        )
+        for label, fn in coro_checks:
             if not inspect.iscoroutinefunction(fn):
                 callable_errors.append(f"{label} not coroutine")
-        for label, fn in (
+        sync_checks = (
             ("ConnectionHandler.chat", getattr(ConnectionHandler, "chat", None)),
             ("ConnectionHandler._handle_function_result", getattr(ConnectionHandler, "_handle_function_result", None)),
             ("OpenAILLM.response", getattr(OpenAILLM, "response", None)),
             ("OpenAILLM.response_with_functions", getattr(OpenAILLM, "response_with_functions", None)),
-        ):
+            ("AliyunBLStreamASR.__init__", getattr(AliyunBLStreamASR, "__init__", None)),
+            ("DoubaoASR.__init__", getattr(DoubaoASR, "__init__", None)),
+            ("DoubaoStreamASR.__init__", getattr(DoubaoStreamASR, "__init__", None)),
+        )
+        for label, fn in sync_checks:
             if not callable(fn):
                 callable_errors.append(f"{label} not callable")
     except Exception as exc:
         callable_errors.append(str(exc))
 
     call_ok = len(callable_errors) == 0
+    total_callables = 25
     checks["callable_contracts"] = {
         "ok": call_ok,
-        "detail": "9/9 upstream callables verified" if call_ok else "; ".join(callable_errors),
+        "detail": f"{total_callables}/{total_callables} upstream callables verified"
+        if call_ok
+        else "; ".join(callable_errors),
     }
     if not call_ok:
         failures.append(f"callable_contracts: {checks['callable_contracts']['detail']}")

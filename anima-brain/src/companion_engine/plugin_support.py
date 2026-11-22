@@ -24,7 +24,8 @@ def workflow(section="workflow"):
 def player_html():
     local = ROOT / "static" / "voice-player.html"
     if not local.is_file():
-        fallback = Path(os.environ.get("ANIMA_BUILT_STATIC_DIR", "/app/built_static")) / "voice-player.html"
+        built_dir = Path(os.environ.get("ANIMA_BUILT_STATIC_DIR", "/app/built_static"))
+        fallback = built_dir / "voice-player.html"
         if fallback.is_file():
             local = fallback
     return local.read_text(encoding="utf-8")

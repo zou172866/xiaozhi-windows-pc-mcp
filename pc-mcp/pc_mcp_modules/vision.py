@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import atexit
 import base64
+import ctypes
+from ctypes import wintypes
 import hashlib
 import io
 import json
@@ -35,34 +37,123 @@ _POSITIONAL_HINTS = (
 
 _vision_http_lock = threading.Lock()
 _vision_http_client: Optional[httpx.Client] = None
+_vision_proxy_http_client: Optional[httpx.Client] = None
+
+_HTTP_LIMITS = httpx.Limits(
+    max_connections=10,
+    max_keepalive_connections=4,
+    keepalive_expiry=60.0,
+)
 
 
-def _get_vision_http_client() -> httpx.Client:
-    """Lazily initialize and reuse a persistent thread-safe httpx.Client for VLM requests (E-3)."""
-    global _vision_http_client
+def _get_vision_http_client(use_proxy: bool = False) -> httpx.Client:
+    """Lazily initialize persistent thread-safe httpx.Client instances (E-3, P0-1).
+
+    - `use_proxy=False` (default, used for domestic DeepSeek VLM): `trust_env=False` so
+      domestic requests never route through overseas HTTP/SOCKS proxies or crash without `socksio`.
+    - `use_proxy=True` (used for Gemini VLM): `trust_env=True` with automatic fallback to
+      direct `trust_env=False` if `socksio` is unavailable in the Python environment.
+    """
+    global _vision_http_client, _vision_proxy_http_client
     with _vision_http_lock:
-        if _vision_http_client is None or _vision_http_client.is_closed:
-            _vision_http_client = httpx.Client(
-                timeout=16.0,
-                limits=httpx.Limits(
-                    max_connections=10,
-                    max_keepalive_connections=4,
-                    keepalive_expiry=60.0,
-                ),
-            )
-        return _vision_http_client
+        if not use_proxy:
+            if _vision_http_client is None or _vision_http_client.is_closed:
+                _vision_http_client = httpx.Client(
+                    timeout=16.0,
+                    limits=_HTTP_LIMITS,
+                    trust_env=False,
+                )
+            return _vision_http_client
+        if _vision_proxy_http_client is None or _vision_proxy_http_client.is_closed:
+            try:
+                _vision_proxy_http_client = httpx.Client(
+                    timeout=16.0,
+                    limits=_HTTP_LIMITS,
+                    trust_env=True,
+                )
+            except ImportError:
+                _vision_proxy_http_client = httpx.Client(
+                    timeout=16.0,
+                    limits=_HTTP_LIMITS,
+                    trust_env=False,
+                )
+        return _vision_proxy_http_client
 
 
 def close_vision_http_client() -> None:
-    """Close the shared persistent vision httpx.Client cleanly on shutdown."""
-    global _vision_http_client
+    """Close shared persistent vision httpx.Client instances cleanly on shutdown."""
+    global _vision_http_client, _vision_proxy_http_client
     with _vision_http_lock:
-        if _vision_http_client is not None:
+        for cli in (_vision_http_client, _vision_proxy_http_client):
+            if cli is not None:
+                try:
+                    cli.close()
+                except Exception:
+                    pass
+        _vision_http_client = None
+        _vision_proxy_http_client = None
+
+
+from .winapi import _user32 as _win_user32
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+def _get_target_monitor_rect(hwnd: Optional[int] = None) -> Optional[tuple[int, int, int, int]]:
+    """Query physical bounding rectangle `(left, top, right, bottom)` of the monitor hosting `hwnd` (P2-2)."""
+    try:
+        u32 = _win_user32
+        target_hwnd = int(hwnd or 0) or int(u32.GetForegroundWindow() or 0)
+        if not target_hwnd:
+            return None
+        hmon = u32.MonitorFromWindow(wintypes.HWND(target_hwnd), 2)  # MONITOR_DEFAULTTONEAREST = 2
+        if not hmon:
+            return None
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not u32.GetMonitorInfoW(wintypes.HMONITOR(hmon), ctypes.byref(mi)):
+            return None
+        left, top, right, bottom = (
+            int(mi.rcMonitor.left),
+            int(mi.rcMonitor.top),
+            int(mi.rcMonitor.right),
+            int(mi.rcMonitor.bottom),
+        )
+        if right > left and bottom > top:
+            return (left, top, right, bottom)
+    except Exception:
+        pass
+    return None
+
+
+def _grab_monitor_rgb(
+    ig: Any, monitor_rect: Optional[tuple[int, int, int, int]] = None
+) -> Image.Image:
+    """Grab an RGB screenshot of `monitor_rect`, preserving zero-arg `ig.grab()` on the primary screen (P2-2)."""
+    if monitor_rect is not None:
+        left, top, right, bottom = monitor_rect
+        is_primary = left == 0 and top == 0
+        if is_primary:
             try:
-                _vision_http_client.close()
+                pg = facade_attr("pyautogui", pyautogui)
+                psw, psh = pg.size()
+                if (right - left, bottom - top) != (int(psw), int(psh)):
+                    is_primary = False
             except Exception:
                 pass
-            _vision_http_client = None
+        if not is_primary:
+            try:
+                return ig.grab(bbox=monitor_rect, all_screens=True).convert("RGB")
+            except TypeError:
+                pass
+    return ig.grab().convert("RGB")
 
 
 atexit.register(close_vision_http_client)
@@ -80,11 +171,13 @@ class LocateResult(tuple):
         region_hash: str = "",
         region_box: Optional[tuple[int, int, int, int]] = None,
         screen_size: Optional[tuple[int, int]] = None,
+        monitor_rect: Optional[tuple[int, int, int, int]] = None,
     ):
         obj = super().__new__(cls, (int(x), int(y), str(src_tag)))
         obj.region_hash = str(region_hash or "")
         obj.region_box = region_box
         obj.screen_size = screen_size
+        obj.monitor_rect = monitor_rect
         return obj
 
 
@@ -149,18 +242,22 @@ def _compute_region_hash(
     box: Optional[tuple[int, int, int, int]] = None,
     half_w: int = 48,
     half_h: int = 32,
+    mon_left: int = 0,
+    mon_top: int = 0,
 ) -> tuple[str, tuple[int, int, int, int]]:
-    """Compute a blinking-cursor-tolerant perceptual hash (mean RGB + 64-bit dHash) around `(cx, cy)` (E-3, 4.1)."""
+    """Compute a blinking-cursor-tolerant perceptual hash (mean RGB + 64-bit dHash) around `(cx, cy)` (E-3, P2-2)."""
     sw, sh = img.size
     if sw <= 0 or sh <= 0:
         return "", (0, 0, 0, 0)
     if box is not None:
         x1, y1, x2, y2 = box
     else:
-        x1 = cx - half_w
-        y1 = cy - half_h
-        x2 = cx + half_w
-        y2 = cy + half_h
+        local_cx = int(cx) - int(mon_left)
+        local_cy = int(cy) - int(mon_top)
+        x1 = local_cx - half_w
+        y1 = local_cy - half_h
+        x2 = local_cx + half_w
+        y2 = local_cy + half_h
     x1 = max(0, min(sw - 1, int(x1)))
     y1 = max(0, min(sh - 1, int(y1)))
     x2 = max(x1 + 1, min(sw, int(x2)))
@@ -279,7 +376,7 @@ def _call_vision_llm(prompt_text: str, pil_img: Image.Image, json_mode: bool = F
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         try:
-            client = _get_vision_http_client()
+            client = _get_vision_http_client() if _name == "deepseek" else _get_vision_http_client(True)
             r = client.post(
                 url,
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -311,7 +408,9 @@ def _parse_json_obj(raw: Optional[str]) -> Optional[dict]:
     return None
 
 
-def _walk_uia_controls(auto, root, max_items: int, sw: int, sh: int) -> list[dict]:
+def _walk_uia_controls(
+    auto, root, max_items: int, sw: int, sh: int, *, mon_left: int = 0, mon_top: int = 0
+) -> list[dict]:
     items: list[dict] = []
     interesting_types = {
         "HyperlinkControl",
@@ -341,7 +440,12 @@ def _walk_uia_controls(auto, root, max_items: int, sw: int, sh: int) -> list[dic
                 continue
             cx = (rect.left + rect.right) // 2
             cy = (rect.top + rect.bottom) // 2
-            if cx < 4 or cy < 4 or cx > sw - 4 or cy > sh - 4:
+            if (
+                cx < mon_left + 4
+                or cy < mon_top + 4
+                or cx > mon_left + sw - 4
+                or cy > mon_top + sh - 4
+            ):
                 continue
             cname = (ctrl.Name or "").strip()
             dup = False
@@ -372,7 +476,11 @@ def _walk_uia_controls(auto, root, max_items: int, sw: int, sh: int) -> list[dic
 
 
 def _collect_uia_elements(
-    target_win=None, max_items: int = 70, window_keyword: str = ""
+    target_win=None,
+    max_items: int = 70,
+    window_keyword: str = "",
+    *,
+    monitor_rect: Optional[tuple[int, int, int, int]] = None,
 ) -> list[dict]:
     """穿透 18 层（支持 Edge/Chrome 网页 DOM DocumentControl）采集当前可见可交互控件及其 1:1 物理像素矩形。"""
     import uiautomation as auto
@@ -389,10 +497,26 @@ def _collect_uia_elements(
                     break
         if root is None:
             root = auto.GetForegroundControl()
+        rect = monitor_rect
+        if rect is None and root is not None:
+            rect = _get_target_monitor_rect(getattr(root, "NativeWindowHandle", None))
+        if rect is not None:
+            mon_left, mon_top, mon_right, mon_bottom = rect
+            return _walk_uia_controls(
+                auto,
+                root,
+                max_items,
+                mon_right - mon_left,
+                mon_bottom - mon_top,
+                mon_left=mon_left,
+                mon_top=mon_top,
+            )
         return _walk_uia_controls(auto, root, max_items, sw, sh)
 
 
-def _draw_som_overlay(base_img: Image.Image, elements: list[dict]) -> Image.Image:
+def _draw_som_overlay(
+    base_img: Image.Image, elements: list[dict], *, mon_left: int = 0, mon_top: int = 0
+) -> Image.Image:
     """在截图上绘制 Set-of-Mark 红色编号角标框，供多模态视觉模型做零误差数字锚定。"""
     annotated = base_img.copy()
     dr = ImageDraw.Draw(annotated)
@@ -403,12 +527,15 @@ def _draw_som_overlay(base_img: Image.Image, elements: list[dict]) -> Image.Imag
 
     for el in elements[:60]:
         idx_str = str(el["id"])
-        x1, y1, x2, y2 = el["left"], el["top"], el["right"], el["bottom"]
+        x1 = int(el["left"]) - int(mon_left)
+        y1 = int(el["top"]) - int(mon_top)
+        x2 = int(el["right"]) - int(mon_left)
+        y2 = int(el["bottom"]) - int(mon_top)
         dr.rectangle([x1, y1, x2, y2], outline=(220, 38, 38), width=2)
         tw = max(22, 11 * len(idx_str) + 8)
         th = 22
         bx1 = max(0, min(annotated.width - tw, x1))
-        by1 = y1 - th if y1 >= th else y1
+        by1 = y1 - th if y1 >= th else max(0, y1)
         dr.rectangle([bx1, by1, bx1 + tw, by1 + th], fill=(220, 38, 38))
         dr.text((bx1 + 4, by1 + 2), idx_str, fill=(255, 255, 255), font=font)
     return annotated
@@ -432,7 +559,13 @@ def _smart_locate_target(target_desc: str) -> Optional[LocateResult]:
 
     # Critical section: collect UIA tree and grab screenshot atomically, then release _gui_lock IMMEDIATELY!
     with _gui_lock:
-        uia_elems = collect_fn(max_items=65)
+        mon_rect = _get_target_monitor_rect()
+        mon_left = int(mon_rect[0]) if mon_rect is not None else 0
+        mon_top = int(mon_rect[1]) if mon_rect is not None else 0
+        try:
+            uia_elems = collect_fn(max_items=65, monitor_rect=mon_rect)
+        except TypeError:
+            uia_elems = collect_fn(max_items=65)
 
         # 第一阶：非方位词描述时，尝试 UIA 精确或强子串匹配
         if not needs_visual_layout and uia_elems:
@@ -454,8 +587,10 @@ def _smart_locate_target(target_desc: str) -> Optional[LocateResult]:
                 uia_box = None
                 uia_screen_size = None
                 try:
-                    uia_img = ig.grab().convert("RGB")
-                    uia_hash, uia_box = _compute_region_hash(uia_img, hit["cx"], hit["cy"])
+                    uia_img = _grab_monitor_rgb(ig, mon_rect)
+                    uia_hash, uia_box = _compute_region_hash(
+                        uia_img, hit["cx"], hit["cy"], mon_left=mon_left, mon_top=mon_top
+                    )
                     uia_screen_size = uia_img.size
                 except Exception:
                     pass
@@ -466,15 +601,20 @@ def _smart_locate_target(target_desc: str) -> Optional[LocateResult]:
                     region_hash=uia_hash,
                     region_box=uia_box,
                     screen_size=uia_screen_size,
+                    monitor_rect=mon_rect,
                 )
 
         # 第二阶截图采样在锁内完成，随后立刻释放 _gui_lock，避免 VLM 推理占锁长达 64s
-        raw_img = ig.grab().convert("RGB")
+        raw_img = _grab_monitor_rgb(ig, mon_rect)
 
     # _gui_lock 已释放：以下 SoM 绘制、VLM 粗定位与高清裁剪二次精修均在锁外执行
     sw, sh = raw_img.size
     marked_subset = uia_elems[:55]
-    som_img = _draw_som_overlay(raw_img, marked_subset) if marked_subset else raw_img
+    som_img = (
+        _draw_som_overlay(raw_img, marked_subset, mon_left=mon_left, mon_top=mon_top)
+        if marked_subset
+        else raw_img
+    )
 
     send_w = min(1600, sw)
     send_h = int(sh * (send_w / sw))
@@ -524,16 +664,21 @@ def _smart_locate_target(target_desc: str) -> Optional[LocateResult]:
     vw = int(((x_max - x_min) / 1000.0) * sw) if has_box else 0
     vh = int(((y_max - y_min) / 1000.0) * sh) if has_box else 0
 
-    final_x, final_y, src_tag = -1, -1, ""
+    local_x, local_y, src_tag = -1, -1, ""
+    has_resolved = False
 
     if 1 <= mark_id <= len(marked_subset):
         el = marked_subset[mark_id - 1]
-        if not has_box or (abs(el["cx"] - vx) <= max(200, vw) and abs(el["cy"] - vy) <= max(150, vh)):
-            final_x, final_y = el["cx"], el["cy"]
+        el_lx = int(el["cx"]) - mon_left
+        el_ly = int(el["cy"]) - mon_top
+        if not has_box or (abs(el_lx - vx) <= max(200, vw) and abs(el_ly - vy) <= max(150, vh)):
+            local_x, local_y = el_lx, el_ly
+            has_resolved = True
             src_tag = f"SoM#{mark_id}「{el['name'][:24] or label}」"
 
-    if final_x < 0 and has_box:
-        final_x, final_y = vx, vy
+    if not has_resolved and has_box:
+        local_x, local_y = vx, vy
+        has_resolved = True
         src_tag = f"视觉定位「{label}」"
         if vw < 200 or vh < 110:
             crop_w, crop_h = min(768, sw), min(512, sh)
@@ -552,23 +697,27 @@ def _smart_locate_target(target_desc: str) -> Optional[LocateResult]:
                 fx2 = _parse_coord_float(fine_obj.get("x_max"), -1.0)
                 fy2 = _parse_coord_float(fine_obj.get("y_max"), -1.0)
                 if 0 <= fx1 < fx2 <= 1000 and 0 <= fy1 < fy2 <= 1000:
-                    final_x = cx1 + int(((fx1 + fx2) / 2000.0) * crop_w)
-                    final_y = cy1 + int(((fy1 + fy2) / 2000.0) * crop_h)
+                    local_x = cx1 + int(((fx1 + fx2) / 2000.0) * crop_w)
+                    local_y = cy1 + int(((fy1 + fy2) / 2000.0) * crop_h)
                     src_tag = f"高清精修定位「{label}」"
 
-    if final_x < 0 or final_y < 0:
+    if not has_resolved or local_x < 0 or local_y < 0:
         return None
 
-    final_x = max(2, min(sw - 2, final_x))
-    final_y = max(2, min(sh - 2, final_y))
-    region_hash, region_box = _compute_region_hash(raw_img, final_x, final_y)
+    local_x = max(2, min(sw - 2, local_x))
+    local_y = max(2, min(sh - 2, local_y))
+    final_x = mon_left + local_x
+    final_y = mon_top + local_y
+    region_hash, region_box = _compute_region_hash(
+        raw_img, final_x, final_y, mon_left=mon_left, mon_top=mon_top
+    )
 
     try:
         dbg = som_img.copy()
         d = ImageDraw.Draw(dbg)
-        d.ellipse([final_x - 16, final_y - 16, final_x + 16, final_y + 16], outline=(16, 185, 129), width=4)
-        d.line([final_x - 26, final_y, final_x + 26, final_y], fill=(16, 185, 129), width=3)
-        d.line([final_x, final_y - 26, final_x, final_y + 26], fill=(16, 185, 129), width=3)
+        d.ellipse([local_x - 16, local_y - 16, local_x + 16, local_y + 16], outline=(16, 185, 129), width=4)
+        d.line([local_x - 26, local_y, local_x + 26, local_y], fill=(16, 185, 129), width=3)
+        d.line([local_x, local_y - 26, local_x, local_y + 26], fill=(16, 185, 129), width=3)
         tmp_img = grounding_img.with_name(f".{grounding_img.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         dbg.resize((1280, max(1, int(sh * (1280 / sw))))).save(tmp_img, format="JPEG", quality=82)
         os.replace(tmp_img, grounding_img)
@@ -582,6 +731,7 @@ def _smart_locate_target(target_desc: str) -> Optional[LocateResult]:
         region_hash=region_hash,
         region_box=region_box,
         screen_size=(sw, sh),
+        monitor_rect=mon_rect,
     )
 
 
@@ -589,7 +739,7 @@ def look_at_screen(question: str = "请简明描述当前电脑屏幕上正在�
     ig = facade_attr("ImageGrab", ImageGrab)
     call_vlm = facade_attr("_call_vision_llm", _call_vision_llm)
     with _gui_lock:
-        img = ig.grab().convert("RGB")
+        img = _grab_monitor_rgb(ig, _get_target_monitor_rect())
     w, h = img.size
     if w > 1600:
         img = img.resize((1600, int(h * (1600 / w))))

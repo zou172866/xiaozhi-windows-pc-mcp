@@ -41,7 +41,8 @@ def register_settings_ui(server, runtime):
     def settings_html():
         local = Path(__file__).parent / "static" / "provider-settings.html"
         if not local.is_file():
-            fallback = Path(os.environ.get("ANIMA_BUILT_STATIC_DIR", "/app/built_static")) / "provider-settings.html"
+            built_dir = Path(os.environ.get("ANIMA_BUILT_STATIC_DIR", "/app/built_static"))
+            fallback = built_dir / "provider-settings.html"
             if fallback.is_file():
                 local = fallback
         return local.read_text(encoding="utf-8")

@@ -378,16 +378,20 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     def _patched_inject_tool_call_fewshot(self, *args, **kwargs):
         res = _orig_inject_fewshot(self, *args, **kwargs)
         try:
-            if tags.has_voice_emotion_tag_rule(str((self.config or {}).get("prompt") or "")):
+            prompt_text = str((self.config or {}).get("prompt") or "")
+            if tags.has_voice_emotion_tag_rule(prompt_text):
+                fewshot_resp = (
+                    "[gentle] 好呀，哥哥想听什么类型的故事呢？轻松一点的日常，还是奇幻冒险的？"
+                    if "哥哥" in prompt_text
+                    else "[gentle] 好呀，你想听什么类型的故事呢？轻松一点的日常，还是奇幻冒险的？"
+                )
                 for m in getattr(self.dialogue, "dialogue", []) or []:
                     if getattr(m, "is_temporary", False) and getattr(m, "tool_calls", None):
                         for tc in m.tool_calls:
                             fn = tc.get("function") if isinstance(tc, dict) else None
                             if isinstance(fn, dict) and fn.get("name") == "direct_answer":
                                 fn["arguments"] = json.dumps(
-                                    {
-                                        "response": "[gentle] 好呀，哥哥想听什么类型的故事呢？轻松一点的日常，还是奇幻冒险的？"
-                                    },
+                                    {"response": fewshot_resp},
                                     ensure_ascii=False,
                                 )
         except Exception:
@@ -418,13 +422,17 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
                 return None
 
             # Reset per-turn emotion & first-segment state when a brand-new sentence_id starts
-            cur_sid = getattr(self, "current_sentence_id", None)
+            cur_sid = getattr(self, "current_sentence_id", None) or getattr(
+                getattr(self, "conn", None), "sentence_id", None
+            )
             if getattr(self, "_emotion_turn_sid", None) != cur_sid:
                 self._emotion_turn_sid = cur_sid
                 self._turn_explicit_emotion = None
                 self._pending_segment_emotion = None
                 self._segment_emotion_queue = []
                 self._first_segment_done_sid = None
+                self.is_first_sentence = True
+                self.tts_audio_first_sentence = True
 
             # Absorb leading tag early ONLY for the very first unspoken sentence of the turn
             s_lead = tags._strip_leading_ws_and_emojis(current_text)
@@ -496,7 +504,9 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         self.processed_chars = len(full_text)
         if not remaining_text:
             return did_any
-        cur_sid = getattr(self, "current_sentence_id", None)
+        cur_sid = getattr(self, "current_sentence_id", None) or getattr(
+            getattr(self, "conn", None), "sentence_id", None
+        )
         if getattr(self, "_emotion_turn_sid", None) != cur_sid:
             self._emotion_turn_sid = cur_sid
             self._turn_explicit_emotion = None
@@ -513,6 +523,40 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
             return True
         return did_any
 
+    def _enqueue_common_segment_emotion(tts_obj, clean_text: str, explicit_seg: Optional[str] = None) -> None:
+        """Enqueue & push 7-emotion ESP32 OLED state for non-GSV TTS providers (EdgeTTS & Cloud HTTP TTS, P1-1)."""
+        if getattr(tts_obj, "_handles_own_segment_emotion", False):
+            return
+        conn = getattr(tts_obj, "conn", None)
+        eff_emo = (
+            explicit_seg
+            or getattr(tts_obj, "_pending_segment_emotion", None)
+            or getattr(tts_obj, "_turn_explicit_emotion", None)
+        )
+        tts_obj._pending_segment_emotion = None
+        if not eff_emo and conn is not None:
+            prompt_str = str((getattr(conn, "config", None) or {}).get("prompt") or "")
+            if tags.has_voice_emotion_tag_rule(prompt_str):
+                dev_id = str(getattr(conn, "device_id", "") or "").strip() or None
+                eff_emo = tags.infer_mei_emotion(clean_text, device_id=dev_id)
+        if not eff_emo:
+            return
+        prof = tags.get_mei_emotion_profile(eff_emo)
+        cur_sid = getattr(tts_obj, "current_sentence_id", None) or getattr(conn, "sentence_id", None)
+        q = getattr(tts_obj, "_segment_emotion_queue", None)
+        if q is None:
+            q = []
+            tts_obj._segment_emotion_queue = q
+        q.append((cur_sid, clean_text, prof["esp32_emoji"], prof["esp32_emotion"]))
+        if len(q) > 64:
+            del q[:-64]
+        if (
+            conn is not None
+            and getattr(tts_obj, "tts_audio_first_sentence", True)
+            and getattr(conn, "_last_pushed_mei_sid", None) != cur_sid
+        ):
+            splitter._push_esp32_emotion_async(conn, prof["esp32_emoji"], prof["esp32_emotion"])
+
     @functools.wraps(_orig_to_tts_stream)
     def _patched_to_tts_stream(self, text, *args, **kwargs):
         seg_emo, stripped = tags.extract_and_strip_emotion(text or "", flush_incomplete=True)
@@ -522,6 +566,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         cleaned = tags.clean_segment_for_tts(stripped)
         if not cleaned:
             return None
+        _enqueue_common_segment_emotion(self, cleaned, seg_emo)
         return _orig_to_tts_stream(self, cleaned, *args, **kwargs)
 
     @functools.wraps(_orig_to_tts)
@@ -569,13 +614,11 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
 
     gsv_mod.TTSProvider.__init__ = _patched_gsv_init
 
-    @functools.wraps(_orig_gsv_text_to_speak)
-    async def _patched_gsv_text_to_speak(self, text, output_file, *args, **kwargs):
-        global _gsv_live_inflight
+    def _prepare_gsv_segment(self, text):
         seg_emo, stripped = tags.extract_and_strip_emotion(text or "", flush_incomplete=True)
         clean_text = tags.clean_segment_for_tts(stripped)
         if not clean_text:
-            return b""
+            return None
 
         conn = getattr(self, "conn", None)
         cur_sid = getattr(self, "current_sentence_id", None) or getattr(conn, "sentence_id", None)
@@ -603,18 +646,10 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
             base_logger.bind(tag=gsv_mod.TAG).info(
                 f"[芽衣多情绪路由] 情绪={emo_key}({chosen_prof['label_zh']}) | speed={request_json['speed_factor']} | 文本={clean_text}"
             )
+        return clean_text, conn, cur_sid, is_first_segment, req_url, request_json, chosen_prof
 
-        timeout_sec = float(getattr(self, "tts_timeout", None) or 30.0)
-        with _gsv_inflight_lock:
-            _gsv_live_inflight += 1
-        try:
-            resp = await asyncio.to_thread(_post_gsv_sync, req_url or self.url, request_json, timeout_sec)
-        finally:
-            with _gsv_inflight_lock:
-                _gsv_live_inflight = max(0, _gsv_live_inflight - 1)
-
+    def _finalize_gsv_response(self, resp, clean_text, conn, cur_sid, is_first_segment, chosen_prof) -> bytes:
         if resp.status_code == 200:
-            # Clear pending segment emotion only after synthesis succeeds (safe across retries)
             self._pending_segment_emotion = None
             if cur_sid and is_first_segment:
                 self._first_segment_done_sid = cur_sid
@@ -633,8 +668,6 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
                 )
                 if len(q) > 64:
                     del q[:-64]
-                # Only push immediately if no audio has begun playing yet for this turn;
-                # subsequent clause emotions are delivered by _patched_send_tts_message via AudioRateController!
                 if getattr(self, "tts_audio_first_sentence", True) and getattr(
                     conn, "_last_pushed_mei_sid", None
                 ) != cur_sid:
@@ -643,16 +676,52 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
                         chosen_prof["esp32_emoji"],
                         chosen_prof["esp32_emotion"],
                     )
-            if output_file:
-                await asyncio.to_thread(_write_file_bytes, output_file, resp.content)
-            else:
-                return resp.content
-        else:
-            error_msg = f"GPT_SoVITS_V2 TTS请求失败: {resp.status_code} - {resp.text}"
-            base_logger.bind(tag=gsv_mod.TAG).error(error_msg)
-            raise Exception(error_msg)
+            return resp.content
+        error_msg = f"GPT_SoVITS_V2 TTS请求失败: {resp.status_code} - {resp.text}"
+        base_logger.bind(tag=gsv_mod.TAG).error(error_msg)
+        raise Exception(error_msg)
 
+    def _patched_gsv_text_to_speak_sync(self, text) -> bytes:
+        global _gsv_live_inflight
+        prep = _prepare_gsv_segment(self, text)
+        if prep is None:
+            return b""
+        clean_text, conn, cur_sid, is_first_segment, req_url, request_json, chosen_prof = prep
+        timeout_sec = float(getattr(self, "tts_timeout", None) or 30.0)
+        with _gsv_inflight_lock:
+            _gsv_live_inflight += 1
+        try:
+            resp = _post_gsv_sync(req_url or self.url, request_json, timeout_sec)
+        finally:
+            with _gsv_inflight_lock:
+                _gsv_live_inflight = max(0, _gsv_live_inflight - 1)
+        return _finalize_gsv_response(self, resp, clean_text, conn, cur_sid, is_first_segment, chosen_prof)
+
+    @functools.wraps(_orig_gsv_text_to_speak)
+    async def _patched_gsv_text_to_speak(self, text, output_file, *args, **kwargs):
+        global _gsv_live_inflight
+        prep = _prepare_gsv_segment(self, text)
+        if prep is None:
+            return b""
+        clean_text, conn, cur_sid, is_first_segment, req_url, request_json, chosen_prof = prep
+        timeout_sec = float(getattr(self, "tts_timeout", None) or 30.0)
+        with _gsv_inflight_lock:
+            _gsv_live_inflight += 1
+        try:
+            resp = await asyncio.to_thread(_post_gsv_sync, req_url or self.url, request_json, timeout_sec)
+        finally:
+            with _gsv_inflight_lock:
+                _gsv_live_inflight = max(0, _gsv_live_inflight - 1)
+        content = _finalize_gsv_response(self, resp, clean_text, conn, cur_sid, is_first_segment, chosen_prof)
+        if output_file:
+            await asyncio.to_thread(_write_file_bytes, output_file, content)
+        else:
+            return content
+
+    gsv_mod.TTSProvider._handles_own_segment_emotion = True
+    gsv_mod.TTSProvider._text_to_speak_sync = _patched_gsv_text_to_speak_sync
     gsv_mod.TTSProvider.text_to_speak = _patched_gsv_text_to_speak
+    gsv_mod.TTSProvider._patched_tts_speak_ref = _patched_gsv_text_to_speak
     gsv_mod.TTSProvider.voice = property(
         lambda self: "raiden_mei" if tags.is_raiden_mei_voice(getattr(self, "ref_audio_path", ""), tts=self) else "default"
     )

@@ -100,6 +100,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "complete_suffixes": list(DEFAULT_VAD_SPECULATIVE_COMPLETE_SUFFIXES),
         "hesitation_suffixes": list(DEFAULT_VAD_SPECULATIVE_HESITATION_SUFFIXES),
     },
+    "recall_style": {
+        "sensitive_filter_enabled": True,
+        "silent_memory_enabled": True,
+        "anti_ai_flavor_enabled": True,
+    },
 }
 
 _settings_lock = threading.RLock()
@@ -283,6 +288,23 @@ def normalize_vad_speculative(raw: Any) -> Dict[str, Any]:
     }
 
 
+def _coerce_bool(val: Any, default: bool) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    return str(val).strip().lower() not in ("0", "false", "no", "off")
+
+
+def normalize_recall_style(raw: Any) -> Dict[str, bool]:
+    d = raw if isinstance(raw, dict) else {}
+    return {
+        "sensitive_filter_enabled": _coerce_bool(d.get("sensitive_filter_enabled"), True),
+        "silent_memory_enabled": _coerce_bool(d.get("silent_memory_enabled"), True),
+        "anti_ai_flavor_enabled": _coerce_bool(d.get("anti_ai_flavor_enabled"), True),
+    }
+
+
 def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
     d = raw if isinstance(raw, dict) else {}
     return {
@@ -293,6 +315,7 @@ def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
         "idle_farewell": normalize_idle_farewell(d.get("idle_farewell")),
         "turn_context": normalize_turn_context(d.get("turn_context")),
         "vad_speculative": normalize_vad_speculative(d.get("vad_speculative")),
+        "recall_style": normalize_recall_style(d.get("recall_style")),
     }
 
 
@@ -617,4 +640,47 @@ def set_vad_speculative(
         "min_chars": int(sec["min_chars"]),
         "complete_suffixes": list(sec["complete_suffixes"]),
         "hesitation_suffixes": list(sec["hesitation_suffixes"]),
+    }
+
+
+def get_recall_style(settings_path: Optional[str] = None) -> Dict[str, bool]:
+    sec = read_runtime_settings(settings_path)["recall_style"]
+    return {
+        "sensitive_filter_enabled": bool(sec["sensitive_filter_enabled"]),
+        "silent_memory_enabled": bool(sec["silent_memory_enabled"]),
+        "anti_ai_flavor_enabled": bool(sec["anti_ai_flavor_enabled"]),
+    }
+
+
+def set_recall_style(
+    *,
+    sensitive_filter_enabled: Optional[bool] = None,
+    silent_memory_enabled: Optional[bool] = None,
+    anti_ai_flavor_enabled: Optional[bool] = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, bool]:
+    for fname, fval in (
+        ("sensitive_filter_enabled", sensitive_filter_enabled),
+        ("silent_memory_enabled", silent_memory_enabled),
+        ("anti_ai_flavor_enabled", anti_ai_flavor_enabled),
+    ):
+        if fval is not None and not isinstance(fval, bool):
+            raise ValueError(f"{fname} must be a boolean, got {type(fval).__name__}")
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if sensitive_filter_enabled is not None:
+            next_cfg["sensitive_filter_enabled"] = bool(sensitive_filter_enabled)
+        if silent_memory_enabled is not None:
+            next_cfg["silent_memory_enabled"] = bool(silent_memory_enabled)
+        if anti_ai_flavor_enabled is not None:
+            next_cfg["anti_ai_flavor_enabled"] = bool(anti_ai_flavor_enabled)
+        return normalize_recall_style(next_cfg)
+
+    saved = update_runtime_section("recall_style", _upd, settings_path=settings_path)
+    sec = saved["recall_style"]
+    return {
+        "sensitive_filter_enabled": bool(sec["sensitive_filter_enabled"]),
+        "silent_memory_enabled": bool(sec["silent_memory_enabled"]),
+        "anti_ai_flavor_enabled": bool(sec["anti_ai_flavor_enabled"]),
     }

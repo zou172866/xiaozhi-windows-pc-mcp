@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 import weakref
 import httpx
 import patch_registry
@@ -114,15 +115,19 @@ def _get_stations_lock() -> asyncio.Lock:
 
 
 def _get_async_client() -> httpx.AsyncClient:
-    """Reuse a module-level httpx.AsyncClient per running event loop (C-7)."""
+    """Reuse a module-level httpx.AsyncClient per running event loop (C-7, P0-1 SOCKS fallback)."""
     loop = asyncio.get_running_loop()
     client = _async_clients.get(loop)
     if client is None or client.is_closed:
-        client = httpx.AsyncClient(
+        kw = dict(
             timeout=httpx.Timeout(8.0, connect=4.0),
             headers=HEADERS,
             limits=httpx.Limits(max_connections=12, max_keepalive_connections=6),
         )
+        try:
+            client = httpx.AsyncClient(**kw)
+        except ImportError:
+            client = httpx.AsyncClient(**kw, trust_env=False)
         _async_clients[loop] = client
     return client
 
@@ -345,9 +350,12 @@ def _match_station(query: str, stations: list[dict]) -> dict | None:
 
 async def _fetch_overseas_wttr(location: str) -> str | None:
     try:
+        encoded_loc = urllib.parse.quote(location.strip(), safe="")
+        if not encoded_loc:
+            return None
         client = _get_async_client()
         r = await client.get(
-            f"https://wttr.in/{location}",
+            f"https://wttr.in/{encoded_loc}",
             params={"format": "j1", "lang": "zh"},
             timeout=httpx.Timeout(6.0, connect=3.0),
         )

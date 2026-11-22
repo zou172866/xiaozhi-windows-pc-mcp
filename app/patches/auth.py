@@ -27,11 +27,23 @@ _ENV_DEFAULTS = {
     "HOST_PROJECT_DIR": xz_common.ROOT_DIR,
 }
 _PATH_ENV_KEYS = frozenset({"HOST_DATA_DIR", "HOST_VOICES_DIR", "HOST_GSV_WEIGHTS_DIR", "HOST_PROJECT_DIR"})
+_ENV_FALLBACKS = {
+    "DOUBAO_ASR_APPID": ("DOUBAO_APPID",),
+    "DOUBAO_ASR_ACCESS_TOKEN": ("DOUBAO_ACCESS_TOKEN",),
+    "DOUBAO_TTS_APPID": ("DOUBAO_APPID",),
+    "DOUBAO_TTS_ACCESS_TOKEN": ("DOUBAO_ACCESS_TOKEN",),
+}
 _EPHEMERAL_ESP32_AUTH_KEY = secrets.token_hex(32)
 
 
+_MAC_DASH_RE = re.compile(r"^[0-9a-f]{2}(?:-[0-9a-f]{2}){5}$")
+
+
 def _normalize_device_id(value) -> str:
-    return str(value or "").strip().lower()
+    s = str(value or "").strip().lower()
+    if _MAC_DASH_RE.match(s):
+        return s.replace("-", ":")
+    return s
 
 
 def normalize_allowed_devices(raw_devices, env_val: str | None = None) -> list[str]:
@@ -53,7 +65,7 @@ def normalize_allowed_devices(raw_devices, env_val: str | None = None) -> list[s
     seen: set[str] = set()
     for entry in candidates:
         for part in re.split(r"[,;\s]+", str(entry)):
-            tok = part.strip().lower()
+            tok = _normalize_device_id(part)
             if not tok or "${" in tok or "}" in tok:
                 continue
             if tok not in seen:
@@ -86,6 +98,10 @@ def _expand_env(obj):
             val = os.environ.get(key)
             if val:
                 return val
+            for fb_key in _ENV_FALLBACKS.get(key, ()):
+                fb_val = os.environ.get(fb_key)
+                if fb_val:
+                    return fb_val
             return _ENV_DEFAULTS.get(key, m.group(0))
 
         return _ENV_PATTERN.sub(_repl, obj)
@@ -249,6 +265,11 @@ def _has_unexpanded_or_invalid_auth_key(handler) -> bool:
 
 
 def _extract_handler_allowed_devices(handler) -> set[str]:
+    live_synced = runtime_events.get_live_allowed_devices_for_handler(handler)
+    if live_synced is None:
+        live_synced = runtime_events.get_live_allowed_devices_for_config(getattr(handler, "config", None))
+    if live_synced is not None:
+        return set(live_synced)
     if hasattr(handler, "allowed_devices"):
         raw = getattr(handler, "allowed_devices")
     else:
@@ -296,6 +317,7 @@ def install_esp32_auth_hardening_patch() -> None:
             else:
                 @functools.wraps(_orig_ota_handle_post)
                 async def _patched_ota_handle_post(self, request, *args, **kwargs):
+                    runtime_events.register_auth_handler(self)
                     auth_enabled = bool(getattr(self, "auth_enable", False))
                     hdrs = {str(k).lower(): str(v) for k, v in dict(request.headers).items()}
                     dev_raw = (hdrs.get("device-id") or "").strip()
@@ -332,6 +354,17 @@ def install_esp32_auth_hardening_patch() -> None:
                             return resp
                         allowed = _extract_handler_allowed_devices(self)
                         if not allowed or dev_norm not in allowed:
+                            if dev_norm:
+                                try:
+                                    runtime_events.publish_event(
+                                        "device_rejected",
+                                        device_id=dev_norm,
+                                        source="ota",
+                                        client_id=client_raw,
+                                        reason="not_in_allowlist",
+                                    )
+                                except Exception:
+                                    pass
                             try:
                                 self.logger.bind(tag="esp32_auth").warning(
                                     f"拒绝未授权设备 OTA 请求: device_id={dev_norm}"
@@ -389,6 +422,16 @@ def install_esp32_auth_hardening_patch() -> None:
                     return resp
 
                 ota_cls.handle_post = _patched_ota_handle_post
+                _orig_ota_init = getattr(ota_cls, "__init__", None)
+                if callable(_orig_ota_init) and not getattr(_orig_ota_init, "_esp32_auth_init_wrapped", False):
+                    @functools.wraps(_orig_ota_init)
+                    def _patched_ota_init(self, *args, **kwargs):
+                        res = _orig_ota_init(self, *args, **kwargs)
+                        runtime_events.register_auth_handler(self)
+                        return res
+
+                    _patched_ota_init._esp32_auth_init_wrapped = True
+                    ota_cls.__init__ = _patched_ota_init
                 ota_cls._esp32_auth_hardened = True
                 patch_registry.record_patch(
                     "esp32_auth_ota",
@@ -466,6 +509,7 @@ def install_esp32_auth_hardening_patch() -> None:
             else:
                 @functools.wraps(_orig_ws_handle_auth)
                 async def _patched_ws_handle_auth(self, websocket, *args, **kwargs):
+                    runtime_events.register_auth_handler(self)
                     raw_headers = dict(getattr(getattr(websocket, "request", None), "headers", None) or {})
                     headers = {str(k).lower(): str(v) for k, v in raw_headers.items()}
                     dev_raw = (headers.get("device-id") or "").strip()
@@ -498,6 +542,17 @@ def install_esp32_auth_hardening_patch() -> None:
 
                     allowed = _extract_handler_allowed_devices(self)
                     if not dev_norm or not allowed or dev_norm not in allowed:
+                        if dev_norm:
+                            try:
+                                runtime_events.publish_event(
+                                    "device_rejected",
+                                    device_id=dev_norm,
+                                    source="ws",
+                                    client_id=client_id,
+                                    reason="not_in_allowlist",
+                                )
+                            except Exception:
+                                pass
                         _reject(f"Device not in allowlist: {dev_norm or 'missing'}")
 
                     if not auth_hdr.lower().startswith("bearer "):
@@ -630,6 +685,7 @@ def install_esp32_auth_hardening_patch() -> None:
 
                 @functools.wraps(_orig_vision_handle_post)
                 async def _patched_vision_handle_post(self, request, *args, **kwargs):
+                    runtime_events.register_auth_handler(self)
                     is_valid, token_device_id = self._verify_auth_token(request)
                     if not is_valid:
                         resp = _aiohttp_web.Response(
@@ -664,6 +720,16 @@ def install_esp32_auth_hardening_patch() -> None:
                     if bool(auth_cfg.get("enabled", False)):
                         allowed = _extract_handler_allowed_devices(self)
                         if not allowed or dev_norm not in allowed:
+                            if dev_norm:
+                                try:
+                                    runtime_events.publish_event(
+                                        "device_rejected",
+                                        device_id=dev_norm,
+                                        source="vision",
+                                        reason="not_in_allowlist",
+                                    )
+                                except Exception:
+                                    pass
                             resp = _aiohttp_web.Response(
                                 text=json.dumps(
                                     self._create_error_response("设备未在白名单中，拒绝访问视觉分析接口"),
@@ -679,6 +745,16 @@ def install_esp32_auth_hardening_patch() -> None:
 
                 vis_cls._verify_auth_token = _patched_vision_verify_auth_token
                 vis_cls.handle_post = _patched_vision_handle_post
+                _orig_vis_init = getattr(vis_cls, "__init__", None)
+                if callable(_orig_vis_init) and not getattr(_orig_vis_init, "_esp32_auth_init_wrapped", False):
+                    @functools.wraps(_orig_vis_init)
+                    def _patched_vis_init(self, *args, **kwargs):
+                        res = _orig_vis_init(self, *args, **kwargs)
+                        runtime_events.register_auth_handler(self)
+                        return res
+
+                    _patched_vis_init._esp32_auth_init_wrapped = True
+                    vis_cls.__init__ = _patched_vis_init
                 vis_cls._esp32_auth_hardened = True
                 patch_registry.record_patch(
                     "esp32_auth_vision",

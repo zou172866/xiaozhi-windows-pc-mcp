@@ -135,9 +135,9 @@ def _scale_pcm16(pcm_bytes: bytes, volume: float) -> bytes:
 
 
 class _WinMMPlayer:
-    """Double-buffered WinMM CALLBACK_EVENT lossless PCM WAV playback queue for Windows audio device."""
+    """Triple-buffered WinMM CALLBACK_EVENT lossless PCM WAV playback queue for Windows audio device."""
 
-    def __init__(self, max_inflight: int = 2):
+    def __init__(self, max_inflight: int = 3):
         # Lock hierarchy: ALWAYS acquire _device_lock before _lock if both are ever held (never reverse).
         self._lock = threading.Lock()
         self._device_lock = threading.Lock()
@@ -424,7 +424,7 @@ class _WinMMPlayer:
                 continue
             else:
                 res = _kernel32.WaitForMultipleObjects(2, self._wait_handles, False, 200)
-                if res == 0x00000102 and (time.monotonic() - last_idle_ts) >= 0.8:
+                if res == 0x00000102 and (time.monotonic() - last_idle_ts) >= 3.0:
                     self._close_device()
                     last_idle_ts = time.monotonic()
 

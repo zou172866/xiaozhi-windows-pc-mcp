@@ -114,6 +114,7 @@ _stats: Dict[str, Any] = {
     "held_incomplete": 0,
     "story_mode_skips": 0,
     "cache_reuses": 0,
+    "inflight_reuses": 0,
     "total_saved_ms": 0.0,
 }
 
@@ -642,8 +643,9 @@ def apply_vad_speculative_patch() -> None:
                 if state.triggered_gen == state.generation or state.result_gen == state.generation:
                     state.invalidate(count_discard=True)
             elif getattr(conn, "client_voice_stop", False):
-                # P1-12: Hard 1100ms cutoff reached: hand off completed speculative result (zero double-decode)
-                # or cancel any still-in-flight speculative task before upstream decode runs.
+                # P1-12 + P1-4: Hard 1100ms cutoff reached: hand off completed speculative result,
+                # keep valid in-flight decode alive for bounded await in _spec_aware_handle_voice_stop,
+                # or cancel stale/resumed tasks.
                 if (
                     state.result_gen == state.generation
                     and state.result_text
@@ -652,7 +654,8 @@ def apply_vad_speculative_patch() -> None:
                     state.committed_text = state.result_text
                     state.committed_pcm_len = state.result_pcm_len
                 elif state.task is not None and not state.task.done():
-                    state.invalidate(count_discard=False)
+                    if state.triggered_gen != state.generation or getattr(conn, "last_is_voice", False):
+                        state.invalidate(count_discard=False)
             elif getattr(conn, "client_have_voice", False) and not getattr(conn, "last_is_voice", False):
                 # P1-12: Never early-commit or start speculative decode while SileroVAD last_is_voice=True
                 # (protects the opening frames when a user resumes speaking inside the sliding window).
@@ -713,11 +716,31 @@ def apply_vad_speculative_patch() -> None:
         sid = str(getattr(conn, "session_id", "") or "")
         st = getattr(conn, "_vad_spec_state", None)
         stashed = False
-        if isinstance(st, _SpeculativeState) and st.committed_text:
-            _stash_asr_speculative_hit(self, sid, st.committed_pcm_len, st.committed_text)
-            stashed = True
-            st.committed_text = None
-            st.committed_pcm_len = 0
+        if isinstance(st, _SpeculativeState):
+            if (
+                not st.committed_text
+                and st.task is not None
+                and not st.task.done()
+                and st.triggered_gen == st.generation
+                and not getattr(conn, "last_is_voice", False)
+            ):
+                try:
+                    await asyncio.wait_for(asyncio.shield(st.task), timeout=0.25)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
+                if (
+                    st.result_gen == st.generation
+                    and st.result_text
+                    and not getattr(conn, "last_is_voice", False)
+                ):
+                    st.committed_text = st.result_text
+                    st.committed_pcm_len = st.result_pcm_len
+                    _bump_stat("inflight_reuses", 1)
+            if st.committed_text:
+                _stash_asr_speculative_hit(self, sid, st.committed_pcm_len, st.committed_text)
+                stashed = True
+                st.committed_text = None
+                st.committed_pcm_len = 0
         try:
             return await _orig_handle_voice_stop(self, conn, asr_audio_task, *args, **kwargs)
         finally:

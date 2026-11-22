@@ -15,6 +15,8 @@ ephemeral <turn_context> block right before the latest user utterance:
 from __future__ import annotations
 
 from collections import deque
+import contextlib
+import contextvars
 from datetime import datetime
 import functools
 import os
@@ -24,11 +26,25 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import patch_registry
+import recall_guard
 import reply_length_router
 import runtime_events
 import runtime_settings
 
 VALID_MODES = frozenset({"split", "legacy"})
+_SKIP_LLM_TELEMETRY_VAR: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "xiaozhi_skip_llm_telemetry", default=False
+)
+
+
+@contextlib.contextmanager
+def suppress_llm_telemetry():
+    """Temporarily bypass LLM prefix-cache & TTFT telemetry for non-dialogue background calls (P1-5)."""
+    tok = _SKIP_LLM_TELEMETRY_VAR.set(True)
+    try:
+        yield
+    finally:
+        _SKIP_LLM_TELEMETRY_VAR.reset(tok)
 
 def _make_block_re(tag: str) -> re.Pattern:
     """Match ONLY standalone line-anchored <tag>...</tag> blocks, never inline prose mentions like '请结合 <memory> 中...'."""
@@ -41,6 +57,7 @@ def _make_block_re(tag: str) -> re.Pattern:
 _CONTEXT_BLOCK_RE = _make_block_re("context")
 _MEMORY_BLOCK_RE = _make_block_re("memory")
 _REPLY_LEN_BLOCK_RE = _make_block_re("reply_length_control")
+_SPEECH_STYLE_BLOCK_RE = _make_block_re("speech_style_rules")
 _SPEAKERS_BLOCK_RE = _make_block_re("speakers_info")
 _TURN_CONTEXT_BLOCK_RE = re.compile(
     r"(?im)(?:^|\r?\n)[ \t]*<turn_context>(?:[ \t]*\r?\n(?:(?!<turn_context>).)*?|[^\r\n<>]*)</turn_context>[ \t]*(?=\r?\n|$)",
@@ -133,6 +150,7 @@ def build_turn_context_block(
     context_block: str = "",
     memory_text: str = "",
     reply_length_block: str = "",
+    speech_style_block: str = "",
     speakers_block: str = "",
 ) -> str:
     """Assemble a single <turn_context> envelope combining all per-turn volatile signals."""
@@ -147,6 +165,8 @@ def build_turn_context_block(
             parts.append(f"<memory>\n{mem_s}\n</memory>")
     if reply_length_block and reply_length_block.strip():
         parts.append(reply_length_block.strip())
+    if speech_style_block and speech_style_block.strip():
+        parts.append(speech_style_block.strip())
     if speakers_block and speakers_block.strip():
         parts.append(speakers_block.strip())
     if not parts:
@@ -181,6 +201,11 @@ def apply_turn_context_to_messages(
 
     active_mode = get_turn_context_mode(mode)
     mem_clean = str(memory_str).strip() if memory_str else ""
+    if mem_clean:
+        try:
+            mem_clean, _ = recall_guard.sanitize_recall_context(mem_clean, record_stats=False)
+        except Exception:
+            pass
     eff_time = current_time_str or datetime.now().strftime("%H:%M")
 
     if active_mode == "legacy":
@@ -198,6 +223,26 @@ def apply_turn_context_to_messages(
                     )
                 else:
                     sys_c = f"{sys_c}\n\n<memory>\n{mem_clean}\n</memory>"
+            elif _MEMORY_BLOCK_RE.search(sys_c):
+                def _sanitize_existing_mem(m: re.Match) -> str:
+                    inner = _extract_inner_tag_text(m.group(0), "memory")
+                    if not inner:
+                        return m.group(0)
+                    try:
+                        san_inner, _ = recall_guard.sanitize_recall_context(inner, record_stats=False)
+                    except Exception:
+                        san_inner = inner
+                    return f"\n<memory>\n{san_inner}\n</memory>"
+
+                sys_c = _MEMORY_BLOCK_RE.sub(_sanitize_existing_mem, sys_c)
+            try:
+                has_mem_leg = bool(mem_clean) or bool(_MEMORY_BLOCK_RE.search(sys_c))
+                style_blk_leg = recall_guard.build_speech_style_directive(has_memory=has_mem_leg)
+                sys_c, _ = _extract_and_strip(_SPEECH_STYLE_BLOCK_RE, sys_c)
+                if style_blk_leg:
+                    sys_c = f"{sys_c.rstrip()}\n\n{style_blk_leg}"
+            except Exception:
+                pass
             out_leg[0]["content"] = sys_c
         try:
             reply_length_router.inject_reply_length_into_messages(out_leg)
@@ -241,6 +286,7 @@ def apply_turn_context_to_messages(
         sys_txt, context_blocks = _extract_and_strip(_CONTEXT_BLOCK_RE, sys_txt)
         sys_txt, memory_blocks = _extract_and_strip(_MEMORY_BLOCK_RE, sys_txt)
         sys_txt, _ = _extract_and_strip(_REPLY_LEN_BLOCK_RE, sys_txt)
+        sys_txt, _ = _extract_and_strip(_SPEECH_STYLE_BLOCK_RE, sys_txt)
         sys_txt, speakers_blocks = _extract_and_strip(_SPEAKERS_BLOCK_RE, sys_txt)
         sys_txt = re.sub(r"\n{3,}", "\n\n", sys_txt).strip()
         out_msgs[0]["content"] = sys_txt
@@ -263,11 +309,25 @@ def apply_turn_context_to_messages(
                 if inner:
                     effective_memory = inner
                     break
+            if effective_memory:
+                try:
+                    effective_memory, _ = recall_guard.sanitize_recall_context(
+                        effective_memory, record_stats=False
+                    )
+                except Exception:
+                    pass
 
         try:
             reply_len_blk = reply_length_router.build_length_directive()
         except Exception:
             reply_len_blk = ""
+
+        try:
+            speech_style_blk = recall_guard.build_speech_style_directive(
+                has_memory=bool(effective_memory)
+            )
+        except Exception:
+            speech_style_blk = ""
 
         speakers_joined = "\n\n".join(b for b in speakers_blocks if b.strip())
 
@@ -275,6 +335,7 @@ def apply_turn_context_to_messages(
             context_block=ctx_joined,
             memory_text=effective_memory,
             reply_length_block=reply_len_blk,
+            speech_style_block=speech_style_blk,
             speakers_block=speakers_joined,
         )
 
@@ -642,6 +703,8 @@ def wrap_llm_client_for_usage(llm_provider: Any, *, log_fn=None) -> bool:
 
     @functools.wraps(orig_create)
     def _tracked_create(*args, **kwargs):
+        if _SKIP_LLM_TELEMETRY_VAR.get():
+            return orig_create(*args, **kwargs)
         is_stream = bool(kwargs.get("stream", False))
         req_kwargs = dict(kwargs)
         added_stream_opts = False
@@ -665,7 +728,7 @@ def wrap_llm_client_for_usage(llm_provider: Any, *, log_fn=None) -> bool:
         if is_stream:
             return _UsageTrackingStream(res, t0=t0, model_name=model_name, log_fn=log_fn)
 
-        # Non-streaming response telemetry
+        # Non-streaming response telemetry (ttft_ms=None because total completion time is not first-token latency)
         u = getattr(res, "usage", None)
         metrics = extract_usage_metrics(u)
         if metrics is not None:
@@ -674,7 +737,7 @@ def wrap_llm_client_for_usage(llm_provider: Any, *, log_fn=None) -> bool:
                 completion_tokens=int(metrics["completion_tokens"] or 0),
                 cache_hit_tokens=metrics["prompt_cache_hit_tokens"],
                 cache_miss_tokens=metrics["prompt_cache_miss_tokens"],
-                ttft_ms=(time.perf_counter() - t0) * 1000.0,
+                ttft_ms=None,
                 model_name=model_name,
             )
         return res

@@ -80,7 +80,7 @@ def get_console_boot_id() -> str:
 
 
 _SECRET_PATTERNS = (
-    (re.compile(r"(Bearer\s+)[A-Za-z0-9._\-~+/=]{6,}", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(Bearer[\s;]+)[A-Za-z0-9._\-~+/=]{6,}", re.IGNORECASE), r"\1***"),
     (re.compile(r"(Basic\s+)[A-Za-z0-9+/=]{8,}", re.IGNORECASE), r"\1***"),
     (re.compile(r"(\bToken\s+)[A-Za-z0-9._\-~+/=]{6,}", re.IGNORECASE), r"\1***"),
     (
@@ -92,21 +92,21 @@ _SECRET_PATTERNS = (
     ),
     (
         re.compile(
-            r"([?#&](?:access_token|refresh_token|auth_token|token|api_key|apikey|auth_key|key)=)[^\s&#\"',;)}\]]+",
+            r"([?#&](?:access_token|refresh_token|auth_token|token|api_key|apikey|auth_key|key|groupid)=)[^\s&#\"',;)}\]]+",
             re.IGNORECASE,
         ),
         r"\1***",
     ),
     (
         re.compile(
-            r"((?:x-goog-api-key|x-api-key|x-console-token|api_key|apikey|access_token|refresh_token|auth_token|auth_key|pc_mcp_token|anima_studio_token|esp32_auth_key|deepseek_api_key|gemini_api_key)\s*[\"']?\s*[:=]\s*[\"']?)[^\s&\"',;)}\]]+",
+            r"(\b(?:x-goog-api-key|x-api-key|x-api-access-key|x-api-app-key|x-console-token|api_key|apikey|access_token|refresh_token|auth_token|auth_key|token|appid|group_id|pc_mcp_token|anima_studio_token|esp32_auth_key|deepseek_api_key|gemini_api_key|siliconflow_api_key|openai_audio_api_key|dashscope_api_key|doubao_appid|doubao_asr_appid|doubao_tts_appid|doubao_access_token|doubao_asr_access_token|doubao_tts_access_token|fishspeech_api_key|minimax_api_key|minimax_group_id)\b\s*[\"']?\s*[:=]\s*[\"']?)(?!None\b|null\b|true\b|false\b)[^\s&\"',;)}\]]+",
             re.IGNORECASE,
         ),
         r"\1***",
     ),
     (
         re.compile(
-            r"(authorization\s*[\"']?\s*[:=]\s*[\"']?(?:(?:Bearer|Basic|Token)\s+)?)[^\s&\"',;)}\]]+",
+            r"(authorization\s*[\"']?\s*[:=]\s*[\"']?(?:(?:Bearer|Basic|Token)[\s;]+)?)[^\s&\"',;)}\]]+",
             re.IGNORECASE,
         ),
         r"\1***",
@@ -209,6 +209,22 @@ def get_allowed_console_origins(port: int | None = None) -> frozenset[str]:
     )
 
 
+_SINGLETON_SECURITY_HEADERS = frozenset(
+    {
+        "host",
+        "origin",
+        "referer",
+        "sec-fetch-site",
+        "content-type",
+        "content-length",
+        "transfer-encoding",
+        "x-console-token",
+        "access-control-request-method",
+    }
+)
+_BAD_REQUEST_DUPLICATE_HEADERS = frozenset({"host", "content-length", "transfer-encoding"})
+
+
 def validate_console_request(
     method: str,
     headers: dict,
@@ -219,7 +235,28 @@ def validate_console_request(
     """Validate Host, internal-host read-only scope, browser CSRF guards, and per-boot X-Console-Token (A-4)."""
     if port is None:
         port = CONSOLE_PORT
-    norm_headers = {str(k).lower(): str(v).strip() for k, v in (headers or {}).items()}
+    norm_headers: dict[str, str] = {}
+    dup_bad_request: str | None = None
+    dup_forbidden: str | None = None
+    for raw_k, raw_v in (headers or {}).items():
+        k_low = str(raw_k).lower()
+        v_clean = str(raw_v).strip()
+        if k_low in norm_headers:
+            if k_low in _BAD_REQUEST_DUPLICATE_HEADERS:
+                dup_bad_request = dup_bad_request or k_low
+                continue
+            if k_low in _SINGLETON_SECURITY_HEADERS:
+                dup_forbidden = dup_forbidden or k_low
+                continue
+            if k_low == "access-control-request-headers" and v_clean:
+                prev = norm_headers[k_low]
+                norm_headers[k_low] = f"{prev}, {v_clean}" if prev else v_clean
+                continue
+        norm_headers[k_low] = v_clean
+
+    if dup_bad_request == "host":
+        return False, int(HTTPStatus.BAD_REQUEST), "Duplicate Host header"
+
     local_hosts = {
         f"localhost:{port}",
         f"127.0.0.1:{port}",
@@ -239,6 +276,11 @@ def validate_console_request(
     if not host or (host not in local_hosts and not is_internal):
         return False, int(HTTPStatus.MISDIRECTED_REQUEST), "Invalid Host header"
 
+    if dup_bad_request:
+        return False, int(HTTPStatus.BAD_REQUEST), f"Duplicate {dup_bad_request} header"
+    if dup_forbidden:
+        return False, int(HTTPStatus.FORBIDDEN), f"Duplicate {dup_forbidden} header rejected"
+
     meth = str(method).upper()
     req_path = urlparse(str(path or "")).path
 
@@ -253,7 +295,38 @@ def validate_console_request(
             )
         return True, int(HTTPStatus.OK), ""
 
+    if meth == "OPTIONS":
+        has_preflight_hdr = (
+            "access-control-request-method" in norm_headers
+            or "access-control-request-headers" in norm_headers
+        )
+        if "origin" in norm_headers or has_preflight_hdr:
+            origin = norm_headers.get("origin", "").lower()
+            if not origin or origin not in allowed_origins:
+                return False, int(HTTPStatus.FORBIDDEN), "Cross-origin OPTIONS rejected"
+        else:
+            referer = norm_headers.get("referer", "").lower()
+            if referer and not any(referer == o or referer.startswith(o + "/") for o in allowed_origins):
+                return False, int(HTTPStatus.FORBIDDEN), "Cross-origin Referer rejected"
+
+        sec_fetch_site = norm_headers.get("sec-fetch-site", "").lower()
+        if sec_fetch_site and sec_fetch_site not in ("same-origin", "none"):
+            return False, int(HTTPStatus.FORBIDDEN), "Cross-site OPTIONS rejected"
+
+        if "access-control-request-method" in norm_headers:
+            req_meth = norm_headers.get("access-control-request-method", "").upper()
+            if req_meth not in ("GET", "POST", "OPTIONS"):
+                return (
+                    False,
+                    int(HTTPStatus.METHOD_NOT_ALLOWED),
+                    "Unsupported Access-Control-Request-Method",
+                )
+
+        return True, int(HTTPStatus.NO_CONTENT), ""
+
     if meth == "POST":
+        if "transfer-encoding" in norm_headers:
+            return False, int(HTTPStatus.BAD_REQUEST), "Transfer-Encoding is not supported"
         origin = norm_headers.get("origin", "").lower()
         if origin:
             if origin not in allowed_origins:

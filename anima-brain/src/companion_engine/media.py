@@ -6,12 +6,14 @@ import base64
 import hashlib
 import json
 import os
+import threading
+import time
 from urllib.parse import quote, urlparse
 from uuid import uuid4
 
 import httpx
 
-from .memory import checked_vector
+from .memory import checked_vector, parse_namespace_dim
 from .models import ObservedMedia
 from .providers import CompatibleProvider, ProviderError
 from .sdk_models import ImageOptions, SpeechOptions, TranscriptionOptions, image_type
@@ -40,7 +42,10 @@ def post(url, *, key="", transport=None, headers=None, timeout=120, **kwargs):
         with httpx.Client(timeout=timeout, follow_redirects=False, transport=transport) as client:
             with client.stream("POST", url, headers=auth, **kwargs) as response:
                 if not response.is_success:
-                    raise ProviderError(f"Provider HTTP {response.status_code}; not retried")
+                    raise ProviderError(
+                        f"Provider HTTP {response.status_code}; not retried",
+                        status_code=response.status_code,
+                    )
                 data = bytearray()
                 for block in response.iter_bytes():
                     data.extend(block)
@@ -62,33 +67,339 @@ def post(url, *, key="", transport=None, headers=None, timeout=120, **kwargs):
         raise ProviderError("Provider connection failed; billing unknown; not retried") from None
 
 
+def _breaker_env_float(name: str, default: float, lo: float, hi: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(lo, min(hi, float(str(raw).strip())))
+    except (TypeError, ValueError):
+        return default
+
+
+class EmbeddingBreakerRegistry:
+    """Thread-safe auth (401/403) & transient circuit breaker for embedding providers.
+
+    Keyed by `(base_url, model, key_fingerprint)` so rotating a fixed key or switching
+    provider/model immediately clears prior auth-breaker trips.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._states: dict[tuple[str, str, str], dict] = {}
+
+    @staticmethod
+    def _provider_key(settings) -> tuple[str, str, str]:
+        base = str(getattr(settings, "embedding_base_url", "") or "").strip().rstrip("/")
+        model = str(getattr(settings, "embedding_model", "") or "").strip()
+        raw_key = ""
+        key_obj = getattr(settings, "embedding_key", None)
+        if key_obj is not None:
+            raw_key = (
+                key_obj.get_secret_value()
+                if hasattr(key_obj, "get_secret_value")
+                else str(key_obj)
+            )
+        stripped_key = raw_key.strip()
+        key_fp = (
+            hashlib.sha256(stripped_key.encode("utf-8")).hexdigest()[:16]
+            if stripped_key
+            else ""
+        )
+        return (base, model, key_fp)
+
+    def _auth_cooldown(self) -> float:
+        return _breaker_env_float("ANIMA_EMBED_AUTH_CB_SECONDS", 1800.0, 1.0, 86400.0)
+
+    def _transient_cooldown(self) -> float:
+        return _breaker_env_float("ANIMA_EMBED_TRANSIENT_CB_SECONDS", 30.0, 1.0, 3600.0)
+
+    def check_auth_blocked(self, settings) -> tuple[bool, dict]:
+        pk = self._provider_key(settings)
+        now = time.monotonic()
+        with self._lock:
+            st = self._states.get(pk)
+            if st and st.get("auth_until", 0.0) > now:
+                return True, {
+                    "status_code": st.get("last_status_code"),
+                    "reason": st.get("degraded_reason") or "auth_failed",
+                    "cooldown_remaining_seconds": round(max(0.0, st["auth_until"] - now), 1),
+                }
+        return False, {}
+
+    def is_circuit_open(self, settings) -> tuple[bool, dict]:
+        pk = self._provider_key(settings)
+        now = time.monotonic()
+        with self._lock:
+            st = self._states.get(pk)
+            if not st:
+                return False, {}
+            if st.get("auth_until", 0.0) > now:
+                return True, {
+                    "auth_breaker_open": True,
+                    "status_code": st.get("last_status_code"),
+                    "reason": st.get("degraded_reason") or "auth_failed",
+                    "cooldown_remaining_seconds": round(max(0.0, st["auth_until"] - now), 1),
+                }
+            if st.get("transient_until", 0.0) > now:
+                return True, {
+                    "auth_breaker_open": False,
+                    "status_code": st.get("last_status_code"),
+                    "reason": st.get("degraded_reason") or "circuit_open",
+                    "cooldown_remaining_seconds": round(max(0.0, st["transient_until"] - now), 1),
+                }
+        return False, {}
+
+    def record_auth_failure(self, settings, status_code: int) -> None:
+        pk = self._provider_key(settings)
+        now = time.monotonic()
+        with self._lock:
+            st = self._states.setdefault(pk, {})
+            st["auth_until"] = now + self._auth_cooldown()
+            st["last_status_code"] = int(status_code)
+            st["degraded_reason"] = f"auth_failed_{int(status_code)}"
+            st["last_failure_at"] = time.time()
+
+    def record_transient_failure(
+        self,
+        settings,
+        reason: str = "transient_error",
+        *,
+        status_code: int | None = None,
+        trip_threshold: int = 3,
+    ) -> None:
+        pk = self._provider_key(settings)
+        now = time.monotonic()
+        with self._lock:
+            st = self._states.setdefault(pk, {})
+            streak = int(st.get("transient_streak") or 0) + 1
+            st["transient_streak"] = streak
+            st["last_status_code"] = status_code
+            st["last_failure_at"] = time.time()
+            if st.get("auth_until", 0.0) <= now:
+                st["degraded_reason"] = reason
+            if streak >= max(1, int(trip_threshold)):
+                st["transient_until"] = now + self._transient_cooldown()
+                if st.get("auth_until", 0.0) <= now:
+                    st["degraded_reason"] = reason or "circuit_open"
+
+    def record_success(self, settings, *, active_space: str = "", dim: int | None = None) -> None:
+        pk = self._provider_key(settings)
+        explicit_dim = getattr(settings, "embedding_dimensions", None)
+        with self._lock:
+            st = self._states.setdefault(pk, {})
+            st["auth_until"] = 0.0
+            st["transient_until"] = 0.0
+            st["transient_streak"] = 0
+            st["last_status_code"] = 200
+            st["degraded_reason"] = ""
+            st["last_success_at"] = time.time()
+            if active_space:
+                st["active_space"] = active_space
+            if dim:
+                st["active_dim"] = int(dim)
+                if not explicit_dim:
+                    st["observed_default_dim"] = int(dim)
+
+    def get_observed_default_dim(self, settings) -> int | None:
+        pk = self._provider_key(settings)
+        with self._lock:
+            st = self._states.get(pk)
+            if st and st.get("observed_default_dim"):
+                return int(st["observed_default_dim"])
+        return None
+
+    def snapshot(self, settings) -> dict:
+        pk = self._provider_key(settings)
+        now = time.monotonic()
+        with self._lock:
+            st = dict(self._states.get(pk) or {})
+        auth_rem = max(0.0, float(st.get("auth_until") or 0.0) - now)
+        trans_rem = max(0.0, float(st.get("transient_until") or 0.0) - now)
+        auth_open = auth_rem > 0.0
+        circuit_open = auth_open or (trans_rem > 0.0)
+        rem = auth_rem if auth_open else trans_rem
+        reason = str(st.get("degraded_reason") or "") if circuit_open else ""
+        return {
+            "auth_breaker_open": auth_open,
+            "circuit_open": circuit_open,
+            "degraded_reason": reason,
+            "cooldown_remaining_seconds": round(rem, 1) if circuit_open else 0.0,
+            "last_status_code": st.get("last_status_code"),
+            "transient_streak": int(st.get("transient_streak") or 0),
+            "active_space": str(st.get("active_space") or ""),
+            "active_dim": st.get("active_dim"),
+            "observed_default_dim": st.get("observed_default_dim"),
+            "last_success_at": st.get("last_success_at"),
+            "last_failure_at": st.get("last_failure_at"),
+        }
+
+    def reset(self, settings=None) -> None:
+        with self._lock:
+            if settings is None:
+                self._states.clear()
+            else:
+                self._states.pop(self._provider_key(settings), None)
+
+
+embedding_breaker = EmbeddingBreakerRegistry()
+
+
 class Embeddings:
     def __init__(self, settings, transport=None):
+        self._settings = settings
         self.base = endpoint(settings.embedding_base_url)
         self.model = settings.embedding_model
         if not self.model:
             raise ValueError("Configure embedding model")
         self.key = settings.embedding_key.get_secret_value()
         self.transport = transport
-        self.namespace = hashlib.sha256(self.base.encode()).hexdigest()[:16] + ":" + self.model
+        raw_dim = getattr(settings, "embedding_dimensions", None)
+        self.dimensions: int | None = int(raw_dim) if raw_dim else None
+        self.base_namespace = hashlib.sha256(self.base.encode()).hexdigest()[:16] + ":" + self.model
+        self.namespace = (
+            self.space_for_dim(self.dimensions) if self.dimensions else self.base_namespace
+        )
+
+    def space_for_dim(self, dim: int | None) -> str:
+        if dim and int(dim) > 0:
+            return f"{self.base_namespace}@{int(dim)}"
+        return self.base_namespace
+
+    def _legacy_space_dim(self, db) -> int | None:
+        if db is None:
+            return None
+        row = db.execute(
+            "SELECT length(vector)/4 FROM retrieval_vectors WHERE model=? LIMIT 1",
+            (self.base_namespace,),
+        ).fetchone()
+        if row and row[0]:
+            return int(row[0])
+        row = db.execute(
+            "SELECT vector FROM evidence_embeddings WHERE model=? LIMIT 1",
+            (self.base_namespace,),
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return len(json.loads(row[0]))
+            except Exception:
+                return None
+        row = db.execute(
+            "SELECT vector FROM vectors WHERE model=? LIMIT 1",
+            (self.base_namespace,),
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return len(json.loads(row[0]))
+            except Exception:
+                return None
+        return None
+
+    def _space_has_vectors(self, db, ns: str) -> bool:
+        if db is None:
+            return False
+        for sql in (
+            "SELECT 1 FROM evidence_embeddings WHERE model=? LIMIT 1",
+            "SELECT 1 FROM retrieval_vectors WHERE model=? LIMIT 1",
+            "SELECT 1 FROM vectors WHERE model=? LIMIT 1",
+        ):
+            if db.execute(sql, (ns,)).fetchone():
+                return True
+        return False
+
+    def resolve_namespace(self, db=None, *, dim: int | None = None) -> str:
+        """Resolve dimension-isolated `<hash>:<model>@<dim>` key, preserving legacy DBs."""
+        eff_dim = int(dim) if dim else self.dimensions
+        if not eff_dim:
+            eff_dim = embedding_breaker.get_observed_default_dim(self._settings)
+        if eff_dim:
+            dim_ns = self.space_for_dim(eff_dim)
+            if db is not None and not self._space_has_vectors(db, dim_ns):
+                legacy_dim = self._legacy_space_dim(db)
+                if legacy_dim == eff_dim:
+                    return self.base_namespace
+            return dim_ns
+
+        if db is not None:
+            prefix = self.base_namespace + "@%"
+            candidates: list[tuple[int, str]] = []
+            for sql in (
+                "SELECT model, count(*) FROM evidence_embeddings WHERE model LIKE ? GROUP BY model",
+                "SELECT model, count(*) FROM retrieval_vectors WHERE model LIKE ? GROUP BY model",
+                "SELECT model, count(*) FROM vectors WHERE model LIKE ? GROUP BY model",
+            ):
+                for ns, cnt in db.execute(sql, (prefix,)).fetchall():
+                    if parse_namespace_dim(ns) is not None:
+                        candidates.append((int(cnt or 0), ns))
+            if candidates:
+                merged_counts: dict[str, int] = {}
+                for cnt, ns in candidates:
+                    merged_counts[ns] = merged_counts.get(ns, 0) + cnt
+                return max(merged_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            if self._legacy_space_dim(db) is not None:
+                return self.base_namespace
+        return self.namespace
 
     def encode(self, texts):
-        response = post(
-            self.base + "/embeddings",
-            key=self.key,
-            transport=self.transport,
-            json={"model": self.model, "input": texts, "encoding_format": "float"},
-        )
+        is_open, binfo = embedding_breaker.is_circuit_open(self._settings)
+        if is_open:
+            code = binfo.get("status_code")
+            if binfo.get("auth_breaker_open"):
+                raise ProviderError(
+                    f"Embedding auth circuit open (HTTP {code}); degraded to lexical FTS5",
+                    status_code=code,
+                )
+            raise ProviderError(
+                f"Embedding circuit open ({binfo.get('reason') or 'transient_error'}); "
+                "degraded to lexical FTS5",
+                status_code=code,
+            )
+        req_payload = {"model": self.model, "input": texts, "encoding_format": "float"}
+        if self.dimensions is not None:
+            req_payload["dimensions"] = self.dimensions
+        try:
+            response = post(
+                self.base + "/embeddings",
+                key=self.key,
+                transport=self.transport,
+                json=req_payload,
+            )
+        except ProviderError as exc:
+            if exc.status_code in (401, 403):
+                embedding_breaker.record_auth_failure(self._settings, exc.status_code)
+            else:
+                embedding_breaker.record_transient_failure(
+                    self._settings,
+                    f"http_{exc.status_code}" if exc.status_code else "connection_error",
+                    status_code=exc.status_code,
+                )
+            raise
         try:
             data = response.json()
             rows = sorted(data["data"], key=lambda r: r["index"])
             if [r["index"] for r in rows] != list(range(len(texts))):
                 raise ValueError("Invalid embedding indices")
+            vectors = [checked_vector(r["embedding"], expected_dim=self.dimensions) for r in rows]
+            if not vectors:
+                raise ValueError("Empty embedding result")
+            dim = len(vectors[0])
+            if any(len(v) != dim for v in vectors):
+                raise ValueError("Inconsistent embedding dimensions within batch")
+            space = self.space_for_dim(dim)
+            embedding_breaker.record_success(self._settings, active_space=space, dim=dim)
             return {
-                "vectors": [checked_vector(r["embedding"]) for r in rows],
+                "vectors": vectors,
+                "dim": dim,
+                "space": space,
                 "usage": data.get("usage", {"billing": "unknown"}),
             }
-        except (ValueError, KeyError, TypeError):
+        except ValueError as exc:
+            msg = str(exc)
+            if "dimension" in msg.lower():
+                embedding_breaker.record_transient_failure(self._settings, "dimension_mismatch")
+                raise ProviderError(f"{msg}; billing may have occurred") from None
+            raise ProviderError("Invalid embedding envelope; billing may have occurred") from None
+        except (KeyError, TypeError):
             raise ProviderError("Invalid embedding envelope; billing may have occurred") from None
 
 

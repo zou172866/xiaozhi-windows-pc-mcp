@@ -1423,6 +1423,176 @@ class TestBatch3PcMcpHardening(unittest.TestCase):
         self.assertIsNotNone(uia_loc)
         self.assertTrue(bool(uia_loc.region_hash), "Stage-1 UIA hit must also populate region_hash")
 
+    def test_p01_socks5_proxy_env_split_and_fallback(self):
+        """P0-1: DeepSeek uses direct trust_env=False client; Gemini uses proxy-aware client with SOCKS5 & ImportError fallback."""
+        vision.close_vision_http_client()
+        try:
+            with patch.dict(os.environ, {"ALL_PROXY": "socks5://127.0.0.1:10808"}, clear=False):
+                c_direct = vision._get_vision_http_client(False)
+                c_proxy = vision._get_vision_http_client(True)
+                self.assertIsNot(c_direct, c_proxy)
+                self.assertFalse(c_direct._trust_env)
+                self.assertTrue(c_proxy._trust_env)
+
+            # Simulate missing socksio -> ImportError falls back cleanly to trust_env=False
+            vision.close_vision_http_client()
+            real_client_cls = vision.httpx.Client
+            calls = []
+
+            def _fake_httpx_client(*args, **kwargs):
+                calls.append(dict(kwargs))
+                if kwargs.get("trust_env", True):
+                    raise ImportError("Using SOCKS proxy, but the 'socksio' package is not installed")
+                return real_client_cls(*args, **kwargs)
+
+            with patch.object(vision.httpx, "Client", side_effect=_fake_httpx_client):
+                c_fb = vision._get_vision_http_client(True)
+                self.assertFalse(c_fb._trust_env)
+                self.assertEqual([c.get("trust_env") for c in calls], [True, False])
+        finally:
+            vision.close_vision_http_client()
+
+    def test_p21_antigravity_dispatched_transcript_mutex_and_followup_bypass(self):
+        """P2-1: Dispatched Antigravity session with real step-level DONE transcript blocks new task on same workdir, allows follow-up."""
+        from l3_backends import claim_workspace_or_enqueue
+
+        ag_backend = AntigravityBackend()
+        brain_dir = self.tmp_root / "fake_brain"
+        conv_id = "conv_active_001"
+        logs_dir = brain_dir / conv_id / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        transcript_fp = logs_dir / "transcript.jsonl"
+        # Real Antigravity transcript schema: intermediate USER_INPUT, PLANNER_RESPONSE(tool_calls), and GENERIC tool results ALL carry status="DONE"!
+        for active_step in (
+            {"type": "USER_INPUT", "status": "DONE", "content": "重构数据库层"},
+            {"type": "PLANNER_RESPONSE", "status": "DONE", "thinking": "Reading files...", "tool_calls": [{"name": "read_file"}]},
+            {"type": "GENERIC", "status": "DONE", "content": "Created At: ...\nCompleted At: ..."},
+        ):
+            transcript_fp.write_text(json.dumps(active_step) + "\n", encoding="utf-8")
+            disp_fp = self.active / "ag_disp_1.json"
+            disp_fp.write_text(
+                json.dumps(
+                    {
+                        "id": "ag_disp_1",
+                        "backend": "antigravity",
+                        "status": "dispatched",
+                        "workdir": str(self.tmp_root),
+                        "conversation_id": conv_id,
+                        "prompt": "重构数据库层",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg_ag = {"backend": "antigravity", "workdir": str(self.tmp_root), "queue_mode": False}
+            try:
+                with (
+                    patch("l3_backends.antigravity._get_brain_dir", return_value=brain_dir),
+                    patch("l3_backends.antigravity._is_worker_alive", return_value=False),
+                ):
+                    # 1. Second independent task on same workdir MUST be blocked during intermediate DONE steps!
+                    msg_blocked = ag_backend.dispatch("ag_new_2", "再改一个文件", False, cfg_ag)
+                    self.assertIn("已有任务进行中", msg_blocked, f"Failed to block on active step: {active_step}")
+
+                    # 1b. CLI claim_workspace_or_enqueue with queue_if_busy=True must reject ('busy') rather than stranding in _workspace_queues
+                    status_cli, msg_cli = claim_workspace_or_enqueue(
+                        workdir=self.tmp_root,
+                        task_id="cli_behind_ag",
+                        backend="dsh",
+                        prompt="测试冲突",
+                        start_fn=lambda: None,
+                        queue_if_busy=True,
+                    )
+                    self.assertEqual(status_cli, "busy")
+                    self.assertIn("已有任务进行中", msg_cli or "")
+
+                    # 2. Follow-up on the active conversation IS allowed through
+                    with patch("l3_backends.antigravity.load_last_active_task", return_value={"conversation_id": conv_id}):
+                        msg_fu = ag_backend.dispatch("ag_fu_3", "顺便补个单测", True, cfg_ag)
+                    self.assertNotIn("已有任务进行中", msg_fu)
+                    for pf in self.pending.glob("*.json"):
+                        pf.unlink(missing_ok=True)
+            finally:
+                disp_fp.unlink(missing_ok=True)
+
+        # 3. Once final PLANNER_RESPONSE has NO tool_calls (status="DONE"), turn is complete and new independent task is allowed
+        disp_fp = self.active / "ag_disp_1.json"
+        disp_fp.write_text(
+            json.dumps(
+                {
+                    "id": "ag_disp_1",
+                    "backend": "antigravity",
+                    "status": "dispatched",
+                    "workdir": str(self.tmp_root),
+                    "conversation_id": conv_id,
+                    "prompt": "重构数据库层",
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            with (
+                patch("l3_backends.antigravity._get_brain_dir", return_value=brain_dir),
+                patch("l3_backends.antigravity._is_worker_alive", return_value=False),
+            ):
+                transcript_fp.write_text(
+                    json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE", "content": "已完成"}) + "\n",
+                    encoding="utf-8",
+                )
+                msg_ok = ag_backend.dispatch("ag_new_4", "开启新任务", False, {"backend": "antigravity", "workdir": str(self.tmp_root)})
+                self.assertNotIn("已有任务进行中", msg_ok)
+                for pf in self.pending.glob("*.json"):
+                    pf.unlink(missing_ok=True)
+        finally:
+            disp_fp.unlink(missing_ok=True)
+
+    def test_p22_negative_coord_secondary_monitor_and_p23_winmm_defaults(self):
+        """P2-2 & P2-3: Secondary negative-coordinate monitor grounding + WinMM max_inflight=3."""
+        sec_mon = (-1920, 0, 0, 1080)
+        sec_img = Image.new("RGB", (1920, 1080), color=(30, 40, 50))
+        d = ImageDraw.Draw(sec_img)
+        # Button at local (960, 540) -> desktop (-960, 540)
+        d.rectangle((910, 510, 1010, 570), fill=(220, 80, 40), outline=(255, 255, 255))
+
+        fake_uia = [
+            {
+                "id": 1,
+                "type": "Button",
+                "name": "副屏确认",
+                "left": -1010,
+                "top": 510,
+                "right": -910,
+                "bottom": 570,
+                "cx": -960,
+                "cy": 540,
+            }
+        ]
+        grab_kwargs = []
+
+        def _fake_grab(*args, **kwargs):
+            grab_kwargs.append(dict(kwargs))
+            return sec_img.copy()
+
+        vlm_json = json.dumps({"found": True, "mark_id": 1, "label": "副屏确认", "x_min": 470, "y_min": 470, "x_max": 530, "y_max": 530})
+        with (
+            patch.object(vision, "_get_target_monitor_rect", return_value=sec_mon),
+            patch.object(pcm, "_collect_uia_elements", return_value=fake_uia),
+            patch.object(pcm.ImageGrab, "grab", side_effect=_fake_grab),
+            patch.object(pcm, "_call_vision_llm", return_value=vlm_json),
+        ):
+            # Force Stage-2 SoM path using positional hint ("左边")
+            loc = vision._smart_locate_target("左边的副屏确认")
+        self.assertIsNotNone(loc)
+        self.assertEqual((loc[0], loc[1]), (-960, 540))
+        self.assertEqual(loc.monitor_rect, sec_mon)
+        self.assertTrue(any(k.get("all_screens") is True and k.get("bbox") == sec_mon for k in grab_kwargs))
+
+        # P2-3: _WinMMPlayer default max_inflight == 3
+        import inspect
+        from pc_mcp_modules import audio_bridge
+
+        sig = inspect.signature(audio_bridge._WinMMPlayer.__init__)
+        self.assertEqual(sig.parameters["max_inflight"].default, 3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

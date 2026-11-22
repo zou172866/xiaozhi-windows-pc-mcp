@@ -9,6 +9,7 @@ from console import server as _server
 from console import shared as _shared
 from console.routes import (
     anima as _anima,
+    audio_api as _audio_api,
     config as _config,
     gsv as _gsv,
     l3 as _l3,
@@ -16,4 +17,4 @@ from console.routes import (
     state as _state,
 )
 
-install_facade(__name__, [_shared, _gsv, _logs, _l3, _anima, _config, _state, _server])
+install_facade(__name__, [_shared, _audio_api, _gsv, _logs, _l3, _anima, _config, _state, _server])

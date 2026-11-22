@@ -49,6 +49,54 @@ ASR:
     model_dir: models/SenseVoiceSmall
     output_dir: tmp/
     language: auto
+  SiliconFlowASR:
+    type: openai
+    base_url: https://api.siliconflow.cn/v1/audio/transcriptions
+    model_name: FunAudioLLM/SenseVoiceSmall
+    api_key: ${SILICONFLOW_API_KEY}
+    output_dir: tmp/
+  OpenaiASR:
+    type: openai
+    base_url: https://api.openai.com/v1/audio/transcriptions
+    model_name: gpt-4o-mini-transcribe
+    api_key: ${OPENAI_AUDIO_API_KEY}
+    output_dir: tmp/
+  Qwen3ASRFlash:
+    type: qwen3_asr_flash
+    api_key: ${DASHSCOPE_API_KEY}
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model_name: qwen3-asr-flash
+    enable_lid: true
+    enable_itn: true
+    context: ''
+    output_dir: tmp/
+  AliyunBLStreamASR:
+    type: aliyunbl_stream
+    api_key: ${DASHSCOPE_API_KEY}
+    model: paraformer-realtime-v2
+    format: pcm
+    sample_rate: 16000
+    disfluency_removal_enabled: false
+    semantic_punctuation_enabled: false
+    max_sentence_silence: 200
+    multi_threshold_mode_enabled: false
+    punctuation_prediction_enabled: true
+    inverse_text_normalization_enabled: true
+    output_dir: tmp/
+  DoubaoASR:
+    type: doubao
+    appid: ${DOUBAO_ASR_APPID}
+    access_token: ${DOUBAO_ASR_ACCESS_TOKEN}
+    cluster: volcengine_input_common
+    output_dir: tmp/
+  DoubaoStreamASR:
+    type: doubao_stream
+    appid: ${DOUBAO_ASR_APPID}
+    access_token: ${DOUBAO_ASR_ACCESS_TOKEN}
+    resource_id: volc.bigasr.sauc.duration
+    enable_multilingual: false
+    end_window_size: 200
+    output_dir: tmp/
 VAD:
   SileroVAD:
     type: silero
@@ -61,6 +109,8 @@ Memory:
     type: anima_brain
     service_url: http://anima-brain:18787
     character_id: xiaozhi
+    isolate_character_by_device: false
+    device_character_map: {}
 LLM:
   DeepSeekLLM:
     type: openai
@@ -78,6 +128,86 @@ TTS:
   EdgeTTS:
     type: edge
     voice: zh-CN-XiaoxiaoNeural
+    output_dir: tmp/
+  CosyVoiceSiliconflow:
+    type: siliconflow
+    model: FunAudioLLM/CosyVoice2-0.5B
+    voice: FunAudioLLM/CosyVoice2-0.5B:anna
+    access_token: ${SILICONFLOW_API_KEY}
+    response_format: wav
+    speed: 1.0
+    output_dir: tmp/
+  OpenAITTS:
+    type: openai
+    api_url: https://api.openai.com/v1/audio/speech
+    api_key: ${OPENAI_AUDIO_API_KEY}
+    model: tts-1
+    voice: nova
+    format: wav
+    speed: 1.0
+    output_dir: tmp/
+  AliBLTTS:
+    type: alibl_stream
+    api_key: ${DASHSCOPE_API_KEY}
+    ws_url: wss://dashscope.aliyuncs.com/api-ws/v1/inference/
+    model: cosyvoice-v2
+    voice: longxiaochun_v2
+    format: pcm
+    rate: 1.0
+    output_dir: tmp/
+  DoubaoTTS:
+    type: doubao
+    api_url: https://openspeech.bytedance.com/api/v1/tts
+    appid: ${DOUBAO_TTS_APPID}
+    access_token: ${DOUBAO_TTS_ACCESS_TOKEN}
+    cluster: volcano_tts
+    authorization: 'Bearer;'
+    voice: BV001_streaming
+    format: wav
+    speed_ratio: 1.0
+    volume_ratio: 1.0
+    pitch_ratio: 1.0
+    output_dir: tmp/
+  HuoshanDoubleStreamTTS:
+    type: huoshan_double_stream
+    ws_url: wss://openspeech.bytedance.com/api/v3/tts/bidirection
+    appid: ${DOUBAO_TTS_APPID}
+    access_token: ${DOUBAO_TTS_ACCESS_TOKEN}
+    resource_id: volc.service_type.10029
+    speaker: zh_female_wanwanxiaohe_moon_bigtts
+    enable_ws_reuse: true
+    audio_params:
+      speech_rate: 0
+      loudness_rate: 0
+    additions:
+      post_process:
+        pitch: 0
+    output_dir: tmp/
+  FishSpeech:
+    type: fishspeech
+    api_url: https://api.fish.audio/v1/tts
+    api_key: ${FISHSPEECH_API_KEY}
+    reference_id: ''
+    reference_audio: []
+    reference_text: []
+    response_format: wav
+    normalize: true
+    max_new_tokens: 1024
+    chunk_length: 200
+    top_p: 0.7
+    repetition_penalty: 1.2
+    temperature: 0.7
+    streaming: false
+    use_memory_cache: 'on'
+    channels: 1
+    rate: 44100
+    output_dir: tmp/
+  MinimaxTTSHTTPStream:
+    type: minimax_httpstream
+    group_id: ${MINIMAX_GROUP_ID}
+    api_key: ${MINIMAX_API_KEY}
+    model: speech-02-turbo
+    voice_id: female-shaonv
     output_dir: tmp/
   GPT_SOVITS_V2:
     type: gpt_sovits_v2

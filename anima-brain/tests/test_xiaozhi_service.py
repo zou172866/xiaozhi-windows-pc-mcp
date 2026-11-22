@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from pydantic import SecretStr
 from starlette.testclient import TestClient
 
 ANIMA_ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +43,7 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
         self.settings = Settings(
             embedding_base_url="https://example.test/v1",
             embedding_model="embed-test",
+            embedding_key=SecretStr("sk-embed-fixture-key"),
             timeout_seconds=150,
         )
         self.brain = CompanionBrain(
@@ -1934,6 +1936,218 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
                 self.assertEqual(row_cc["character_id"], "char_alpha")
                 self.assertIn("Alpha回复", row_cc["payload"])
                 self.assertNotIn("Beta覆写尝试", row_cc["payload"])
+
+    def test_p12_chinese_episode_fts5_bigram_priority_and_bounded_vector_recall(self):
+        """P1-2 & P2-4: Chinese episode BM25 recall, stopword filtering, 120ms LRU query vector, and multi-device character auto-provision."""
+        from companion_engine.engine import terms
+        import asyncio as _aio
+
+        svc.ensure_default_character(self.brain)
+        # 1. Long Chinese query retains content bigrams near the end instead of truncating on single-char noise
+        long_q = "我昨天下午在公司跟你说过那个关于长沙胃疼吃奥美拉唑的事情你还记得吗呀呢吧"
+        toks = terms(long_q)[:24]
+        self.assertIn("长沙", toks)
+        self.assertIn("胃疼", toks)
+        self.assertIn("拉唑", toks)
+        self.assertNotIn("的", toks)
+        self.assertNotIn("吗", toks)
+        noun_toks = terms("周末在哈尔滨领养了一只哈士奇还在清吧聊了天")
+        self.assertIn("哈尔", noun_toks)
+        self.assertIn("哈士", noun_toks)
+        self.assertIn("清吧", noun_toks)
+
+        # 2. Chinese episode document is indexed in retrieval_search and recalled by BM25
+        ctx_t = self.brain.engine.prepare_turn("xiaozhi", "我在长沙出差有点胃疼", request_id="ep-src-1")
+        self.brain.engine.commit_turn(
+            "xiaozhi",
+            ctx_t.turn_id,
+            svc.CommitRequest(assistant_reply="记得按时吃温热的粥和奥美拉唑。"),
+        )
+        self.brain.engine.memory.consolidate(
+            "xiaozhi",
+            "episode",
+            "上周去长沙出差期间深夜胃疼，芽衣叮嘱备好奥美拉唑并少喝冰美式。",
+            [ctx_t.turn_id + ":user"],
+        )
+        layers = self.brain.engine.retrieval.search("xiaozhi", "长沙胃疼吃什么药", limit=5)
+        self.assertTrue(
+            any("奥美拉唑" in d["text"] for d in layers["documents"]),
+            f"Expected Chinese episode document in BM25 layered recall, got {layers['documents']}",
+        )
+
+        # 3. Controlled 120ms query embedding + LRU cache hit + timeout fallback
+        svc._query_embed_lru.clear()
+        svc._query_embed_fail_streak = 0
+        svc._query_embed_cb_until = 0.0
+        self.brain.runtime.settings.embedding_base_url = "https://api.example.com/v1"
+        self.brain.runtime.settings.embedding_model = "text-embedding-test"
+        from pydantic import SecretStr
+
+        self.brain.runtime.settings.embedding_key = SecretStr("sk-embed-test-key-123456")
+
+        encode_calls = []
+
+        def _fake_encode(self_emb, texts):
+            encode_calls.append(list(texts))
+            return {"vectors": [[0.6, 0.8]], "usage": {"total_tokens": 5}}
+
+        from companion_engine.media import Embeddings
+
+        with unittest.mock.patch.object(Embeddings, "encode", _fake_encode):
+            v1, ns1 = _aio.run(svc.resolve_recall_query_embedding(self.brain, "宠物叫什么"))
+            v2, ns2 = _aio.run(svc.resolve_recall_query_embedding(self.brain, "宠物叫什么"))
+        self.assertEqual(v1, [0.6, 0.8])
+        self.assertEqual(v2, [0.6, 0.8])
+        self.assertEqual(ns1, ns2)
+        self.assertEqual(len(encode_calls), 1, "Second identical query must hit in-memory LRU cache")
+
+        # Slow embedding (>120ms) times out cleanly to (None, None) without raising
+        def _slow_encode(self_emb, texts):
+            time.sleep(0.25)
+            return {"vectors": [[1.0, 0.0]], "usage": {}}
+
+        with unittest.mock.patch.object(Embeddings, "encode", _slow_encode):
+            t0 = time.monotonic()
+            v_slow, ns_slow = _aio.run(svc.resolve_recall_query_embedding(self.brain, "慢速向量超时回退测试"))
+            elapsed = time.monotonic() - t0
+        self.assertIsNone(v_slow)
+        self.assertIsNone(ns_slow)
+        self.assertLess(elapsed, 0.22)
+
+        # 4. P2-4: Mapped family-member character_id auto-provisions isolated character without leaking into default 'xiaozhi'
+        svc.extract_and_commit_turn(
+            self.brain,
+            "kid_room",
+            "req-kid-1",
+            "我最喜欢恐龙拼图",
+            "好呀，明天一起拼霸王龙！",
+        )
+        kid_recall = svc.build_fast_recall_context(self.brain, "kid_room", "恐龙")
+        default_recall = svc.build_fast_recall_context(self.brain, "xiaozhi", "恐龙")
+        self.assertIn("恐龙拼图", kid_recall["context_text"])
+        self.assertNotIn("恐龙拼图", default_recall["context_text"])
+
+    def test_oobe_resolve_companion_settings_url_matched_key_fallbacks(self):
+        """OOBE: DeepSeek/Gemini fallback keys match provider URL host and never cross-wire secrets."""
+        from companion_engine import Settings
+
+        # 1. Default DeepSeek URL with only DEEPSEEK_API_KEY
+        s1 = Settings(base_url="https://api.deepseek.com/v1", model="deepseek-chat", api_key="")
+        r1 = svc.resolve_companion_settings(
+            s1,
+            env={"ANIMA_FALLBACK_DEEPSEEK_KEY": "sk-ds-111", "ANIMA_FALLBACK_GEMINI_KEY": ""},
+        )
+        self.assertEqual(r1.base_url, "https://api.deepseek.com/v1")
+        self.assertEqual(r1.api_key.get_secret_value(), "sk-ds-111")
+        self.assertEqual(r1.summary_key.get_secret_value(), "sk-ds-111")
+
+        # 2. Explicit Gemini URL + BOTH DeepSeek & Gemini keys -> MUST pick Gemini key (never DeepSeek key!)
+        s2 = Settings(
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            model="gemini-3.5-flash-lite",
+            api_key="sk-ds-wrong-fallback",
+            summary_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            summary_model="gemini-3.5-flash-lite",
+            summary_key="sk-ds-wrong-fallback",
+            embedding_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            embedding_model="gemini-embedding-001",
+            embedding_key="",
+        )
+        r2 = svc.resolve_companion_settings(
+            s2,
+            env={
+                "ANIMA_LLM_BASE_URL_EXPLICIT": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "ANIMA_FALLBACK_DEEPSEEK_KEY": "sk-ds-111",
+                "ANIMA_FALLBACK_GEMINI_KEY": "AIza-gem-222",
+            },
+        )
+        self.assertEqual(r2.api_key.get_secret_value(), "AIza-gem-222")
+        self.assertEqual(r2.summary_key.get_secret_value(), "AIza-gem-222")
+        self.assertEqual(r2.embedding_key.get_secret_value(), "AIza-gem-222")
+
+        # 3. No explicit base URL + ONLY GEMINI_API_KEY -> switches default route cleanly to Gemini
+        s3 = Settings(base_url="https://api.deepseek.com/v1", model="deepseek-chat", api_key="AIza-gem-333")
+        r3 = svc.resolve_companion_settings(
+            s3,
+            env={"ANIMA_FALLBACK_DEEPSEEK_KEY": "", "ANIMA_FALLBACK_GEMINI_KEY": "AIza-gem-333"},
+        )
+        self.assertEqual(r3.base_url, "https://generativelanguage.googleapis.com/v1beta/openai")
+        self.assertEqual(r3.model, "gemini-3.5-flash-lite")
+        self.assertEqual(r3.api_key.get_secret_value(), "AIza-gem-333")
+
+        # 4. Explicit ANIMA_LLM_API_KEY always wins over fallbacks (and summary inherits when same URL)
+        s4 = Settings(base_url="https://api.deepseek.com/v1", model="deepseek-chat", api_key="sk-custom-999")
+        r4 = svc.resolve_companion_settings(
+            s4,
+            env={
+                "ANIMA_LLM_API_KEY_EXPLICIT": "sk-custom-999",
+                "ANIMA_FALLBACK_DEEPSEEK_KEY": "sk-ds-111",
+                "ANIMA_FALLBACK_GEMINI_KEY": "AIza-gem-222",
+            },
+        )
+        self.assertEqual(r4.api_key.get_secret_value(), "sk-custom-999")
+        self.assertEqual(r4.summary_key.get_secret_value(), "sk-custom-999")
+
+        # 5. Cross-provider leak protection: NEVER leak Gemini key to DeepSeek, DeepSeek key to Gemini, or either to 3rd-party URL
+        s5_ds_no_key = Settings(
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-chat",
+            api_key="AIza-gem-leaked",
+            summary_base_url="https://api.deepseek.com/v1",
+            summary_key="AIza-gem-leaked",
+        )
+        r5 = svc.resolve_companion_settings(
+            s5_ds_no_key,
+            env={
+                "ANIMA_LLM_BASE_URL_EXPLICIT": "https://api.deepseek.com/v1",
+                "ANIMA_LLM_API_KEY_EXPLICIT": "",
+                "ANIMA_SUMMARY_API_KEY_EXPLICIT": "",
+                "ANIMA_FALLBACK_DEEPSEEK_KEY": "",
+                "ANIMA_FALLBACK_GEMINI_KEY": "AIza-gem-leaked",
+            },
+        )
+        self.assertEqual(r5.api_key.get_secret_value(), "")
+        self.assertEqual(r5.summary_key.get_secret_value(), "")
+
+        s6_gem_no_key = Settings(
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            model="gemini-3.5-flash-lite",
+            api_key="sk-ds-leaked",
+            summary_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            summary_key="sk-ds-leaked",
+        )
+        r6 = svc.resolve_companion_settings(
+            s6_gem_no_key,
+            env={
+                "ANIMA_LLM_BASE_URL_EXPLICIT": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "ANIMA_LLM_API_KEY_EXPLICIT": "",
+                "ANIMA_SUMMARY_API_KEY_EXPLICIT": "",
+                "ANIMA_FALLBACK_DEEPSEEK_KEY": "sk-ds-leaked",
+                "ANIMA_FALLBACK_GEMINI_KEY": "",
+            },
+        )
+        self.assertEqual(r6.api_key.get_secret_value(), "")
+        self.assertEqual(r6.summary_key.get_secret_value(), "")
+
+        s7_other_url = Settings(
+            base_url="https://api.siliconflow.cn/v1",
+            model="Qwen/Qwen2.5",
+            api_key="sk-ds-leaked",
+            summary_base_url="https://api.siliconflow.cn/v1",
+            summary_key="sk-ds-leaked",
+        )
+        r7 = svc.resolve_companion_settings(
+            s7_other_url,
+            env={
+                "ANIMA_LLM_BASE_URL_EXPLICIT": "https://api.siliconflow.cn/v1",
+                "ANIMA_LLM_API_KEY_EXPLICIT": "",
+                "ANIMA_SUMMARY_API_KEY_EXPLICIT": "",
+                "ANIMA_FALLBACK_DEEPSEEK_KEY": "sk-ds-leaked",
+                "ANIMA_FALLBACK_GEMINI_KEY": "AIza-gem-leaked",
+            },
+        )
+        self.assertEqual(r7.api_key.get_secret_value(), "")
+        self.assertEqual(r7.summary_key.get_secret_value(), "")
 
 
 if __name__ == "__main__":

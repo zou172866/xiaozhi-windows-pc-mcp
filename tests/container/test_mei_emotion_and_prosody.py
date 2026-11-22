@@ -966,6 +966,71 @@ class TestContainerOfflinePipeline(unittest.TestCase):
         self.assertFalse(ok_ipost)
         self.assertEqual(st_ipost, 403)
 
+        # P2-5: OPTIONS preflight validates Origin, internal Host, and Sec-Fetch-Site
+        ok_opt_good, st_opt_good, _ = cs.validate_console_request(
+            "OPTIONS",
+            {"Host": "localhost:18080", "Origin": "http://localhost:18080"},
+            path="/api/config",
+        )
+        self.assertTrue(ok_opt_good)
+        self.assertEqual(st_opt_good, 204)
+
+        ok_opt_bad_orig, st_opt_bad_orig, _ = cs.validate_console_request(
+            "OPTIONS",
+            {"Host": "localhost:18080", "Origin": "https://evil.example"},
+            path="/api/config",
+        )
+        self.assertFalse(ok_opt_bad_orig)
+        self.assertEqual(st_opt_bad_orig, 403)
+
+        ok_opt_ih, st_opt_ih, _ = cs.validate_console_request(
+            "OPTIONS",
+            {"Host": "xiaozhi-esp32-server:18080", "Origin": "http://localhost:18080"},
+            path="/api/health",
+        )
+        self.assertFalse(ok_opt_ih)
+        self.assertEqual(st_opt_ih, 403)
+
+        ok_opt_no_orig_pf, st_opt_no_orig_pf, _ = cs.validate_console_request(
+            "OPTIONS",
+            {"Host": "localhost:18080", "Access-Control-Request-Method": "POST"},
+            path="/api/config",
+        )
+        self.assertFalse(ok_opt_no_orig_pf)
+        self.assertEqual(st_opt_no_orig_pf, 403)
+
+        ok_opt_bad_m, st_opt_bad_m, _ = cs.validate_console_request(
+            "OPTIONS",
+            {
+                "Host": "localhost:18080",
+                "Origin": "http://localhost:18080",
+                "Access-Control-Request-Method": "DELETE",
+            },
+            path="/api/config",
+        )
+        self.assertFalse(ok_opt_bad_m)
+        self.assertEqual(st_opt_bad_m, 405)
+
+        ok_dup_orig, st_dup_orig, _ = cs.validate_console_request(
+            "OPTIONS",
+            {
+                "Host": "localhost:18080",
+                "Origin": "https://evil.example",
+                "origin": "http://localhost:18080",
+            },
+            path="/api/config",
+        )
+        self.assertFalse(ok_dup_orig)
+        self.assertEqual(st_dup_orig, 403)
+
+        ok_dup_host, st_dup_host, _ = cs.validate_console_request(
+            "GET",
+            {"Host": "xiaozhi-esp32-server:18080", "host": "localhost:18080"},
+            path="/",
+        )
+        self.assertFalse(ok_dup_host)
+        self.assertEqual(st_dup_host, 400)
+
         # 2. Log secret redaction
         red = cs._redact_secrets(
             "Authorization: Bearer abcdef1234567890 #token=mysecret sk-1234567890abcdef AIzaSyA12345678901234567890"
@@ -5019,6 +5084,49 @@ class TestLiveOnlineIntegration(unittest.TestCase):
                 headers={"X-Console-Token": console_tok},
             )
             self.assertEqual(r_l3_evil.status_code, 400)
+
+            # P2-5: Live OPTIONS preflight returns 204 for loopback Origin and 403 for cross-origin / internal Host
+            r_opt_live = client.options(
+                "http://127.0.0.1:18080/api/config",
+                headers={
+                    "Origin": "http://127.0.0.1:18080",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "Content-Type, X-Console-Token",
+                },
+            )
+            self.assertEqual(r_opt_live.status_code, 204)
+            self.assertEqual(r_opt_live.headers.get("Access-Control-Allow-Origin"), "http://127.0.0.1:18080")
+            self.assertEqual(r_opt_live.headers.get("Access-Control-Allow-Methods"), "GET, POST, OPTIONS")
+            self.assertEqual(
+                client.options(
+                    "http://127.0.0.1:18080/api/config",
+                    headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"},
+                ).status_code,
+                403,
+            )
+            self.assertEqual(
+                client.options(
+                    "http://127.0.0.1:18080/api/health",
+                    headers={"Host": "xiaozhi-esp32-server:18080"},
+                ).status_code,
+                403,
+            )
+            self.assertEqual(
+                client.options(
+                    "http://127.0.0.1:18080/api/config",
+                    headers={
+                        "Origin": "http://127.0.0.1:18080",
+                        "Access-Control-Request-Method": "DELETE",
+                    },
+                ).status_code,
+                405,
+            )
+            r_del_live = client.delete(
+                "http://127.0.0.1:18080/api/config",
+                headers={"Host": "evil.example:18080", "Origin": "http://127.0.0.1:18080"},
+            )
+            self.assertEqual(r_del_live.status_code, 501)
+            self.assertNotIn("access-control-allow-origin", {k.lower() for k in r_del_live.headers.keys()})
 
     def test_live_a1_container_mount_isolation(self):
         """A-1: Main container sees zero *.bin, token files, anima-data, or .ckpt/.pth, and ro mounts reject writes."""

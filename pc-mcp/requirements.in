@@ -11,6 +11,7 @@ psutil>=7.2.2,<8
 PyAutoGUI>=0.9.54,<1
 pycaw>=20260927
 pyperclip>=1.11.0,<2
+socksio>=1.0.0,<2
 starlette>=1.10.0,<2
 uiautomation>=2.0.29,<3
 uvicorn>=0.54.0,<1

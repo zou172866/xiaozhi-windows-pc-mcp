@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from http import HTTPStatus
 import io
+import json
 import math
 import os
 import struct
@@ -13,6 +14,8 @@ import time
 from urllib.parse import quote
 import wave
 
+import httpx
+import requests
 import yaml
 try:
     import edge_tts
@@ -22,12 +25,27 @@ except ImportError:
 import mei_emotion_router
 import pc_audio_router
 from console import shared
+from console.routes import audio_api
+
+_PORTABLE_MEI_GPT_WEIGHTS = f"{shared.HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/gpt.ckpt"
+_PORTABLE_MEI_SOVITS_WEIGHTS = f"{shared.HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/sovits.pth"
+_PORTABLE_MEI_VERSION = "v4"
+
+_DEFAULT_MEI_GPT_WEIGHTS = (
+    os.environ.get("GSV_MEI_GPT_WEIGHTS", "").strip()
+    or _PORTABLE_MEI_GPT_WEIGHTS
+)
+_DEFAULT_MEI_SOVITS_WEIGHTS = (
+    os.environ.get("GSV_MEI_SOVITS_WEIGHTS", "").strip()
+    or _PORTABLE_MEI_SOVITS_WEIGHTS
+)
+_DEFAULT_MEI_VERSION = os.environ.get("GSV_MEI_VERSION", "").strip() or _PORTABLE_MEI_VERSION
 
 GSV_PROFILES = {
     "__gsv_raiden_mei__": {
-        "version": "v4",
-        "gpt_weights": f"{shared.HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/芽衣/芽衣-e10.ckpt",
-        "sovits_weights": f"{shared.HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/芽衣/芽衣_e10_s430_l32.pth",
+        "version": _DEFAULT_MEI_VERSION,
+        "gpt_weights": _DEFAULT_MEI_GPT_WEIGHTS,
+        "sovits_weights": _DEFAULT_MEI_SOVITS_WEIGHTS,
         "block": {
             "type": "gpt_sovits_v2",
             "voice_id": "__gsv_raiden_mei__",
@@ -130,17 +148,169 @@ def _gsv_timeout_within_budget(default_timeout: float) -> float:
     return min(float(default_timeout), rem)
 
 
+_preserved_boot_mei_weights: dict[str, tuple[str, str, str]] = {}
+_MEI_WEIGHTS_BACKUP_FILENAME = ".gsv_mei_custom_weights.json"
+
+
+def _norm_weight_path(path: str) -> str:
+    return str(path or "").strip().replace("\\", "/")
+
+
+def _mei_weights_backup_path(yaml_path: str | None) -> str:
+    if not yaml_path:
+        return ""
+    parent = os.path.dirname(os.path.abspath(yaml_path))
+    return os.path.join(parent, _MEI_WEIGHTS_BACKUP_FILENAME) if parent else ""
+
+
+def _read_preserved_mei_backup(yaml_path: str | None) -> tuple[str, str, str] | None:
+    bpath = _mei_weights_backup_path(yaml_path)
+    if not bpath or not os.path.isfile(bpath):
+        return None
+    try:
+        with open(bpath, "r", encoding="utf-8") as rf:
+            data = json.load(rf)
+        if not isinstance(data, dict):
+            return None
+        ver = str(data.get("version") or "").strip() or _PORTABLE_MEI_VERSION
+        t2s = str(data.get("t2s_weights_path") or "").strip()
+        vits = str(data.get("vits_weights_path") or "").strip()
+        if _is_custom_mei_weights(t2s, vits):
+            return (ver, t2s, vits)
+    except Exception as exc:
+        shared._log_rate_limited("read_mei_weights_backup", exc)
+    return None
+
+
+def _persist_preserved_mei_backup(yaml_path: str | None, preserved: tuple[str, str, str]) -> None:
+    bpath = _mei_weights_backup_path(yaml_path)
+    if not bpath:
+        return
+    ver, t2s, vits = preserved
+    if not _is_custom_mei_weights(t2s, vits):
+        return
+    try:
+        payload = json.dumps(
+            {
+                "version": ver or _PORTABLE_MEI_VERSION,
+                "t2s_weights_path": t2s,
+                "vits_weights_path": vits,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        shared._atomic_write_text(bpath, payload + "\n")
+    except Exception as exc:
+        shared._log_rate_limited("persist_mei_weights_backup", exc)
+
+
+def _read_boot_gsv_custom() -> tuple[str, str, str] | None:
+    """Read (version, t2s_weights_path, vits_weights_path) from shared.GSV_INFER_YAML if present."""
+    yaml_path = shared.GSV_INFER_YAML
+    if not yaml_path or not os.path.exists(yaml_path):
+        return None
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as rf:
+            boot_cfg = yaml.safe_load(rf) or {}
+        custom = boot_cfg.get("custom") or {}
+        if not isinstance(custom, dict):
+            return None
+        ver = str(custom.get("version") or "").strip()
+        t2s = str(custom.get("t2s_weights_path") or "").strip()
+        vits = str(custom.get("vits_weights_path") or "").strip()
+        if t2s or vits:
+            return (ver, t2s, vits)
+    except Exception as exc:
+        shared._log_rate_limited("detect_boot_gsv_voice", exc)
+    return None
+
+
+def _is_custom_mei_weights(t2s: str, vits: str) -> bool:
+    """Return True if a boot YAML weight pair is a user's custom fine-tuned raiden_mei / local model."""
+    if not t2s or not vits:
+        return False
+    low_t2s = _norm_weight_path(t2s).lower()
+    low_vits = _norm_weight_path(vits).lower()
+    tw_prof = GSV_PROFILES["__gsv_xiaozhi_tw__"]
+    if (
+        low_t2s == _norm_weight_path(tw_prof["gpt_weights"]).lower()
+        and low_vits == _norm_weight_path(tw_prof["sovits_weights"]).lower()
+    ):
+        return False
+    if "raiden_mei" in low_t2s or "raiden_mei" in low_vits:
+        return True
+    # Preserve any user-customized local weight pair (including half-pretrained fine-tuned GPT or SoVITS)
+    if (
+        not low_t2s.startswith("gpt_sovits/pretrained_models/")
+        or not low_vits.startswith("gpt_sovits/pretrained_models/")
+    ):
+        return True
+    return False
+
+
+def _snapshot_boot_mei_weights(*, persist_backup: bool = False) -> tuple[str, str, str] | None:
+    """Remember custom fine-tuned weights from shared.GSV_INFER_YAML before any voice switch overwrites it."""
+    yaml_path = shared.GSV_INFER_YAML
+    boot = _read_boot_gsv_custom()
+    if boot is not None and _is_custom_mei_weights(boot[1], boot[2]):
+        preserved = (boot[0] or _PORTABLE_MEI_VERSION, boot[1], boot[2])
+        if yaml_path:
+            _preserved_boot_mei_weights[yaml_path] = preserved
+            if persist_backup:
+                _persist_preserved_mei_backup(yaml_path, preserved)
+        return preserved
+    if yaml_path and yaml_path in _preserved_boot_mei_weights:
+        return _preserved_boot_mei_weights[yaml_path]
+    disk_preserved = _read_preserved_mei_backup(yaml_path)
+    if disk_preserved is not None and yaml_path:
+        _preserved_boot_mei_weights[yaml_path] = disk_preserved
+        return disk_preserved
+    return None
+
+
+def _resolve_gsv_weights(voice_id: str) -> tuple[str, str, str]:
+    """Resolve effective (version, gpt_weights, sovits_weights) for a GSV voice profile.
+
+    Priority for `__gsv_raiden_mei__`:
+      1. Explicit `GSV_MEI_GPT_WEIGHTS` / `GSV_MEI_SOVITS_WEIGHTS` / `GSV_MEI_VERSION` env overrides
+      2. Existing custom fine-tuned weights from `tts_infer_xiaozhi.yaml` (preserved across switches & restarts)
+      3. Portable default profile weights under `HOST_GSV_WEIGHTS_DIR/raiden_mei/v4`
+    """
+    if voice_id != "__gsv_raiden_mei__":
+        prof = GSV_PROFILES[voice_id]
+        return str(prof["version"]), str(prof["gpt_weights"]), str(prof["sovits_weights"])
+
+    version = _PORTABLE_MEI_VERSION
+    gpt_w = _PORTABLE_MEI_GPT_WEIGHTS
+    sovits_w = _PORTABLE_MEI_SOVITS_WEIGHTS
+
+    preserved = _snapshot_boot_mei_weights()
+    if preserved is not None:
+        version, gpt_w, sovits_w = preserved
+
+    env_ver = os.environ.get("GSV_MEI_VERSION", "").strip()
+    env_gpt = os.environ.get("GSV_MEI_GPT_WEIGHTS", "").strip()
+    env_sov = os.environ.get("GSV_MEI_SOVITS_WEIGHTS", "").strip()
+    if env_ver:
+        version = env_ver
+    if env_gpt:
+        gpt_w = env_gpt
+    if env_sov:
+        sovits_w = env_sov
+    return version, gpt_w, sovits_w
+
+
 def _detect_boot_gsv_voice() -> str | None:
-    if os.path.exists(shared.GSV_INFER_YAML):
-        try:
-            with open(shared.GSV_INFER_YAML, "r", encoding="utf-8") as rf:
-                boot_cfg = yaml.safe_load(rf) or {}
-            t2s = str((boot_cfg.get("custom") or {}).get("t2s_weights_path") or "")
-            for vid, prof in GSV_PROFILES.items():
-                if prof["gpt_weights"] == t2s:
-                    return vid
-        except Exception as exc:
-            shared._log_rate_limited("detect_boot_gsv_voice", exc)
+    boot = _read_boot_gsv_custom()
+    if boot is None:
+        return None
+    _ver, t2s, vits = boot
+    norm_t2s = _norm_weight_path(t2s)
+    norm_vits = _norm_weight_path(vits)
+    for vid in GSV_PROFILES:
+        _, prof_gpt, prof_sov = _resolve_gsv_weights(vid)
+        if _norm_weight_path(prof_gpt) == norm_t2s and (not norm_vits or _norm_weight_path(prof_sov) == norm_vits):
+            return vid
     return None
 
 
@@ -175,19 +345,27 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
     with _gsv_weights_lock:
         if _active_gsv_loaded is None:
             _active_gsv_loaded = _detect_boot_gsv_voice()
+        _snapshot_boot_mei_weights(persist_backup=bool(persist_boot_yaml and voice_id != "__gsv_raiden_mei__"))
+        version, gpt_weights, sovits_weights = _resolve_gsv_weights(voice_id)
         if _active_gsv_loaded != voice_id:
             client = shared._get_console_http_client()
             t_gpt = _gsv_timeout_within_budget(25.0)
-            r1 = client.get(f"{shared.GSV_Host}/set_gpt_weights", params={"weights_path": prof["gpt_weights"]}, timeout=t_gpt)
+            r1 = client.get(f"{shared.GSV_Host}/set_gpt_weights", params={"weights_path": gpt_weights}, timeout=t_gpt)
             if r1.status_code != 200:
-                raise RuntimeError(f"切换 GPT 权重失败 (HTTP {r1.status_code}): {r1.text[:160]}")
+                raise RuntimeError(
+                    f"切换 GPT 权重失败 (HTTP {r1.status_code}): {r1.text[:160]}；"
+                    "若未放入本地自定义权重，请在 .env 配置 GSV_MEI_GPT_WEIGHTS 或切换为 EdgeTTS / 云端 TTS"
+                )
             # GPT weights are now mutated on GPU: mark state dirty (distinct from None) so a SoVITS
             # failure forces restoration instead of falling back to _detect_boot_gsv_voice().
             _active_gsv_loaded = "__dirty__"
             t_sov = _gsv_timeout_within_budget(30.0)
-            r2 = client.get(f"{shared.GSV_Host}/set_sovits_weights", params={"weights_path": prof["sovits_weights"]}, timeout=t_sov)
+            r2 = client.get(f"{shared.GSV_Host}/set_sovits_weights", params={"weights_path": sovits_weights}, timeout=t_sov)
             if r2.status_code != 200:
-                raise RuntimeError(f"切换 SoVITS 权重失败 (HTTP {r2.status_code}): {r2.text[:160]}")
+                raise RuntimeError(
+                    f"切换 SoVITS 权重失败 (HTTP {r2.status_code}): {r2.text[:160]}；"
+                    "若未放入本地自定义权重，请在 .env 配置 GSV_MEI_SOVITS_WEIGHTS 或切换为 EdgeTTS / 云端 TTS"
+                )
             _active_gsv_loaded = voice_id
         if persist_boot_yaml:
             boot_cfg = {}
@@ -198,25 +376,34 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
                 except Exception as exc:
                     shared._log_rate_limited("read_gsv_infer_yaml", exc)
                     boot_cfg = {}
+            prev_custom = boot_cfg.get("custom") if isinstance(boot_cfg.get("custom"), dict) else {}
             boot_cfg["custom"] = {
-                "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
-                "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
-                "device": "cuda",
-                "is_half": True,
-                "t2s_weights_path": prof["gpt_weights"],
-                "version": prof["version"],
-                "vits_weights_path": prof["sovits_weights"],
+                "bert_base_path": prev_custom.get("bert_base_path")
+                or "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
+                "cnhuhbert_base_path": prev_custom.get("cnhuhbert_base_path")
+                or "GPT_SoVITS/pretrained_models/chinese-hubert-base",
+                "device": prev_custom.get("device") or "cuda",
+                "is_half": prev_custom["is_half"] if "is_half" in prev_custom else True,
+                "t2s_weights_path": gpt_weights,
+                "version": version,
+                "vits_weights_path": sovits_weights,
             }
             shared._atomic_write_text(shared.GSV_INFER_YAML, yaml.safe_dump(boot_cfg, allow_unicode=True, sort_keys=False))
 
 
 def _get_current_voice_id(cfg: dict) -> str:
     selected = (cfg or {}).get("selected_module") or {}
-    tts_key = selected.get("TTS", "GPT_SOVITS_V2")
+    tts_key = selected.get("TTS", "EdgeTTS")
     tts_cfg = ((cfg or {}).get("TTS") or {}).get(tts_key) or {}
     if tts_key == "GPT_SOVITS_V2":
         return _resolve_gsv_voice_id(tts_cfg)
-    return str(tts_cfg.get("voice_id") or tts_cfg.get("voice") or "zh-CN-XiaoxiaoNeural")
+    if tts_key == "EdgeTTS":
+        return str(tts_cfg.get("voice_id") or tts_cfg.get("voice") or "zh-CN-XiaoxiaoNeural")
+    if tts_key == "HuoshanDoubleStreamTTS":
+        return str(tts_cfg.get("speaker") or "zh_female_wanwanxiaohe_moon_bigtts")
+    if tts_key == "FishSpeech":
+        return str(tts_cfg.get("reference_id") or "")
+    return str(tts_cfg.get("voice_id") or tts_cfg.get("voice") or "")
 
 
 _GSV_VOICE_IDENTITY_KEYS = (
@@ -316,23 +503,67 @@ def handle_post_audio_test(handler) -> None:
 def handle_post_tts_preview(handler) -> None:
     try:
         body = handler._read_body_json()
-        raw_voice = body.get("voice", "__gsv_raiden_mei__")
+        raw_tts_provider = body.get("tts_provider")
+        if raw_tts_provider is not None and not isinstance(raw_tts_provider, str):
+            handler._send_json({"ok": False, "error": "字段 tts_provider 必须为字符串"}, HTTPStatus.BAD_REQUEST)
+            return
+        tts_provider = (raw_tts_provider or "").strip() if raw_tts_provider is not None else ""
+
+        raw_text = str(body.get("text") or "你好呀，我是小智，今天过得怎么样？有什么需要我帮忙的随时告诉我。").strip()
+        req_emotion = str(body.get("emotion") or "auto").strip().lower()
+        tag_emo, stripped_text = mei_emotion_router.extract_and_strip_emotion(
+            raw_text, flush_incomplete=True
+        )
+        clean_text = mei_emotion_router.clean_segment_for_tts(stripped_text) or "你好呀，我是小智。"
+
+        if tts_provider and tts_provider not in ("GPT_SOVITS_V2", "EdgeTTS"):
+            if tts_provider not in audio_api.CLOUD_TTS_PROVIDERS:
+                handler._send_json(
+                    {"ok": False, "error": f"无效的试听 TTS 引擎: {tts_provider}"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            raw_tts_cfg = body.get("tts_config")
+            if raw_tts_cfg is not None and not isinstance(raw_tts_cfg, dict):
+                handler._send_json({"ok": False, "error": "字段 tts_config 必须为 JSON 对象"}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                audio_bytes, content_type = audio_api.synthesize_cloud_tts_preview(
+                    tts_provider,
+                    clean_text[:120],
+                    tts_config_override=raw_tts_cfg,
+                )
+            except ValueError as ve:
+                handler._send_json({"ok": False, "error": shared._redact_secrets(str(ve))}, HTTPStatus.BAD_REQUEST)
+                return
+            except (asyncio.TimeoutError, TimeoutError, requests.exceptions.Timeout, httpx.TimeoutException):
+                handler._send_json(
+                    {
+                        "ok": False,
+                        "error": f"云端 TTS 试听超时（超过 {int(audio_api.CLOUD_PREVIEW_TIMEOUT_SECONDS)} 秒），请检查网络或代理设置。",
+                    },
+                    HTTPStatus.GATEWAY_TIMEOUT,
+                )
+                return
+            handler.send_response(HTTPStatus.OK)
+            handler.send_header("Content-Type", content_type)
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header("Content-Length", str(len(audio_bytes)))
+            handler.end_headers()
+            handler.wfile.write(audio_bytes)
+            return
+
+        raw_voice = body.get("voice", "zh-CN-XiaoxiaoNeural")
         if raw_voice is not None and not isinstance(raw_voice, str):
             handler._send_json({"ok": False, "error": "字段 voice 必须为字符串"}, HTTPStatus.BAD_REQUEST)
             return
-        voice = (raw_voice or "__gsv_raiden_mei__").strip()
+        voice = (raw_voice or "zh-CN-XiaoxiaoNeural").strip()
         if voice not in ALLOWED_VOICES:
             handler._send_json(
                 {"ok": False, "error": f"无效的试听音色 ID: {voice or '(空)'}"},
                 HTTPStatus.BAD_REQUEST,
             )
             return
-        raw_text = str(body.get("text") or "嗯，哥哥欢迎回来，今天的工作辛苦了，我已经为你泡好了热茶。").strip()
-        req_emotion = str(body.get("emotion") or "auto").strip().lower()
-        tag_emo, stripped_text = mei_emotion_router.extract_and_strip_emotion(
-            raw_text, flush_incomplete=True
-        )
-        clean_text = mei_emotion_router.clean_segment_for_tts(stripped_text) or "欢迎回来，今天辛苦了。"
         if voice in GSV_PROFILES:
             configured_gsv = _get_configured_gsv_voice()
             needs_weight_swap = bool(configured_gsv and configured_gsv != voice)
@@ -494,7 +725,7 @@ def handle_post_tts_preview(handler) -> None:
             handler.wfile.write(mp3_bytes)
     except shared._BadRequestError:
         raise
-    except TimeoutError as e:
+    except (TimeoutError, requests.exceptions.Timeout, httpx.TimeoutException) as e:
         err_payload = {"ok": False, "error": shared._redact_secrets(str(e))}
         dirty_v, dirty_e = _get_voice_dirty_state()
         if dirty_v:

@@ -8,16 +8,19 @@ Falls back seamlessly to ESP32 built-in speaker if host 18900 audio bridge is un
 from __future__ import annotations
 
 import asyncio
+import collections
 import functools
 import io
 import json
 import math
 import os
+import queue
+import struct
 import threading
 import time
 import wave
 import weakref
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import httpx
 
@@ -195,6 +198,40 @@ def _get_silent_opus_frame(sample_rate: int = 16000) -> bytes:
         return pkt
 
 
+def pcm16_to_wav(pcm_bytes: bytes, sample_rate: int, channels: int = 1) -> Tuple[bytes, int]:
+    """Wrap raw 16-bit little-endian PCM bytes with a 44-byte RIFF/WAVE header (zero transcoding)."""
+    sr = max(8000, int(sample_rate or 16000))
+    ch = max(1, int(channels or 1))
+    data = bytes(pcm_bytes or b"")
+    frame_bytes = ch * 2
+    rem = len(data) % frame_bytes
+    if rem:
+        data = data + (b"\x00" * (frame_bytes - rem))
+    n_frames = len(data) // frame_bytes
+    dur_ms = int(round((n_frames / float(sr)) * 1000.0)) if n_frames > 0 else 0
+    if n_frames > 0 and dur_ms <= 0:
+        dur_ms = 1
+    data_len = len(data)
+    byte_rate = sr * frame_bytes
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_len,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM
+        ch,
+        sr,
+        byte_rate,
+        frame_bytes,
+        16,
+        b"data",
+        data_len,
+    )
+    return header + data, dur_ms
+
+
 def ensure_pcm_wav(audio_bytes: bytes, file_type: str = "wav") -> Tuple[bytes, int]:
     """Return (16-bit PCM WAV bytes, duration_ms). Lossless zero-copy passthrough for WAV."""
     if len(audio_bytes) >= 44 and audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE":
@@ -220,6 +257,12 @@ def _ensure_conn_pc_state(conn):
         conn._pc_audio_queue_lock = threading.Lock()
     if not hasattr(conn, "_pc_audio_clip_queue"):
         conn._pc_audio_clip_queue = []
+    if not hasattr(conn, "_pc_stream_pending_chunks"):
+        conn._pc_stream_pending_chunks = collections.deque()
+    if not hasattr(conn, "_pc_stream_drain_task"):
+        conn._pc_stream_drain_task = None
+    if not hasattr(conn, "_pc_audio_abort_gen"):
+        conn._pc_audio_abort_gen = 0
     if not hasattr(conn, "_pc_audio_send_lock"):
         conn._pc_audio_send_lock = asyncio.Lock()
     if not hasattr(conn, "_pc_audio_active_sid"):
@@ -260,6 +303,548 @@ def _clear_pc_clips(conn) -> None:
     _ensure_conn_pc_state(conn)
     with conn._pc_audio_queue_lock:
         conn._pc_audio_clip_queue.clear()
+
+
+def _clear_pc_stream_chunks(conn):
+    _ensure_conn_pc_state(conn)
+    with conn._pc_audio_queue_lock:
+        conn._pc_audio_abort_gen = int(getattr(conn, "_pc_audio_abort_gen", 0) or 0) + 1
+        conn._pc_stream_pending_chunks.clear()
+        drain_task = getattr(conn, "_pc_stream_drain_task", None)
+    if drain_task is not None and not drain_task.done():
+        try:
+            drain_task.cancel()
+        except Exception:
+            pass
+    return drain_task
+
+
+async def _drain_pc_stream_chunks(conn) -> None:
+    _ensure_conn_pc_state(conn)
+    cur_task = asyncio.current_task()
+    try:
+        while True:
+            with conn._pc_audio_queue_lock:
+                if not conn._pc_stream_pending_chunks:
+                    break
+                chunk_sid, chunk_gen, wav_bytes, vol = conn._pc_stream_pending_chunks.popleft()
+            if getattr(conn, "client_abort", False):
+                continue
+            if chunk_sid and getattr(conn, "sentence_id", None) != chunk_sid:
+                continue
+            if int(getattr(conn, "_pc_audio_abort_gen", 0) or 0) != chunk_gen:
+                continue
+            await _post_play_to_pc(conn, chunk_sid, wav_bytes, vol)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        reschedule = False
+        with conn._pc_audio_queue_lock:
+            if getattr(conn, "_pc_stream_drain_task", None) is cur_task:
+                conn._pc_stream_drain_task = None
+            if conn._pc_stream_pending_chunks and not getattr(conn, "client_abort", False):
+                reschedule = True
+        if reschedule:
+            _schedule_pc_stream_drain(conn)
+
+
+def _schedule_pc_stream_drain(conn) -> bool:
+    loop = getattr(conn, "loop", None)
+    if loop is None or loop.is_closed():
+        return False
+
+    def _ensure_task():
+        with conn._pc_audio_queue_lock:
+            existing = getattr(conn, "_pc_stream_drain_task", None)
+            if existing is not None and not existing.done():
+                return
+            if not conn._pc_stream_pending_chunks:
+                return
+            conn._pc_stream_drain_task = loop.create_task(_drain_pc_stream_chunks(conn))
+
+    try:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            _ensure_task()
+        else:
+            loop.call_soon_threadsafe(_ensure_task)
+        return True
+    except Exception:
+        return False
+
+
+def _enqueue_pc_stream_wav(conn, cur_sid, wav_bytes: bytes, dur_ms: int, volume: float) -> None:
+    """Queue a lossless streaming PCM WAV chunk to Windows PC speakers in strict FIFO order."""
+    if conn is None or not wav_bytes:
+        return
+    _ensure_conn_pc_state(conn)
+    with conn._pc_audio_queue_lock:
+        if conn._pc_audio_active_sid != cur_sid:
+            conn._pc_audio_queued_ms = 0
+        conn._pc_audio_active_sid = cur_sid
+        conn._pc_audio_queued_ms += max(0, int(dur_ms or 0))
+        abort_gen = int(getattr(conn, "_pc_audio_abort_gen", 0) or 0)
+        conn._pc_stream_pending_chunks.append((cur_sid, abort_gen, wav_bytes, float(volume)))
+        while len(conn._pc_stream_pending_chunks) > 256:
+            conn._pc_stream_pending_chunks.popleft()
+    if not _schedule_pc_stream_drain(conn):
+        # Fallback for sync/unit-test environments without an active conn.loop
+        while True:
+            with conn._pc_audio_queue_lock:
+                if not conn._pc_stream_pending_chunks:
+                    break
+                c_sid, c_gen, w_bytes, c_vol = conn._pc_stream_pending_chunks.popleft()
+            if getattr(conn, "client_abort", False):
+                continue
+            if c_sid and getattr(conn, "sentence_id", None) != c_sid:
+                continue
+            if int(getattr(conn, "_pc_audio_abort_gen", 0) or 0) != c_gen:
+                continue
+            play_wav_on_pc_sync(w_bytes, volume=c_vol)
+
+
+async def _wait_pc_stream_drain(conn, cur_sid: Optional[str], timeout: float = 15.0) -> None:
+    """Wait until all queued streaming PCM WAV chunks for `cur_sid` have been submitted to 18900."""
+    if conn is None:
+        return
+    _ensure_conn_pc_state(conn)
+    deadline = time.monotonic() + max(0.5, float(timeout))
+    while time.monotonic() < deadline:
+        if getattr(conn, "client_abort", False):
+            return
+        if cur_sid is not None and getattr(conn, "sentence_id", None) != cur_sid:
+            return
+        with conn._pc_audio_queue_lock:
+            task = getattr(conn, "_pc_stream_drain_task", None)
+            has_pending = bool(conn._pc_stream_pending_chunks)
+        if task is not None and not task.done():
+            rem = max(0.05, deadline - time.monotonic())
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=min(1.0, rem))
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:
+                return
+            continue
+        if has_pending:
+            await _drain_pc_stream_chunks(conn)
+            continue
+        break
+
+
+STREAMING_PC_SUPPORTED_RATES: Dict[str, Tuple[int, ...]] = {
+    "alibl_stream": (8000, 16000, 22050, 24000, 44100, 48000),
+    "huoshan_double_stream": (8000, 16000, 22050, 24000, 32000, 44100, 48000),
+    "minimax_httpstream": (8000, 16000, 22050, 24000, 32000, 44100),
+}
+STREAMING_PC_DEFAULT_RATES: Dict[str, int] = {
+    "alibl_stream": 48000,
+    "huoshan_double_stream": 48000,
+    "minimax_httpstream": 44100,
+}
+
+
+def resolve_streaming_pc_sample_rate(provider_kind: str) -> int:
+    """Return the highest safe lossless PCM sample rate for a streaming TTS provider in PC speaker mode."""
+    supported = STREAMING_PC_SUPPORTED_RATES.get(provider_kind, (16000, 24000, 48000))
+    default_sr = STREAMING_PC_DEFAULT_RATES.get(provider_kind, max(supported))
+    raw_env = (os.environ.get("PC_AUDIO_STREAM_SAMPLE_RATE") or "").strip()
+    if raw_env:
+        try:
+            req = int(raw_env)
+            if req in supported:
+                return req
+            # Clamp to highest supported rate <= req (or max supported if req > max)
+            le_rates = [r for r in supported if r <= req]
+            return max(le_rates) if le_rates else min(supported)
+        except (TypeError, ValueError):
+            pass
+    return default_sr
+
+
+def _get_or_init_pc_stream_ctx(tts_obj) -> dict:
+    ctx = getattr(tts_obj, "_pc_stream_ctx", None)
+    if not isinstance(ctx, dict):
+        ctx = {
+            "lock": threading.Lock(),
+            "active": False,
+            "sid": None,
+            "sample_rate": 48000,
+            "volume": 1.0,
+            "first_chunk_ms": 200,
+            "chunk_ms": 320,
+            "pcm_buf": bytearray(),
+            "sent_any": False,
+            "total_samples": 0,
+            "emitted_frames": 0,
+        }
+        tts_obj._pc_stream_ctx = ctx
+    return ctx
+
+
+def _reset_pc_stream_ctx(
+    tts_obj,
+    *,
+    active: bool,
+    sid: Optional[str] = None,
+    sample_rate: int = 48000,
+    volume: float = 1.0,
+) -> dict:
+    ctx = _get_or_init_pc_stream_ctx(tts_obj)
+    with ctx["lock"]:
+        ctx["active"] = bool(active)
+        ctx["sid"] = sid
+        ctx["sample_rate"] = int(sample_rate or 48000)
+        ctx["volume"] = float(volume if volume is not None else 1.0)
+        ctx["pcm_buf"].clear()
+        ctx["sent_any"] = False
+        ctx["total_samples"] = 0
+        ctx["emitted_frames"] = 0
+    return ctx
+
+
+def _is_live_pc_stream_callback(tts_obj, callback) -> bool:
+    ctx = getattr(tts_obj, "_pc_stream_ctx", None)
+    if not isinstance(ctx, dict) or not ctx.get("active"):
+        return False
+    handle_opus = getattr(tts_obj, "handle_opus", None)
+    if handle_opus is None or callback is None:
+        return False
+    return callback == handle_opus
+
+
+def _flush_pc_stream_buffer(
+    tts_obj,
+    *,
+    end_of_stream: bool,
+    callback: Optional[Callable[[bytes], Any]] = None,
+) -> int:
+    """Flush buffered streaming PCM to Windows PC speakers and emit matched 60ms silent Opus frames."""
+    ctx = getattr(tts_obj, "_pc_stream_ctx", None)
+    conn = getattr(tts_obj, "conn", None)
+    if not isinstance(ctx, dict) or not ctx.get("active") or conn is None:
+        return 0
+    cb = callback or getattr(tts_obj, "handle_opus", None)
+    if cb is None:
+        return 0
+
+    wav_bytes: Optional[bytes] = None
+    dur_ms = 0
+    emit_n = 0
+    cur_sid = None
+    vol = 1.0
+    sr_esp32 = int(getattr(conn, "sample_rate", 16000) or 16000)
+
+    with ctx["lock"]:
+        if not ctx.get("active"):
+            return 0
+        cur_sid = ctx.get("sid") or getattr(conn, "sentence_id", None) or getattr(tts_obj, "current_sentence_id", None)
+        if getattr(conn, "client_abort", False) or (
+            cur_sid and getattr(conn, "sentence_id", None) and conn.sentence_id != cur_sid
+        ):
+            ctx["pcm_buf"].clear()
+            return 0
+
+        buf: bytearray = ctx["pcm_buf"]
+        sr = max(8000, int(ctx.get("sample_rate", 48000) or 48000))
+        vol = float(ctx.get("volume", 1.0))
+
+        min_ms = ctx["first_chunk_ms"] if not ctx["sent_any"] else ctx["chunk_ms"]
+        min_bytes = int(sr * 2 * min_ms / 1000.0)
+        if min_bytes % 2 == 1:
+            min_bytes += 1
+
+        if end_of_stream or len(buf) >= min_bytes:
+            if end_of_stream and (len(buf) % 2 == 1):
+                buf.append(0)
+            n_bytes = len(buf) - (len(buf) % 2)
+            if n_bytes > 0:
+                chunk = bytes(buf[:n_bytes])
+                del buf[:n_bytes]
+                wav_bytes, dur_ms = pcm16_to_wav(chunk, sr, channels=1)
+                ctx["sent_any"] = True
+                ctx["total_samples"] += n_bytes // 2
+
+            total_samples = ctx["total_samples"]
+            if total_samples > 0:
+                total_ms = (total_samples / float(sr)) * 1000.0
+                if end_of_stream:
+                    target_frames = max(1, int(math.ceil(total_ms / 60.0)))
+                else:
+                    target_frames = int(math.floor(total_ms / 60.0))
+                emit_n = max(0, target_frames - ctx["emitted_frames"])
+                ctx["emitted_frames"] += emit_n
+
+    if wav_bytes:
+        _enqueue_pc_stream_wav(conn, cur_sid, wav_bytes, dur_ms, vol)
+    if emit_n > 0:
+        silent_pkt = _get_silent_opus_frame(sr_esp32)
+        for _ in range(emit_n):
+            cb(silent_pkt)
+    return emit_n
+
+
+def _feed_pc_stream_pcm(
+    tts_obj,
+    pcm_data: bytes,
+    *,
+    end_of_stream: bool,
+    callback: Callable[[bytes], Any],
+) -> None:
+    ctx = getattr(tts_obj, "_pc_stream_ctx", None)
+    if not isinstance(ctx, dict) or not ctx.get("active"):
+        return
+    if pcm_data:
+        with ctx["lock"]:
+            if ctx.get("active"):
+                ctx["pcm_buf"].extend(pcm_data)
+    _flush_pc_stream_buffer(tts_obj, end_of_stream=bool(end_of_stream), callback=callback)
+
+
+class _PCAwareAudioQueue(queue.Queue):
+    """queue.Queue subclass that flushes buffered streaming PCM before SentenceType.FIRST/LAST boundaries."""
+
+    def __init__(self, tts_obj):
+        super().__init__()
+        self._tts_ref = weakref.ref(tts_obj)
+
+    def put(self, item, block=True, timeout=None):
+        tts_obj = self._tts_ref()
+        if tts_obj is not None and isinstance(item, tuple) and item:
+            from core.providers.tts.dto.dto import SentenceType
+
+            stype = item[0]
+            if stype in (SentenceType.FIRST, SentenceType.LAST):
+                ctx = getattr(tts_obj, "_pc_stream_ctx", None)
+                if isinstance(ctx, dict) and ctx.get("active"):
+                    with ctx["lock"]:
+                        has_buf = bool(ctx["pcm_buf"]) or (
+                            stype == SentenceType.LAST and ctx["total_samples"] > 0
+                        )
+                    if has_buf:
+                        _flush_pc_stream_buffer(tts_obj, end_of_stream=True)
+        return super().put(item, block=block, timeout=timeout)
+
+
+class _AliBLWSProxy:
+    """Transparent WebSocket proxy that injects PC-mode 48kHz PCM sample_rate into AliBL run-task."""
+
+    def __init__(self, ws, tts_obj):
+        self._ws = ws
+        self._tts_ref = weakref.ref(tts_obj)
+
+    async def send(self, data, *args, **kwargs):
+        tts_obj = self._tts_ref()
+        if tts_obj is not None and isinstance(data, str) and "run-task" in data:
+            ctx = getattr(tts_obj, "_pc_stream_ctx", None)
+            if isinstance(ctx, dict) and ctx.get("active"):
+                try:
+                    msg = json.loads(data)
+                    if (msg.get("header") or {}).get("action") == "run-task":
+                        params = (msg.get("payload") or {}).get("parameters")
+                        if isinstance(params, dict) and str(params.get("format", "pcm")).lower() == "pcm":
+                            params["sample_rate"] = int(ctx["sample_rate"])
+                            data = json.dumps(msg, ensure_ascii=False)
+                except Exception:
+                    pass
+        return await self._ws.send(data, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._ws, name)
+
+
+def _ensure_pc_stream_hooks(tts_obj) -> None:
+    """Idempotently attach _PCAwareAudioQueue and PC-aware opus_encoder interceptor onto a streaming TTS instance."""
+    cur_q = getattr(tts_obj, "tts_audio_queue", None)
+    if cur_q is not None and not isinstance(cur_q, _PCAwareAudioQueue):
+        new_q = _PCAwareAudioQueue(tts_obj)
+        while True:
+            try:
+                new_q.put_nowait(cur_q.get_nowait())
+            except queue.Empty:
+                break
+        tts_obj.tts_audio_queue = new_q
+
+    enc = getattr(tts_obj, "opus_encoder", None)
+    if enc is not None and not getattr(enc, "_pc_stream_wrapped", False):
+        orig_encode = enc.encode_pcm_to_opus_stream
+        tts_ref = weakref.ref(tts_obj)
+
+        @functools.wraps(orig_encode)
+        def _pc_aware_encode(pcm_data: bytes, end_of_stream: bool = False, callback=None, *args, **kwargs):
+            owner = tts_ref()
+            if owner is not None and _is_live_pc_stream_callback(owner, callback):
+                _feed_pc_stream_pcm(owner, pcm_data, end_of_stream=bool(end_of_stream), callback=callback)
+                return None
+            return orig_encode(pcm_data, end_of_stream, callback, *args, **kwargs)
+
+        enc.encode_pcm_to_opus_stream = _pc_aware_encode
+        enc._pc_stream_wrapped = True
+
+
+def attach_streaming_pc_audio_hooks(tts_cls, *, provider_kind: str) -> None:
+    """Attach PC 48kHz/44.1kHz lossless speaker passthrough to AliBLTTS / HuoshanDoubleStreamTTS / MinimaxTTSHTTPStream."""
+    if getattr(tts_cls, "_pc_audio_stream_patched", False):
+        return
+
+    _orig_open = tts_cls.open_audio_channels
+
+    @functools.wraps(_orig_open)
+    async def _pc_stream_open_audio_channels(self, conn, *args, **kwargs):
+        _ensure_pc_stream_hooks(self)
+        res = await _orig_open(self, conn, *args, **kwargs)
+        _ensure_pc_stream_hooks(self)
+        return res
+
+    tts_cls.open_audio_channels = _pc_stream_open_audio_channels
+
+    if provider_kind == "alibl_stream":
+        _orig_ensure_conn = tts_cls._ensure_connection
+        _orig_start_session = tts_cls.start_session
+
+        @functools.wraps(_orig_ensure_conn)
+        async def _pc_alibl_ensure_connection(self, *args, **kwargs):
+            ws = await _orig_ensure_conn(self, *args, **kwargs)
+            if ws is not None and not isinstance(ws, _AliBLWSProxy):
+                proxy = _AliBLWSProxy(ws, self)
+                self.ws = proxy
+                return proxy
+            return ws
+
+        @functools.wraps(_orig_start_session)
+        async def _pc_alibl_start_session(self, session_id, *args, **kwargs):
+            _ensure_pc_stream_hooks(self)
+            cfg = read_audio_output_config()
+            fmt_ok = str(getattr(self, "format", "pcm") or "pcm").strip().lower() == "pcm"
+            is_pc = bool(
+                cfg["target"] == "pc"
+                and fmt_ok
+                and getattr(self, "conn", None) is not None
+                and await is_pc_audio_bridge_online_async()
+            )
+            sr = resolve_streaming_pc_sample_rate("alibl_stream")
+            _reset_pc_stream_ctx(
+                self,
+                active=is_pc,
+                sid=session_id or getattr(getattr(self, "conn", None), "sentence_id", None),
+                sample_rate=sr,
+                volume=cfg["volume"],
+            )
+            return await _orig_start_session(self, session_id, *args, **kwargs)
+
+        tts_cls._ensure_connection = _pc_alibl_ensure_connection
+        tts_cls.start_session = _pc_alibl_start_session
+
+    elif provider_kind == "huoshan_double_stream":
+        _orig_start_session = tts_cls.start_session
+        _orig_to_tts = getattr(tts_cls, "to_tts", None)
+
+        @functools.wraps(_orig_start_session)
+        async def _pc_huoshan_start_session(self, session_id, *args, **kwargs):
+            _ensure_pc_stream_hooks(self)
+            conn = getattr(self, "conn", None)
+            cfg = read_audio_output_config()
+            is_pc = bool(
+                cfg["target"] == "pc"
+                and conn is not None
+                and await is_pc_audio_bridge_online_async()
+            )
+            base_sr = int(getattr(conn, "sample_rate", 16000) or 16000)
+            pc_sr = resolve_streaming_pc_sample_rate("huoshan_double_stream")
+            if isinstance(getattr(self, "audio_params", None), dict):
+                self.audio_params["sample_rate"] = pc_sr if is_pc else base_sr
+            _reset_pc_stream_ctx(
+                self,
+                active=is_pc,
+                sid=session_id or getattr(conn, "sentence_id", None),
+                sample_rate=pc_sr,
+                volume=cfg["volume"],
+            )
+            return await _orig_start_session(self, session_id, *args, **kwargs)
+
+        tts_cls.start_session = _pc_huoshan_start_session
+
+        if callable(_orig_to_tts):
+            @functools.wraps(_orig_to_tts)
+            def _pc_huoshan_to_tts(self, text, *args, **kwargs):
+                params = getattr(self, "audio_params", None)
+                prev_sr = params.get("sample_rate") if isinstance(params, dict) else None
+                enc_sr = getattr(getattr(self, "opus_encoder", None), "sample_rate", None)
+                conn_sr = getattr(getattr(self, "conn", None), "sample_rate", None)
+                target_sr = enc_sr or conn_sr
+                if isinstance(params, dict) and target_sr:
+                    params["sample_rate"] = int(target_sr)
+                try:
+                    return _orig_to_tts(self, text, *args, **kwargs)
+                finally:
+                    if isinstance(params, dict) and prev_sr is not None:
+                        params["sample_rate"] = prev_sr
+
+            tts_cls.to_tts = _pc_huoshan_to_tts
+
+    elif provider_kind == "minimax_httpstream":
+        _orig_text_to_speak = tts_cls.text_to_speak
+        _orig_to_tts = getattr(tts_cls, "to_tts", None)
+
+        @functools.wraps(_orig_text_to_speak)
+        async def _pc_minimax_text_to_speak(self, text, is_last, *args, **kwargs):
+            _ensure_pc_stream_hooks(self)
+            conn = getattr(self, "conn", None)
+            cur_sid = getattr(conn, "sentence_id", None) or getattr(self, "current_sentence_id", None)
+            ctx = _get_or_init_pc_stream_ctx(self)
+            audio_setting = getattr(self, "audio_setting", None)
+            fmt_ok = str((audio_setting or {}).get("format", "pcm") if isinstance(audio_setting, dict) else "pcm").strip().lower() == "pcm"
+            base_sr = int(getattr(conn, "sample_rate", 16000) or 16000)
+            pc_sr = resolve_streaming_pc_sample_rate("minimax_httpstream")
+
+            # Lock PC mode decision per turn (sentence_id) so multi-sentence turns stay format-consistent
+            need_eval = (ctx.get("sid") != cur_sid) or (cur_sid is None)
+            if need_eval:
+                cfg = read_audio_output_config()
+                is_pc = bool(
+                    cfg["target"] == "pc"
+                    and fmt_ok
+                    and conn is not None
+                    and await is_pc_audio_bridge_online_async()
+                )
+                _reset_pc_stream_ctx(
+                    self,
+                    active=is_pc,
+                    sid=cur_sid,
+                    sample_rate=pc_sr,
+                    volume=cfg["volume"],
+                )
+            else:
+                is_pc = bool(ctx.get("active"))
+
+            if isinstance(audio_setting, dict):
+                audio_setting["sample_rate"] = pc_sr if is_pc else base_sr
+            return await _orig_text_to_speak(self, text, is_last, *args, **kwargs)
+
+        tts_cls.text_to_speak = _pc_minimax_text_to_speak
+
+        if callable(_orig_to_tts):
+            @functools.wraps(_orig_to_tts)
+            def _pc_minimax_to_tts(self, text, *args, **kwargs):
+                aset = getattr(self, "audio_setting", None)
+                prev_sr = aset.get("sample_rate") if isinstance(aset, dict) else None
+                enc_sr = getattr(getattr(self, "opus_encoder", None), "sample_rate", None)
+                conn_sr = getattr(getattr(self, "conn", None), "sample_rate", None)
+                target_sr = enc_sr or conn_sr
+                if isinstance(aset, dict) and target_sr:
+                    aset["sample_rate"] = int(target_sr)
+                try:
+                    return _orig_to_tts(self, text, *args, **kwargs)
+                finally:
+                    if isinstance(aset, dict) and prev_sr is not None:
+                        aset["sample_rate"] = prev_sr
+
+            tts_cls.to_tts = _pc_minimax_to_tts
+
+    tts_cls._pc_audio_stream_patched = True
 
 
 async def _post_play_to_pc(conn, turn_id: str, wav_bytes: bytes, volume: float) -> bool:
@@ -468,6 +1053,22 @@ def apply_pc_audio_to_tts_patch() -> None:
         print(f"[PCAudioRouter] 跳过挂载 TTS 拦截层（签名契约不匹配）: {sig_det}", flush=True)
         return
 
+    _pc_tts_tls = threading.local()
+
+    def _run_tts_speak_for_pc(tts_obj, clean_text: str):
+        sync_fn = getattr(tts_obj, "_text_to_speak_sync", None)
+        has_instance_override = "text_to_speak" in getattr(tts_obj, "__dict__", {})
+        cls_speak = getattr(type(tts_obj), "text_to_speak", None)
+        expected_ref = getattr(type(tts_obj), "_patched_tts_speak_ref", None)
+        if callable(sync_fn) and not has_instance_override and (expected_ref is None or cls_speak is expected_ref):
+            return sync_fn(clean_text)
+
+        loop = getattr(_pc_tts_tls, "loop", None)
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            _pc_tts_tls.loop = loop
+        return loop.run_until_complete(tts_obj.text_to_speak(clean_text, None))
+
     @functools.wraps(_orig_to_tts_stream)
     def _pc_aware_to_tts_stream(self, text, *args, **kwargs):
         opus_handler = kwargs.get("opus_handler", args[0] if args else None)
@@ -493,7 +1094,7 @@ def apply_pc_audio_to_tts_patch() -> None:
         audio_bytes = None
         while max_repeat_time > 0:
             try:
-                audio_bytes = asyncio.run(self.text_to_speak(clean_text, None))
+                audio_bytes = _run_tts_speak_for_pc(self, clean_text)
                 if audio_bytes:
                     break
                 max_repeat_time -= 1
@@ -624,12 +1225,15 @@ def apply_pc_audio_playback_patches() -> None:
                     await _post_play_to_pc(conn, clip_sid, wav_bytes, vol)
 
             elif state == "stop" and conn._pc_audio_active_sid == cur_sid:
+                # Ensure any queued streaming PCM WAV chunks finished submitting to 18900 before draining.
+                await _wait_pc_stream_drain(conn, cur_sid)
                 # Drain AudioRateController queue ONLY (no extra 240ms ESP32 speaker sleep!) so every
                 # queued sentence_start callback submits its WAV clip to 18900, then dynamically poll
                 # /audio/wait until Windows speakers finish the exact last millisecond of audio.
                 rc = getattr(conn, "audio_rate_controller", None)
                 if rc is not None and hasattr(rc, "queue_empty_event"):
                     await _wait_rate_controller_empty(conn, rc, cur_sid)
+                await _wait_pc_stream_drain(conn, cur_sid)
                 if not getattr(conn, "client_abort", False) and getattr(conn, "sentence_id", None) == cur_sid:
                     async with conn._pc_audio_send_lock:
                         pass
@@ -695,6 +1299,7 @@ def apply_pc_audio_playback_patches() -> None:
         if conn is not None:
             _ensure_conn_pc_state(conn)
             _clear_pc_clips(conn)
+            _clear_pc_stream_chunks(conn)
             was_pc = conn._pc_audio_active_sid is not None or read_audio_output_config()["target"] == "pc"
             conn._pc_audio_active_sid = None
             conn._pc_audio_queued_ms = 0

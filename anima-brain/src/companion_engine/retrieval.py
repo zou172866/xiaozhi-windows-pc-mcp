@@ -14,7 +14,7 @@ import time
 from array import array
 from datetime import datetime, timezone
 
-from .memory import checked_vector
+from .memory import checked_vector, parse_namespace_dim
 
 
 class LayeredMemory:
@@ -37,6 +37,11 @@ class LayeredMemory:
                 "CREATE TABLE IF NOT EXISTS retrieval_vectors (id TEXT REFERENCES "
                 "retrieval_items(id) ON DELETE CASCADE, model TEXT, digest TEXT, vector BLOB, "
                 "PRIMARY KEY(id,model))"
+            )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS retrieval_terms_state ("
+                "id TEXT PRIMARY KEY REFERENCES retrieval_items(id) ON DELETE CASCADE, "
+                "raw_text TEXT)"
             )
             for event, body in {
                 "INSERT": "INSERT INTO retrieval_search VALUES(new.id,new.text);",
@@ -73,6 +78,29 @@ class LayeredMemory:
                 "CREATE INDEX IF NOT EXISTS memory_state_key ON memory_details"
                 "(json_extract(data,'$.state_key'))"
             )
+        with engine._lock:
+            self._sync_tokenized_fts_locked()
+
+    def _sync_tokenized_fts_locked(self) -> None:
+        from .engine import terms
+
+        stale = self.db.execute(
+            "SELECT i.id, i.text FROM retrieval_items i "
+            "LEFT JOIN retrieval_terms_state s ON s.id = i.id "
+            "WHERE s.id IS NULL OR s.raw_text != i.text"
+        ).fetchall()
+        if not stale:
+            return
+        with self.engine._transaction():
+            for rid, rtext in stale:
+                raw = str(rtext or "")
+                tok_str = " ".join(terms(raw))
+                combined = f"{raw} {tok_str}".strip() if tok_str else raw
+                self.db.execute("DELETE FROM retrieval_search WHERE id=?", (rid,))
+                self.db.execute("INSERT INTO retrieval_search VALUES(?,?)", (rid, combined))
+                self.db.execute(
+                    "INSERT OR REPLACE INTO retrieval_terms_state VALUES(?,?)", (rid, raw)
+                )
 
     def candidates(self, character_id, model, limit=32):
         with self.engine._lock:
@@ -90,7 +118,7 @@ class LayeredMemory:
     def store(self, character_id, item_id, model, vector, text):
         from .engine import Conflict
 
-        values = checked_vector(vector)
+        values = checked_vector(vector, expected_dim=parse_namespace_dim(model))
         with self.engine._transaction():
             row = self.db.execute(
                 "SELECT text FROM retrieval_items WHERE id=? AND owner=? AND character_id=?",
@@ -125,6 +153,7 @@ class LayeredMemory:
             raise ValueError("Invalid layered search bounds")
         with self.engine._lock:
             self.engine._character(character_id)
+            self._sync_tokenized_fts_locked()
             ranks = []
             cosine = {}
             tokens = terms(query)[:48]
@@ -142,24 +171,27 @@ class LayeredMemory:
                         )
                     ]
                 )
-                # unicode61 cannot segment CJK. Bounded substring candidates complement FTS.
-                cjk = [t for t in tokens if len(t) >= 2 and re.search(r"[\u3400-\u9fff]", t)][:8]
+                # Bounded CJK substring candidates ranked by matching bigram count.
+                cjk = [t for t in tokens if 2 <= len(t) <= 8 and re.search(r"[\u3400-\u9fff]", t)][
+                    :16
+                ]
                 if cjk:
                     clause = " OR ".join("instr(text,?)>0" for _ in cjk)
+                    hits = " + ".join("(CASE WHEN instr(text,?)>0 THEN 1 ELSE 0 END)" for _ in cjk)
                     ranks.append(
                         [
                             r[0]
                             for r in self.db.execute(
                                 f"SELECT id FROM retrieval_items WHERE owner=? AND character_id=? "
-                                f"AND ({clause}) ORDER BY id LIMIT 60",
-                                (self.engine.owner, character_id, *cjk),
+                                f"AND ({clause}) ORDER BY ({hits}) DESC, id ASC LIMIT 60",
+                                (self.engine.owner, character_id, *cjk, *cjk),
                             )
                         ]
                     )
             if vector is not None:
-                q = checked_vector(vector)
                 if not model:
                     raise ValueError("Embedding namespace required")
+                q = checked_vector(vector, expected_dim=parse_namespace_dim(model))
                 heap = []
                 for row in self.db.execute(
                     "SELECT i.id,v.vector FROM retrieval_vectors v JOIN retrieval_items i "
@@ -265,3 +297,127 @@ class LayeredMemory:
                 "state. Concurrent jobs, additive preferences and different events can coexist. "
                 "Similarity is NOT proof. Use exact IDs/revisions in commit_turn corrections.",
             }
+
+    def vector_spaces(self, character_id: str | None = None) -> list[dict]:
+        """List coexisting multi-space embedding namespaces and vector counts."""
+        spaces: dict[str, dict] = {}
+
+        def _label_of(ns: str, dim: int | None) -> str:
+            raw = ns.split(":", 1)[1] if ":" in ns else ns
+            if "@" in raw:
+                return raw
+            return f"{raw}@{dim}" if dim else raw
+
+        with self.engine._lock:
+            if character_id is not None:
+                ev_rows = self.db.execute(
+                    "SELECT v.model, count(*), min(v.vector) FROM evidence_embeddings v "
+                    "JOIN evidence_chunks c ON c.id=v.chunk_id "
+                    "JOIN evidence e ON e.id=c.evidence_id "
+                    "WHERE e.owner=? AND e.character_id=? GROUP BY v.model",
+                    (self.engine.owner, character_id),
+                ).fetchall()
+                rv_rows = self.db.execute(
+                    "SELECT v.model, count(*), min(length(v.vector)/4) FROM retrieval_vectors v "
+                    "JOIN retrieval_items i ON i.id=v.id "
+                    "WHERE i.owner=? AND i.character_id=? GROUP BY v.model",
+                    (self.engine.owner, character_id),
+                ).fetchall()
+                lg_rows = self.db.execute(
+                    "SELECT v.model, count(*), min(v.vector) FROM vectors v "
+                    "JOIN evidence e ON e.id=v.evidence_id "
+                    "WHERE e.owner=? AND e.character_id=? GROUP BY v.model",
+                    (self.engine.owner, character_id),
+                ).fetchall()
+            else:
+                ev_rows = self.db.execute(
+                    "SELECT v.model, count(*), min(v.vector) FROM evidence_embeddings v "
+                    "JOIN evidence_chunks c ON c.id=v.chunk_id "
+                    "JOIN evidence e ON e.id=c.evidence_id "
+                    "WHERE e.owner=? GROUP BY v.model",
+                    (self.engine.owner,),
+                ).fetchall()
+                rv_rows = self.db.execute(
+                    "SELECT v.model, count(*), min(length(v.vector)/4) FROM retrieval_vectors v "
+                    "JOIN retrieval_items i ON i.id=v.id "
+                    "WHERE i.owner=? GROUP BY v.model",
+                    (self.engine.owner,),
+                ).fetchall()
+                lg_rows = self.db.execute(
+                    "SELECT v.model, count(*), min(v.vector) FROM vectors v "
+                    "JOIN evidence e ON e.id=v.evidence_id "
+                    "WHERE e.owner=? GROUP BY v.model",
+                    (self.engine.owner,),
+                ).fetchall()
+
+        for ns, cnt, sample_vec in ev_rows:
+            dim = parse_namespace_dim(ns)
+            if dim is None and sample_vec:
+                try:
+                    dim = len(json.loads(sample_vec))
+                except Exception:
+                    dim = None
+            rec = spaces.setdefault(
+                ns,
+                {
+                    "namespace": ns,
+                    "label": _label_of(ns, dim),
+                    "dim": dim,
+                    "evidence_vectors": 0,
+                    "retrieval_vectors": 0,
+                    "legacy_vectors": 0,
+                },
+            )
+            rec["evidence_vectors"] += int(cnt or 0)
+            if rec["dim"] is None and dim is not None:
+                rec["dim"] = dim
+                rec["label"] = _label_of(ns, dim)
+
+        for ns, cnt, sample_dim in rv_rows:
+            dim = parse_namespace_dim(ns) or (int(sample_dim) if sample_dim else None)
+            rec = spaces.setdefault(
+                ns,
+                {
+                    "namespace": ns,
+                    "label": _label_of(ns, dim),
+                    "dim": dim,
+                    "evidence_vectors": 0,
+                    "retrieval_vectors": 0,
+                    "legacy_vectors": 0,
+                },
+            )
+            rec["retrieval_vectors"] += int(cnt or 0)
+            if rec["dim"] is None and dim is not None:
+                rec["dim"] = dim
+                rec["label"] = _label_of(ns, dim)
+
+        for ns, cnt, sample_vec in lg_rows:
+            dim = parse_namespace_dim(ns)
+            if dim is None and sample_vec:
+                try:
+                    dim = len(json.loads(sample_vec))
+                except Exception:
+                    dim = None
+            rec = spaces.setdefault(
+                ns,
+                {
+                    "namespace": ns,
+                    "label": _label_of(ns, dim),
+                    "dim": dim,
+                    "evidence_vectors": 0,
+                    "retrieval_vectors": 0,
+                    "legacy_vectors": 0,
+                },
+            )
+            rec["legacy_vectors"] += int(cnt or 0)
+            if rec["dim"] is None and dim is not None:
+                rec["dim"] = dim
+                rec["label"] = _label_of(ns, dim)
+
+        return sorted(
+            spaces.values(),
+            key=lambda s: (
+                -(s["evidence_vectors"] + s["retrieval_vectors"] + s["legacy_vectors"]),
+                s["namespace"],
+            ),
+        )

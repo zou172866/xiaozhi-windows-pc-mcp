@@ -110,6 +110,10 @@ _user32.PostThreadMessageW.argtypes = [
     wintypes.LPARAM,
 ]
 _user32.PostThreadMessageW.restype = wintypes.BOOL
+_user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+_user32.MonitorFromWindow.restype = wintypes.HMONITOR
+_user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.c_void_p]
+_user32.GetMonitorInfoW.restype = wintypes.BOOL
 
 
 class _GUITHREADINFO(ctypes.Structure):

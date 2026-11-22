@@ -865,6 +865,61 @@ class TestObsidianExporter(unittest.TestCase):
         self.assertEqual(obs_mod._yaml_scalar("2026-11-19"), '"2026-11-19"')
         self.assertEqual(obs_mod._yaml_scalar("雷电芽衣"), "雷电芽衣")
 
+    def test_p15_snapshot_fingerprint_parity_and_o1_export_seq_short_circuit(self):
+        """P1-5: In-memory snapshot fingerprint matches DB fingerprint and unchanged polls short-circuit via export_seq."""
+        self._commit_turn("req-fp-1", "今天做了番茄牛腩", "闻起来就很香呢！")
+        exporter = self._make_exporter()
+        r1 = exporter.sync_startup_backfill()
+        self.assertTrue(r1["ok"])
+        db_fp, db_sigs = exporter.compute_db_fingerprint()
+        self.assertEqual(exporter._last_fingerprint, db_fp)
+        self.assertEqual(exporter._known_turn_sigs, db_sigs)
+        self.assertIsNotNone(exporter._last_export_seq)
+
+        # Unchanged poll short-circuits via O(1) xiaozhi_export_seq WITHOUT calling _read_snapshot_data or compute_db_fingerprint
+        with (
+            unittest.mock.patch.object(
+                exporter, "_read_snapshot_data", side_effect=AssertionError("Must not scan snapshot when seq unchanged")
+            ),
+            unittest.mock.patch.object(
+                exporter, "compute_db_fingerprint", side_effect=AssertionError("Must not full-scan DB when seq unchanged")
+            ),
+        ):
+            r_unchanged = exporter.sync_if_db_changed()
+        self.assertTrue(r_unchanged["ok"])
+        self.assertFalse(r_unchanged["changed"])
+
+        # Same-connection write bumps SQLite trigger seq and exports in a single snapshot pass
+        self._commit_turn(
+            "req-fp-2",
+            "晚上还要去夜跑五公里",
+            "注意热身和补水哦。",
+            memories=[MemoryDraft(key="night_run", text="计划晚上夜跑五公里", category="goal", source_quote="夜跑五公里")],
+        )
+        with unittest.mock.patch.object(
+            exporter, "compute_db_fingerprint", side_effect=AssertionError("Incremental export must derive fp from snapshot")
+        ):
+            r_changed = exporter.sync_if_db_changed()
+        self.assertTrue(r_changed["ok"])
+        self.assertTrue(r_changed["changed"])
+        self.assertGreaterEqual(r_changed["written"], 1)
+        self.assertEqual(exporter._last_fingerprint, exporter.compute_db_fingerprint()[0])
+
+        # Direct fact_lifecycle invalidation (without touching memories row) must also bump export_seq and change fingerprint
+        mems_now = {m.key: m for m in self.brain.engine.memories(svc.DEFAULT_CHARACTER_ID)}
+        retired_lc = mems_now["night_run"].lifecycle.model_copy(
+            update={"invalidation": "superseded", "invalidated_at": time.time()}
+        )
+        with self.brain.engine._transaction():
+            self.brain.engine.db.execute(
+                "UPDATE fact_lifecycle SET data=? WHERE memory_id=?",
+                (retired_lc.model_dump_json(), mems_now["night_run"].id),
+            )
+        r_lc = exporter.sync_if_db_changed()
+        self.assertTrue(r_lc["ok"])
+        self.assertTrue(r_lc["changed"])
+        self.assertEqual(exporter._last_fingerprint, exporter.compute_db_fingerprint()[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

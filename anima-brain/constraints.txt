@@ -79,6 +79,8 @@ rpds-py==2026.9.1
     # via
     #   jsonschema
     #   referencing
+socksio==1.0.0
+    # via companion-engine
 sse-starlette==3.7.0
     # via mcp
 starlette==0.52.1

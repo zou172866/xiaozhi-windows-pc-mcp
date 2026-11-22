@@ -27,7 +27,7 @@ import re
 import threading
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -35,6 +35,11 @@ from zoneinfo import ZoneInfo
 from companion_engine import emotion
 from companion_engine.automation import _SECRET_PATTERNS
 from companion_engine.models import CharacterSpec
+
+try:
+    import recall_sanitizer as _recall_sanitizer
+except Exception:
+    _recall_sanitizer = None
 
 log = logging.getLogger("anima-obsidian")
 
@@ -476,6 +481,8 @@ class ObsidianExporter:
         config_path: str | Path | None = None,
         default_enabled: bool = False,
         snapshot_interval_seconds: int = 600,
+        default_briefing_enabled: bool = True,
+        briefing_interval_seconds: int = 3600,
     ):
         self.brain = brain
         self.character_id = character_id
@@ -484,15 +491,33 @@ class ObsidianExporter:
         self.config_path = Path(config_path) if config_path else None
         self.default_enabled = bool(default_enabled)
         self.snapshot_interval_seconds = max(15, int(snapshot_interval_seconds))
+        self.default_briefing_enabled = bool(default_briefing_enabled)
+        self.briefing_interval_seconds = max(300, int(briefing_interval_seconds))
 
         self._op_lock = threading.RLock()
-        self._enabled = self._load_enabled_setting()
+        self._enabled, self._briefing_enabled = self._load_settings()
         self._writable: bool | None = None
         self._last_error: str = ""
         self._last_export_ts: float = 0.0
         self._last_export_at: str = ""
         self._last_export_reason: str = ""
+        self._last_briefing_ts: float = 0.0
+        self._last_briefing_at: str = ""
+        self._last_briefing_reason: str = ""
+        self._last_briefing_daily_date: str = ""
+        self._last_briefing_week_key: str = ""
+        self._last_briefing_stats: dict[str, Any] = {
+            "written": 0,
+            "skipped": 0,
+            "daily_turns": 0,
+            "weekly_turns": 0,
+            "open_loops": 0,
+            "urgent_loops": 0,
+        }
         self._last_fingerprint: str = ""
+        self._last_export_seq: int | None = None
+        self._seq_triggers_ready: bool = False
+        self._seq_triggers_has_meta: bool = False
         self._known_turn_sigs: dict[str, tuple[str, str, int]] = {}  # turn_id -> (date_str, content_sha8, used_tools)
         self._last_stats: dict[str, Any] = {
             "turns": 0,
@@ -505,38 +530,57 @@ class ObsidianExporter:
             "files_skipped": 0,
         }
 
-    def _load_enabled_setting(self) -> bool:
+    def _load_settings(self) -> tuple[bool, bool]:
+        en = self.default_enabled
+        br = self.default_briefing_enabled
         if self.config_path and self.config_path.is_file():
             try:
                 data = json.loads(self.config_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and isinstance(data.get("enabled"), bool):
-                    return bool(data["enabled"])
+                if isinstance(data, dict):
+                    if isinstance(data.get("enabled"), bool):
+                        en = bool(data["enabled"])
+                    if isinstance(data.get("briefing_enabled"), bool):
+                        br = bool(data["briefing_enabled"])
             except Exception:
                 pass
-        return self.default_enabled
+        return en, br
+
+    def _persist_settings_locked(self) -> None:
+        if self.config_path is None:
+            return
+        try:
+            _atomic_write_if_changed(
+                self.config_path,
+                json.dumps(
+                    {
+                        "enabled": self._enabled,
+                        "briefing_enabled": self._briefing_enabled,
+                        "updated_at": round(time.time(), 3),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+            )
+        except OSError as exc:
+            log.warning("Failed to persist obsidian_sync_config.json: %s", exc)
 
     def is_enabled(self) -> bool:
         return bool(self._enabled)
 
+    def is_briefing_enabled(self) -> bool:
+        return bool(self._briefing_enabled)
+
     def set_enabled(self, enabled: bool) -> dict[str, Any]:
         with self._op_lock:
             self._enabled = bool(enabled)
-            if self.config_path is not None:
-                try:
-                    _atomic_write_if_changed(
-                        self.config_path,
-                        json.dumps(
-                            {
-                                "enabled": self._enabled,
-                                "updated_at": round(time.time(), 3),
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        )
-                        + "\n",
-                    )
-                except OSError as exc:
-                    log.warning("Failed to persist obsidian_sync_config.json: %s", exc)
+            self._persist_settings_locked()
+        return self.status()
+
+    def set_briefing_enabled(self, briefing_enabled: bool) -> dict[str, Any]:
+        with self._op_lock:
+            self._briefing_enabled = bool(briefing_enabled)
+            self._persist_settings_locked()
         return self.status()
 
     def _has_turn_meta_table(self, db) -> bool:
@@ -544,6 +588,59 @@ class ObsidianExporter:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='xiaozhi_turn_meta'"
         ).fetchone()
         return row is not None
+
+    def _ensure_change_seq_triggers_locked(self, db, *, has_meta: bool) -> int:
+        """Install lightweight monotonic SQLite triggers so `sync_if_db_changed` polls in O(1) (P1-5)."""
+        if not self._seq_triggers_ready or (has_meta and not self._seq_triggers_has_meta):
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS xiaozhi_export_seq ("
+                "id INTEGER PRIMARY KEY CHECK (id = 1), "
+                "seq INTEGER NOT NULL DEFAULT 0)"
+            )
+            db.execute("INSERT OR IGNORE INTO xiaozhi_export_seq(id, seq) VALUES(1, 0)")
+            tables = [
+                "characters",
+                "turns",
+                "turn_appraisals",
+                "memories",
+                "memory_details",
+                "fact_lifecycle",
+                "revisions",
+                "documents",
+                "document_metadata",
+                "notebooks",
+            ]
+            if has_meta:
+                tables.append("xiaozhi_turn_meta")
+            existing_tables = {
+                r[0]
+                for r in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            for tbl in tables:
+                if tbl not in existing_tables:
+                    continue
+                for op in ("INSERT", "UPDATE", "DELETE"):
+                    trig_name = f"xz_exp_seq_{tbl}_{op.lower()}"
+                    db.execute(
+                        f"CREATE TRIGGER IF NOT EXISTS {trig_name} AFTER {op} ON {tbl} "
+                        "BEGIN UPDATE xiaozhi_export_seq SET seq = seq + 1 WHERE id = 1; END"
+                    )
+            self._seq_triggers_ready = True
+            if has_meta:
+                self._seq_triggers_has_meta = True
+        row = db.execute("SELECT seq FROM xiaozhi_export_seq WHERE id = 1").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def _read_export_seq(self) -> int | None:
+        try:
+            engine = self.brain.engine
+            with engine._lock:
+                has_meta = self._has_turn_meta_table(engine.db)
+                return self._ensure_change_seq_triggers_locked(engine.db, has_meta=has_meta)
+        except Exception:
+            return None
 
     def _read_snapshot_data(self) -> dict[str, Any]:
         """Take a single consistent read-only snapshot of character data under engine._lock."""
@@ -559,6 +656,7 @@ class ObsidianExporter:
             state = json.loads(char_row["state"])
             tz = _resolve_tz(spec.timezone)
             has_meta = self._has_turn_meta_table(engine.db)
+            export_seq = self._ensure_change_seq_triggers_locked(engine.db, has_meta=has_meta)
 
             if has_meta:
                 turn_rows = engine.db.execute(
@@ -615,6 +713,7 @@ class ObsidianExporter:
                         "source": raw_src,
                         "device_id": str(r["meta_device_id"] or ""),
                         "used_tools": bool(r["meta_used_tools"]),
+                        "appraisal_raw": str(r["appraisal_json"] or ""),
                         "emotion": str(app_data.get("emotion") or "").strip(),
                         "intensity": int(app_data.get("intensity") or 0),
                     }
@@ -672,8 +771,18 @@ class ObsidianExporter:
                     }
                 )
 
+            app_row = engine.db.execute(
+                "SELECT count(*) FROM turn_appraisals a JOIN turns t ON t.id=a.turn_id "
+                "WHERE t.owner=? AND t.character_id=?",
+                (engine.owner, self.character_id),
+            ).fetchone()
+
             return {
                 "owner": engine.owner,
+                "raw_spec": char_row["spec"],
+                "raw_state": char_row["state"],
+                "export_seq": export_seq,
+                "app_count": int(app_row[0]) if app_row else 0,
                 "spec": spec,
                 "state": state,
                 "tz": tz,
@@ -683,6 +792,60 @@ class ObsidianExporter:
                 "revisions": revisions,
                 "documents": documents,
             }
+
+    def _compute_fingerprint_from_snapshot(
+        self, snap: dict[str, Any]
+    ) -> tuple[str, dict[str, tuple[str, str, int]]]:
+        """Derive `(fingerprint, turn_sigs)` in memory from an already-loaded snapshot (zero extra DB locks, P1-5)."""
+        turn_sigs: dict[str, tuple[str, str, int]] = {}
+        t_digest_parts = []
+        for t in snap["turns"]:
+            d_str = t["date"]
+            c_hash = hashlib.sha256(
+                f"{t['user_message']}\0{t['assistant_reply']}\0{t.get('appraisal_raw', '')}".encode("utf-8")
+            ).hexdigest()[:12]
+            sig = (d_str, c_hash, 1 if t["used_tools"] else 0)
+            turn_sigs[t["id"]] = sig
+            t_digest_parts.append(f"{t['id']}:{sig[0]}:{sig[1]}:{sig[2]}")
+        t_digest_parts.sort()
+
+        memories = snap["memories"]
+        revisions = snap["revisions"]
+        documents = snap["documents"]
+        active_mem_count = sum(1 for m in memories if not m.lifecycle.invalidation)
+        open_loop_count = sum(
+            1 for m in memories if not m.lifecycle.invalidation and m.details.loop_status == "open"
+        )
+        mem_sig = (
+            len(memories),
+            max((m.updated_at for m in memories), default=0),
+            sum((m.revision for m in memories), 0),
+            active_mem_count,
+            open_loop_count,
+        )
+        rev_sig = (
+            len(revisions),
+            max((r["changed_at"] for r in revisions), default=0),
+        )
+        doc_sig = (
+            len(documents),
+            max((d["created_at"] for d in documents), default=0),
+        )
+        app_sig = (int(snap.get("app_count", 0)),)
+        raw_sig = json.dumps(
+            {
+                "spec": snap["raw_spec"],
+                "state": snap["raw_state"],
+                "turns": hashlib.sha256("|".join(t_digest_parts).encode("utf-8")).hexdigest(),
+                "mem": mem_sig,
+                "rev": rev_sig,
+                "doc": doc_sig,
+                "app": app_sig,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(raw_sig.encode("utf-8")).hexdigest(), turn_sigs
 
     def compute_db_fingerprint(self) -> tuple[str, dict[str, tuple[str, str, int]]]:
         """Cheap read-only fingerprint of DB state + turn_id -> (date, content_sha8, used_tools) map."""
@@ -737,8 +900,14 @@ class ObsidianExporter:
             t_digest_parts.sort()
 
             mem_sig = engine.db.execute(
-                "SELECT count(*), coalesce(max(updated_at), 0), coalesce(sum(revision), 0) "
-                "FROM memories WHERE owner=? AND character_id=?",
+                "SELECT count(*), coalesce(max(m.updated_at), 0), coalesce(sum(m.revision), 0), "
+                "coalesce(sum(CASE WHEN json_extract(l.data, '$.invalidation') IS NULL THEN 1 ELSE 0 END), 0), "
+                "coalesce(sum(CASE WHEN json_extract(l.data, '$.invalidation') IS NULL "
+                "AND json_extract(d.data, '$.loop_status') = 'open' THEN 1 ELSE 0 END), 0) "
+                "FROM memories m "
+                "LEFT JOIN fact_lifecycle l ON l.memory_id = m.id "
+                "LEFT JOIN memory_details d ON d.memory_id = m.id "
+                "WHERE m.owner=? AND m.character_id=?",
                 (engine.owner, self.character_id),
             ).fetchone()
             rev_sig = engine.db.execute(
@@ -1331,6 +1500,7 @@ class ObsidianExporter:
             f"- [[记忆/未完待续|未完待续]]：待跟进事项 **{open_loops}** 项",
             f"- [[记忆/关系与情绪状态|关系与情绪状态]]：当前关系阶段 **{stage_zh}**",
             f"- [[记忆/核心人物笔记|核心人物笔记]]：综合档案 **{core_count}** 份",
+            "- [[简报/最新简报|离线每日/每周简报]]：低成本离线待跟进梳理与近期摘要（无主动语音打扰）",
             "",
             f"## 每日对话归档（共 {len(sorted_dates)} 天 · {len(turns)} 轮）",
         ]
@@ -1400,6 +1570,32 @@ class ObsidianExporter:
 
             tz = snap["tz"]
             spec = snap["spec"]
+            fp, turn_sigs = self._compute_fingerprint_from_snapshot(snap)
+            if mode == "incremental_if_changed":
+                extra_only = set(dirty_dates or ())
+                if fp and fp == self._last_fingerprint and not extra_only:
+                    self._last_export_seq = snap.get("export_seq")
+                    return {"ok": True, "changed": False, "written": 0, "skipped": 0}
+                computed_dirty: set[str] = set(extra_only)
+                today_s = datetime.now(tz).strftime("%Y-%m-%d")
+                if not self._known_turn_sigs:
+                    for d_str in {sig[0] for sig in turn_sigs.values()}:
+                        target = self.export_dir / (_dialogue_rel_path(d_str) + ".md")
+                        if d_str >= today_s or not target.is_file():
+                            computed_dirty.add(d_str)
+                else:
+                    for tid, sig in turn_sigs.items():
+                        old_sig = self._known_turn_sigs.get(tid)
+                        if old_sig != sig:
+                            computed_dirty.add(sig[0])
+                            if old_sig is not None and old_sig[0] != sig[0]:
+                                computed_dirty.add(old_sig[0])
+                    for tid, old_sig in self._known_turn_sigs.items():
+                        if tid not in turn_sigs:
+                            computed_dirty.add(old_sig[0])
+                computed_dirty.add(today_s)
+                dirty_dates = computed_dirty
+
             by_date, block_map = self._build_turn_index(snap["turns"])
             today_str = datetime.now(tz).strftime("%Y-%m-%d")
 
@@ -1498,10 +1694,10 @@ class ObsidianExporter:
                             except OSError:
                                 pass
 
-                # Update tracking state & fingerprint
-                fp, turn_sigs = self.compute_db_fingerprint()
+                # Update tracking state & fingerprint directly from in-memory snapshot (zero duplicate DB scan)
                 self._last_fingerprint = fp
                 self._known_turn_sigs = turn_sigs
+                self._last_export_seq = snap.get("export_seq")
                 self._last_error = ""
                 now = time.time()
                 self._last_export_ts = now
@@ -1588,52 +1784,23 @@ class ObsidianExporter:
         reason: str = "snapshot_poll",
         extra_dirty_dates: set[str] | None = None,
     ) -> dict[str, Any]:
-        """Periodic/post-Studio check: export only if DB fingerprint changed; respects frozen past days."""
+        """Periodic/post-Studio check: O(1) sequence short-circuit + single-snapshot incremental export (P1-5)."""
         with self._op_lock:
-            fp, cur_turn_sigs = self.compute_db_fingerprint()
             extra = set(extra_dirty_dates or ())
-            if fp and fp == self._last_fingerprint and not extra:
-                return {"ok": True, "changed": False, "written": 0, "skipped": 0}
-
-            try:
-                engine = self.brain.engine
-                with engine._lock:
-                    row = engine.db.execute(
-                        "SELECT spec FROM characters WHERE owner=? AND id=?",
-                        (engine.owner, self.character_id),
-                    ).fetchone()
-                    tz = _resolve_tz(CharacterSpec.model_validate_json(row["spec"]).timezone if row else "Asia/Shanghai")
-            except Exception:
-                tz = _resolve_tz("Asia/Shanghai")
-            today_str = datetime.now(tz).strftime("%Y-%m-%d")
-
-            dirty: set[str] = set(extra)
-            if not self._known_turn_sigs:
-                # No baseline export yet: mirror startup_backfill's frozen-day policy so
-                # existing historical files are NEVER overwritten during an incremental sync.
-                for d_str in {sig[0] for sig in cur_turn_sigs.values()}:
-                    target = self.export_dir / (_dialogue_rel_path(d_str) + ".md")
-                    if d_str >= today_str or not target.is_file():
-                        dirty.add(d_str)
-            else:
-                for tid, sig in cur_turn_sigs.items():
-                    old_sig = self._known_turn_sigs.get(tid)
-                    if old_sig != sig:
-                        dirty.add(sig[0])
-                        if old_sig is not None and old_sig[0] != sig[0]:
-                            dirty.add(old_sig[0])
-                for tid, old_sig in self._known_turn_sigs.items():
-                    if tid not in cur_turn_sigs:
-                        dirty.add(old_sig[0])
-            dirty.add(today_str)
+            if self._last_fingerprint and not extra and self._last_export_seq is not None:
+                cur_seq = self._read_export_seq()
+                if cur_seq is not None and cur_seq == self._last_export_seq:
+                    return {"ok": True, "changed": False, "written": 0, "skipped": 0}
 
             res = self._run_export(
-                mode="incremental",
-                dirty_dates=dirty,
+                mode="incremental_if_changed",
+                dirty_dates=extra,
                 reason=reason,
                 force_all_dates=False,
                 include_snapshots=True,
             )
+            if res.get("changed") is False:
+                return res
             res["changed"] = True
             return res
 
@@ -1660,6 +1827,476 @@ class ObsidianExporter:
         ts = float(occurred_at) if occurred_at and float(occurred_at) > 0 else time.time()
         return _fmt_date(ts, tz)
 
+    @staticmethod
+    def _briefing_safe_text(text: str, max_len: int = 160) -> str:
+        s = _single_line_text(redact_credentials(str(text or "")))
+        if _recall_sanitizer is not None:
+            try:
+                s, _ = _recall_sanitizer.redact_sensitive_entities(s)
+            except Exception:
+                pass
+        if len(s) > max_len:
+            s = s[: max_len - 1].rstrip() + "…"
+        return s
+
+    def _classify_open_loops(self, snap: dict[str, Any], target_day) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[Any]]:
+        """Partition open follow-ups into urgent/near-term vs regular, plus recently resolved items."""
+        active_mems = [m for m in snap["memories"] if not m.lifecycle.invalidation]
+        open_mems = [m for m in active_mems if m.details.loop_status == "open"]
+        resolved_mems = [m for m in active_mems if m.details.loop_status == "resolved"]
+        urgent: list[dict[str, Any]] = []
+        regular: list[dict[str, Any]] = []
+        for m in open_mems:
+            ev_date = m.details.event_date
+            days_left: int | None = None
+            is_urgent = False
+            if ev_date is not None:
+                days_left = (ev_date - target_day).days
+                if days_left <= 3:
+                    is_urgent = True
+            if int(m.details.importance or 5) >= 8:
+                is_urgent = True
+            rec = {"memory": m, "days_left": days_left}
+            if is_urgent:
+                urgent.append(rec)
+            else:
+                regular.append(rec)
+        urgent.sort(
+            key=lambda x: (
+                x["days_left"] if x["days_left"] is not None else 999,
+                -int(x["memory"].details.importance or 5),
+                -float(x["memory"].updated_at or 0.0),
+            )
+        )
+        regular.sort(
+            key=lambda x: (
+                -int(x["memory"].details.importance or 5),
+                -float(x["memory"].updated_at or 0.0),
+            )
+        )
+        return urgent, regular, resolved_mems
+
+    @staticmethod
+    def _memory_effective_date(
+        memory: Any, block_map: dict[str, tuple[str, str]], tz: ZoneInfo
+    ) -> str:
+        tid = getattr(memory, "source_turn_id", None)
+        if tid and tid in block_map:
+            return block_map[tid][0]
+        return _fmt_date(float(getattr(memory, "updated_at", 0.0) or 0.0), tz)
+
+    def _render_daily_briefing(
+        self,
+        snap: dict[str, Any],
+        by_date: dict[str, list[dict[str, Any]]],
+        block_map: dict[str, tuple[str, str]],
+        target_dt: datetime,
+    ) -> tuple[str, dict[str, Any]]:
+        tz = snap["tz"]
+        spec = snap["spec"]
+        day_str = target_dt.strftime("%Y-%m-%d")
+        day_date = target_dt.date()
+        day_turns = by_date.get(day_str, [])
+        urgent, regular, resolved_all = self._classify_open_loops(snap, day_date)
+        resolved_today = [
+            m for m in resolved_all if self._memory_effective_date(m, block_map, tz) == day_str
+        ]
+        new_facts_today = [
+            m
+            for m in snap["memories"]
+            if not m.lifecycle.invalidation
+            and self._memory_effective_date(m, block_map, tz) == day_str
+        ]
+        day_episodes = [
+            d
+            for d in snap["documents"]
+            if d.get("kind") == "episode"
+            and _fmt_date(float(d.get("created_at") or 0.0), tz) == day_str
+        ]
+
+        src_counts = Counter(t.get("source") or "esp32" for t in day_turns)
+        mood_counts = Counter(t["emotion"] for t in day_turns if t.get("emotion"))
+        max_ts = max(
+            [float(t.get("effective_ts") or 0.0) for t in day_turns]
+            + [float(m.updated_at or 0.0) for m in new_facts_today]
+            + [float(x["memory"].updated_at or 0.0) for x in (*urgent, *regular)]
+            + [0.0]
+        )
+
+        lines = [
+            "---",
+            "type: 小智每日简报",
+            "period: daily",
+            f"date: {day_str}",
+            f"character: {_yaml_scalar(spec.name)}",
+            f"updated: {_yaml_optional_updated(max_ts, tz)}",
+            f"turns: {len(day_turns)}",
+            f"open_loops: {len(urgent) + len(regular)}",
+            f"urgent_loops: {len(urgent)}",
+            f"new_facts: {len(new_facts_today)}",
+            "tags: [小智/简报/每日]",
+            "---",
+            "",
+            f"# {day_str} · 离线每日待跟进与摘要简报",
+            "",
+            "> [!note] 离线低成本自动梳理生成（仅写入 Obsidian，不触发主动语音打扰）。",
+            "",
+            "## 一、待跟进事项分层",
+        ]
+        if not urgent and not regular:
+            lines.append("- 当前无未完待续事项。")
+        else:
+            if urgent:
+                lines.append("### 优先 / 临近待跟进")
+                for item in urgent[:10]:
+                    m = item["memory"]
+                    dl = item["days_left"]
+                    due_txt = ""
+                    if dl is not None:
+                        if dl < 0:
+                            due_txt = f" · 已过目标日 {-dl} 天"
+                        elif dl == 0:
+                            due_txt = " · 今天"
+                        else:
+                            due_txt = f" · 距目标日 {dl} 天"
+                    link = self._turn_wikilink(m.source_turn_id, block_map, "原话")
+                    suffix = f" ({link})" if link else ""
+                    lines.append(
+                        f"- [ ] **{self._briefing_safe_text(m.text, 140)}** "
+                        f"（重要度 {int(m.details.importance or 5)}/10{due_txt}）{suffix}"
+                    )
+            if regular:
+                lines.append("### 常规待跟进")
+                for item in regular[:12]:
+                    m = item["memory"]
+                    rec_d = self._memory_effective_date(m, block_map, tz)
+                    link = self._turn_wikilink(m.source_turn_id, block_map, "原话")
+                    suffix = f" ({link})" if link else ""
+                    lines.append(
+                        f"- [ ] {self._briefing_safe_text(m.text, 140)}（记录于 {rec_d}）{suffix}"
+                    )
+        if resolved_today:
+            lines.append("### 今日已完结")
+            for m in resolved_today[:8]:
+                lines.append(f"- [x] {self._briefing_safe_text(m.text, 140)}")
+        lines.append("")
+
+        lines.append("## 二、今日互动与情绪脉络")
+        if not day_turns:
+            lines.append(f"- {day_str} 暂无已提交对话记录。")
+        else:
+            rel = _dialogue_rel_path(day_str)
+            src_desc = " / ".join(
+                f"{'ESP32' if k == 'esp32' else 'Studio'} {v} 轮" for k, v in src_counts.most_common()
+            )
+            mood_desc = (
+                " / ".join(f"{k}({v})" for k, v in mood_counts.most_common(4))
+                if mood_counts
+                else "平稳"
+            )
+            lines.append(f"- 共 **{len(day_turns)}** 轮互动（{src_desc}）· 情绪脉络：{mood_desc} · [[{rel}|查看当日完整对话]]")
+            for t in day_turns[-6:]:
+                hhmm = _fmt_time(t["effective_ts"], tz)
+                u_prev = self._briefing_safe_text(t.get("user_message") or "", 90)
+                bid = f"t-{t['id'].replace('-', '')[:8]}"
+                lines.append(f"  - `{hhmm}` {u_prev}（[[{rel}#^{bid}|跳转]]）")
+        lines.append("")
+
+        lines.append("## 三、今日沉淀记忆与片段")
+        if not new_facts_today and not day_episodes:
+            lines.append("- 今日暂无新增或更新的长期记忆条目。")
+        else:
+            for m in new_facts_today[:12]:
+                lines.append(f"- `[{m.category}]` {self._briefing_safe_text(m.text, 150)}")
+            for ep in day_episodes[:4]:
+                lines.append(f"- **互动片段**：{self._briefing_safe_text(ep.get('text') or '', 200)}")
+        lines.append("")
+
+        return "\n".join(lines), {
+            "daily_date": day_str,
+            "daily_turns": len(day_turns),
+            "open_loops": len(urgent) + len(regular),
+            "urgent_loops": len(urgent),
+        }
+
+    def _render_weekly_briefing(
+        self,
+        snap: dict[str, Any],
+        by_date: dict[str, list[dict[str, Any]]],
+        block_map: dict[str, tuple[str, str]],
+        target_dt: datetime,
+    ) -> tuple[str, dict[str, Any]]:
+        tz = snap["tz"]
+        spec = snap["spec"]
+        iso_year, iso_week, iso_weekday = target_dt.isocalendar()
+        week_key = f"{iso_year}-W{iso_week:02d}"
+        week_start_date = (target_dt - timedelta(days=iso_weekday - 1)).date()
+        week_end_date = week_start_date + timedelta(days=6)
+        week_dates = [(week_start_date + timedelta(days=i)).isoformat() for i in range(7)]
+
+        week_turns: list[dict[str, Any]] = []
+        active_days: list[str] = []
+        for d_str in week_dates:
+            dts = by_date.get(d_str, [])
+            if dts:
+                active_days.append(d_str)
+                week_turns.extend(dts)
+
+        week_date_set = set(week_dates)
+        week_facts = [
+            m
+            for m in snap["memories"]
+            if not m.lifecycle.invalidation
+            and self._memory_effective_date(m, block_map, tz) in week_date_set
+        ]
+        week_episodes = [
+            d
+            for d in snap["documents"]
+            if d.get("kind") == "episode"
+            and _fmt_date(float(d.get("created_at") or 0.0), tz) in week_date_set
+        ]
+        core_docs = [d for d in snap["documents"] if d.get("kind") in ("core", "character_core")]
+
+        urgent, regular, resolved_all = self._classify_open_loops(snap, target_dt.date())
+        resolved_week = [
+            m for m in resolved_all if self._memory_effective_date(m, block_map, tz) in week_date_set
+        ]
+        carry_over = [
+            item
+            for item in (*urgent, *regular)
+            if self._memory_effective_date(item["memory"], block_map, tz) < week_start_date.isoformat()
+        ]
+
+        max_ts = max(
+            [float(t.get("effective_ts") or 0.0) for t in week_turns]
+            + [float(m.updated_at or 0.0) for m in week_facts]
+            + [float(x["memory"].updated_at or 0.0) for x in (*urgent, *regular)]
+            + [0.0]
+        )
+
+        lines = [
+            "---",
+            "type: 小智每周简报",
+            "period: weekly",
+            f"week: {week_key}",
+            f"week_start: {week_start_date.isoformat()}",
+            f"week_end: {week_end_date.isoformat()}",
+            f"character: {_yaml_scalar(spec.name)}",
+            f"updated: {_yaml_optional_updated(max_ts, tz)}",
+            f"turns: {len(week_turns)}",
+            f"active_days: {len(active_days)}",
+            f"open_loops: {len(urgent) + len(regular)}",
+            f"episodes: {len(week_episodes)}",
+            "tags: [小智/简报/每周]",
+            "---",
+            "",
+            f"# {week_key}（{week_start_date.isoformat()} ～ {week_end_date.isoformat()}）· 每周离线梳理简报",
+            "",
+            "> [!note] 按周离线聚合待跟进事项、活跃互动与记忆沉淀，方便统一回看，无主动语音打扰。",
+            "",
+            "## 一、本周待跟进总览",
+            f"- 当前未完待续：**{len(urgent) + len(regular)}** 项（优先 **{len(urgent)}** 项 · 跨周遗留 **{len(carry_over)}** 项 · 本周已完结 **{len(resolved_week)}** 项）",
+        ]
+        for item in (*urgent[:8], *regular[:8]):
+            m = item["memory"]
+            rec_d = self._memory_effective_date(m, block_map, tz)
+            tag = "跨周未闭环" if rec_d < week_start_date.isoformat() else "本周新增"
+            link = self._turn_wikilink(m.source_turn_id, block_map, "原话")
+            suffix = f" ({link})" if link else ""
+            lines.append(f"- [ ] `[{tag}]` {self._briefing_safe_text(m.text, 140)}（{rec_d}）{suffix}")
+        lines.append("")
+
+        lines.append("## 二、本周互动日历")
+        if not active_days:
+            lines.append("- 本周暂无已提交对话。")
+        else:
+            for d_str in reversed(active_days):
+                dts = by_date[d_str]
+                moods = [m for m, _ in Counter(t["emotion"] for t in dts if t.get("emotion")).most_common(3)]
+                mood_txt = f" · 情绪：{' / '.join(moods)}" if moods else ""
+                rel = _dialogue_rel_path(d_str)
+                lines.append(
+                    f"- [[{rel}|{d_str}]] · {len(dts)} 轮{mood_txt} · [[简报/每日/{d_str}|当日简报]]"
+                )
+        lines.append("")
+
+        lines.append("## 三、本周记忆与片段沉淀")
+        cat_counts = Counter(m.category for m in week_facts)
+        if cat_counts:
+            cat_desc = " / ".join(f"{k}: {v}" for k, v in cat_counts.most_common())
+            lines.append(f"- 本周新增/更新记忆 **{len(week_facts)}** 条（{cat_desc}）")
+            for m in week_facts[:12]:
+                lines.append(f"  - `[{m.category}]` {self._briefing_safe_text(m.text, 140)}")
+        else:
+            lines.append("- 本周暂无新增/更新长期记忆条目。")
+        if week_episodes:
+            lines.append("### 本周互动片段摘要")
+            for ep in week_episodes[:6]:
+                lines.append(f"- {self._briefing_safe_text(ep.get('text') or '', 220)}")
+        if core_docs:
+            lines.append("### 核心档案要点")
+            for cd in core_docs[:2]:
+                lines.append(f"- {self._briefing_safe_text(cd.get('text') or '', 220)}")
+        lines.append("")
+
+        return "\n".join(lines), {
+            "week_key": week_key,
+            "weekly_turns": len(week_turns),
+            "active_days": len(active_days),
+        }
+
+    def _render_latest_briefing_index(
+        self,
+        spec: Any,
+        daily_meta: dict[str, Any],
+        weekly_meta: dict[str, Any],
+        snap: dict[str, Any],
+        block_map: dict[str, tuple[str, str]],
+        target_dt: datetime,
+    ) -> str:
+        tz = snap["tz"]
+        day_str = daily_meta["daily_date"]
+        week_key = weekly_meta["week_key"]
+        urgent, regular, _ = self._classify_open_loops(snap, target_dt.date())
+        lines = [
+            "---",
+            "type: 小智简报索引",
+            f"character: {_yaml_scalar(spec.name)}",
+            f"latest_daily: {day_str}",
+            f"latest_weekly: {week_key}",
+            f"open_loops: {len(urgent) + len(regular)}",
+            "tags: [小智/简报]",
+            "---",
+            "",
+            f"# {spec.name} · 离线每日/每周简报入口",
+            "",
+            f"- 最新每日简报：[[简报/每日/{day_str}|{day_str} 每日简报]]（当日 {daily_meta['daily_turns']} 轮）",
+            f"- 最新每周简报：[[简报/每周/{week_key}|{week_key} 每周简报]]（本周 {weekly_meta['weekly_turns']} 轮 · 活跃 {weekly_meta['active_days']} 天）",
+            f"- 全部待跟进：[[记忆/未完待续|未完待续]]（共 {len(urgent) + len(regular)} 项 · 优先 {len(urgent)} 项）",
+            "",
+            "## 置顶待跟进速览",
+        ]
+        top_items = [*urgent[:5], *regular[:5]][:6]
+        if not top_items:
+            lines.append("- 当前无未完待续事项。")
+        else:
+            for item in top_items:
+                m = item["memory"]
+                rec_d = self._memory_effective_date(m, block_map, tz)
+                lines.append(f"- [ ] {self._briefing_safe_text(m.text, 140)}（{rec_d}）")
+        lines.append("")
+        return "\n".join(lines)
+
+    def export_briefings(
+        self,
+        *,
+        reason: str = "scheduled_briefing",
+        target_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate low-cost offline layered daily & weekly briefings in Obsidian (no voice push)."""
+        started = time.monotonic()
+        with self._op_lock:
+            writable, probe_err = _probe_writable(self.export_dir)
+            self._writable = writable
+            if not writable:
+                err = f"Vault 目录不可写: {probe_err}"
+                return {"ok": False, "error": err, "writable": False, "written": 0, "skipped": 0}
+            try:
+                snap = self._read_snapshot_data()
+            except Exception as exc:
+                err = f"读取记忆库失败: {redact_credentials(str(exc))[:160]}"
+                return {"ok": False, "error": err, "writable": True, "written": 0, "skipped": 0}
+
+            tz = snap["tz"]
+            spec = snap["spec"]
+            if target_date is not None and str(target_date).strip():
+                raw_td = str(target_date).strip()
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_td):
+                    raise ValueError(f"Invalid target_date format (expected YYYY-MM-DD): {raw_td}")
+                try:
+                    parsed_d = datetime.strptime(raw_td, "%Y-%m-%d").date()
+                except ValueError as exc:
+                    raise ValueError(f"Invalid calendar target_date: {raw_td}") from exc
+                target_dt = datetime(parsed_d.year, parsed_d.month, parsed_d.day, 12, 0, 0, tzinfo=tz)
+            else:
+                target_dt = datetime.now(tz)
+
+            by_date, block_map = self._build_turn_index(snap["turns"])
+            daily_md, daily_meta = self._render_daily_briefing(snap, by_date, block_map, target_dt)
+            weekly_md, weekly_meta = self._render_weekly_briefing(snap, by_date, block_map, target_dt)
+            index_md = self._render_latest_briefing_index(
+                spec, daily_meta, weekly_meta, snap, block_map, target_dt
+            )
+
+            brief_root = self.export_dir / "简报"
+            index_path = brief_root / "最新简报.md"
+            write_latest_index = True
+            if target_date is not None and str(target_date).strip() and index_path.is_file():
+                try:
+                    existing_idx = index_path.read_text(encoding="utf-8", errors="replace")
+                    m_prev = re.search(r"(?m)^latest_daily:\s*(\d{4}-\d{2}-\d{2})\s*$", existing_idx)
+                    if m_prev and m_prev.group(1) > daily_meta["daily_date"]:
+                        write_latest_index = False
+                except OSError:
+                    pass
+
+            targets = [
+                (brief_root / "每日" / f"{daily_meta['daily_date']}.md", daily_md),
+                (brief_root / "每周" / f"{weekly_meta['week_key']}.md", weekly_md),
+            ]
+            if write_latest_index:
+                targets.append((index_path, index_md))
+            written = 0
+            skipped = 0
+            try:
+                for path, content in targets:
+                    res = _atomic_write_if_changed(path, content)
+                    if res == "written":
+                        written += 1
+                    else:
+                        skipped += 1
+            except OSError as exc:
+                self._writable = False
+                err = f"写入简报失败: {redact_credentials(str(exc))[:180]}"
+                return {"ok": False, "error": err, "writable": False, "written": written, "skipped": skipped}
+
+            now = time.time()
+            self._last_briefing_ts = now
+            self._last_briefing_at = _fmt_iso_sec(now, tz)
+            self._last_briefing_reason = reason
+            self._last_briefing_daily_date = daily_meta["daily_date"]
+            self._last_briefing_week_key = weekly_meta["week_key"]
+            self._last_briefing_stats = {
+                "written": written,
+                "skipped": skipped,
+                "daily_turns": daily_meta["daily_turns"],
+                "weekly_turns": weekly_meta["weekly_turns"],
+                "open_loops": daily_meta["open_loops"],
+                "urgent_loops": daily_meta["urgent_loops"],
+            }
+            dur_ms = round((time.monotonic() - started) * 1000, 1)
+            log.info(
+                "Obsidian offline briefing (%s) completed in %.1fms: day=%s week=%s written=%d skipped=%d",
+                reason,
+                dur_ms,
+                daily_meta["daily_date"],
+                weekly_meta["week_key"],
+                written,
+                skipped,
+            )
+            return {
+                "ok": True,
+                "reason": reason,
+                "writable": True,
+                "written": written,
+                "skipped": skipped,
+                "duration_ms": dur_ms,
+                "daily_date": daily_meta["daily_date"],
+                "week_key": weekly_meta["week_key"],
+                "last_briefing_at": self._last_briefing_at,
+                "stats": dict(self._last_briefing_stats),
+            }
+
     def status(self) -> dict[str, Any]:
         with self._op_lock:
             if self._writable is None:
@@ -1669,15 +2306,28 @@ class ObsidianExporter:
                     self._last_error = f"Vault 目录不可写: {err}"
             return {
                 "enabled": bool(self._enabled),
+                "briefing_enabled": bool(self._briefing_enabled),
                 "writable": bool(self._writable),
                 "export_dir": str(self.export_dir),
                 "host_export_dir": self.host_export_dir,
                 "snapshot_interval_seconds": self.snapshot_interval_seconds,
+                "briefing_interval_seconds": self.briefing_interval_seconds,
                 "last_export_at": self._last_export_at,
                 "last_export_ts": self._last_export_ts,
                 "last_export_reason": self._last_export_reason,
                 "last_error": self._last_error,
                 "stats": dict(self._last_stats),
+                "briefing": {
+                    "enabled": bool(self._briefing_enabled),
+                    "interval_seconds": self.briefing_interval_seconds,
+                    "last_briefing_at": self._last_briefing_at,
+                    "last_briefing_ts": self._last_briefing_ts,
+                    "last_briefing_reason": self._last_briefing_reason,
+                    "daily_date": self._last_briefing_daily_date,
+                    "week_key": self._last_briefing_week_key,
+                    "stats": dict(self._last_briefing_stats),
+                    "voice_push": False,
+                },
             }
 
 
@@ -1733,8 +2383,24 @@ class ObsidianSyncRunner:
                     self._startup_done = True
             else:
                 await asyncio.to_thread(self.exporter.sync_if_db_changed, reason="toggle_enabled")
+            if self.exporter.is_briefing_enabled():
+                await asyncio.to_thread(self.exporter.export_briefings, reason="toggle_enabled")
             status = self.exporter.status()
         return status
+
+    async def set_briefing_enabled_async(self, briefing_enabled: bool) -> dict[str, Any]:
+        status = await asyncio.to_thread(self.exporter.set_briefing_enabled, briefing_enabled)
+        if briefing_enabled and self.exporter.is_enabled():
+            await asyncio.to_thread(self.exporter.export_briefings, reason="briefing_toggle_enabled")
+            status = self.exporter.status()
+        return status
+
+    async def run_briefings_now(self, *, reason: str = "manual_briefing", target_date: str | None = None) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.exporter.export_briefings,
+            reason=reason,
+            target_date=target_date,
+        )
 
     async def rebuild_now(self) -> dict[str, Any]:
         result = await asyncio.to_thread(self.exporter.rebuild_all, reason="manual_rebuild")
@@ -1795,12 +2461,20 @@ class ObsidianSyncRunner:
                     self._startup_done = True
             except Exception as exc:
                 log.warning("Obsidian startup backfill error: %s", exc)
+            if self.exporter.is_briefing_enabled():
+                try:
+                    await asyncio.to_thread(self.exporter.export_briefings, reason="startup_briefing")
+                except Exception as exc:
+                    log.warning("Obsidian startup briefing error: %s", exc)
 
         interval = float(self.exporter.snapshot_interval_seconds)
+        brief_interval = float(self.exporter.briefing_interval_seconds)
         next_poll = time.monotonic() + interval
+        next_briefing = time.monotonic() + brief_interval
 
         while not self._stop_event.is_set():
-            wait_sec = max(0.2, next_poll - time.monotonic())
+            now_mono = time.monotonic()
+            wait_sec = max(0.2, min(next_poll, next_briefing) - now_mono)
             try:
                 await asyncio.wait_for(self._wake_event.wait(), timeout=wait_sec)
             except asyncio.TimeoutError:
@@ -1862,3 +2536,13 @@ class ObsidianSyncRunner:
                             self.exporter.sync_if_db_changed,
                             reason="snapshot_poll",
                         )
+            if time.monotonic() >= next_briefing:
+                next_briefing = time.monotonic() + brief_interval
+                if self.exporter.is_enabled() and self.exporter.is_briefing_enabled():
+                    try:
+                        await asyncio.to_thread(
+                            self.exporter.export_briefings,
+                            reason="scheduled_briefing",
+                        )
+                    except Exception as exc:
+                        log.warning("Obsidian scheduled briefing error: %s", exc)

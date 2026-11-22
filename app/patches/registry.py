@@ -229,6 +229,15 @@ PATCH_CATALOG: List[Dict[str, Any]] = [
         "failure_behavior": "fail-soft (runs upstream sync decode, marks /api/health degraded)",
         "tests": ["tests/container/test_batch3_pipeline_vad.py", "tests/container/test_upstream_contracts.py"],
     },
+    {
+        "name": "cloud_audio_api",
+        "module": "app/patches/cloud_audio.py",
+        "target": "core.providers.{asr.{openai,qwen3_asr_flash,aliyunbl_stream,doubao,doubao_stream},tts.{openai,siliconflow,doubao,fishspeech,alibl_stream,huoshan_double_stream,minimax_httpstream}}",
+        "category": "experience",
+        "contract": "async speech_to_text / receive_audio / text_to_speak / start_session / finish_session / open_audio_channels + sync {DoubaoTTS,DoubaoASR,DoubaoStreamASR,AliyunBLStreamASR,MinimaxTTSHTTPStream}.__init__; non-blocking cloud HTTP, SSRF/secret redaction, ESP32 emotion-tag sync, and 48kHz/44.1kHz PC speaker passthrough",
+        "failure_behavior": "fail-soft (skips mismatched cloud provider targets, marks /api/health degraded)",
+        "tests": ["tests/container/test_cloud_audio_api.py", "tests/container/test_upstream_contracts.py"],
+    },
 ]
 
 

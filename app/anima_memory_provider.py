@@ -50,9 +50,71 @@ TAG = __name__
 _GLOBAL_CONFIG = {
     "service_url": "http://anima-brain:18787",
     "character_id": "xiaozhi",
+    "device_character_map": {},
+    "isolate_character_by_device": False,
     "token_file": xz_common.ANIMA_TOKEN_PATH,
     "outbox_db": os.path.join(xz_common.STATE_DIR, "anima_outbox.sqlite"),
 }
+
+_SAFE_CHAR_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+
+
+def _parse_device_character_map(raw: Any) -> dict[str, str]:
+    """Parse optional `device_id -> character_id` map for multi-member multi-ESP32 households (P2-4)."""
+    mapping: dict[str, str] = {}
+    source: dict[Any, Any] = {}
+    if isinstance(raw, dict):
+        source = raw
+    elif isinstance(raw, str) and raw.strip():
+        s = raw.strip()
+        if s.startswith("{"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict):
+                    source = parsed
+            except Exception:
+                source = {}
+        else:
+            for item in s.split(","):
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    source[k] = v
+    for raw_dev, raw_cid in source.items():
+        dev_k = str(raw_dev or "").strip().lower()[:64]
+        cid_v = str(raw_cid or "").strip().lower()[:48]
+        if dev_k and cid_v and _SAFE_CHAR_ID_RE.match(cid_v):
+            mapping[dev_k] = cid_v
+    return mapping
+
+
+def resolve_character_id_for_device(
+    device_id: str | None = None,
+    *,
+    base_character_id: str | None = None,
+    device_map: dict[str, str] | None = None,
+    isolate_by_device: bool | None = None,
+) -> str:
+    """Resolve Anima character_id for an ESP32 device without collapsing per-device warm recall caches (P2-4)."""
+    base_cid = str(base_character_id or _GLOBAL_CONFIG.get("character_id") or "xiaozhi").strip() or "xiaozhi"
+    dev_k = str(device_id or "").strip().lower()[:64]
+    if not dev_k or dev_k == "__default__":
+        return base_cid
+    eff_map = device_map if isinstance(device_map, dict) else (_GLOBAL_CONFIG.get("device_character_map") or {})
+    mapped = eff_map.get(dev_k)
+    if mapped and _SAFE_CHAR_ID_RE.match(mapped):
+        return mapped
+    eff_iso = (
+        bool(_GLOBAL_CONFIG.get("isolate_character_by_device", False))
+        if isolate_by_device is None
+        else bool(isolate_by_device)
+    )
+    if eff_iso:
+        slug = re.sub(r"[^a-z0-9]+", "", dev_k)[:16]
+        if slug:
+            cand = f"{base_cid.lower()}_{slug}"[:48]
+            if _SAFE_CHAR_ID_RE.match(cand):
+                return cand
+    return base_cid
 
 _SENSITIVE_ERR_RE = re.compile(
     r"(?i)(Bearer\s+[A-Za-z0-9._\-~+/=]+|sk-[A-Za-z0-9_\-]{12,}|AIza[0-9A-Za-z_\-]{16,})"
@@ -283,7 +345,8 @@ class AnimaOutbox:
     def enqueue(self, turns_payload: list[dict[str, Any]], *, character_id: str | None = None) -> int:
         if not turns_payload:
             return 0
-        cid = (character_id or self._character_id_getter()).strip() or "xiaozhi"
+        explicit_cid = str(character_id or "").strip()
+        default_cid = explicit_cid or (self._character_id_getter().strip() or "xiaozhi")
         now = time.time()
         queued = 0
         with self._lock:
@@ -292,6 +355,11 @@ class AnimaOutbox:
                 item = _canonical_turn_payload(raw)
                 if item is None:
                     continue
+                cid = (
+                    explicit_cid
+                    if explicit_cid
+                    else resolve_character_id_for_device(item.get("device_id"), base_character_id=default_cid)
+                )
                 req_id = item["request_id"]
                 existing = db.execute(
                     "SELECT payload_json, payload_hash, status FROM outbox_turns WHERE request_id=?",
@@ -967,6 +1035,21 @@ class MemoryProvider(MemoryProviderBase):
             cfg.get("service_url") or "http://anima-brain:18787"
         ).rstrip("/")
         _GLOBAL_CONFIG["character_id"] = str(cfg.get("character_id") or "xiaozhi").strip()
+        raw_dev_map = cfg.get("device_character_map")
+        if raw_dev_map is None:
+            raw_dev_map = os.environ.get("ANIMA_DEVICE_CHARACTER_MAP", "")
+        self._device_character_map = _parse_device_character_map(raw_dev_map)
+        raw_iso = cfg.get("isolate_character_by_device")
+        if raw_iso is None:
+            raw_iso = (os.environ.get("ANIMA_ISOLATE_CHARACTER_BY_DEVICE") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        self._isolate_character_by_device = bool(raw_iso)
+        _GLOBAL_CONFIG["device_character_map"] = dict(self._device_character_map)
+        _GLOBAL_CONFIG["isolate_character_by_device"] = self._isolate_character_by_device
         if cfg.get("token_file"):
             _GLOBAL_CONFIG["token_file"] = str(cfg["token_file"])
         if cfg.get("outbox_db"):
@@ -1116,6 +1199,14 @@ class MemoryProvider(MemoryProviderBase):
         except TypeError:
             mei_emotion_router.set_anima_mood(mood_str)
 
+    def _resolve_character_id(self, dev_key: str) -> str:
+        return resolve_character_id_for_device(
+            None if dev_key == "__default__" else dev_key,
+            base_character_id=_GLOBAL_CONFIG["character_id"],
+            device_map=self._device_character_map,
+            isolate_by_device=self._isolate_character_by_device,
+        )
+
     async def _fetch_recall_once(
         self,
         query: str,
@@ -1126,12 +1217,13 @@ class MemoryProvider(MemoryProviderBase):
     ) -> str:
         url = _GLOBAL_CONFIG["service_url"] + "/xiaozhi/recall"
         client = self._get_async_client()
+        target_cid = self._resolve_character_id(dev_key)
         t0 = time.monotonic()
         resp = await client.post(
             url,
             headers={"Authorization": f"Bearer {token}"},
             json={
-                "character_id": _GLOBAL_CONFIG["character_id"],
+                "character_id": target_cid,
                 "query": query or "",
             },
         )
@@ -1148,14 +1240,24 @@ class MemoryProvider(MemoryProviderBase):
             ctx,
             flags=re.DOTALL,
         ).strip()
+        # 召回层敏感实体自动拦截（防语音外放泄露密钥、手机号、银行卡、证件号、验证码）
+        redacted_cnt = 0
+        try:
+            import recall_guard
+
+            ctx, rg_meta = recall_guard.sanitize_recall_context(ctx)
+            redacted_cnt = int(rg_meta.get("redacted_count") or 0)
+        except Exception:
+            pass
         # 4.1 #4: Check generation freshness BEFORE mutating device Anima mood so stale recalls never overwrite newer mood
         is_current_gen = gen is None or gen >= self._recall_gen.get(dev_key, 0)
         if is_current_gen:
             self._set_device_anima_mood(mood_str, dev_key)
         self._record_recall_success(dev_key, ctx, elapsed_ms, gen=gen)
+        redact_note = f", 已拦截敏感实体={redacted_cnt}" if redacted_cnt else ""
         logger.bind(tag=TAG).info(
             f"Anima Brain 极速召回成功 ({elapsed_ms:.0f}ms): 事实={data.get('facts_count', 0)}, "
-            f"待跟进={data.get('open_loops_count', 0)}, 状态={data.get('mood', '')}"
+            f"待跟进={data.get('open_loops_count', 0)}, 状态={data.get('mood', '')}{redact_note}"
         )
         return ctx
 

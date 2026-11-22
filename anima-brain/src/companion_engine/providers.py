@@ -16,7 +16,9 @@ from .models import CommitRequest, TurnContext, Usage
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(self, message: str = "", *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -149,7 +151,8 @@ class CompatibleProvider:
         if not response.is_success:
             # Never echo server bodies, URL credentials or request headers to a host tool.
             raise ProviderError(
-                f"Provider HTTP {response.status_code}; not retried. Check provider dashboard."
+                f"Provider HTTP {response.status_code}; not retried. Check provider dashboard.",
+                status_code=response.status_code,
             )
         try:
             data = response.json()

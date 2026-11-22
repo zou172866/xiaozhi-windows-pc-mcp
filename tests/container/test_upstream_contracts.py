@@ -44,12 +44,12 @@ class TestUpstreamImageContracts(unittest.TestCase):
             f"Upstream SERVER_VERSION mismatch: got {info.get('actual')!r}, expected {info.get('expected')!r}",
         )
 
-    def test_all_20_patches_registered_ok_and_match_catalog(self):
+    def test_all_21_patches_registered_ok_and_match_catalog(self):
         catalog = self.patch_registry.get_patch_catalog()
         catalog_names = [p["name"] for p in catalog]
         self.assertEqual(len(catalog_names), len(set(catalog_names)), "Duplicate names in PATCH_CATALOG")
         expected_patches = set(catalog_names)
-        self.assertEqual(len(expected_patches), 20, f"Expected 20 cataloged patches, got {len(expected_patches)}")
+        self.assertEqual(len(expected_patches), 21, f"Expected 21 cataloged patches, got {len(expected_patches)}")
 
         # Verify security category metadata matches SECURITY_PATCH_NAMES 1-to-1
         for entry in catalog:
@@ -126,6 +126,48 @@ class TestUpstreamImageContracts(unittest.TestCase):
         self.assertTrue(callable(OpenAILLM.response))
         self.assertTrue(callable(OpenAILLM.response_with_functions))
 
+        # Cloud audio API provider contracts (21st patch: cloud_audio_api)
+        from core.providers.asr.aliyunbl_stream import ASRProvider as AliyunBLStreamASR
+        from core.providers.asr.doubao import ASRProvider as DoubaoASR
+        from core.providers.asr.doubao_stream import ASRProvider as DoubaoStreamASR
+        from core.providers.asr.openai import ASRProvider as OpenaiASR
+        from core.providers.asr.qwen3_asr_flash import ASRProvider as Qwen3ASR
+        from core.providers.tts.alibl_stream import TTSProvider as AliBLTTS
+        from core.providers.tts.doubao import TTSProvider as DoubaoTTS
+        from core.providers.tts.fishspeech import TTSProvider as FishSpeechTTS
+        from core.providers.tts.huoshan_double_stream import TTSProvider as HuoshanTTS
+        from core.providers.tts.minimax_httpstream import TTSProvider as MinimaxTTS
+        from core.providers.tts.openai import TTSProvider as OpenAITTS
+        from core.providers.tts.siliconflow import TTSProvider as SiliconFlowTTS
+
+        self.assertTrue(callable(AliyunBLStreamASR.__init__))
+        self.assertTrue(getattr(AliyunBLStreamASR, "_cloud_audio_patched", False))
+        self.assertTrue(getattr(DoubaoASR, "_cloud_audio_patched", False))
+        self.assertTrue(getattr(DoubaoStreamASR, "_cloud_audio_patched", False))
+
+        for coro_fn in (
+            OpenaiASR.speech_to_text,
+            Qwen3ASR.speech_to_text,
+            DoubaoASR.speech_to_text,
+            DoubaoStreamASR.receive_audio,
+            OpenAITTS.text_to_speak,
+            SiliconFlowTTS.text_to_speak,
+            DoubaoTTS.text_to_speak,
+            FishSpeechTTS.text_to_speak,
+            AliBLTTS.text_to_speak,
+            AliBLTTS.start_session,
+            AliBLTTS.open_audio_channels,
+            HuoshanTTS.text_to_speak,
+            HuoshanTTS.start_session,
+            HuoshanTTS.open_audio_channels,
+            MinimaxTTS.text_to_speak,
+            MinimaxTTS.open_audio_channels,
+        ):
+            self.assertTrue(inspect.iscoroutinefunction(coro_fn), f"Expected coroutine: {coro_fn}")
+        self.assertTrue(getattr(AliBLTTS, "_pc_audio_stream_patched", False))
+        self.assertTrue(getattr(HuoshanTTS, "_pc_audio_stream_patched", False))
+        self.assertTrue(getattr(MinimaxTTS, "_pc_audio_stream_patched", False))
+
     def test_h1_zero_import_side_effects_and_boot_contract_self_check(self):
         """H-1: Importing boot / start_with_env / patches has ZERO side effects; install_all records contract self-check."""
         import json as _json
@@ -149,7 +191,7 @@ class TestUpstreamImageContracts(unittest.TestCase):
                 "cwd0 = os.getcwd(); "
                 "th0 = {t.name for t in threading.enumerate()}; "
                 "import boot, start_with_env, patch_registry, mei_emotion_router, pc_audio_router, reply_length_router, nmc_weather_patch, console_server; "
-                "import patches, patches.auth, patches.memory_hooks, patches.asr, patches.contracts, patches.emotion, console.server, console.shared; "
+                "import patches, patches.auth, patches.memory_hooks, patches.asr, patches.cloud_audio, patches.contracts, patches.emotion, console.server, console.shared; "
                 "cwd1 = os.getcwd(); "
                 "th1 = {t.name for t in threading.enumerate()}; "
                 "patches = patch_registry.get_all_patches(); "

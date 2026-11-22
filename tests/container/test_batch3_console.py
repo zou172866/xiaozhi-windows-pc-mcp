@@ -1128,6 +1128,77 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
                 self.assertEqual(r_good.headers.get("Access-Control-Allow-Origin"), good_origin)
                 self.assertEqual(r_good.headers.get("Vary"), "Origin")
 
+                # 2b. P2-5: OPTIONS CORS preflight rejects non-allowlisted Origin, internal/evil Host & cross-site,
+                #     and returns 204 No Content with CORS allow headers for exact loopback Origin
+                for bad_origin in (
+                    "http://localhost:3000",
+                    "http://127.0.0.1:8888",
+                    f"https://localhost:{port}",
+                    f"https://127.0.0.1:{port}",
+                    "http://evil.example",
+                    "null",
+                    "",
+                ):
+                    r_opt_bad = client.options(
+                        f"http://127.0.0.1:{port}/api/config",
+                        headers={
+                            "Origin": bad_origin,
+                            "Access-Control-Request-Method": "POST",
+                            "Access-Control-Request-Headers": "content-type, x-console-token",
+                        },
+                    )
+                    self.assertEqual(r_opt_bad.status_code, 403, f"Bad Origin {bad_origin!r} OPTIONS must be 403")
+                    self.assertNotIn(
+                        "access-control-allow-origin",
+                        {k.lower() for k in r_opt_bad.headers.keys()},
+                    )
+
+                r_opt_internal = client.options(
+                    f"http://127.0.0.1:{port}/api/health",
+                    headers={"Host": f"xiaozhi-esp32-server:{port}", "Origin": good_origin},
+                )
+                self.assertEqual(r_opt_internal.status_code, 403)
+                self.assertNotIn(
+                    "access-control-allow-origin",
+                    {k.lower() for k in r_opt_internal.headers.keys()},
+                )
+
+                r_opt_evil_host = client.options(
+                    f"http://127.0.0.1:{port}/api/config",
+                    headers={"Host": f"evil.example:{port}", "Origin": good_origin},
+                )
+                self.assertEqual(r_opt_evil_host.status_code, 421)
+                self.assertNotIn(
+                    "access-control-allow-origin",
+                    {k.lower() for k in r_opt_evil_host.headers.keys()},
+                )
+
+                r_opt_cross_site = client.options(
+                    f"http://127.0.0.1:{port}/api/config",
+                    headers={"Origin": good_origin, "Sec-Fetch-Site": "cross-site"},
+                )
+                self.assertEqual(r_opt_cross_site.status_code, 403)
+
+                # Subsequent valid OPTIONS on the same keep-alive client must succeed with 204 No Content
+                for opt_path in ("/api/config", "/api/persona/history", "/api/dream"):
+                    r_opt_ok = client.options(
+                        f"http://127.0.0.1:{port}{opt_path}",
+                        headers={
+                            "Origin": good_origin,
+                            "Access-Control-Request-Method": "POST",
+                            "Access-Control-Request-Headers": "content-type, x-console-token",
+                        },
+                    )
+                    self.assertEqual(r_opt_ok.status_code, 204)
+                    self.assertEqual(r_opt_ok.content, b"")
+                    self.assertEqual(r_opt_ok.headers.get("Access-Control-Allow-Origin"), good_origin)
+                    self.assertEqual(r_opt_ok.headers.get("Access-Control-Allow-Methods"), "GET, POST, OPTIONS")
+                    self.assertEqual(
+                        r_opt_ok.headers.get("Access-Control-Allow-Headers"),
+                        "Content-Type, X-Console-Token",
+                    )
+                    self.assertEqual(r_opt_ok.headers.get("Allow"), "GET, POST, OPTIONS")
+
             # 3. Malformed HTTP request (self.headers not initialized / None) must NOT raise AttributeError
             sent_hdrs: list[tuple[str, str]] = []
 
@@ -1147,6 +1218,140 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
             self.assertIn("content-security-policy", hdr_names)
             self.assertIn("x-content-type-options", hdr_names)
             self.assertNotIn("access-control-allow-origin", hdr_names)
+        finally:
+            cs.CONSOLE_PORT = orig_port
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_p2_5_console_options_smuggling_and_fail_closed_cors_guards(self):
+        """P2-5 hardening: OPTIONS *, disallowed ACRM, duplicate header smuggling, and 501 fail-closed CORS."""
+        import socket as _sock
+
+        httpd, port = _start_test_console_server()
+        orig_port = cs.CONSOLE_PORT
+        cs.CONSOLE_PORT = port
+
+        def _raw_http_request(raw_req: bytes) -> tuple[int, dict[str, str], bytes]:
+            with _sock.create_connection(("127.0.0.1", port), timeout=5.0) as sock_obj:
+                sock_obj.sendall(raw_req)
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = sock_obj.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                head_bytes, body_rem = buf.split(b"\r\n\r\n", 1)
+                lines = head_bytes.decode("iso-8859-1").split("\r\n")
+                status_code = int(lines[0].split()[1])
+                hdr_map: dict[str, str] = {}
+                for ln in lines[1:]:
+                    if ":" in ln:
+                        k, v = ln.split(":", 1)
+                        hdr_map[k.strip().lower()] = v.strip()
+                if "content-length" in hdr_map:
+                    clen = int(hdr_map["content-length"])
+                    while len(body_rem) < clen:
+                        chunk = sock_obj.recv(4096)
+                        if not chunk:
+                            break
+                        body_rem += chunk
+                    body_rem = body_rem[:clen]
+                return status_code, hdr_map, body_rem
+
+        try:
+            good_origin = f"http://127.0.0.1:{port}"
+            with httpx.Client(trust_env=False, timeout=5.0) as client:
+                # 1. Disallowed or empty Access-Control-Request-Method on OPTIONS must be 405 without ACAO
+                for bad_acrm in ("DELETE", "PUT", "PATCH", ""):
+                    r_bad_m = client.options(
+                        f"http://127.0.0.1:{port}/api/config",
+                        headers={
+                            "Origin": good_origin,
+                            "Access-Control-Request-Method": bad_acrm,
+                        },
+                    )
+                    self.assertEqual(r_bad_m.status_code, 405, f"ACRM={bad_acrm!r} must be rejected with 405")
+                    self.assertNotIn("access-control-allow-origin", {k.lower() for k in r_bad_m.headers.keys()})
+
+            # 2a. Valid GET sets _security_allowed only for that response; unvalidated 501 DELETE with evil/internal
+            #     Host (both standalone and when reusing a handler instance) must NOT reflect Access-Control-Allow-Origin
+            st1, h1, _ = _raw_http_request(
+                f"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {good_origin}\r\n\r\n".encode()
+            )
+            self.assertEqual(st1, 200)
+            self.assertEqual(h1.get("access-control-allow-origin"), good_origin)
+
+            for bad_host in (f"evil.example:{port}", f"xiaozhi-esp32-server:{port}"):
+                st_del, h_del, _ = _raw_http_request(
+                    f"DELETE /api/config HTTP/1.1\r\nHost: {bad_host}\r\nOrigin: {good_origin}\r\n\r\n".encode()
+                )
+                self.assertEqual(st_del, 501)
+                self.assertNotIn("access-control-allow-origin", h_del)
+
+            # Verify ConsoleHandler.end_headers() explicitly clears _security_allowed after one response
+            reused_hdrs: list[list[tuple[str, str]]] = []
+
+            class _KeepAliveStub(cs.ConsoleHandler):
+                def __init__(self):
+                    self.headers = {"Origin": good_origin}
+                    self._headers_buffer = []
+                    self._security_allowed = True
+
+                def send_header(self, keyword, value):
+                    reused_hdrs[-1].append((keyword, value))
+
+            ka = _KeepAliveStub()
+            with patch.object(cs.BaseHTTPRequestHandler, "end_headers", lambda self: None):
+                reused_hdrs.append([])
+                ka.end_headers()
+                reused_hdrs.append([])
+                ka.end_headers()
+            self.assertIn("access-control-allow-origin", {k.lower() for k, _ in reused_hdrs[0]})
+            self.assertFalse(ka._security_allowed)
+            self.assertNotIn("access-control-allow-origin", {k.lower() for k, _ in reused_hdrs[1]})
+
+            # 2b. OPTIONS * asterisk-form target: 204 without Origin, 403 for internal Host
+            st4, h4, b4 = _raw_http_request(
+                f"OPTIONS * HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode()
+            )
+            self.assertEqual(st4, 204)
+            self.assertEqual(b4, b"")
+            self.assertEqual(h4.get("allow"), "GET, POST, OPTIONS")
+            self.assertNotIn("access-control-allow-origin", h4)
+
+            st5, h5, _ = _raw_http_request(
+                f"OPTIONS * HTTP/1.1\r\nHost: xiaozhi-esp32-server:{port}\r\n\r\n".encode()
+            )
+            self.assertEqual(st5, 403)
+            self.assertNotIn("access-control-allow-origin", h5)
+
+            # 2c. Duplicate Host header smuggling MUST be rejected with 400 (never serving / HTML token)
+            st6, h6, b6 = _raw_http_request(
+                f"GET / HTTP/1.1\r\nHost: xiaozhi-esp32-server:{port}\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode()
+            )
+            self.assertEqual(st6, 400)
+            self.assertNotIn(cs.get_console_token().encode("utf-8"), b6)
+            self.assertNotIn("access-control-allow-origin", h6)
+
+            # 2d. Duplicate Origin (both orders) and duplicate Sec-Fetch-Site MUST be rejected with 403
+            for dup_req in (
+                (
+                    f"OPTIONS /api/config HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                    f"Origin: https://evil.example\r\nOrigin: {good_origin}\r\n"
+                    f"Access-Control-Request-Method: POST\r\n\r\n"
+                ),
+                (
+                    f"GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                    f"Origin: {good_origin}\r\nOrigin: https://evil.example\r\n\r\n"
+                ),
+                (
+                    f"OPTIONS /api/config HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                    f"Origin: {good_origin}\r\nSec-Fetch-Site: cross-site\r\nSec-Fetch-Site: same-origin\r\n\r\n"
+                ),
+            ):
+                st_dup, h_dup, _ = _raw_http_request(dup_req.encode())
+                self.assertEqual(st_dup, 403)
+                self.assertNotIn("access-control-allow-origin", h_dup)
         finally:
             cs.CONSOLE_PORT = orig_port
             httpd.shutdown()
@@ -1333,14 +1538,12 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
     def test_p2_console_hardening_allowlists_redaction_boot_id_lock_and_facade_broadcast(self):
         """4.1 #2 & H-1: malformed headers, /api/relationship allowlist, /api/audio-test volume, boot_id/app.js refresh, redaction, facade broadcast."""
         import io
-        import math
         import console.routes.anima as anima_mod
         import console.routes.config as cfg_mod
         import console.routes.gsv as gsv_mod
         import console.routes.state as state_mod
         import console.server as srv_mod
         import console.shared as shared_mod
-        import console_server as cs
         import start_with_env as swe
         import boot as boot_mod
         from patches import asr as asr_patch_mod
@@ -1493,6 +1696,450 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
         finally:
             self.assertEqual(boot_mod.ROOT_DIR, orig_root)
             self.assertEqual(asr_patch_mod.ROOT_DIR, orig_root)
+
+    def test_oobe_esp32_allowlist_api_live_sync_and_generic_defaults(self):
+        """OOBE: 18080 ESP32 rejected-device one-click allowlist API + live sync + generic UI/GSV defaults."""
+        import runtime_events
+        from console.routes import gsv as gsv_mod
+        from patches import auth as auth_patch
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_p = os.path.join(td, ".config.yaml")
+            with open(cfg_p, "w", encoding="utf-8") as f:
+                yaml.safe_dump(
+                    {
+                        "server": {
+                            "auth_key": "${ESP32_AUTH_KEY}",
+                            "auth": {"enabled": True, "allowed_devices": ["${ESP32_ALLOWED_DEVICES}"]},
+                        },
+                        "selected_module": {"LLM": "DeepSeekLLM", "TTS": "EdgeTTS"},
+                    },
+                    f,
+                    allow_unicode=True,
+                )
+
+            httpd, port = _start_test_console_server()
+            orig_port = cs.CONSOLE_PORT
+            cs.CONSOLE_PORT = port
+            runtime_events.reset_runtime_events()
+
+            class _FakeLiveSrv:
+                def __init__(self, cfg, allowed=None):
+                    self.config = cfg
+                    if allowed is not None:
+                        self.allowed_devices = allowed
+
+            live_cfg = {"server": {"auth": {"enabled": True, "allowed_devices": []}}}
+            live_ws = _FakeLiveSrv(live_cfg, allowed=set())
+            # Distinct config dict (tests handler-level sync even when OTAHandler does not share ws_server.config)
+            live_ota = _FakeLiveSrv({"server": {"auth": {"enabled": True, "allowed_devices": []}}}, allowed=set())
+            isolated_ota = _FakeLiveSrv({"server": {"auth": {"enabled": True, "allowed_devices": []}}})
+            runtime_events.register_ws_server(live_ws)
+            runtime_events.register_auth_handler(live_ota)
+
+            try:
+                with (
+                    patch.object(cs, "CONFIG_PATH", cfg_p),
+                    patch.dict(os.environ, {"ESP32_ALLOWED_DEVICES": "11:22:33:44:55:aa"}, clear=False),
+                ):
+                    # Record a rejected ESP32 device (and duplicate hit increments count)
+                    runtime_events.publish_event(
+                        "device_rejected",
+                        device_id="AA:BB:CC:DD:EE:01",
+                        source="ota",
+                        client_id="cli-new",
+                        reason="not_in_allowlist",
+                    )
+                    runtime_events.publish_event(
+                        "device_rejected",
+                        device_id="aa:bb:cc:dd:ee:01",
+                        source="ota",
+                        client_id="cli-new",
+                        reason="not_in_allowlist",
+                    )
+
+                    tok = cs.get_console_token()
+                    auth_hdrs = _post_headers(port, token=tok)
+                    no_tok_hdrs = _post_headers(port, token=None)
+
+                    with httpx.Client(timeout=5.0, trust_env=False) as client:
+                        # 1. GET /api/esp32-devices and /api/state expose env + pending without leaking auth_key
+                        r_get = client.get(f"http://127.0.0.1:{port}/api/esp32-devices")
+                        self.assertEqual(r_get.status_code, 200)
+                        ea = r_get.json()["esp32_auth"]
+                        self.assertTrue(ea["auth_enabled"])
+                        self.assertEqual(ea["env_allowed_devices"], ["11:22:33:44:55:aa"])
+                        self.assertEqual(ea["config_allowed_devices"], [])
+                        self.assertEqual(len(ea["pending_devices"]), 1)
+                        self.assertEqual(ea["pending_devices"][0]["device_id"], "aa:bb:cc:dd:ee:01")
+                        self.assertEqual(ea["pending_devices"][0]["count"], 2)
+                        self.assertNotIn("auth_key", ea)
+
+                        # 2. POST /api/esp32-devices MUST require X-Console-Token (401) & block internal Host (403)
+                        r_unauth = client.post(
+                            f"http://127.0.0.1:{port}/api/esp32-devices",
+                            json={"action": "add", "device_id": "aa:bb:cc:dd:ee:01"},
+                            headers=no_tok_hdrs,
+                        )
+                        self.assertEqual(r_unauth.status_code, 401)
+
+                        r_internal = client.post(
+                            f"http://127.0.0.1:{port}/api/esp32-devices",
+                            json={"action": "add", "device_id": "aa:bb:cc:dd:ee:01"},
+                            headers={**auth_hdrs, "Host": f"xiaozhi-esp32-server:{port}"},
+                        )
+                        self.assertEqual(r_internal.status_code, 403)
+
+                        # 3. Invalid inputs return HTTP 400
+                        for bad_body in (
+                            {"action": "add", "device_id": "${ESP32_ALLOWED_DEVICES}"},
+                            {"action": "add", "device_id": "bad mac with space"},
+                            {"action": "drop", "device_id": "aa:bb:cc:dd:ee:01"},
+                            {"action": "add", "device_id": "aa:bb:cc:dd:ee:01", "extra": 1},
+                        ):
+                            r_bad = client.post(
+                                f"http://127.0.0.1:{port}/api/esp32-devices",
+                                json=bad_body,
+                                headers=auth_hdrs,
+                            )
+                            self.assertEqual(r_bad.status_code, 400, f"Expected 400 for {bad_body}")
+
+                        # 4. One-click allowlist normalizes dash MAC, persists to YAML (keeping ${ESP32_ALLOWED_DEVICES}),
+                        #    clears pending, and hot-syncs ONLY live server/handlers (not isolated mocks)
+                        r_add = client.post(
+                            f"http://127.0.0.1:{port}/api/esp32-devices",
+                            json={"action": "add", "device_id": "AA-BB-CC-DD-EE-01"},
+                            headers=auth_hdrs,
+                        )
+                        self.assertEqual(r_add.status_code, 200)
+                        add_j = r_add.json()
+                        self.assertEqual(add_j["device_id"], "aa:bb:cc:dd:ee:01")
+                        self.assertEqual(add_j["esp32_auth"]["pending_devices"], [])
+                        self.assertIn("aa:bb:cc:dd:ee:01", add_j["esp32_auth"]["allowed_devices"])
+                        self.assertIn("11:22:33:44:55:aa", add_j["esp32_auth"]["allowed_devices"])
+                        self.assertIn("aa:bb:cc:dd:ee:01", auth_patch._extract_handler_allowed_devices(live_ws))
+                        self.assertIn("aa:bb:cc:dd:ee:01", auth_patch._extract_handler_allowed_devices(live_ota))
+                        self.assertEqual(auth_patch._extract_handler_allowed_devices(isolated_ota), set())
+
+                        with open(cfg_p, "r", encoding="utf-8") as rf:
+                            persisted = yaml.safe_load(rf)
+                        self.assertIn("${ESP32_ALLOWED_DEVICES}", persisted["server"]["auth"]["allowed_devices"])
+                        self.assertIn("aa:bb:cc:dd:ee:01", persisted["server"]["auth"]["allowed_devices"])
+
+                        # 5. Removing env-only device returns 400; removing console-added device succeeds
+                        r_rm_env = client.post(
+                            f"http://127.0.0.1:{port}/api/esp32-devices",
+                            json={"action": "remove", "device_id": "11:22:33:44:55:aa"},
+                            headers=auth_hdrs,
+                        )
+                        self.assertEqual(r_rm_env.status_code, 400)
+
+                        r_rm_ok = client.post(
+                            f"http://127.0.0.1:{port}/api/esp32-devices",
+                            json={"action": "remove", "device_id": "aa:bb:cc:dd:ee:01"},
+                            headers=auth_hdrs,
+                        )
+                        self.assertEqual(r_rm_ok.status_code, 200)
+                        self.assertNotIn("aa:bb:cc:dd:ee:01", auth_patch._extract_handler_allowed_devices(live_ws))
+
+                        # 6. Dismiss clears pending without allowlisting (including malformed/short Device-Ids)
+                        runtime_events.publish_event(
+                            "device_rejected",
+                            device_id="de:ad:be:ef:00:09",
+                            source="ws",
+                            reason="not_in_allowlist",
+                        )
+                        runtime_events.publish_event(
+                            "device_rejected",
+                            device_id="bad/id",
+                            source="ota",
+                            reason="not_in_allowlist",
+                        )
+                        r_dis = client.post(
+                            f"http://127.0.0.1:{port}/api/esp32-devices",
+                            json={"action": "dismiss", "device_id": "de:ad:be:ef:00:09"},
+                            headers=auth_hdrs,
+                        )
+                        self.assertEqual(r_dis.status_code, 200)
+                        r_dis_bad = client.post(
+                            f"http://127.0.0.1:{port}/api/esp32-devices",
+                            json={"action": "dismiss", "device_id": "bad/id"},
+                            headers=auth_hdrs,
+                        )
+                        self.assertEqual(r_dis_bad.status_code, 200)
+                        self.assertEqual(r_dis_bad.json()["esp32_auth"]["pending_devices"], [])
+                        self.assertNotIn("de:ad:be:ef:00:09", r_dis_bad.json()["esp32_auth"]["allowed_devices"])
+            finally:
+                runtime_events.reset_runtime_events()
+                cs.CONSOLE_PORT = orig_port
+                httpd.shutdown()
+                httpd.server_close()
+
+        # 7. Verify generic defaults in gsv.py and static UI (no personal hardcoded weights or default wording)
+        self.assertNotIn("芽衣-e10.ckpt", gsv_mod.GSV_PROFILES["__gsv_raiden_mei__"]["gpt_weights"])
+        self.assertNotIn("芽衣_e10_s430_l32.pth", gsv_mod.GSV_PROFILES["__gsv_raiden_mei__"]["sovits_weights"])
+        with open(cs.HTML_PATH, "r", encoding="utf-8") as f:
+            html_src = f.read()
+        with open(cs.JS_PATH, "r", encoding="utf-8") as f:
+            js_src = f.read()
+        for el_id in ("esp32AuthBadge", "esp32PendingWrap", "esp32PendingList", "esp32AllowedList", "esp32MacInput", "esp32AddMacBtn", "esp32AuthHint"):
+            self.assertIn(f'id="{el_id}"', html_src)
+        self.assertIn('consolePost("/api/esp32-devices"', js_src)
+        self.assertNotIn("哥哥欢迎回来", html_src)
+        self.assertNotIn("播放雷电芽衣原声测试片段", js_src)
+        self.assertNotIn("太棒啦哥哥", js_src)
+        self.assertNotIn("别难过了哥哥", js_src)
+
+    def test_oobe_preboot_esp32_allowlist_sync_and_gsv_custom_weight_preservation(self):
+        """OOBE Round 2: pre-boot ESP32 allowlist applies to late-registering handlers & custom GSV weights are preserved."""
+        import os
+        import tempfile
+        from unittest.mock import patch
+        import yaml
+        import console_server as cs
+        import console.routes.gsv as gsv_mod
+        import runtime_events
+        from patches import auth as auth_patch
+
+        # Part A: Pre-boot allowlist race — user adds MAC in 18080 BEFORE OTA/Vision/WS handlers finish __init__
+        class _FakeLateHandler:
+            def __init__(self, cfg, allowed=None):
+                self.config = cfg
+                if allowed is not None:
+                    self.allowed_devices = allowed
+
+        runtime_events.reset_runtime_events()
+        try:
+            runtime_events.set_live_allowed_devices(["AA:BB:CC:DD:EE:99", "11:22:33:44:55:66"])
+            late_ws = _FakeLateHandler({"server": {"auth": {"enabled": True, "allowed_devices": []}}}, allowed=set())
+            late_ota = _FakeLateHandler({"server": {"auth": {"enabled": True, "allowed_devices": []}}}, allowed=set())
+            late_vis = _FakeLateHandler({"server": {"auth": {"enabled": True, "allowed_devices": []}}})
+            unregistered = _FakeLateHandler({"server": {"auth": {"enabled": True, "allowed_devices": []}}}, allowed=set())
+
+            runtime_events.register_ws_server(late_ws)
+            runtime_events.register_auth_handler(late_ota)
+            runtime_events.register_auth_handler(late_vis)
+
+            expected = {"aa:bb:cc:dd:ee:99", "11:22:33:44:55:66"}
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(late_ws), expected)
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(late_ota), expected)
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(late_vis), expected)
+            self.assertEqual(late_ws.allowed_devices, expected)
+            self.assertEqual(late_ota.allowed_devices, expected)
+            self.assertEqual(late_vis.config["server"]["auth"]["allowed_devices"], sorted(expected))
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(unregistered), set())
+
+            # Subsequent update propagates to all late-registered handlers
+            runtime_events.set_live_allowed_devices(["11:22:33:44:55:66"])
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(late_ws), {"11:22:33:44:55:66"})
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(late_ota), {"11:22:33:44:55:66"})
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(late_vis), {"11:22:33:44:55:66"})
+
+            # Dash-MAC normalization across auth.py & runtime_events, plus None-section & GC safety
+            self.assertEqual(
+                auth_patch.normalize_allowed_devices(["AA-BB-CC-DD-EE-07"], env_val="11-22-33-44-55-66"),
+                ["aa:bb:cc:dd:ee:07", "11:22:33:44:55:66"],
+            )
+            self.assertEqual(auth_patch._normalize_device_id("DE-AD-BE-EF-00-01"), "de:ad:be:ef:00:01")
+            runtime_events.set_live_allowed_devices(["AA-BB-CC-DD-EE-77"])
+            null_sec_handler = _FakeLateHandler({"server": None}, allowed=set())
+            null_auth_handler = _FakeLateHandler({"server": {"auth": None}}, allowed=set())
+            runtime_events.register_auth_handler(null_sec_handler)
+            runtime_events.register_auth_handler(null_auth_handler)
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(null_sec_handler), {"aa:bb:cc:dd:ee:77"})
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(null_auth_handler), {"aa:bb:cc:dd:ee:77"})
+            # Repeated register calls on an already-synced handler must stay idempotent
+            runtime_events.register_auth_handler(null_sec_handler)
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(null_sec_handler), {"aa:bb:cc:dd:ee:77"})
+            # Dropping the only strong ref to a registered handler must not leave dangling config tracking
+            import gc as _gc
+
+            ephemeral_cfg = {"server": {"auth": {"enabled": True, "allowed_devices": []}}}
+            ephemeral_h = _FakeLateHandler(ephemeral_cfg, allowed=set())
+            runtime_events.register_auth_handler(ephemeral_h)
+            self.assertEqual(runtime_events.get_live_allowed_devices_for_config(ephemeral_cfg), {"aa:bb:cc:dd:ee:77"})
+            del ephemeral_h
+            _gc.collect()
+            self.assertIsNone(runtime_events.get_live_allowed_devices_for_config(ephemeral_cfg))
+
+            # reset_runtime_events() clears remembered allowlist cleanly for isolated unit tests
+            runtime_events.reset_runtime_events()
+            after_reset = _FakeLateHandler(
+                {"server": {"auth": {"enabled": True, "allowed_devices": ["fe:ed:fa:ce:00:01"]}}},
+                allowed={"fe:ed:fa:ce:00:01"},
+            )
+            runtime_events.register_auth_handler(after_reset)
+            self.assertEqual(auth_patch._extract_handler_allowed_devices(after_reset), {"fe:ed:fa:ce:00:01"})
+        finally:
+            runtime_events.reset_runtime_events()
+
+        # Part B: Existing machine custom raiden_mei weights in tts_infer_xiaozhi.yaml MUST be detected and preserved
+        with tempfile.TemporaryDirectory() as td:
+            infer_p = os.path.join(td, "tts_infer_xiaozhi.yaml")
+            custom_gpt = "/models/gsv_weights/raiden_mei/v4/custom/mei_finetuned.ckpt"
+            custom_sov = "/models/gsv_weights/raiden_mei/v4/custom/mei_finetuned.pth"
+            with open(infer_p, "w", encoding="utf-8") as wf:
+                yaml.safe_dump(
+                    {
+                        "custom": {
+                            "version": "v4",
+                            "device": "cpu",
+                            "is_half": False,
+                            "bert_base_path": "custom/bert",
+                            "t2s_weights_path": custom_gpt,
+                            "vits_weights_path": custom_sov,
+                        }
+                    },
+                    wf,
+                    allow_unicode=True,
+                )
+
+            http_calls: list[tuple[str, str]] = []
+
+            class _Resp200:
+                status_code = 200
+                text = "ok"
+
+            class _FakeClient:
+                def get(self, url, params=None, timeout=None):
+                    http_calls.append((url.rsplit("/", 1)[-1], (params or {}).get("weights_path", "")))
+                    return _Resp200()
+
+            orig_loaded = gsv_mod._active_gsv_loaded
+            gsv_mod._active_gsv_loaded = None
+            gsv_mod._preserved_boot_mei_weights.pop(infer_p, None)
+            try:
+                with (
+                    patch.object(cs, "GSV_INFER_YAML", infer_p),
+                    patch.object(cs, "_get_console_http_client", return_value=_FakeClient()),
+                    patch.dict(
+                        os.environ,
+                        {"GSV_MEI_GPT_WEIGHTS": "", "GSV_MEI_SOVITS_WEIGHTS": "", "GSV_MEI_VERSION": ""},
+                        clear=False,
+                    ),
+                ):
+                    # 1. Boot detection matches custom raiden_mei weights without clobbering
+                    self.assertEqual(gsv_mod._detect_boot_gsv_voice(), "__gsv_raiden_mei__")
+                    gsv_mod._ensure_gsv_weights("__gsv_raiden_mei__", persist_boot_yaml=True)
+                    self.assertEqual(http_calls, [], "Already-loaded custom boot weights must not re-swap")
+                    with open(infer_p, "r", encoding="utf-8") as rf:
+                        after_same = yaml.safe_load(rf)
+                    self.assertEqual(after_same["custom"]["t2s_weights_path"], custom_gpt)
+                    self.assertEqual(after_same["custom"]["vits_weights_path"], custom_sov)
+                    self.assertEqual(after_same["custom"]["device"], "cpu")
+                    self.assertIs(after_same["custom"]["is_half"], False)
+                    self.assertEqual(after_same["custom"]["bert_base_path"], "custom/bert")
+
+                    # 2. Switch to __gsv_xiaozhi_tw__ (persisting YAML), simulate container restart
+                    #    (clear in-memory cache), then switch back to __gsv_raiden_mei__:
+                    #    MUST restore preserved custom weights from sidecar backup, not defaults!
+                    gsv_mod._ensure_gsv_weights("__gsv_xiaozhi_tw__", persist_boot_yaml=True)
+                    gsv_mod._preserved_boot_mei_weights.clear()
+                    gsv_mod._active_gsv_loaded = None
+                    http_calls.clear()
+                    gsv_mod._ensure_gsv_weights("__gsv_raiden_mei__", persist_boot_yaml=True)
+                    self.assertEqual(
+                        http_calls,
+                        [("set_gpt_weights", custom_gpt), ("set_sovits_weights", custom_sov)],
+                    )
+                    with open(infer_p, "r", encoding="utf-8") as rf:
+                        after_back = yaml.safe_load(rf)
+                    self.assertEqual(after_back["custom"]["t2s_weights_path"], custom_gpt)
+                    self.assertEqual(after_back["custom"]["vits_weights_path"], custom_sov)
+
+                # 2b. Half-pretrained custom fine-tune (pretrained s1v3.ckpt + custom SoVITS without "raiden_mei"
+                #     in path) AND Windows backslash path separator matching must be preserved!
+                with tempfile.TemporaryDirectory() as td_half:
+                    half_p = os.path.join(td_half, "tts_infer_xiaozhi.yaml")
+                    half_gpt = "GPT_SoVITS/pretrained_models/s1v3.ckpt"
+                    half_sov_win = r"D:\my_models\speaker_e12.pth"
+                    with open(half_p, "w", encoding="utf-8") as wf:
+                        yaml.safe_dump(
+                            {
+                                "custom": {
+                                    "version": "v4",
+                                    "t2s_weights_path": half_gpt,
+                                    "vits_weights_path": half_sov_win,
+                                }
+                            },
+                            wf,
+                            allow_unicode=True,
+                        )
+                    gsv_mod._active_gsv_loaded = None
+                    with (
+                        patch.object(cs, "GSV_INFER_YAML", half_p),
+                        patch.dict(
+                            os.environ,
+                            {"GSV_MEI_GPT_WEIGHTS": "", "GSV_MEI_SOVITS_WEIGHTS": "", "GSV_MEI_VERSION": ""},
+                            clear=False,
+                        ),
+                    ):
+                        self.assertTrue(gsv_mod._is_custom_mei_weights(half_gpt, half_sov_win))
+                        self.assertEqual(gsv_mod._detect_boot_gsv_voice(), "__gsv_raiden_mei__")
+                    with (
+                        patch.object(cs, "GSV_INFER_YAML", half_p),
+                        patch.dict(
+                            os.environ,
+                            {
+                                "GSV_MEI_GPT_WEIGHTS": half_gpt,
+                                "GSV_MEI_SOVITS_WEIGHTS": "D:/my_models/speaker_e12.pth",
+                                "GSV_MEI_VERSION": "v4",
+                            },
+                            clear=False,
+                        ),
+                    ):
+                        self.assertEqual(gsv_mod._detect_boot_gsv_voice(), "__gsv_raiden_mei__")
+                    gsv_mod._preserved_boot_mei_weights.pop(half_p, None)
+
+                # 3. Explicit GSV_MEI_* env override takes priority over preserved boot YAML
+                env_gpt = "/env/raiden_mei/override.ckpt"
+                env_sov = "/env/raiden_mei/override.pth"
+                gsv_mod._active_gsv_loaded = None
+                http_calls.clear()
+                with (
+                    patch.object(cs, "GSV_INFER_YAML", infer_p),
+                    patch.object(cs, "_get_console_http_client", return_value=_FakeClient()),
+                    patch.dict(
+                        os.environ,
+                        {"GSV_MEI_GPT_WEIGHTS": env_gpt, "GSV_MEI_SOVITS_WEIGHTS": env_sov, "GSV_MEI_VERSION": "v4"},
+                        clear=False,
+                    ),
+                ):
+                    self.assertIsNone(gsv_mod._detect_boot_gsv_voice())
+                    gsv_mod._ensure_gsv_weights("__gsv_raiden_mei__", persist_boot_yaml=True)
+                    self.assertEqual(
+                        http_calls,
+                        [("set_gpt_weights", env_gpt), ("set_sovits_weights", env_sov)],
+                    )
+
+                # 4. Shared s1v3.ckpt between two profiles does NOT misidentify __gsv_xiaozhi_tw__ as __gsv_raiden_mei__
+                with open(infer_p, "w", encoding="utf-8") as wf:
+                    yaml.safe_dump(
+                        {
+                            "custom": {
+                                "version": "v2ProPlus",
+                                "t2s_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+                                "vits_weights_path": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
+                            }
+                        },
+                        wf,
+                        allow_unicode=True,
+                    )
+                with (
+                    patch.object(cs, "GSV_INFER_YAML", infer_p),
+                    patch.dict(
+                        os.environ,
+                        {
+                            "GSV_MEI_GPT_WEIGHTS": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+                            "GSV_MEI_SOVITS_WEIGHTS": "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth",
+                        },
+                        clear=False,
+                    ),
+                ):
+                    self.assertEqual(gsv_mod._detect_boot_gsv_voice(), "__gsv_xiaozhi_tw__")
+            finally:
+                gsv_mod._active_gsv_loaded = orig_loaded
+                gsv_mod._preserved_boot_mei_weights.pop(infer_p, None)
 
 
 if __name__ == "__main__":

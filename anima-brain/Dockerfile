@@ -1,21 +1,35 @@
+# Optional domestic mirror prefix & package registries (empty defaults keep exact upstream digests & registries)
+ARG DOCKER_MIRROR_PREFIX=
+
 # Stage 1: Build official Companion Studio React web console AND MCP UI static assets (H-2, H-4)
-FROM node:22-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS web-builder
+FROM ${DOCKER_MIRROR_PREFIX}node:22-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS web-builder
+ARG NPM_REGISTRY=
 
 WORKDIR /build/examples/showcase
 COPY examples/showcase/package.json examples/showcase/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+RUN if [ -n "${NPM_REGISTRY}" ]; then \
+        npm ci --no-audit --no-fund --registry="${NPM_REGISTRY}"; \
+    else \
+        npm ci --no-audit --no-fund; \
+    fi
 COPY docs /build/docs
 COPY examples/showcase/ ./
 RUN npm run build
 
 WORKDIR /build/ui
 COPY ui/package.json ui/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+RUN if [ -n "${NPM_REGISTRY}" ]; then \
+        npm ci --no-audit --no-fund --registry="${NPM_REGISTRY}"; \
+    else \
+        npm ci --no-audit --no-fund; \
+    fi
 COPY ui/ ./
 RUN mkdir -p /build/src/companion_engine/static && npm run build
 
 # Stage 2: Lightweight reproducible Python 3.12 runtime for Anima Brain + Companion Studio + XiaoZhi Bridge (H-2)
-FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+FROM ${DOCKER_MIRROR_PREFIX}python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+ARG PIP_INDEX_URL=
+ARG PIP_TRUSTED_HOST=
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -26,8 +40,11 @@ WORKDIR /app
 
 # Layer 1: Install pinned runtime & build dependencies from pyproject.toml + constraints.txt (Py 3.12)
 COPY pyproject.toml constraints.txt ./
-RUN python -c "import tomllib, pathlib; d=tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']; deps=list(d.get('dependencies',[]))+list(d.get('optional-dependencies',{}).get('http',[]))+list(d.get('optional-dependencies',{}).get('calls',[])); pathlib.Path('/tmp/reqs.txt').write_text('\n'.join(deps)+'\n', encoding='utf-8')" \
-    && pip install --no-cache-dir -c constraints.txt hatchling -r /tmp/reqs.txt \
+RUN set -- --no-cache-dir -c constraints.txt; \
+    if [ -n "${PIP_INDEX_URL}" ]; then set -- "$@" -i "${PIP_INDEX_URL}"; fi; \
+    if [ -n "${PIP_TRUSTED_HOST}" ]; then set -- "$@" --trusted-host "${PIP_TRUSTED_HOST}"; fi; \
+    python -c "import tomllib, pathlib; d=tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']; deps=list(d.get('dependencies',[]))+list(d.get('optional-dependencies',{}).get('http',[]))+list(d.get('optional-dependencies',{}).get('calls',[])); pathlib.Path('/tmp/reqs.txt').write_text('\n'.join(deps)+'\n', encoding='utf-8')" \
+    && pip install "$@" hatchling -r /tmp/reqs.txt \
     && rm -f /tmp/reqs.txt
 
 # Layer 2: Copy source + built static UI assets and install non-editable wheel (no -e, offline)
@@ -45,6 +62,8 @@ COPY --from=web-builder /build/src/companion_engine/static/voice-player.html /ap
 COPY --from=web-builder /build/src/companion_engine/static/voice-player-notices.txt /app/built_static/voice-player-notices.txt
 COPY --from=web-builder /build/src/companion_engine/static/memory-panel.html /app/built_static/memory-panel.html
 COPY --from=web-builder /build/src/companion_engine/static/provider-settings.html /app/built_static/provider-settings.html
+COPY recall_sanitizer.py /app/recall_sanitizer.py
+COPY dream_executor.py /app/dream_executor.py
 COPY obsidian_exporter.py /app/obsidian_exporter.py
 COPY xiaozhi_anima_service.py /app/xiaozhi_anima_service.py
 

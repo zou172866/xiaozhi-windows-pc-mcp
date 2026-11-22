@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+import concurrent.futures
 import datetime
 import json
 import logging
@@ -20,10 +22,12 @@ import shutil
 import sqlite3
 import threading
 import time
+from urllib.parse import urlparse
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from pydantic import SecretStr
 import uvicorn
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -42,6 +46,8 @@ from companion_engine.models import (
     MemoryDraft,
 )
 from companion_engine.temporal import local_today
+import dream_executor
+import recall_sanitizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,6 +120,13 @@ OBSIDIAN_EXPORT_DIR = Path(os.environ.get("OBSIDIAN_EXPORT_DIR", "/obsidian"))
 OBSIDIAN_HOST_DIR = (os.environ.get("OBSIDIAN_HOST_DIR") or "").strip() or str(OBSIDIAN_EXPORT_DIR)
 OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS = _env_int("OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS", 600, 15, 86400)
 OBSIDIAN_DEBOUNCE_SECONDS = _env_float("OBSIDIAN_DEBOUNCE_SECONDS", 5.0, 0.1, 60.0)
+OBSIDIAN_BRIEFING_ENABLED = _env_bool("OBSIDIAN_BRIEFING_ENABLED", True)
+OBSIDIAN_BRIEFING_INTERVAL_SECONDS = _env_int("OBSIDIAN_BRIEFING_INTERVAL_SECONDS", 3600, 300, 86400)
+
+# AutoDream offline read-only reflection & recall privacy sanitizer settings
+DREAM_ENABLED = _env_bool("ANIMA_DREAM_ENABLED", True)
+DREAM_INTERVAL_SECONDS = _env_int("ANIMA_DREAM_INTERVAL_SECONDS", 21600, 300, 604800)
+RECALL_SENSITIVE_FILTER_ENABLED = _env_bool("ANIMA_RECALL_SENSITIVE_FILTER", True)
 
 # Online SQLite backup & WAL governance settings (B-2, B-3, B-6)
 BACKUP_ENABLED = _env_bool("ANIMA_BACKUP_ENABLED", True)
@@ -698,12 +711,38 @@ def install_gemini_embedding_compat_patch() -> None:
         return
 
     def _compat_encode(self, texts):
-        response = _media_mod.post(
-            self.base + "/embeddings",
-            key=self.key,
-            transport=self.transport,
-            json={"model": self.model, "input": texts, "encoding_format": "float"},
-        )
+        is_open, binfo = _media_mod.embedding_breaker.is_circuit_open(self._settings)
+        if is_open:
+            code = binfo.get("status_code")
+            if binfo.get("auth_breaker_open"):
+                raise ProviderError(
+                    f"Embedding auth circuit open (HTTP {code}); degraded to lexical FTS5",
+                    status_code=code,
+                )
+            raise ProviderError(
+                f"Embedding circuit open ({binfo.get('reason') or 'transient_error'}); degraded to lexical FTS5",
+                status_code=code,
+            )
+        req_payload = {"model": self.model, "input": texts, "encoding_format": "float"}
+        if getattr(self, "dimensions", None) is not None:
+            req_payload["dimensions"] = self.dimensions
+        try:
+            response = _media_mod.post(
+                self.base + "/embeddings",
+                key=self.key,
+                transport=self.transport,
+                json=req_payload,
+            )
+        except ProviderError as exc:
+            if exc.status_code in (401, 403):
+                _media_mod.embedding_breaker.record_auth_failure(self._settings, exc.status_code)
+            else:
+                _media_mod.embedding_breaker.record_transient_failure(
+                    self._settings,
+                    f"http_{exc.status_code}" if exc.status_code else "connection_error",
+                    status_code=exc.status_code,
+                )
+            raise
         try:
             data = response.json()
             raw_rows = data["data"]
@@ -715,16 +754,38 @@ def install_gemini_embedding_compat_patch() -> None:
                     raise ValueError("Invalid embedding indices")
             else:
                 rows = raw_rows
+            vectors = [
+                _media_mod.checked_vector(r["embedding"], expected_dim=getattr(self, "dimensions", None))
+                for r in rows
+            ]
+            if not vectors:
+                raise ValueError("Empty embedding result")
+            dim = len(vectors[0])
+            if any(len(v) != dim for v in vectors):
+                raise ValueError("Inconsistent embedding dimensions within batch")
+            space = self.space_for_dim(dim)
+            _media_mod.embedding_breaker.record_success(self._settings, active_space=space, dim=dim)
             return {
-                "vectors": [_media_mod.checked_vector(r["embedding"]) for r in rows],
+                "vectors": vectors,
+                "dim": dim,
+                "space": space,
                 "usage": data.get("usage") or {"billing": "unknown"},
             }
-        except (ValueError, KeyError, TypeError):
+        except ValueError as exc:
+            msg = str(exc)
+            if "dimension" in msg.lower():
+                _media_mod.embedding_breaker.record_transient_failure(self._settings, "dimension_mismatch")
+                raise ProviderError(f"{msg}; billing may have occurred") from None
+            raise ProviderError("Invalid embedding envelope; billing may have occurred") from None
+        except (KeyError, TypeError):
             raise ProviderError("Invalid embedding envelope; billing may have occurred") from None
 
     _media_mod.Embeddings.encode = _compat_encode
     _media_mod.Embeddings._gemini_index_patched = True
     log.info("Applied Gemini OpenAI-compatible /embeddings index compatibility patch")
+
+
+_SAFE_CHAR_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 
 
 def ensure_default_character(brain: CompanionBrain) -> None:
@@ -740,6 +801,36 @@ def ensure_default_character(brain: CompanionBrain) -> None:
             timezone="Asia/Shanghai",
         )
         log.info("Created default Anima Brain character: %s (小智)", DEFAULT_CHARACTER_ID)
+
+
+def ensure_character_exists(brain: CompanionBrain, character_id: str) -> str:
+    """Ensure `character_id` exists in `brain`, auto-provisioning mapped multi-ESP32 characters safely (P2-4)."""
+    ensure_default_character(brain)
+    cid = str(character_id or "").strip()
+    if not cid or cid == DEFAULT_CHARACTER_ID:
+        return DEFAULT_CHARACTER_ID
+    chars = brain.characters()
+    by_id = {c.id: c for c in chars}
+    if cid in by_id:
+        return cid
+    if not _SAFE_CHAR_KEY_RE.match(cid) or len(chars) >= 32:
+        return DEFAULT_CHARACTER_ID
+    base = by_id.get(DEFAULT_CHARACTER_ID)
+    try:
+        brain.create_character(
+            character_id=cid,
+            name=base.name if base else "小智",
+            persona=base.persona if base else DEFAULT_PERSONA,
+            core_persona=base.core_persona if base else "",
+            memory_policy=base.memory_policy if base else "automatic",
+            relationship_enabled=base.relationship_enabled if base else True,
+            romance_enabled=base.romance_enabled if base else False,
+            timezone=base.timezone if base else "Asia/Shanghai",
+        )
+        log.info("Auto-provisioned mapped multi-device Anima character: %s", cid)
+        return cid
+    except Exception:
+        return DEFAULT_CHARACTER_ID
 
 
 def _count_consecutive_failures(engine, character_id: str, kind: str) -> int:
@@ -1264,8 +1355,313 @@ def _fmt_mem_date(ts: float | None) -> str:
         return ""
 
 
-def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: str) -> dict[str, Any]:
-    """Read-only sub-15ms recall from SQLite/FTS5/PAD without reserving a pending turn."""
+RECALL_EMBED_TIMEOUT_SECONDS = _env_float("ANIMA_RECALL_EMBED_TIMEOUT_SECONDS", 0.12, 0.02, 2.0)
+_QUERY_EMBED_LRU_MAX = 256
+_QUERY_EMBED_LRU_TTL_SECONDS = 1800.0
+_query_embed_lock = threading.Lock()
+_query_embed_lru: "OrderedDict[tuple[str, str], tuple[list[float], float]]" = OrderedDict()
+_query_embed_inflight: dict[tuple[str, str], asyncio.Task] = {}
+_query_embed_fail_streak: int = 0
+_query_embed_cb_until: float = 0.0
+_query_embed_last_degraded_reason: str = ""
+_query_embed_sem: asyncio.Semaphore | None = None
+_query_embed_sem_loop: asyncio.AbstractEventLoop | None = None
+_query_embed_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="anima-qembed"
+)
+
+
+def _get_query_embed_sem() -> asyncio.Semaphore:
+    global _query_embed_sem, _query_embed_sem_loop
+    loop = asyncio.get_running_loop()
+    if _query_embed_sem is None or _query_embed_sem_loop is not loop:
+        _query_embed_sem = asyncio.Semaphore(4)
+        _query_embed_sem_loop = loop
+    return _query_embed_sem
+
+
+def _is_loopback_base_url(base_url: str) -> bool:
+    """Return True only when base_url's parsed hostname is genuinely a loopback address."""
+    raw = str(base_url or "").strip()
+    if not raw:
+        return False
+    try:
+        host = (urlparse(raw).hostname or "").strip().lower()
+    except ValueError:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _format_space_label(ns: str, dim: int | None = None) -> str:
+    raw = ns.split(":", 1)[1] if ":" in ns else ns
+    if "@" in raw:
+        return raw
+    return f"{raw}@{dim}" if dim else raw
+
+
+def get_semantic_retrieval_health(
+    brain: CompanionBrain, character_id: str = DEFAULT_CHARACTER_ID
+) -> dict[str, Any]:
+    """Build explicit multi-space embedding & FTS5 degradation status for /health and console UI."""
+    from companion_engine.media import Embeddings, embedding_breaker
+    from companion_engine.memory import parse_namespace_dim
+
+    runtime = getattr(brain, "runtime", None)
+    settings = getattr(runtime, "settings", None)
+    base_url = str(getattr(settings, "embedding_base_url", "") or "").strip() if settings else ""
+    model = str(getattr(settings, "embedding_model", "") or "").strip() if settings else ""
+    configured = bool(base_url and model)
+
+    spaces_raw: list[dict[str, Any]] = []
+    try:
+        spaces_raw = brain.engine.retrieval.vector_spaces(character_id)
+    except Exception:
+        spaces_raw = []
+
+    raw_key = settings.embedding_key.get_secret_value().strip() if getattr(settings, "embedding_key", None) else ""
+    is_loopback = _is_loopback_base_url(base_url)
+    key_missing = bool(configured) and ((not raw_key and not is_loopback) or ("${" in raw_key and "}" in raw_key))
+
+    if not configured:
+        return {
+            "configured": False,
+            "semantic_available": False,
+            "retrieval_mode": "lexical_fts5",
+            "degraded": False,
+            "degraded_reason": "unconfigured",
+            "degraded_message_zh": "未配置远程向量模型，当前运行于纯 FTS5 中文词法检索模式",
+            "active_model": "",
+            "active_space": "",
+            "active_label": "",
+            "active_dim": None,
+            "auth_breaker_open": False,
+            "circuit_open": False,
+            "cooldown_remaining_seconds": 0.0,
+            "spaces_count": len(spaces_raw),
+            "spaces": [
+                {
+                    "label": s["label"],
+                    "dim": s["dim"],
+                    "evidence_vectors": s["evidence_vectors"],
+                    "retrieval_vectors": s["retrieval_vectors"],
+                    "legacy_vectors": s["legacy_vectors"],
+                    "active": False,
+                }
+                for s in spaces_raw[:8]
+            ],
+        }
+
+    if key_missing:
+        return {
+            "configured": True,
+            "semantic_available": False,
+            "retrieval_mode": "lexical_fts5",
+            "degraded": True,
+            "degraded_reason": "embedding_key_missing",
+            "degraded_message_zh": "向量接口密钥未配置，当前已降级为纯 FTS5 中文词法检索模式",
+            "active_model": model,
+            "active_space": "",
+            "active_label": "",
+            "active_dim": None,
+            "auth_breaker_open": False,
+            "circuit_open": False,
+            "cooldown_remaining_seconds": 0.0,
+            "spaces_count": len(spaces_raw),
+            "spaces": [
+                {
+                    "label": s["label"],
+                    "dim": s["dim"],
+                    "evidence_vectors": s["evidence_vectors"],
+                    "retrieval_vectors": s["retrieval_vectors"],
+                    "legacy_vectors": s["legacy_vectors"],
+                    "active": False,
+                }
+                for s in spaces_raw[:8]
+            ],
+        }
+
+    b_snap = embedding_breaker.snapshot(settings)
+    active_ns = ""
+    explicit_dim = getattr(settings, "embedding_dimensions", None)
+    active_dim = explicit_dim or b_snap.get("observed_default_dim")
+    try:
+        embed = Embeddings(settings, getattr(runtime, "transport", None))
+        active_ns = embed.resolve_namespace(brain.engine.db, dim=active_dim)
+        if not active_dim:
+            active_dim = parse_namespace_dim(active_ns)
+            if not active_dim:
+                for sp in spaces_raw:
+                    if sp["namespace"] == active_ns and sp.get("dim"):
+                        active_dim = sp["dim"]
+                        break
+    except Exception:
+        active_ns = ""
+
+    now_mono = time.monotonic()
+    with _query_embed_lock:
+        q_cb_rem = max(0.0, _query_embed_cb_until - now_mono)
+        q_last_reason = _query_embed_last_degraded_reason
+
+    auth_open = bool(b_snap.get("auth_breaker_open"))
+    circuit_open = bool(b_snap.get("circuit_open")) or (q_cb_rem > 0.0)
+    cooldown_rem = max(float(b_snap.get("cooldown_remaining_seconds") or 0.0), round(q_cb_rem, 1))
+
+    degraded = False
+    degraded_reason = ""
+    degraded_msg = ""
+    if auth_open:
+        degraded = True
+        degraded_reason = str(b_snap.get("degraded_reason") or "auth_failed")
+        code = b_snap.get("last_status_code") or "401/403"
+        degraded_msg = f"向量接口鉴权失败 (HTTP {code})，已自动熔断并降级为纯 FTS5 词法检索"
+    elif circuit_open:
+        degraded = True
+        degraded_reason = str(b_snap.get("degraded_reason") or q_last_reason or "circuit_open")
+        degraded_msg = f"向量接口连续异常已熔断 ({degraded_reason})，当前降级为纯 FTS5 词法检索"
+
+    active_label = _format_space_label(active_ns, active_dim) if active_ns else (
+        f"{model}@{active_dim}" if active_dim else model
+    )
+    safe_spaces = [
+        {
+            "label": s["label"],
+            "dim": s["dim"],
+            "evidence_vectors": s["evidence_vectors"],
+            "retrieval_vectors": s["retrieval_vectors"],
+            "legacy_vectors": s["legacy_vectors"],
+            "active": bool(active_ns and s["namespace"] == active_ns),
+        }
+        for s in spaces_raw[:8]
+    ]
+    return {
+        "configured": True,
+        "semantic_available": not degraded,
+        "retrieval_mode": "lexical_fts5" if degraded else "hybrid_rrf",
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
+        "degraded_message_zh": degraded_msg or f"语义+FTS5 混合检索正常（活动空间：{active_label}）",
+        "active_model": model,
+        "active_space": active_ns,
+        "active_label": active_label,
+        "active_dim": active_dim,
+        "auth_breaker_open": auth_open,
+        "circuit_open": circuit_open,
+        "cooldown_remaining_seconds": round(cooldown_rem, 1),
+        "spaces_count": len(spaces_raw),
+        "spaces": safe_spaces,
+    }
+
+
+async def resolve_recall_query_embedding(
+    brain: CompanionBrain, query: str
+) -> tuple[list[float] | None, str | None]:
+    """Encode `query` with 120ms hard timeout, multi-space namespace, 401/403 auth breaker & LRU cache (P1-2)."""
+    global _query_embed_fail_streak, _query_embed_cb_until, _query_embed_last_degraded_reason
+    q_norm = " ".join(str(query or "").strip().split())[:512]
+    if len(q_norm) < 2:
+        return None, None
+
+    runtime = getattr(brain, "runtime", None)
+    settings = getattr(runtime, "settings", None)
+    if settings is None or not getattr(settings, "embedding_model", "") or not getattr(settings, "embedding_base_url", ""):
+        return None, None
+    raw_key = settings.embedding_key.get_secret_value().strip() if getattr(settings, "embedding_key", None) else ""
+    base_url = str(settings.embedding_base_url or "").strip()
+    is_loopback = _is_loopback_base_url(base_url)
+    if (not raw_key and not is_loopback) or ("${" in raw_key and "}" in raw_key):
+        return None, None
+
+    try:
+        from companion_engine.media import Embeddings, embedding_breaker
+
+        cb_open, _ = embedding_breaker.is_circuit_open(settings)
+        if cb_open:
+            return None, None
+        embed = Embeddings(settings, getattr(runtime, "transport", None))
+        pref_ns = embed.resolve_namespace(brain.engine.db)
+    except Exception:
+        return None, None
+
+    cache_key = (pref_ns, q_norm)
+    now = time.monotonic()
+    with _query_embed_lock:
+        hit = _query_embed_lru.get(cache_key)
+        if hit is not None:
+            if (now - hit[1]) <= _QUERY_EMBED_LRU_TTL_SECONDS:
+                _query_embed_lru.move_to_end(cache_key)
+                vec_cached = hit[0]
+                resolved_ns = embed.resolve_namespace(brain.engine.db, dim=len(vec_cached))
+                return vec_cached, resolved_ns
+            _query_embed_lru.pop(cache_key, None)
+        if _query_embed_cb_until > now:
+            return None, None
+
+    existing_task = _query_embed_inflight.get(cache_key)
+    if existing_task is None or existing_task.done():
+        sem = _get_query_embed_sem()
+
+        async def _encode_and_store() -> tuple[list[float], str] | None:
+            global _query_embed_fail_streak, _query_embed_cb_until, _query_embed_last_degraded_reason
+            try:
+                async with sem:
+                    loop = asyncio.get_running_loop()
+                    res = await loop.run_in_executor(_query_embed_executor, embed.encode, [q_norm])
+                vec = res["vectors"][0]
+                actual_ns = embed.resolve_namespace(brain.engine.db, dim=len(vec))
+                with _query_embed_lock:
+                    _query_embed_fail_streak = 0
+                    _query_embed_cb_until = 0.0
+                    _query_embed_last_degraded_reason = ""
+                    now_ts = time.monotonic()
+                    _query_embed_lru[cache_key] = (vec, now_ts)
+                    _query_embed_lru.move_to_end(cache_key)
+                    if actual_ns != pref_ns:
+                        _query_embed_lru[(actual_ns, q_norm)] = (vec, now_ts)
+                        _query_embed_lru.move_to_end((actual_ns, q_norm))
+                    while len(_query_embed_lru) > _QUERY_EMBED_LRU_MAX:
+                        _query_embed_lru.popitem(last=False)
+                return vec, actual_ns
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                if status_code in (401, 403):
+                    embedding_breaker.record_auth_failure(settings, int(status_code))
+                    with _query_embed_lock:
+                        _query_embed_last_degraded_reason = f"auth_failed_{int(status_code)}"
+                else:
+                    with _query_embed_lock:
+                        _query_embed_fail_streak += 1
+                        _query_embed_last_degraded_reason = (
+                            f"http_{status_code}" if status_code else type(exc).__name__
+                        )
+                        if _query_embed_fail_streak >= 3:
+                            _query_embed_cb_until = time.monotonic() + 30.0
+                log.debug("Recall query embedding skipped: %s", _sanitize_error_for_log(str(exc)))
+                return None
+            finally:
+                if _query_embed_inflight.get(cache_key) is asyncio.current_task():
+                    _query_embed_inflight.pop(cache_key, None)
+
+        existing_task = asyncio.create_task(_encode_and_store())
+        _query_embed_inflight[cache_key] = existing_task
+
+    try:
+        res_pair = await asyncio.wait_for(asyncio.shield(existing_task), timeout=RECALL_EMBED_TIMEOUT_SECONDS)
+        if res_pair is not None:
+            return res_pair[0], res_pair[1]
+    except (asyncio.TimeoutError, Exception):
+        pass
+    return None, None
+
+
+def build_fast_recall_context(
+    brain: CompanionBrain,
+    character_id: str,
+    query: str,
+    *,
+    query_vector: list[float] | None = None,
+    embed_model: str | None = None,
+) -> dict[str, Any]:
+    """Read-only fast recall from SQLite/FTS5/PAD (+ optional bounded query vector) without reserving a pending turn."""
     engine = brain.engine
     query = (query or "").strip()[:4000]
     now = time.time()
@@ -1274,9 +1670,8 @@ def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: s
         try:
             row = engine._character(character_id)
         except Exception:
-            ensure_default_character(brain)
-            row = engine._character(DEFAULT_CHARACTER_ID)
-            character_id = DEFAULT_CHARACTER_ID
+            character_id = ensure_character_exists(brain, character_id)
+            row = engine._character(character_id)
 
         spec = CharacterSpec.model_validate_json(row["spec"])
         today = local_today(engine, character_id)
@@ -1341,7 +1736,17 @@ def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: s
             try:
                 from companion_engine.models import Memory as MemoryModel
 
-                layers = engine.retrieval.search(character_id, query, limit=8)
+                use_vec = query_vector is not None and bool(embed_model)
+                try:
+                    layers = (
+                        engine.retrieval.search(
+                            character_id, query, vector=query_vector, model=embed_model, limit=8
+                        )
+                        if use_vec
+                        else engine.retrieval.search(character_id, query, limit=8)
+                    )
+                except ValueError:
+                    layers = engine.retrieval.search(character_id, query, limit=8)
                 layered_facts = [MemoryModel.model_validate(m) for m in layers.get("facts", [])]
                 layered_docs = layers.get("documents", [])
             except Exception as exc:
@@ -1351,7 +1756,22 @@ def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: s
             except Exception as exc:
                 log.debug("FTS search skipped: %s", exc)
             try:
-                evidence_sources = engine.memory.recall(character_id, query, limit=4).get("sources", [])
+                use_vec = query_vector is not None and bool(embed_model)
+                try:
+                    ev_res = (
+                        engine.memory.recall(
+                            character_id,
+                            query,
+                            query_vector=query_vector,
+                            model=embed_model,
+                            limit=4,
+                        )
+                        if use_vec
+                        else engine.memory.recall(character_id, query, limit=4)
+                    )
+                except ValueError:
+                    ev_res = engine.memory.recall(character_id, query, limit=4)
+                evidence_sources = ev_res.get("sources", [])
             except Exception as exc:
                 log.debug("Evidence recall skipped: %s", exc)
 
@@ -1447,12 +1867,30 @@ def build_fast_recall_context(brain: CompanionBrain, character_id: str, query: s
         sections.append("【最近跨端对话衔接（若当前在同一轮已包含则勿重复）】\n" + "\n---\n".join(rt_lines))
 
     formatted = "\n\n".join(sections)
+    redact_meta: dict[str, Any] = {"redacted_count": 0, "categories": {}}
+    if RECALL_SENSITIVE_FILTER_ENABLED and formatted:
+        formatted, redact_meta = recall_sanitizer.redact_sensitive_entities(formatted)
+    used_semantic = query_vector is not None and bool(embed_model)
+    sem_health = get_semantic_retrieval_health(brain, character_id)
+    query_eligible_for_embed = len(" ".join(query.split())) >= 2
+    sem_degraded = bool(sem_health.get("configured")) and (not used_semantic) and query_eligible_for_embed
+    sem_reason = (
+        str(sem_health.get("degraded_reason") or "query_embed_timeout_or_fallback")
+        if sem_degraded
+        else (str(sem_health.get("degraded_reason") or "") if sem_health.get("degraded") else "")
+    )
     return {
         "character_id": character_id,
         "character_name": spec.name,
         "mood": mood_summary,
         "facts_count": len(active_facts),
         "open_loops_count": len(open_loops),
+        "retrieval_mode": "hybrid_rrf" if used_semantic else "lexical_fts5",
+        "vector_space": embed_model or sem_health.get("active_space") or "",
+        "semantic_degraded": sem_degraded or bool(sem_health.get("degraded")),
+        "semantic_degraded_reason": sem_reason,
+        "sensitive_redacted_count": int(redact_meta.get("redacted_count") or 0),
+        "sensitive_redacted_categories": dict(redact_meta.get("categories") or {}),
         "context_text": formatted,
     }
 
@@ -2137,8 +2575,7 @@ def extract_and_commit_turn(
         try:
             row = engine._character(character_id)
         except Exception:
-            ensure_default_character(brain)
-            character_id = DEFAULT_CHARACTER_ID
+            character_id = ensure_character_exists(brain, character_id)
             row = engine._character(character_id)
 
         existing_turn = engine.db.execute(
@@ -2489,10 +2926,17 @@ def create_combined_asgi_app(
             config_path=DATA_DIR / "obsidian_sync_config.json",
             default_enabled=OBSIDIAN_SYNC_ENABLED,
             snapshot_interval_seconds=OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS,
+            default_briefing_enabled=OBSIDIAN_BRIEFING_ENABLED,
+            briefing_interval_seconds=OBSIDIAN_BRIEFING_INTERVAL_SECONDS,
         )
     obsidian_runner = ObsidianSyncRunner(
         obsidian_exporter,
         debounce_seconds=OBSIDIAN_DEBOUNCE_SECONDS,
+    )
+    dream_manager = dream_executor.DreamManager(
+        brain,
+        default_enabled=DREAM_ENABLED,
+        default_interval_seconds=DREAM_INTERVAL_SECONDS,
     )
 
     allowed_hosts = {
@@ -2790,12 +3234,29 @@ def create_combined_asgi_app(
                 if is_idle:
                     await asyncio.to_thread(checkpoint_wal_if_idle, brain, is_idle=True)
                 await asyncio.to_thread(run_online_backup, brain, backup_dir)
+                try:
+                    char_ids = await asyncio.to_thread(
+                        lambda: [c.id for c in brain.characters()] or [DEFAULT_CHARACTER_ID]
+                    )
+                    for cid_dream in char_ids:
+                        d_cfg = await asyncio.to_thread(dream_manager.get_config, cid_dream)
+                        if d_cfg.get("enabled") and (
+                            time.time() - float(d_cfg.get("last_run_ts") or 0.0)
+                        ) >= float(d_cfg.get("interval_seconds") or DREAM_INTERVAL_SECONDS):
+                            await asyncio.to_thread(
+                                dream_manager.run_dream_cycle,
+                                cid_dream,
+                                reason="scheduled",
+                                skip_if_no_new_evidence=True,
+                            )
+                except Exception as dream_exc:
+                    log.warning("AutoDream scheduled check failed: %s", _sanitize_inbox_error(dream_exc))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.warning("review_healer iteration failed: %s", exc)
 
-    def _check_db_and_backup_blocking() -> tuple[bool, str, dict[str, int], dict[str, Any], dict[str, Any]]:
+    def _check_db_and_backup_blocking() -> tuple[bool, str, dict[str, int], dict[str, Any], dict[str, Any], dict[str, Any]]:
         inbox_snap = {
             "pending": 0,
             "pending_retries": 0,
@@ -2819,13 +3280,14 @@ def create_combined_asgi_app(
         backup_snap = dict(get_backup_status(brain, backup_dir))
         if backup_snap.get("last_error"):
             backup_snap["last_error"] = "backup_error"
-        return db_ok, db_err, inbox_snap, backup_snap, obs_public
+        sem_snap = get_semantic_retrieval_health(brain, DEFAULT_CHARACTER_ID)
+        return db_ok, db_err, inbox_snap, backup_snap, obs_public, sem_snap
 
     async def _build_health_response(*, authenticated: bool = False) -> tuple[dict[str, Any], int]:
         # Snapshot event-loop-owned asyncio state on the loop thread before offloading blocking DB/FS checks
         worker_alive = (worker_task is not None) and (not worker_task.done()) and (not shutting_down)
         stats_snap = dict(ingest_stats)
-        db_ok, db_err, inbox_snap, backup_snap, obs_public = await asyncio.to_thread(
+        db_ok, db_err, inbox_snap, backup_snap, obs_public, sem_snap = await asyncio.to_thread(
             _check_db_and_backup_blocking
         )
 
@@ -2856,6 +3318,10 @@ def create_combined_asgi_app(
         degraded_reasons: list[str] = []
         if inbox_dead > 0:
             degraded_reasons.append(f"inbox_dead_nonzero: {inbox_dead}")
+        if sem_snap.get("degraded"):
+            degraded_reasons.append(
+                f"semantic_retrieval_degraded: {sem_snap.get('degraded_reason') or 'lexical_fts5'}"
+            )
 
         healthy = len(reasons) == 0
         status_str = "unhealthy" if not healthy else ("degraded" if degraded_reasons else "ok")
@@ -2884,6 +3350,7 @@ def create_combined_asgi_app(
             },
             "backup": backup_snap,
             "obsidian": obs_public,
+            "semantic_retrieval": sem_snap,
         }
         return payload, (200 if healthy else 503)
 
@@ -3048,14 +3515,24 @@ def create_combined_asgi_app(
                         return
 
                     if path == "/xiaozhi/obsidian/config" and req.method == "POST":
-                        if "enabled" not in body or not isinstance(body.get("enabled"), bool):
+                        has_en = "enabled" in body
+                        has_br = "briefing_enabled" in body
+                        if (not has_en and not has_br) or (has_en and not isinstance(body.get("enabled"), bool)) or (
+                            has_br and not isinstance(body.get("briefing_enabled"), bool)
+                        ):
                             resp = JSONResponse(
-                                {"error": "Field 'enabled' (boolean) is required"},
+                                {"error": "Field 'enabled' and/or 'briefing_enabled' (boolean) is required"},
                                 status_code=400,
                             )
                             await resp(scope, receive, send)
                             return
-                        status_data = await obsidian_runner.set_enabled_async(bool(body["enabled"]))
+                        status_data = obsidian_exporter.status()
+                        if has_en:
+                            status_data = await obsidian_runner.set_enabled_async(bool(body["enabled"]))
+                        if has_br:
+                            status_data = await obsidian_runner.set_briefing_enabled_async(
+                                bool(body["briefing_enabled"])
+                            )
                         resp = JSONResponse({"ok": True, "obsidian": status_data, **status_data})
                         await resp(scope, receive, send)
                         return
@@ -3071,9 +3548,242 @@ def create_combined_asgi_app(
                         await resp(scope, receive, send)
                         return
 
+                    if path == "/xiaozhi/obsidian/briefing" and req.method == "POST":
+                        target_date = body.get("target_date")
+                        if target_date is not None:
+                            if not isinstance(target_date, str):
+                                resp = JSONResponse({"error": "Field 'target_date' must be YYYY-MM-DD"}, status_code=400)
+                                await resp(scope, receive, send)
+                                return
+                            td_clean = target_date.strip()
+                            if td_clean:
+                                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", td_clean):
+                                    resp = JSONResponse({"error": "Field 'target_date' must be YYYY-MM-DD"}, status_code=400)
+                                    await resp(scope, receive, send)
+                                    return
+                                try:
+                                    from datetime import date as _date_cls
+
+                                    _date_cls.fromisoformat(td_clean)
+                                except ValueError:
+                                    resp = JSONResponse({"error": "Field 'target_date' is not a valid calendar date"}, status_code=400)
+                                    await resp(scope, receive, send)
+                                    return
+                                target_date = td_clean
+                            else:
+                                target_date = None
+                        try:
+                            result = await obsidian_runner.run_briefings_now(
+                                reason="manual_briefing",
+                                target_date=target_date,
+                            )
+                        except ValueError as exc:
+                            resp = JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+                            await resp(scope, receive, send)
+                            return
+                        status_data = obsidian_exporter.status()
+                        code = 200 if result.get("ok") else 500
+                        resp = JSONResponse(
+                            {"result": result, "obsidian": status_data, **result},
+                            status_code=code,
+                        )
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/embedding/reset-breaker" and req.method == "POST":
+                        from companion_engine.media import embedding_breaker
+
+                        embedding_breaker.reset(getattr(brain.runtime, "settings", None))
+                        with _query_embed_lock:
+                            globals()["_query_embed_fail_streak"] = 0
+                            globals()["_query_embed_cb_until"] = 0.0
+                            globals()["_query_embed_last_degraded_reason"] = ""
+                        sem_snap = await asyncio.to_thread(get_semantic_retrieval_health, brain, char_id)
+                        resp = JSONResponse({"ok": True, "semantic_retrieval": sem_snap})
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/dream/status" and req.method == "GET":
+                        st_filter = req.query_params.get("status")
+                        pid_filter = (req.query_params.get("proposal_id") or "").strip()
+                        if pid_filter:
+                            prop = await asyncio.to_thread(
+                                dream_manager.get_proposal,
+                                char_id,
+                                pid_filter,
+                            )
+                            if prop is None:
+                                resp = JSONResponse({"ok": False, "error": f"Proposal not found: {pid_filter}"}, status_code=404)
+                            else:
+                                resp = JSONResponse({"ok": True, "proposal": prop, "proposals": [prop]})
+                            await resp(scope, receive, send)
+                            return
+                        data = await asyncio.to_thread(
+                            dream_manager.status,
+                            char_id,
+                            status_filter=st_filter,
+                        )
+                        resp = JSONResponse({"ok": True, **data})
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/dream/config" and req.method == "POST":
+                        has_en = "enabled" in body
+                        has_iv = "interval_seconds" in body
+                        has_asr = "existing_asr_corrections" in body
+                        en_arg = body.get("enabled") if has_en else None
+                        iv_arg = body.get("interval_seconds") if has_iv else None
+                        asr_arg = body.get("existing_asr_corrections") if has_asr else None
+                        if not has_en and not has_iv and not has_asr:
+                            resp = JSONResponse(
+                                {
+                                    "error": "Provide 'enabled' (bool), 'interval_seconds' (int), and/or 'existing_asr_corrections' (object)"
+                                },
+                                status_code=400,
+                            )
+                            await resp(scope, receive, send)
+                            return
+                        if has_en and not isinstance(en_arg, bool):
+                            resp = JSONResponse({"error": "Field 'enabled' must be boolean"}, status_code=400)
+                            await resp(scope, receive, send)
+                            return
+                        if has_asr and not isinstance(asr_arg, dict):
+                            resp = JSONResponse(
+                                {"error": "Field 'existing_asr_corrections' must be an object"},
+                                status_code=400,
+                            )
+                            await resp(scope, receive, send)
+                            return
+                        all_chars_arg = body.get("all_characters")
+                        if all_chars_arg is not None and not isinstance(all_chars_arg, bool):
+                            resp = JSONResponse({"error": "Field 'all_characters' must be boolean"}, status_code=400)
+                            await resp(scope, receive, send)
+                            return
+                        explicit_cid = bool(
+                            str(body.get("character_id") or req.query_params.get("character_id") or "").strip()
+                        )
+                        sync_all = bool(all_chars_arg) if all_chars_arg is not None else (not explicit_cid)
+                        try:
+                            cfg_res = await asyncio.to_thread(
+                                dream_manager.update_config,
+                                char_id,
+                                enabled=en_arg,
+                                interval_seconds=iv_arg,
+                                existing_asr_corrections=asr_arg,
+                                sync_all_characters=sync_all,
+                            )
+                            resp = JSONResponse({"ok": True, "config": cfg_res})
+                        except ValueError as exc:
+                            resp = JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/dream/run" and req.method == "POST":
+                        asr_map = body.get("existing_asr_corrections")
+                        if asr_map is not None and not isinstance(asr_map, dict):
+                            resp = JSONResponse(
+                                {"error": "Field 'existing_asr_corrections' must be an object"},
+                                status_code=400,
+                            )
+                            await resp(scope, receive, send)
+                            return
+                        known_terms = body.get("known_terms")
+                        if known_terms is not None and not isinstance(known_terms, list):
+                            resp = JSONResponse(
+                                {"error": "Field 'known_terms' must be a list of strings"},
+                                status_code=400,
+                            )
+                            await resp(scope, receive, send)
+                            return
+                        res = await asyncio.to_thread(
+                            dream_manager.run_dream_cycle,
+                            char_id,
+                            reason="manual",
+                            existing_asr_corrections=asr_map,
+                            known_terms=known_terms,
+                            skip_if_no_new_evidence=False,
+                        )
+                        resp = JSONResponse(res)
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/dream/approve" and req.method == "POST":
+                        pid = str(body.get("proposal_id") or "").strip()
+                        if not pid:
+                            resp = JSONResponse({"ok": False, "error": "Field 'proposal_id' is required"}, status_code=400)
+                            await resp(scope, receive, send)
+                            return
+                        exp_bh = body.get("expected_baseline_hash")
+                        if exp_bh is not None and not isinstance(exp_bh, str):
+                            resp = JSONResponse({"ok": False, "error": "Field 'expected_baseline_hash' must be string"}, status_code=400)
+                            await resp(scope, receive, send)
+                            return
+                        ext_applied = bool(body.get("external_applied", False))
+                        ext_res = body.get("external_result") if isinstance(body.get("external_result"), dict) else None
+                        note_s = str(body.get("note") or "")
+                        try:
+                            res = await asyncio.to_thread(
+                                dream_manager.approve_proposal,
+                                char_id,
+                                pid,
+                                expected_baseline_hash=exp_bh,
+                                note=note_s,
+                                external_applied=ext_applied,
+                                external_result=ext_res,
+                            )
+                            obsidian_runner.notify_db_change()
+                            resp = JSONResponse(res, status_code=200)
+                        except KeyError as exc:
+                            resp = JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+                        except dream_executor.DreamConflictError as exc:
+                            resp = JSONResponse(
+                                {
+                                    "ok": False,
+                                    "error": str(exc),
+                                    "conflict": True,
+                                    "expected_baseline_hash": exc.expected_baseline_hash,
+                                    "current_baseline_hash": exc.current_baseline_hash,
+                                },
+                                status_code=409,
+                            )
+                        except ValueError as exc:
+                            resp = JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/dream/reject" and req.method == "POST":
+                        pid = str(body.get("proposal_id") or "").strip()
+                        if not pid:
+                            resp = JSONResponse({"ok": False, "error": "Field 'proposal_id' is required"}, status_code=400)
+                            await resp(scope, receive, send)
+                            return
+                        note_s = str(body.get("note") or "")
+                        try:
+                            res = await asyncio.to_thread(
+                                dream_manager.reject_proposal,
+                                char_id,
+                                pid,
+                                note=note_s,
+                            )
+                            resp = JSONResponse(res, status_code=200)
+                        except KeyError as exc:
+                            resp = JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+                        except dream_executor.DreamConflictError as exc:
+                            resp = JSONResponse({"ok": False, "error": str(exc), "conflict": True}, status_code=409)
+                        await resp(scope, receive, send)
+                        return
+
                     if path == "/xiaozhi/recall" and req.method == "POST":
                         query = str(body.get("query") or "")
-                        data = await asyncio.to_thread(build_fast_recall_context, brain, char_id, query)
+                        q_vec, q_model = await resolve_recall_query_embedding(brain, query)
+                        data = await asyncio.to_thread(
+                            build_fast_recall_context,
+                            brain,
+                            char_id,
+                            query,
+                            query_vector=q_vec,
+                            embed_model=q_model,
+                        )
                         resp = JSONResponse(data)
                         await resp(scope, receive, send)
                         return
@@ -3250,18 +3960,132 @@ def create_combined_asgi_app(
     return combined_app
 
 
+_DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+_DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+
+def _classify_provider_url(url: str) -> str:
+    try:
+        host = (urlparse(str(url or "").strip()).hostname or "").lower()
+    except Exception:
+        host = ""
+    if host == "generativelanguage.googleapis.com" or host.endswith(".googleapis.com"):
+        return "gemini"
+    if host == "api.deepseek.com" or host.endswith(".deepseek.com"):
+        return "deepseek"
+    return "other"
+
+
+def resolve_companion_settings(
+    settings: Settings,
+    env: Mapping[str, str] | None = None,
+) -> Settings:
+    """Resolve URL-matched API key fallbacks so DeepSeek/Gemini never cross-wire keys or fail silently."""
+    src = os.environ if env is None else env
+    ds_fallback = (src.get("ANIMA_FALLBACK_DEEPSEEK_KEY") or "").strip()
+    gem_fallback = (src.get("ANIMA_FALLBACK_GEMINI_KEY") or "").strip()
+    base_url_explicit = bool((src.get("ANIMA_LLM_BASE_URL_EXPLICIT") or "").strip())
+    llm_key_explicit = bool((src.get("ANIMA_LLM_API_KEY_EXPLICIT") or "").strip())
+    summary_url_explicit = bool((src.get("ANIMA_SUMMARY_BASE_URL_EXPLICIT") or "").strip())
+    summary_key_explicit = bool((src.get("ANIMA_SUMMARY_API_KEY_EXPLICIT") or "").strip())
+    embed_key_explicit = bool((src.get("ANIMA_EMBEDDING_API_KEY_EXPLICIT") or "").strip())
+
+    llm_explicit_tracked = "ANIMA_LLM_API_KEY_EXPLICIT" in src
+    sum_explicit_tracked = "ANIMA_SUMMARY_API_KEY_EXPLICIT" in src or llm_explicit_tracked
+    emb_explicit_tracked = "ANIMA_EMBEDDING_API_KEY_EXPLICIT" in src
+
+    def _is_known_fallback(val: str) -> bool:
+        return bool(val) and (val == ds_fallback or val == gem_fallback)
+
+    # If user did not pin ANIMA_LLM_BASE_URL and only has GEMINI_API_KEY (no DEEPSEEK_API_KEY),
+    # route default Anima LLM cleanly to Gemini instead of sending GEMINI_API_KEY to DeepSeek.
+    if not base_url_explicit and not llm_key_explicit and not ds_fallback and gem_fallback:
+        if not settings.base_url or _classify_provider_url(settings.base_url) == "deepseek":
+            settings.base_url = _DEFAULT_GEMINI_BASE_URL
+            settings.model = _DEFAULT_GEMINI_MODEL
+            settings.api_key = SecretStr(gem_fallback)
+            if not summary_url_explicit:
+                settings.summary_base_url = _DEFAULT_GEMINI_BASE_URL
+                settings.summary_model = _DEFAULT_GEMINI_MODEL
+
+    if not llm_key_explicit:
+        main_kind = _classify_provider_url(settings.base_url)
+        cur_main = settings.api_key.get_secret_value()
+        if main_kind == "gemini":
+            if gem_fallback:
+                settings.api_key = SecretStr(gem_fallback)
+            elif llm_explicit_tracked or _is_known_fallback(cur_main):
+                settings.api_key = SecretStr("")
+        elif main_kind == "deepseek":
+            if ds_fallback:
+                settings.api_key = SecretStr(ds_fallback)
+            elif llm_explicit_tracked or _is_known_fallback(cur_main):
+                settings.api_key = SecretStr("")
+        elif llm_explicit_tracked or _is_known_fallback(cur_main):
+            settings.api_key = SecretStr("")
+
+    if not summary_key_explicit:
+        sum_url = settings.summary_base_url or settings.base_url
+        sum_kind = _classify_provider_url(sum_url)
+        same_as_main = bool(sum_url) and (sum_url.rstrip("/") == (settings.base_url or "").rstrip("/"))
+        cur_sum = settings.summary_key.get_secret_value()
+        if same_as_main and settings.api_key.get_secret_value():
+            settings.summary_key = settings.api_key
+        elif sum_kind == "gemini":
+            if gem_fallback:
+                settings.summary_key = SecretStr(gem_fallback)
+            elif sum_explicit_tracked or _is_known_fallback(cur_sum):
+                settings.summary_key = SecretStr("")
+        elif sum_kind == "deepseek":
+            if ds_fallback:
+                settings.summary_key = SecretStr(ds_fallback)
+            elif sum_explicit_tracked or _is_known_fallback(cur_sum):
+                settings.summary_key = SecretStr("")
+        elif sum_explicit_tracked or _is_known_fallback(cur_sum):
+            settings.summary_key = SecretStr("")
+
+    if not embed_key_explicit and settings.embedding_base_url:
+        emb_kind = _classify_provider_url(settings.embedding_base_url)
+        cur_emb = settings.embedding_key.get_secret_value()
+        if not cur_emb or emb_explicit_tracked or _is_known_fallback(cur_emb):
+            if emb_kind == "gemini":
+                if gem_fallback:
+                    settings.embedding_key = SecretStr(gem_fallback)
+                elif emb_explicit_tracked or _is_known_fallback(cur_emb):
+                    settings.embedding_key = SecretStr("")
+            elif emb_kind == "deepseek":
+                if ds_fallback:
+                    settings.embedding_key = SecretStr(ds_fallback)
+                elif emb_explicit_tracked or _is_known_fallback(cur_emb):
+                    settings.embedding_key = SecretStr("")
+            elif emb_explicit_tracked or _is_known_fallback(cur_emb):
+                settings.embedding_key = SecretStr("")
+
+    return settings
+
+
 def main():
     install_gemini_embedding_compat_patch()
     token = load_or_create_token()
     studio_url = f"http://localhost:{PORT}/#token={token}"
     URL_PATH.write_text(studio_url + "\n", encoding="utf-8")
 
-    settings = Settings.from_env()
+    settings = resolve_companion_settings(Settings.from_env())
+    # Drop transient fallback env vars after settings resolution so they never linger in child env
+    for _tmp_k in ("ANIMA_FALLBACK_DEEPSEEK_KEY", "ANIMA_FALLBACK_GEMINI_KEY"):
+        os.environ.pop(_tmp_k, None)
     # Keep reader_enabled off by default for fast single-hop chat in Companion Studio too
     if "COMPANION_READER_ENABLED" not in os.environ:
         settings.reader_enabled = False
     if "COMPANION_TIMEOUT_SECONDS" not in os.environ and settings.timeout_seconds < DEFAULT_TIMEOUT_SECONDS:
         settings.timeout_seconds = DEFAULT_TIMEOUT_SECONDS
+    log.info(
+        "Anima LLM provider: host=%s model=%s key=%s | embedding=%s",
+        (urlparse(settings.base_url).hostname or settings.base_url or "unset"),
+        settings.model or "unset",
+        "configured" if settings.api_key.get_secret_value() else "missing",
+        (urlparse(settings.embedding_base_url).hostname or "disabled") if settings.embedding_base_url else "disabled",
+    )
 
     automation = MemoryAutomation(
         embedding=bool(settings.embedding_base_url and settings.embedding_model),

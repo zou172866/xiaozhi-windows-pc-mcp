@@ -877,11 +877,18 @@ def _find_active_workspace_task_locked(ws_key: str) -> Optional[Dict[str, Any]]:
                     return {
                         "task_id": tid,
                         "backend": str(obj.get("backend") or ""),
+                        "status": "running",
                         "prompt": str(obj.get("prompt") or "")[:80],
                         "workdir": rec_wd,
                         "pid": child_pid,
                         "pid_create_time": child_ct,
                     }
+            # P2-1: Also check Sidecar-dispatched Antigravity sessions whose transcript.jsonl is still active
+            from .antigravity import find_busy_dispatched_antigravity_task_locked
+
+            dispatched_busy = find_busy_dispatched_antigravity_task_locked(ws_key)
+            if dispatched_busy is not None:
+                return dispatched_busy
     except Exception:
         pass
     return None
@@ -938,7 +945,9 @@ def claim_workspace_or_enqueue(
             }
             _workspace_active_tasks[ws_key] = entry
         else:
-            if not use_queue or start_fn is None:
+            # Sidecar-dispatched Antigravity tasks finish in an external IDE process without invoking
+            # release_workspace_slot(), so never strand CLI tasks in _workspace_queues behind them.
+            if not use_queue or start_fn is None or busy.get("status") == "dispatched":
                 return "busy", format_workspace_busy_message(workdir, busy)
             q = _workspace_queues.setdefault(ws_key, [])
             if len(q) >= _MAX_WORKSPACE_QUEUE_SIZE:

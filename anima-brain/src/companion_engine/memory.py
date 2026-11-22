@@ -297,9 +297,9 @@ class MemorySystem:
                 ]
             semantic = []
             if query_vector is not None:
-                q = checked_vector(query_vector)
                 if not model:
                     raise ValueError("Embedding model namespace required")
+                q = checked_vector(query_vector, expected_dim=parse_namespace_dim(model))
                 cursor = self.db.execute(
                     "SELECT v.evidence_id,v.vector FROM vectors v JOIN evidence e ON "
                     "e.id=v.evidence_id "
@@ -410,7 +410,7 @@ class MemorySystem:
             ]
 
     def store_vector(self, character_id, evidence_id, model, vector, source_text):
-        normalized = checked_vector(vector)
+        normalized = checked_vector(vector, expected_dim=parse_namespace_dim(model))
         with self.engine._transaction():
             row = self._source(character_id, evidence_id)
             note = self.db.execute(
@@ -764,13 +764,32 @@ class MemorySystem:
         return result
 
 
-def checked_vector(vector):
+def parse_namespace_dim(model: str | None) -> int | None:
+    """Extract trailing `@<dim>` vector dimension from a multi-space embedding namespace."""
+    if not isinstance(model, str) or "@" not in model:
+        return None
+    suffix = model.rsplit("@", 1)[1].strip()
+    if suffix.isdigit():
+        dim = int(suffix)
+        if 1 <= dim <= 8192:
+            return dim
+    return None
+
+
+def checked_vector(vector, *, expected_dim: int | None = None):
     if (
         not isinstance(vector, list)
         or not 1 <= len(vector) <= 8192
-        or any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in vector)
+        or any(
+            not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v)
+            for v in vector
+        )
     ):
         raise ValueError("Invalid embedding vector")
+    if expected_dim is not None and len(vector) != int(expected_dim):
+        raise ValueError(
+            f"Embedding dimension mismatch: expected {int(expected_dim)}, got {len(vector)}"
+        )
     norm = math.sqrt(sum(v * v for v in vector))
     if not norm:
         raise ValueError("Zero embedding vector")

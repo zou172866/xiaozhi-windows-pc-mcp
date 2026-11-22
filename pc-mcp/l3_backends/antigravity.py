@@ -34,6 +34,12 @@ from . import (
 TRANSCRIPT_TAIL_BYTES = 64 * 1024  # H-6: Read at most the last 64 KB of transcript.jsonl
 _CLAIMED_TMP_RE = re.compile(r"^\..+\.claimed\.(\d+)\.(\d+)\.tmp$")
 _CLAIMED_TMP_MAX_AGE_SECONDS = 120.0
+_DISPATCHED_TRANSCRIPT_ACTIVE_SECONDS = 90.0
+_DISPATCHED_INIT_GRACE_SECONDS = 15.0
+_ABORTED_TRANSCRIPT_STATUSES = frozenset(
+    {"CANCELLED", "CANCELED", "STOPPED", "ABORTED", "IDLE"}
+)
+_STEP_FINISHED_STATUSES = frozenset({"", "DONE", "COMPLETED", "FINISHED"})
 
 
 def _is_live_claim_file(pfp: Path, *, max_age_seconds: float = _CLAIMED_TMP_MAX_AGE_SECONDS) -> bool:
@@ -142,6 +148,98 @@ def _is_worker_alive() -> bool:
         return False
 
 
+def _is_dispatched_conversation_busy(
+    conv_id: str,
+    task_file: Path,
+    *,
+    active_window_seconds: float = _DISPATCHED_TRANSCRIPT_ACTIVE_SECONDS,
+    init_grace_seconds: float = _DISPATCHED_INIT_GRACE_SECONDS,
+) -> bool:
+    """Return True if a Sidecar-dispatched Antigravity conversation is still actively executing (P2-1)."""
+    now = time.time()
+    try:
+        safe_conv = validate_task_id(conv_id) if conv_id else ""
+    except ValueError:
+        safe_conv = ""
+    if safe_conv:
+        try:
+            brain_root = _get_brain_dir().resolve()
+            t_path = (brain_root / safe_conv / ".system_generated" / "logs" / "transcript.jsonl").resolve()
+            if t_path.is_relative_to(brain_root) and t_path.is_file():
+                age = now - t_path.stat().st_mtime
+                if age > active_window_seconds:
+                    return False
+                lines, _ = _read_tail_lines(t_path, max_bytes=16384)
+                for ln in reversed(lines):
+                    if not ln.strip():
+                        continue
+                    try:
+                        obj = json.loads(ln)
+                    except Exception:
+                        continue
+                    step_type = str(obj.get("type") or "").strip().upper()
+                    status = str(obj.get("status") or "").strip().upper()
+                    if status in _ABORTED_TRANSCRIPT_STATUSES:
+                        return False
+                    if step_type == "PLANNER_RESPONSE":
+                        tool_calls = obj.get("tool_calls")
+                        has_tool_calls = isinstance(tool_calls, (list, tuple)) and len(tool_calls) > 0
+                        if not has_tool_calls and status in _STEP_FINISHED_STATUSES:
+                            return False
+                        return True
+                    # Non-final steps (USER_INPUT, SYSTEM_MESSAGE, GENERIC tool result, CHECKPOINT, retryable ERROR_MESSAGE)
+                    # carry status="DONE" per step while the agent turn is still actively executing!
+                    return True
+                return age <= init_grace_seconds
+        except Exception:
+            return False
+
+    try:
+        return (now - task_file.stat().st_mtime) <= init_grace_seconds
+    except OSError:
+        return False
+
+
+def find_busy_dispatched_antigravity_task_locked(ws_key: str) -> Dict[str, Any] | None:
+    """Scan ACTIVE_DIR for a Sidecar-dispatched Antigravity session still actively editing `ws_key` (P2-1)."""
+    if not ACTIVE_DIR.exists():
+        return None
+    candidates: list[tuple[float, Path, dict]] = []
+    for fp in sorted(ACTIVE_DIR.glob("*.json")):
+        if fp.is_symlink():
+            continue
+        try:
+            obj = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("backend") != "antigravity" or obj.get("status") != "dispatched":
+            continue
+        rec_wd = str(obj.get("workdir") or "").strip()
+        if not rec_wd or normalize_workspace_key(rec_wd) != ws_key:
+            continue
+        try:
+            mtime = fp.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        candidates.append((mtime, fp, obj))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for _, fp, obj in candidates[:4]:
+        conv_id = str(obj.get("conversation_id") or "").strip()
+        if _is_dispatched_conversation_busy(conv_id, fp):
+            return {
+                "task_id": str(obj.get("id") or fp.stem),
+                "backend": "antigravity",
+                "status": "dispatched",
+                "conversation_id": conv_id,
+                "prompt": str(obj.get("prompt") or "")[:80],
+                "workdir": str(obj.get("workdir") or ""),
+            }
+    return None
+
+
 class AntigravityBackend(L3Backend):
     name = "antigravity"
     label_zh = "Google Antigravity（反重力）"
@@ -173,7 +271,13 @@ class AntigravityBackend(L3Backend):
         with _workspace_guard_lock:
             busy = _find_active_workspace_task_locked(ws_key)
             if busy is not None:
-                return format_workspace_busy_message(workdir, busy)
+                is_same_conv_followup = (
+                    bool(follow_up_last)
+                    and busy.get("backend") == "antigravity"
+                    and busy.get("status") == "dispatched"
+                )
+                if not is_same_conv_followup:
+                    return format_workspace_busy_message(workdir, busy)
             if not follow_up_last and not is_workspace_queue_mode(cfg) and PENDING_DIR.exists():
                 live_claims = [
                     cfp

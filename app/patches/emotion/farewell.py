@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import patch_registry
 import runtime_events
 import runtime_settings
+import turn_context_router
 import xz_common
 from patches.emotion import tags
 
@@ -145,7 +146,8 @@ async def generate_llm_idle_farewell(
             pass
 
     def _call_sync() -> str:
-        resp = client.chat.completions.create(**request_params)
+        with turn_context_router.suppress_llm_telemetry():
+            resp = client.chat.completions.create(**request_params)
         choices = getattr(resp, "choices", None) or []
         if not choices:
             return ""

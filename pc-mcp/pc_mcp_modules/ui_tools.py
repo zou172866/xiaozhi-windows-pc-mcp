@@ -23,7 +23,14 @@ from .security import (
     redact_secrets,
     trigger_emergency_stop,
 )
-from .vision import _compute_region_hash, _region_hashes_match, _smart_locate_target, _walk_uia_controls
+from .vision import (
+    _compute_region_hash,
+    _get_target_monitor_rect,
+    _grab_monitor_rgb,
+    _region_hashes_match,
+    _smart_locate_target,
+    _walk_uia_controls,
+)
 from .winapi import _get_foreground_window_info, _get_window_info_at_point, _user32
 
 MAX_STALE_RELOCATE_RETRIES = 2
@@ -94,7 +101,19 @@ def inspect_window_ui(window_keyword: str = "") -> str:
             else:
                 target_win = auto.GetForegroundControl()
             win_name = (target_win.Name or "当前窗口") if target_win else "当前窗口"
-            elems = walk_fn(auto, target_win, 45, sw, sh)
+            mon_rect = (
+                _get_target_monitor_rect(getattr(target_win, "NativeWindowHandle", None))
+                if target_win is not None
+                else None
+            )
+            if mon_rect is not None:
+                ml, mt, mr, mb = mon_rect
+                try:
+                    elems = walk_fn(auto, target_win, 45, mr - ml, mb - mt, mon_left=ml, mon_top=mt)
+                except TypeError:
+                    elems = walk_fn(auto, target_win, 45, sw, sh)
+            else:
+                elems = walk_fn(auto, target_win, 45, sw, sh)
 
     audit_fn(
         tool="pc_inspect_window_ui",
@@ -148,7 +167,7 @@ def _pc_ui_action_locked(
             action=act,
             outcome="blocked",
             reason="emergency_stop",
-            target=element_name or (f"({x},{y})" if x >= 0 and y >= 0 else ""),
+            target=element_name or (f"({x},{y})" if not (x == -1 and y == -1) else ""),
             hotkey=hotkey,
             text=text,
             press_enter=press_enter,
@@ -170,17 +189,41 @@ def _pc_ui_action_locked(
         else:
             pg.click(cx, cy)
 
+    def _is_explicit_screen_point_valid(px: int, py: int) -> bool:
+        if px == -1 and py == -1:
+            return False
+        if px >= 0 and py >= 0:
+            return True
+        try:
+            vx_left = int(u32.GetSystemMetrics(76))  # SM_XVIRTUALSCREEN
+            vy_top = int(u32.GetSystemMetrics(77))  # SM_YVIRTUALSCREEN
+            vx_w = int(u32.GetSystemMetrics(78))  # SM_CXVIRTUALSCREEN
+            vy_h = int(u32.GetSystemMetrics(79))  # SM_CYVIRTUALSCREEN
+            if vx_w > 0 and vy_h > 0:
+                return (vx_left <= px < vx_left + vx_w) and (vy_top <= py < vy_top + vy_h)
+        except Exception:
+            pass
+        return False
+
     def _is_target_region_fresh_locked(loc_obj, cx: int, cy: int) -> bool:
-        """Re-capture screenshot under _gui_lock and compare perceptual region hash before clicking (E-3, 4.1)."""
+        """Re-capture screenshot under _gui_lock and compare perceptual region hash before clicking (E-3, P2-2)."""
         expected_hash = str(getattr(loc_obj, "region_hash", "") or "")
         if not expected_hash:
             return True
         expected_box = getattr(loc_obj, "region_box", None)
         expected_size = getattr(loc_obj, "screen_size", None)
-        fresh_img = ig.grab().convert("RGB")
+        expected_mon = getattr(loc_obj, "monitor_rect", None)
+        mon_left = int(expected_mon[0]) if expected_mon is not None else 0
+        mon_top = int(expected_mon[1]) if expected_mon is not None else 0
+        fresh_img = _grab_monitor_rgb(ig, expected_mon)
         if expected_size is not None and fresh_img.size != expected_size:
             return False
-        fresh_hash, _ = region_hash_fn(fresh_img, cx, cy, box=expected_box)
+        try:
+            fresh_hash, _ = region_hash_fn(
+                fresh_img, cx, cy, box=expected_box, mon_left=mon_left, mon_top=mon_top
+            )
+        except TypeError:
+            fresh_hash, _ = region_hash_fn(fresh_img, cx, cy, box=expected_box)
         match_fn = facade_attr("_region_hashes_match", _region_hashes_match)
         return bool(fresh_hash and match_fn(expected_hash, fresh_hash))
 
@@ -319,7 +362,7 @@ def _pc_ui_action_locked(
                         )
                         verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
                         return f"已精准{verb} {src_desc}，物理像素坐标 ({cx}, {cy})。"
-            elif x >= 0 and y >= 0:
+            elif _is_explicit_screen_point_valid(x, y):
                 with _gui_lock:
                     fg_info = fg_info_fn()
                     tgt_info = pt_info_fn(x, y)
@@ -514,7 +557,7 @@ def _pc_ui_action_locked(
             action=act,
             outcome="blocked",
             reason="emergency_stop",
-            target=element_name or (f"({x},{y})" if x >= 0 and y >= 0 else ""),
+            target=element_name or (f"({x},{y})" if not (x == -1 and y == -1) else ""),
             hotkey=hotkey,
             text=text,
             press_enter=press_enter,
@@ -528,7 +571,7 @@ def _pc_ui_action_locked(
             action=act,
             outcome="blocked",
             reason="failsafe_triggered",
-            target=element_name or (f"({x},{y})" if x >= 0 and y >= 0 else ""),
+            target=element_name or (f"({x},{y})" if not (x == -1 and y == -1) else ""),
             detail="PyAutoGUI corner FAILSAFE triggered; downgraded to safe mode",
         )
         return "安全急停已触发（鼠标移至屏幕角落 FAILSAFE），已立即中止 L2 操作并降回安全挡。"

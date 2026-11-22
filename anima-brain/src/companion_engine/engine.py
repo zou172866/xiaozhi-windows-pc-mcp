@@ -87,15 +87,72 @@ def encoded(value) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+_EN_STOP = {"a", "an", "the", "i", "my", "me", "is", "are", "was", "do", "you", "what", "and", "to"}
+_CJK_STOP_CHARS = frozenset(
+    "的了是在我有和就都而及与着或你他她它们这那吧吗呢呀啊哦嗯哈啦嘛么把被让给向往从到对跟比很太更最也还又再才只曾已正将要会能可好去来上下里外个"
+)
+_CJK_STOP_BIGRAMS = frozenset(
+    {
+        "我的",
+        "你的",
+        "他的",
+        "她的",
+        "它的",
+        "我们",
+        "你们",
+        "他们",
+        "是的",
+        "不是",
+        "没有",
+        "什么",
+        "怎么",
+        "这个",
+        "那个",
+        "一下",
+        "一些",
+        "一点",
+        "可以",
+        "觉得",
+        "知道",
+        "时候",
+        "好吧",
+        "走吧",
+        "来吧",
+        "去吧",
+        "是吧",
+        "对吧",
+        "行吧",
+        "哈哈",
+    }
+)
+
+
+_CJK_PARTICLE_SPLIT = frozenset("的了着吗呢呀啊哦嗯啦嘛")
+
+
 def terms(text: str) -> list[str]:
     normalized = unicodedata.normalize("NFKC", text).lower()
-    stop = {"a", "an", "the", "i", "my", "me", "is", "are", "was", "do", "you", "what", "and", "to"}
-    result = [word for word in re.findall(r"[^\W_]+", normalized) if word not in stop]
-    # Explicit lexical CJK support; no claim of semantic/embedding retrieval.
+    result = [word for word in re.findall(r"[^\W_]+", normalized) if word not in _EN_STOP]
+    # Explicit lexical CJK support: filter colloquial particles and prioritize 2-char bigrams.
     for sequence in re.findall(r"[\u3400-\u9fff\u3040-\u30ff]+", normalized):
-        result.extend(sequence)
-        result.extend(sequence[i : i + 2] for i in range(len(sequence) - 1))
-    return sorted(set(result))
+        if len(sequence) == 1:
+            if sequence not in _CJK_STOP_CHARS:
+                result.append(sequence)
+            continue
+        for ch in sequence:
+            if ch not in _CJK_STOP_CHARS:
+                result.append(ch)
+        for i in range(len(sequence) - 1):
+            bg = sequence[i : i + 2]
+            if bg not in _CJK_STOP_BIGRAMS and not any(c in _CJK_PARTICLE_SPLIT for c in bg):
+                result.append(bg)
+    def _term_priority(tok: str) -> tuple[int, str]:
+        if 2 <= len(tok) <= 16:
+            has_cjk_stop = any(c in _CJK_STOP_CHARS for c in tok)
+            return (1 if has_cjk_stop else 0, tok)
+        return (2 if len(tok) == 1 else 3, tok)
+
+    return sorted(set(result), key=_term_priority)
 
 
 class Engine:

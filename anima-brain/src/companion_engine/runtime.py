@@ -36,6 +36,7 @@ class Settings(Model):
     embedding_base_url: str = ""
     embedding_model: str = ""
     embedding_key: SecretStr = SecretStr("")
+    embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
     speech_provider: str = Field(default="elevenlabs", pattern="^(elevenlabs|minimax|doubao)$")
     speech_model: str = ""
     speech_key: SecretStr = SecretStr("")
@@ -63,6 +64,8 @@ class Settings(Model):
         for name in cls.model_fields:
             raw = os.environ.get("COMPANION_" + name.upper())
             if raw is not None:
+                if name in ("embedding_dimensions", "temperature") and not str(raw).strip():
+                    continue
                 values[name] = raw
         return cls(**values)
 
@@ -229,21 +232,27 @@ class Runtime:
                 context.retrieval_mode = "lexical_embedding_provider_missing"
                 return enforce_context_policy(self.engine, context)
             try:
-                from .media import Embeddings
+                from .media import Embeddings, embedding_breaker
 
+                cb_open, _ = embedding_breaker.is_circuit_open(self.settings)
+                if cb_open:
+                    context.retrieval_mode = "lexical_semantic_unavailable"
+                    return enforce_context_policy(self.engine, context)
                 embed = Embeddings(self.settings, self.transport)
                 result = self.operation(
                     character_id,
                     "query_embedding",
                     "turn-" + context.turn_id,
-                    {"query": message, "namespace": embed.namespace},
+                    {"query": message, "namespace": embed.resolve_namespace(self.engine.db)},
                     lambda: embed.encode([message]),
                 )
+                q_vec = result["vectors"][0]
+                active_ns = embed.resolve_namespace(self.engine.db, dim=len(q_vec))
                 found = self.engine.memory.recall(
                     character_id,
                     message,
-                    query_vector=result["vectors"][0],
-                    model=embed.namespace,
+                    query_vector=q_vec,
+                    model=active_ns,
                     **self._evidence_limits(),
                 )
                 self._merge_layers(
@@ -251,8 +260,8 @@ class Runtime:
                     self.engine.retrieval.search(
                         character_id,
                         message,
-                        vector=result["vectors"][0],
-                        model=embed.namespace,
+                        vector=q_vec,
+                        model=active_ns,
                         **self._layer_limits(),
                     ),
                     prioritize=True,
@@ -842,32 +851,60 @@ class Runtime:
                 **self.engine.memory.recall(character_id, query, **self._evidence_limits()),
                 "layers": self.engine.retrieval.search(character_id, query, **self._layer_limits()),
             }
-        from .media import Embeddings
+        from .media import Embeddings, embedding_breaker
 
+        cb_open, binfo = embedding_breaker.is_circuit_open(self.settings)
+        if cb_open:
+            return {
+                **self.engine.memory.recall(character_id, query, **self._evidence_limits()),
+                "semantic_degraded": True,
+                "degraded_reason": str(binfo.get("reason") or "circuit_open"),
+                "layers": self.engine.retrieval.search(
+                    character_id, query, **self._layer_limits()
+                ),
+            }
         embed = Embeddings(self.settings, self.transport)
-        result = self.operation(
-            character_id,
-            "query_embedding",
-            str(uuid4()),
-            {"query": query},
-            lambda: embed.encode([query]),
-        )
-        return {
-            **self.engine.memory.recall(
+        try:
+            result = self.operation(
                 character_id,
-                query,
-                query_vector=result["vectors"][0],
-                model=embed.namespace,
-                **self._evidence_limits(),
-            ),
-            "layers": self.engine.retrieval.search(
-                character_id,
-                query,
-                vector=result["vectors"][0],
-                model=embed.namespace,
-                **self._layer_limits(),
-            ),
-        }
+                "query_embedding",
+                str(uuid4()),
+                {"query": query},
+                lambda: embed.encode([query]),
+            )
+            q_vec = result["vectors"][0]
+            active_ns = embed.resolve_namespace(self.engine.db, dim=len(q_vec))
+            return {
+                **self.engine.memory.recall(
+                    character_id,
+                    query,
+                    query_vector=q_vec,
+                    model=active_ns,
+                    **self._evidence_limits(),
+                ),
+                "vector_space": active_ns,
+                "semantic_degraded": False,
+                "layers": self.engine.retrieval.search(
+                    character_id,
+                    query,
+                    vector=q_vec,
+                    model=active_ns,
+                    **self._layer_limits(),
+                ),
+            }
+        except (ValueError, ProviderError, Conflict) as exc:
+            b_snap = embedding_breaker.snapshot(self.settings)
+            reason = b_snap.get("degraded_reason") or (
+                f"http_{exc.status_code}"
+                if isinstance(exc, ProviderError) and exc.status_code
+                else "semantic_unavailable"
+            )
+            return {
+                **self.engine.memory.recall(character_id, query, **self._evidence_limits()),
+                "semantic_degraded": True,
+                "degraded_reason": reason,
+                "layers": self.engine.retrieval.search(character_id, query, **self._layer_limits()),
+            }
 
     def index(self, character_id, request_id):
         from .media import Embeddings
@@ -875,24 +912,34 @@ class Runtime:
         embed = Embeddings(self.settings, self.transport)
 
         def run():
-            rows = self.engine.evidence_index.candidates(character_id, embed.namespace)
+            active_ns = embed.resolve_namespace(self.engine.db)
+            rows = self.engine.evidence_index.candidates(character_id, active_ns)
             derived = self.engine.retrieval.candidates(
-                character_id, embed.namespace, 32 - len(rows)
+                character_id, active_ns, 32 - len(rows)
             )
             if not rows and not derived:
-                return {"indexed": 0, "usage": {"network_calls": 0}}
+                return {"indexed": 0, "space": active_ns, "usage": {"network_calls": 0}}
             texts = [r["text"] for r in rows]
             texts += [r["text"] for r in derived]
             result = embed.encode(texts)
-            for row, text, vector in zip(rows, texts, result["vectors"]):
+            vecs = result["vectors"]
+            dim = len(vecs[0])
+            target_ns = embed.resolve_namespace(self.engine.db, dim=dim)
+            for row, text, vector in zip(rows, texts, vecs):
                 self.engine.evidence_index.store(
-                    character_id, row["id"], row["lane"], embed.namespace, vector, text
+                    character_id, row["id"], row["lane"], target_ns, vector, text
                 )
-            for row, vector in zip(derived, result["vectors"][len(rows) :]):
+            for row, vector in zip(derived, vecs[len(rows) :]):
                 self.engine.retrieval.store(
-                    character_id, row["id"], embed.namespace, vector, row["text"]
+                    character_id, row["id"], target_ns, vector, row["text"]
                 )
-            return {"indexed": len(rows), "derived_indexed": len(derived), "usage": result["usage"]}
+            return {
+                "indexed": len(rows),
+                "derived_indexed": len(derived),
+                "space": target_ns,
+                "dim": dim,
+                "usage": result["usage"],
+            }
 
         return self.operation(character_id, "index", request_id, {}, run)
 
@@ -986,27 +1033,33 @@ class Runtime:
                         )["sources"]
                     ]
                 if self.settings.embedding_model and policy.semantic_retrieval:
-                    from .media import Embeddings
+                    from .media import Embeddings, embedding_breaker
 
-                    embed = Embeddings(self.settings, self.transport)
-                    encoded = self.operation(
-                        character_id,
-                        "note_query_embedding",
-                        str(uuid4()),
-                        {"source_id": source["id"], "query": source["text"]},
-                        lambda: embed.encode([source["text"][:16000]]),
-                    )
-                    semantic = self.engine.memory.recall(
-                        character_id,
-                        source["text"][:16000],
-                        limit=5,
-                        before_id=source["id"],
-                        query_vector=encoded["vectors"][0],
-                        model=embed.namespace,
-                    )
-                    candidate_ids = list(
-                        dict.fromkeys([c["id"] for c in semantic["sources"]] + candidate_ids)
-                    )[:5]
+                    blocked, _ = embedding_breaker.is_circuit_open(self.settings)
+                    if not blocked:
+                        embed = Embeddings(self.settings, self.transport)
+                        try:
+                            encoded = self.operation(
+                                character_id,
+                                "note_query_embedding",
+                                str(uuid4()),
+                                {"source_id": source["id"], "query": source["text"]},
+                                lambda: embed.encode([source["text"][:16000]]),
+                            )
+                            q_vec = encoded["vectors"][0]
+                            active_ns = embed.resolve_namespace(self.engine.db, dim=len(q_vec))
+                            semantic = self.engine.memory.recall(
+                                character_id,
+                                source["text"][:16000],
+                                limit=5,
+                                before_id=source["id"],
+                                query_vector=q_vec,
+                                model=active_ns,
+                            )
+                            merged_ids = [c["id"] for c in semantic["sources"]] + candidate_ids
+                            candidate_ids = list(dict.fromkeys(merged_ids))[:5]
+                        except (ProviderError, ValueError):
+                            pass
                 with self.engine._lock:
                     new_source = note_evolution.snapshot(self.engine, character_id, source["id"])
                     candidates = [

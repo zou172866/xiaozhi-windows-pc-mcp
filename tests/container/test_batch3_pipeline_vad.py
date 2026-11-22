@@ -120,18 +120,20 @@ class TestBatch3StandaloneUnits(unittest.TestCase):
         self.assertIsNotNone(ex_path, "Missing config/asr_corrections.example.json")
         with open(ex_path, "r", encoding="utf-8") as f:
             ex_data = json.load(f)
-        self.assertEqual(ex_data["corrections"]["牙医"], "芽衣")
-        self.assertEqual(ex_data["corrections"]["雷电牙医"], "雷电芽衣")
+        self.assertEqual(ex_data["corrections"]["小志"], "小智")
+        self.assertEqual(ex_data["corrections"]["你好小志"], "你好小智")
+        self.assertNotIn("牙医", ex_data["corrections"], "Generic XiaoZhi default must not rewrite 牙医->芽衣")
 
         with tempfile.TemporaryDirectory() as td:
             corr_path = os.path.join(td, "asr_corrections.json")
-            # Default seed works even before file exists
+            # Default seed works even before file exists and preserves generic vocabulary (e.g. 牙医)
             d0 = asr_corrections.get_asr_corrections(corr_path)
             self.assertTrue(d0["enabled"])
-            self.assertEqual(d0["corrections"]["牙医"], "芽衣")
+            self.assertEqual(d0["corrections"]["小志"], "小智")
+            self.assertNotIn("牙医", d0["corrections"])
             self.assertEqual(
-                asr_corrections.apply_asr_corrections("雷电牙医你好呀，牙医帮我查天气", path=corr_path),
-                "雷电芽衣你好呀，芽衣帮我查天气",
+                asr_corrections.apply_asr_corrections("你好小志，帮我预约明天的牙医", path=corr_path),
+                "你好小智，帮我预约明天的牙医",
             )
 
             # Save custom rules (including longest-match & single-pass non-cascading check)

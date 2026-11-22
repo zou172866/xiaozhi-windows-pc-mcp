@@ -17,8 +17,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -41,8 +43,11 @@ _DEFAULT_UPSTREAM_IMAGE = (
     "@sha256:cececd7752e00e044bf9f099751a140834053573bbe6dd55ecbcedcb20c19c25"
 )
 _RAN_RE = re.compile(r"Ran\s+(\d+)\s+tests?\s+in\s+([0-9.]+)s")
-_SKIP_RE = re.compile(r"skipped=(\d+)")
-_IMAGE_RE = re.compile(r"^\s*image:\s*(\S+xiaozhi-esp32-server\S+)\s*$", re.MULTILINE)
+_SKIP_RE = re.compile(r"\((?:[^()\n]*,\s*)?skipped=(\d+)\)")
+_IMAGE_RE = re.compile(
+    r"^\s*image:\s*(?:\$\{[A-Za-z_][A-Za-z0-9_]*:-)?([^\s}]+xiaozhi-esp32-server[^\s}]+)\}?\s*$",
+    re.MULTILINE,
+)
 
 
 def resolve_upstream_image() -> str:
@@ -58,18 +63,31 @@ def resolve_upstream_image() -> str:
     return _DEFAULT_UPSTREAM_IMAGE
 
 
-def _ephemeral_container_cmd(test_filename: str, *, image: str) -> list[str]:
-    """Build an ephemeral `docker run --rm` command (H-8: zero dependency on running containers).
+def _ephemeral_container_cmd(test_filenames: str | list[str] | tuple[str, ...], *, image: str) -> list[str]:
+    """Build an ephemeral `docker run --rm` command (H-8 / P3-2: zero dependency on running containers).
 
-    Seeds disposable `/opt/xiaozhi-esp32-server/data/.config.yaml` from public
-    `config/.config.example.yaml` inside the ephemeral container so upstream imports
-    succeed identically on local hosts and clean GitHub Actions CI runners.
+    Accepts one or multiple test filenames; when multiple files are passed, executes each in an
+    isolated Python subprocess with freshly reset `/tmp/xz_test_state` and `.config.yaml` inside
+    a single container startup (~3x faster offline regression).
     """
-    bootstrap_sh = (
-        "mkdir -p /opt/xiaozhi-esp32-server/data /opt/xiaozhi-esp32-server/state /tmp/xz_test_state && "
-        "cp /opt/xiaozhi-esp32-server/config_templates/.config.example.yaml /opt/xiaozhi-esp32-server/data/.config.yaml && "
-        f"exec python3 /opt/xiaozhi-esp32-server/tests/{test_filename}"
-    )
+    files = [test_filenames] if isinstance(test_filenames, str) else list(test_filenames)
+    if len(files) == 1:
+        bootstrap_sh = (
+            "mkdir -p /opt/xiaozhi-esp32-server/data /opt/xiaozhi-esp32-server/state /tmp/xz_test_state && "
+            "cp /opt/xiaozhi-esp32-server/config_templates/.config.example.yaml /opt/xiaozhi-esp32-server/data/.config.yaml && "
+            f"exec python3 /opt/xiaozhi-esp32-server/tests/{files[0]}"
+        )
+    else:
+        joined = " ".join(files)
+        bootstrap_sh = (
+            "set -e; "
+            "mkdir -p /opt/xiaozhi-esp32-server/data /opt/xiaozhi-esp32-server/state; "
+            f"for tf in {joined}; do "
+            "rm -rf /tmp/xz_test_state && mkdir -p /tmp/xz_test_state && "
+            "cp /opt/xiaozhi-esp32-server/config_templates/.config.example.yaml /opt/xiaozhi-esp32-server/data/.config.yaml && "
+            'python3 "/opt/xiaozhi-esp32-server/tests/$tf"; '
+            "done"
+        )
     cmd = [
         "docker",
         "run",
@@ -129,9 +147,8 @@ def _run_suite(
     skipped = 0
     for m in _RAN_RE.finditer(combined):
         ran += int(m.group(1))
-    sm = _SKIP_RE.search(combined)
-    if sm:
-        skipped = int(sm.group(1))
+    for sm in _SKIP_RE.finditer(combined):
+        skipped += int(sm.group(1))
     executed = max(0, ran - skipped)
     ok = proc.returncode == 0
     if verbose or not ok:
@@ -191,6 +208,7 @@ def _build_plan(
                         "unittest",
                         "/app/tests/test_xiaozhi_service.py",
                         "/app/tests/test_obsidian_exporter.py",
+                        "/app/tests/test_diva_anima_mechanisms.py",
                         "-v",
                     ],
                     None,
@@ -199,41 +217,49 @@ def _build_plan(
         plan.append(
             (
                 "unit",
-                "Container offline pipeline (ephemeral docker run --rm: emotion, auth, outbox, recall, farewell, state)",
-                _ephemeral_container_cmd("test_mei_emotion_and_prosody.py", image=upstream_image),
+                "Container offline suites x6 (single ephemeral docker run --rm, subprocess-isolated)",
+                _ephemeral_container_cmd(
+                    [
+                        "test_mei_emotion_and_prosody.py",
+                        "test_batch3_anima_outbox.py",
+                        "test_batch3_pipeline_vad.py",
+                        "test_batch3_console.py",
+                        "test_cloud_audio_api.py",
+                        "test_diva_borrowed_mechanisms.py",
+                    ],
+                    image=upstream_image,
+                ),
                 None,
             )
         )
-        plan.append(
-            (
-                "unit",
-                "Batch 3 Anima outbox dead-lettering/replay & per-device recall (ephemeral docker run --rm: B-5, C-6)",
-                _ephemeral_container_cmd("test_batch3_anima_outbox.py", image=upstream_image),
-                None,
+        if shutil.which("node"):
+            plan.append(
+                (
+                    "unit",
+                    "Host Node.js vm console frontend audit (CAS rollback, Dream offline, semantic UI, DOM IDs)",
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os, sys, unittest; "
+                            "os.environ['XIAOZHI_REQUIRE_NODE_VM'] = '1'; "
+                            f"os.environ['XIAOZHI_APP_DIR'] = {str(APP_DIR)!r}; "
+                            f"sys.path.insert(0, {str(TESTS_CONTAINER_DIR)!r}); "
+                            "import test_diva_borrowed_mechanisms as m; "
+                            "suite = unittest.TestSuite([m.TestDivaBorrowedMechanisms('test_r2_frontend_dom_audit_and_vm_cas_offline_semantic_checks')]); "
+                            "res = unittest.TextTestRunner(verbosity=2).run(suite); "
+                            "raise SystemExit(0 if res.wasSuccessful() else 1)"
+                        ),
+                    ],
+                    None,
+                )
             )
-        )
-        plan.append(
-            (
-                "unit",
-                "Batch 3 voice pipeline, speculative VAD 34-case suite, idle trim & ASR corrections (ephemeral docker run --rm)",
-                _ephemeral_container_cmd("test_batch3_pipeline_vad.py", image=upstream_image),
-                None,
-            )
-        )
-        plan.append(
-            (
-                "unit",
-                "Batch 3 18080 console hardening, allowlists, redaction & static assets (ephemeral docker run --rm)",
-                _ephemeral_container_cmd("test_batch3_console.py", image=upstream_image),
-                None,
-            )
-        )
 
     if layer in ("contract", "all"):
         plan.append(
             (
                 "contract",
-                "Upstream image contracts (ephemeral docker run --rm: SERVER_VERSION, 20 patches + PATCH_CATALOG sync, zero side-effects)",
+                "Upstream image contracts (ephemeral docker run --rm: SERVER_VERSION, 21 patches + PATCH_CATALOG sync, zero side-effects)",
                 _ephemeral_container_cmd("test_upstream_contracts.py", image=upstream_image),
                 None,
             )
@@ -297,12 +323,43 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--skip-pc-mcp", action="store_true", help="Skip host Windows pc-mcp unittest suite")
     parser.add_argument("--skip-anima", action="store_true", help="Skip Anima Brain Docker unittest suite")
+    parser.add_argument("--sequential", action="store_true", help="Run all suites sequentially instead of parallel offline pool")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print full suite stdout/stderr even on pass")
     args = parser.parse_args(argv)
 
     plan = _build_plan(args.layer, skip_pc_mcp=args.skip_pc_mcp, skip_anima=args.skip_anima)
+    offline_plan = [item for item in plan if item[0] in ("unit", "contract")]
+    live_plan = [item for item in plan if item[0] not in ("unit", "contract")]
     results = []
-    for lyr, name, cmd, stdin_text in plan:
+
+    if len(offline_plan) > 1 and not args.sequential and not args.verbose:
+        print(f"==> Running {len(offline_plan)} offline test tracks in parallel ...", flush=True)
+        for lyr, name, _, _ in offline_plan:
+            print(f"    * [{lyr.upper()}] {name}", flush=True)
+        with ThreadPoolExecutor(max_workers=min(4, len(offline_plan))) as pool:
+            futs = [
+                pool.submit(_run_suite, lyr, name, cmd, verbose=False, stdin_text=stdin_text)
+                for lyr, name, cmd, stdin_text in offline_plan
+            ]
+            for fut in futs:
+                res = fut.result()
+                status = "PASS" if res["ok"] else "FAIL"
+                skip_note = f" (skipped={res['skipped']})" if res["skipped"] else ""
+                print(
+                    f"    [{res['layer'].upper()}] {status}: {res['executed']} executed{skip_note} in {res['elapsed']:.2f}s — {res['name']}",
+                    flush=True,
+                )
+                results.append(res)
+    else:
+        for lyr, name, cmd, stdin_text in offline_plan:
+            print(f"==> [{lyr.upper()}] {name} ...", flush=True)
+            res = _run_suite(lyr, name, cmd, verbose=args.verbose, stdin_text=stdin_text)
+            status = "PASS" if res["ok"] else "FAIL"
+            skip_note = f" (skipped={res['skipped']})" if res["skipped"] else ""
+            print(f"    {status}: {res['executed']} executed{skip_note} in {res['elapsed']:.2f}s", flush=True)
+            results.append(res)
+
+    for lyr, name, cmd, stdin_text in live_plan:
         print(f"==> [{lyr.upper()}] {name} ...", flush=True)
         res = _run_suite(lyr, name, cmd, verbose=args.verbose, stdin_text=stdin_text)
         status = "PASS" if res["ok"] else "FAIL"

@@ -78,6 +78,515 @@ function Get-DetectedObsidianVaults {
     return ($vaults | Select-Object -Unique)
 }
 
+function Ensure-YamlSubBlockFromTemplate {
+    param(
+        [string]$YamlText,
+        [string]$TemplateText,
+        [string]$SectionName,
+        [string]$BlockName
+    )
+    if (-not $YamlText -or -not $TemplateText -or -not $SectionName -or -not $BlockName) { return $YamlText }
+    if ($YamlText -match ("(?m)^  " + [regex]::Escape($BlockName) + ":\s*$")) { return $YamlText }
+    $tplNorm = $TemplateText.Replace("`r`n", "`n")
+    $secMatch = [regex]::Match($tplNorm, "(?ms)^" + [regex]::Escape($SectionName) + ":\n(.*?)(?=^[A-Za-z_][A-Za-z0-9_]*:|\z)")
+    if (-not $secMatch.Success) { return $YamlText }
+    $secBody = $secMatch.Groups[1].Value
+    $blkMatch = [regex]::Match($secBody, "(?ms)(^  " + [regex]::Escape($BlockName) + ":\n(?:    [^\n]*\n|\n)*)")
+    if (-not $blkMatch.Success) { return $YamlText }
+    $blockStr = $blkMatch.Groups[1].Value.TrimEnd("`n") + "`n"
+    $useCrlf = $YamlText.Contains("`r`n")
+    $yNorm = $YamlText.Replace("`r`n", "`n")
+    $insPat = "(?m)^(" + [regex]::Escape($SectionName) + ":\n)"
+    if ($yNorm -match $insPat) {
+        $yNorm = [regex]::Replace($yNorm, $insPat, ('$1' + $blockStr.Replace('$', '$$')), 1)
+    } else {
+        if (-not $yNorm.EndsWith("`n")) { $yNorm += "`n" }
+        $yNorm += "${SectionName}:`n${blockStr}"
+    }
+    if ($useCrlf) { return $yNorm.Replace("`n", "`r`n") }
+    return $yNorm
+}
+
+function Test-IsExcludedLanIPv4 {
+    param([string]$Ip)
+    if (-not $Ip) { return $true }
+    $addr = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip.Trim(), [ref]$addr)) { return $true }
+    if ($addr.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { return $true }
+    $b = $addr.GetAddressBytes()
+    # 0.0.0.0/8, 127.0.0.0/8 (loopback), 169.254.0.0/16 (APIPA)
+    if ($b[0] -eq 0 -or $b[0] -eq 127) { return $true }
+    if ($b[0] -eq 169 -and $b[1] -eq 254) { return $true }
+    # 198.18.0.0/15 (Clash / Mihomo / sing-box Fake-IP TUN)
+    if ($b[0] -eq 198 -and ($b[1] -eq 18 -or $b[1] -eq 19)) { return $true }
+    # 100.64.0.0/10 (Tailscale / CGNAT)
+    if ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) { return $true }
+    # 224.0.0.0/4+ (multicast / reserved)
+    if ($b[0] -ge 224) { return $true }
+    return $false
+}
+
+function Test-IsVirtualAdapterName {
+    param(
+        [string]$Alias = "",
+        [string]$Description = ""
+    )
+    $combined = "$Alias $Description"
+    return ($combined -match '(?i)(WSL|vEthernet|Docker|Loopback|Hyper-V|VirtualBox|VMware|Clash|Mihomo|\bMeta\b|FlClash|sing-?box|sing-?tun|Wintun|WireGuard|Tailscale|ZeroTier|OpenVPN|TAP-Windows|TAP-Win32|\bTUN\d*\b|VPN|WARP|Cloudflare|Radmin|Hamachi|EasyTier|Netch|Nekoray|v2ray|Bluetooth|Npcap|Kernel Debug)')
+}
+
+function Get-PrivateLanRank {
+    param([string]$Ip)
+    $addr = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip.Trim(), [ref]$addr)) { return 9 }
+    $b = $addr.GetAddressBytes()
+    if ($b[0] -eq 192 -and $b[1] -eq 168) { return 0 }
+    if ($b[0] -eq 10) { return 1 }
+    if ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) { return 2 }
+    return 3
+}
+
+function Select-BestLanIPv4 {
+    param([object[]]$Candidates = $null)
+    $rows = @()
+    if ($null -eq $Candidates) {
+        try {
+            $adapterByIdx = @{}
+            foreach ($ad in (Get-NetAdapter -ErrorAction SilentlyContinue)) {
+                $adapterByIdx[[int]$ad.ifIndex] = $ad
+            }
+            $metricByIdx = @{}
+            foreach ($iface in (Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+                if ($null -ne $iface.InterfaceMetric) {
+                    $metricByIdx[[int]$iface.ifIndex] = [int]$iface.InterfaceMetric
+                }
+            }
+            foreach ($ipObj in (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+                $ifIdx = [int]$ipObj.InterfaceIndex
+                $ad = $adapterByIdx[$ifIdx]
+                $metricVal = if ($metricByIdx.ContainsKey($ifIdx)) {
+                    $metricByIdx[$ifIdx]
+                } elseif ($ipObj.PSObject.Properties["InterfaceMetric"] -and $null -ne $ipObj.InterfaceMetric) {
+                    [int]$ipObj.InterfaceMetric
+                } else {
+                    9999
+                }
+                $rows += [pscustomobject]@{
+                    IPAddress            = [string]$ipObj.IPAddress
+                    InterfaceAlias       = [string]$ipObj.InterfaceAlias
+                    InterfaceDescription = if ($ad) { [string]$ad.InterfaceDescription } else { "" }
+                    Status               = if ($ad) { [string]$ad.Status } else { "Up" }
+                    Virtual              = if ($ad -and $null -ne $ad.Virtual) { [bool]$ad.Virtual } else { $false }
+                    InterfaceMetric      = $metricVal
+                }
+            }
+        } catch {}
+    } else {
+        $rows = @($Candidates)
+    }
+
+    $valid = @()
+    foreach ($r in $rows) {
+        $ip = [string]($r.IPAddress)
+        $alias = [string]($r.InterfaceAlias)
+        $desc = if ($r.PSObject.Properties["InterfaceDescription"]) { [string]$r.InterfaceDescription } else { "" }
+        $status = if ($r.PSObject.Properties["Status"] -and $r.Status) { [string]$r.Status } else { "Up" }
+        $isVirt = if ($r.PSObject.Properties["Virtual"]) { [bool]$r.Virtual } else { $false }
+        $metric = if ($r.PSObject.Properties["InterfaceMetric"] -and $null -ne $r.InterfaceMetric) { [int]$r.InterfaceMetric } else { 9999 }
+
+        if ($status -ne "Up") { continue }
+        if (Test-IsExcludedLanIPv4 -Ip $ip) { continue }
+        if (Test-IsVirtualAdapterName -Alias $alias -Description $desc) { continue }
+
+        $valid += [pscustomobject]@{
+            IPAddress            = $ip.Trim()
+            InterfaceAlias       = $alias
+            InterfaceDescription = $desc
+            LanRank              = (Get-PrivateLanRank -Ip $ip)
+            VirtRank             = if ($isVirt) { 1 } else { 0 }
+            InterfaceMetric      = $metric
+        }
+    }
+
+    return @($valid | Sort-Object -Property LanRank, VirtRank, InterfaceMetric, IPAddress)
+}
+
+function Parse-PythonProbeLine {
+    param([string]$Line)
+    if (-not $Line -or -not $Line.Contains("|")) { return $null }
+    $parts = $Line.Trim().Split("|", 2)
+    $verStr = $parts[0].Trim()
+    $exePath = $parts[1].Trim()
+    if (-not $exePath -or ($exePath -match '(?i)\\WindowsApps\\')) { return $null }
+    if ($verStr -match '^(\d+)\.(\d+)\.(\d+)$') {
+        $maj = [int]$Matches[1]
+        $min = [int]$Matches[2]
+        return [pscustomobject]@{
+            Version    = $verStr
+            Major      = $maj
+            Minor      = $min
+            Executable = $exePath
+            Supported  = ($maj -eq 3 -and $min -ge 10 -and $min -le 12)
+        }
+    }
+    return $null
+}
+
+function Find-ValidHostPython {
+    $probes = @(
+        @{ Cmd = "py"; Args = @("-3.12") },
+        @{ Cmd = "py"; Args = @("-3.11") },
+        @{ Cmd = "py"; Args = @("-3.10") },
+        @{ Cmd = "python"; Args = @() },
+        @{ Cmd = "python3"; Args = @() }
+    )
+    $rejected = @()
+    $seenExes = @{}
+    $pySnippet = "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{sys.executable}')"
+
+    foreach ($p in $probes) {
+        $cmdInfo = Get-Command $p.Cmd -ErrorAction SilentlyContinue
+        if (-not $cmdInfo) { continue }
+        if ($cmdInfo.Source -and ($cmdInfo.Source -match '(?i)\\WindowsApps\\') -and $p.Cmd -ne "py") {
+            $rejected += "Windows Store 占位符 ($($cmdInfo.Source))"
+            continue
+        }
+        try {
+            $allArgs = @($p.Args) + @("-c", $pySnippet)
+            $out = & $cmdInfo.Source @allArgs 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $out) { continue }
+            $firstLine = ($out | Select-Object -First 1).ToString().Trim()
+            $parsed = Parse-PythonProbeLine -Line $firstLine
+            if (-not $parsed) { continue }
+            if ($seenExes.ContainsKey($parsed.Executable.ToLowerInvariant())) { continue }
+            $seenExes[$parsed.Executable.ToLowerInvariant()] = $true
+            if ($parsed.Supported) {
+                return [pscustomobject]@{
+                    Found            = $true
+                    Executable       = $parsed.Executable
+                    Version          = $parsed.Version
+                    RejectedVersions = $rejected
+                }
+            } else {
+                $rejected += "Python $($parsed.Version) ($($parsed.Executable))"
+            }
+        } catch {}
+    }
+
+    return [pscustomobject]@{
+        Found            = $false
+        Executable       = ""
+        Version          = ""
+        RejectedVersions = $rejected
+    }
+}
+
+function Test-PcMcpVenvHealthy {
+    param([string]$VenvPythonPath)
+    if (-not $VenvPythonPath -or -not (Test-Path $VenvPythonPath)) { return $false }
+    try {
+        $out = & $VenvPythonPath -c "import sys, uvicorn, starlette, httpx; assert (3, 10) <= sys.version_info[:2] <= (3, 12); print('OK')" 2>$null
+        return ($LASTEXITCODE -eq 0 -and (($out | Select-Object -First 1).ToString().Trim() -eq "OK"))
+    } catch {
+        return $false
+    }
+}
+
+function Test-NodeAndNpxAvailable {
+    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+    $npxCmd = Get-Command npx -ErrorAction SilentlyContinue
+    $dshCmd = Get-Command dsh -ErrorAction SilentlyContinue
+    $nodeVer = ""
+    if ($nodeCmd) {
+        try {
+            $nv = & $nodeCmd.Source -v 2>$null
+            if ($LASTEXITCODE -eq 0 -and $nv) { $nodeVer = ($nv | Select-Object -First 1).ToString().Trim() }
+        } catch {}
+    }
+    return [pscustomobject]@{
+        NodeOk      = ($null -ne $nodeCmd -and [bool]$nodeVer)
+        NodeVersion = $nodeVer
+        NpxOk       = ($null -ne $npxCmd)
+        DshOk       = ($null -ne $dshCmd)
+    }
+}
+
+function Test-PortSpecMatches {
+    param(
+        [object]$LocalPort,
+        [int]$TargetPort
+    )
+    foreach ($entry in @($LocalPort)) {
+        $rawStr = [string]$entry
+        if (-not $rawStr) { continue }
+        foreach ($tok in ($rawStr -split ',')) {
+            $s = $tok.Trim()
+            if (-not $s) { continue }
+            if ($s -eq [string]$TargetPort) { return $true }
+            if ($s -match '^(\d+)-(\d+)$') {
+                $lo = [int]$Matches[1]; $hi = [int]$Matches[2]
+                if ($TargetPort -ge $lo -and $TargetPort -le $hi) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
+function Evaluate-FirewallRulesForPorts {
+    param(
+        [int[]]$Ports = @(18000, 18003),
+        [int]$ActiveProfileMask = 2,
+        [bool]$FirewallActive = $true,
+        [object[]]$Rules = @()
+    )
+    $res = [pscustomobject]@{
+        Checked           = $true
+        FirewallActive    = $FirewallActive
+        ActiveProfileMask = $ActiveProfileMask
+        HasPublicProfile  = (($ActiveProfileMask -band 4) -ne 0)
+        AllowedPorts      = @()
+        MissingPorts      = @()
+    }
+    if (-not $FirewallActive) {
+        $res.AllowedPorts = @($Ports)
+        return $res
+    }
+    $matchingRules = @()
+    foreach ($r in @($Rules)) {
+        if (-not $r) { continue }
+        if (-not [bool]$r.Enabled) { continue }
+        if ([int]$r.Direction -ne 1) { continue }
+        if ([int]$r.Action -ne 1) { continue }
+        $proto = [int]$r.Protocol
+        if ($proto -ne 6 -and $proto -ne 256) { continue }
+        $appName = if ($r.PSObject.Properties["ApplicationName"] -and $null -ne $r.ApplicationName) { [string]$r.ApplicationName } else { "" }
+        if ($appName.Trim()) { continue }
+        $remoteAddr = if ($r.PSObject.Properties["RemoteAddresses"] -and $null -ne $r.RemoteAddresses) { [string]$r.RemoteAddresses } else { "*" }
+        if ($remoteAddr.Trim() -match '^(127\.0\.0\.1|::1)(/\d+)?$') { continue }
+        $ruleProf = [int]$r.Profiles
+        if ($ActiveProfileMask -ne 0 -and (($ruleProf -band $ActiveProfileMask) -ne $ActiveProfileMask)) { continue }
+        $matchingRules += $r
+    }
+    foreach ($port in $Ports) {
+        $matched = $false
+        foreach ($r in $matchingRules) {
+            $lp = if ($r.PSObject.Properties["LocalPorts"] -and $null -ne $r.LocalPorts) { ([string]$r.LocalPorts).Trim() } else { "" }
+            if ($lp -eq "*" -or $lp -ieq "Any" -or (Test-PortSpecMatches -LocalPort $lp -TargetPort $port)) {
+                $matched = $true
+                break
+            }
+        }
+        if ($matched) { $res.AllowedPorts += $port } else { $res.MissingPorts += $port }
+    }
+    return $res
+}
+
+function Test-XiaozhiFirewallPorts {
+    param([int[]]$Ports = @(18000, 18003))
+    try {
+        # HNetCfg.FwPolicy2 COM works without Administrator elevation (unlike Get-NetFirewallRule CIM)
+        $fw = New-Object -ComObject HNetCfg.FwPolicy2
+        # Scope profile mask to the primary physical LAN adapter so unrelated WSL/Hyper-V Public NICs don't cause false positives
+        $curMask = 0
+        try {
+            $bestLan = @(Select-BestLanIPv4)
+            if ($bestLan.Count -gt 0) {
+                $lanAlias = [string]$bestLan[0].InterfaceAlias
+                $profObj = Get-NetConnectionProfile -InterfaceAlias $lanAlias -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($profObj) {
+                    switch ([string]$profObj.NetworkCategory) {
+                        "DomainAuthenticated" { $curMask = 1 }
+                        "Private"             { $curMask = 2 }
+                        "Public"              { $curMask = 4 }
+                    }
+                }
+            }
+        } catch {}
+        if ($curMask -le 0) { $curMask = [int]$fw.CurrentProfileTypes }
+        if ($curMask -le 0) { $curMask = 2 }
+        $enabledActiveMask = 0
+        foreach ($bit in @(1, 2, 4)) {
+            if ((($curMask -band $bit) -ne 0) -and [bool]$fw.FirewallEnabled($bit)) {
+                $enabledActiveMask = $enabledActiveMask -bor $bit
+            }
+        }
+        if ($enabledActiveMask -eq 0) {
+            return [pscustomobject]@{
+                Checked           = $true
+                FirewallActive    = $false
+                ActiveProfileMask = $curMask
+                HasPublicProfile  = (($curMask -band 4) -ne 0)
+                AllowedPorts      = @($Ports)
+                MissingPorts      = @()
+            }
+        }
+        $ruleSnap = @()
+        foreach ($r in $fw.Rules) {
+            if (-not $r.Enabled -or $r.Direction -ne 1 -or $r.Action -ne 1) { continue }
+            if ($r.Protocol -ne 6 -and $r.Protocol -ne 256) { continue }
+            if (-not [string]::IsNullOrWhiteSpace($r.ApplicationName)) { continue }
+            $ruleSnap += [pscustomobject]@{
+                Enabled         = [bool]$r.Enabled
+                Direction       = [int]$r.Direction
+                Action          = [int]$r.Action
+                Protocol        = [int]$r.Protocol
+                LocalPorts      = [string]$r.LocalPorts
+                Profiles        = [int]$r.Profiles
+                ApplicationName = [string]$r.ApplicationName
+                RemoteAddresses = [string]$r.RemoteAddresses
+            }
+        }
+        return (Evaluate-FirewallRulesForPorts -Ports $Ports -ActiveProfileMask $enabledActiveMask -FirewallActive $true -Rules $ruleSnap)
+    } catch {
+        return [pscustomobject]@{
+            Checked           = $false
+            FirewallActive    = $false
+            ActiveProfileMask = 0
+            HasPublicProfile  = $false
+            AllowedPorts      = @()
+            MissingPorts      = @()
+        }
+    }
+}
+
+function Add-XiaozhiFirewallRules {
+    param([int[]]$Ports = @(18000, 18003))
+    $ruleCmds = @('$ErrorActionPreference = ''Stop''')
+    foreach ($p in $Ports) {
+        $rName = if ($p -eq 18000) { "XiaoZhi ESP32 WebSocket (TCP 18000)" } else { "XiaoZhi ESP32 OTA/Vision (TCP $p)" }
+        $ruleCmds += "Remove-NetFirewallRule -DisplayName '$rName' -ErrorAction SilentlyContinue; New-NetFirewallRule -DisplayName '$rName' -Direction Inbound -Profile Private -Protocol TCP -LocalPort $p -Action Allow -ErrorAction Stop | Out-Null"
+    }
+    $scriptCmd = $ruleCmds -join "; "
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+    try {
+        if ($isAdmin) {
+            Invoke-Expression $scriptCmd
+            return $true
+        }
+        $encodedCmd = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($scriptCmd))
+        $proc = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCmd
+        )
+        return ($null -ne $proc -and $proc.ExitCode -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Get-AnimaProviderKind {
+    param([string]$Url)
+    $s = if ($null -ne $Url) { $Url.Trim() } else { "" }
+    if (-not $s) { return "deepseek" }
+    $hostName = ""
+    try {
+        $uri = [System.Uri]$s
+        if ($uri -and $uri.IsAbsoluteUri -and $uri.Host) {
+            $hostName = $uri.Host.Trim().ToLowerInvariant()
+        }
+    } catch {}
+    if ($hostName -eq "generativelanguage.googleapis.com" -or $hostName.EndsWith(".googleapis.com")) {
+        return "gemini"
+    }
+    if ($hostName -eq "api.deepseek.com" -or $hostName.EndsWith(".deepseek.com")) {
+        return "deepseek"
+    }
+    return "other"
+}
+
+function Get-AnimaKeyConflictAdvice {
+    param(
+        [string]$MemChoice,
+        [string]$EffectiveAnimaUrl = "",
+        [string]$DeepSeekKey = "",
+        [string]$UserAnimaKey = "",
+        [string]$MachineAnimaKey = "",
+        [string]$DotEnvAnimaKey = "",
+        [string]$UserSummaryKey = "",
+        [string]$MachineSummaryKey = "",
+        [string]$DotEnvSummaryKey = ""
+    )
+    $ds = if ($null -ne $DeepSeekKey) { $DeepSeekKey.TrimStart([char]0xfeff).Trim() } else { "" }
+    $uKey = if ($null -ne $UserAnimaKey) { $UserAnimaKey.TrimStart([char]0xfeff).Trim() } else { "" }
+    $mKey = if ($null -ne $MachineAnimaKey) { $MachineAnimaKey.TrimStart([char]0xfeff).Trim() } else { "" }
+    $eKey = if ($null -ne $DotEnvAnimaKey) { $DotEnvAnimaKey.TrimStart([char]0xfeff).Trim() } else { "" }
+    $uSum = if ($null -ne $UserSummaryKey) { $UserSummaryKey.TrimStart([char]0xfeff).Trim() } else { "" }
+    $mSum = if ($null -ne $MachineSummaryKey) { $MachineSummaryKey.TrimStart([char]0xfeff).Trim() } else { "" }
+    $eSum = if ($null -ne $DotEnvSummaryKey) { $DotEnvSummaryKey.TrimStart([char]0xfeff).Trim() } else { "" }
+
+    $isDeepSeekUrl = ((Get-AnimaProviderKind -Url $EffectiveAnimaUrl) -eq "deepseek")
+    $userAction = "none"
+    $userReason = ""
+    $warnMachine = $false
+    $warnDotEnv = $false
+    $summaryUserAction = "none"
+    $summaryUserReason = ""
+    $warnSummaryMachine = $false
+    $warnSummaryDotEnv = $false
+
+    if ($MemChoice -eq "2") {
+        if ($uKey) {
+            $userAction = "auto_clear"
+            $userReason = "gemini_mode_clears_user_anima_key"
+        }
+        if ($mKey) { $warnMachine = $true }
+        if ($eKey) { $warnDotEnv = $true }
+        if ($uSum) {
+            $summaryUserAction = "auto_clear"
+            $summaryUserReason = "gemini_mode_clears_user_summary_key"
+        }
+        if ($mSum) { $warnSummaryMachine = $true }
+        if ($eSum) { $warnSummaryDotEnv = $true }
+    } elseif ($isDeepSeekUrl) {
+        if ($uKey -and ($uKey -match '^AIza')) {
+            $userAction = "auto_clear"
+            $userReason = "stale_gemini_key_in_deepseek_mode"
+        } elseif ($uKey -and $ds -and ($uKey -ne $ds)) {
+            $userAction = "prompt_clear"
+            $userReason = "differs_from_deepseek_key"
+        } elseif ($uKey -and (-not $ds)) {
+            $userAction = "prompt_clear"
+            $userReason = "orphan_user_anima_key_without_deepseek_key"
+        }
+        if ($mKey -and (($mKey -match '^AIza') -or (-not $ds) -or ($mKey -ne $ds))) {
+            $warnMachine = $true
+        }
+        if ($eKey -and (($eKey -match '^AIza') -or (-not $ds) -or ($eKey -ne $ds))) {
+            $warnDotEnv = $true
+        }
+
+        if ($uSum -and ($uSum -match '^AIza')) {
+            $summaryUserAction = "auto_clear"
+            $summaryUserReason = "stale_gemini_summary_key_in_deepseek_mode"
+        } elseif ($uSum -and $ds -and ($uSum -ne $ds)) {
+            $summaryUserAction = "prompt_clear"
+            $summaryUserReason = "summary_differs_from_deepseek_key"
+        } elseif ($uSum -and (-not $ds)) {
+            $summaryUserAction = "prompt_clear"
+            $summaryUserReason = "orphan_user_summary_key_without_deepseek_key"
+        }
+        if ($mSum -and (($mSum -match '^AIza') -or (-not $ds) -or ($mSum -ne $ds))) {
+            $warnSummaryMachine = $true
+        }
+        if ($eSum -and (($eSum -match '^AIza') -or (-not $ds) -or ($eSum -ne $ds))) {
+            $warnSummaryDotEnv = $true
+        }
+    }
+
+    return [pscustomobject]@{
+        IsDeepSeekUrl      = $isDeepSeekUrl
+        UserAction         = $userAction
+        UserReason         = $userReason
+        WarnMachine        = $warnMachine
+        WarnDotEnv         = $warnDotEnv
+        SummaryUserAction  = $summaryUserAction
+        SummaryUserReason  = $summaryUserReason
+        WarnSummaryMachine = $warnSummaryMachine
+        WarnSummaryDotEnv  = $warnSummaryDotEnv
+    }
+}
+
 if ($env:XIAOZHI_INIT_SETUP_LIB_ONLY -eq "1") {
     return
 }
@@ -96,26 +605,54 @@ if ($hasExistingEnv) {
     Write-Host "[安全模式] 检测到已有 .env，将采用增量合并更新，保留你原有的自定义配置与注释。" -ForegroundColor Green
 }
 
-# 1. 自动探测局域网 IPv4
-$detectedIp = ""
-try {
-    $detectedIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.IPAddress -notlike "127.*" -and
-            $_.IPAddress -notlike "169.254.*" -and
-            $_.InterfaceAlias -notmatch "WSL|vEthernet|Docker|Loopback|Hyper-V|VirtualBox|VMware"
-        } |
-        Sort-Object -Property InterfaceMetric |
-        Select-Object -First 1 -ExpandProperty IPAddress
-} catch {}
-if (-not $detectedIp) { $detectedIp = "192.168.1.100" }
-$defaultIp = if ($existingEnv.ContainsKey("HOST_LAN_IP") -and $existingEnv["HOST_LAN_IP"]) { $existingEnv["HOST_LAN_IP"] } else { $detectedIp }
+# 0. 开箱环境预检（Docker / Python 3.10-3.12 / 防火墙）
+Write-Host "`n[环境预检] 正在检查本机基础依赖..." -ForegroundColor DarkCyan
+$dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
+if ($dockerCmd) {
+    $dInfo = docker info --format "{{.ServerVersion}}" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $dInfo) {
+        Write-Host "  [OK] Docker Desktop 运行中 (v$dInfo)" -ForegroundColor Green
+    } else {
+        Write-Host "  [提示] 已安装 Docker CLI，但 Docker Desktop 尚未启动（启动服务时会自动拉起）。" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "  [缺失] 未检测到 Docker Desktop！请先安装并启用 WSL2 后端: https://www.docker.com/products/docker-desktop/" -ForegroundColor Red
+}
+
+$hostPyInfo = Find-ValidHostPython
+if ($hostPyInfo.Found) {
+    Write-Host "  [OK] 宿主机 Python $($hostPyInfo.Version) 已就绪 ($($hostPyInfo.Executable))" -ForegroundColor Green
+} else {
+    Write-Host "  [缺失] 未找到受支持的宿主机 Python 3.10～3.12（已自动排除 Windows Store 占位符）！" -ForegroundColor Red
+    if ($hostPyInfo.RejectedVersions.Count -gt 0) {
+        Write-Host "        检测到但不兼容的版本: $($hostPyInfo.RejectedVersions -join '; ')" -ForegroundColor DarkYellow
+    }
+    Write-Host "        请安装 Python 3.11 或 3.12（勾选 Add python.exe to PATH）: https://www.python.org/downloads/windows/" -ForegroundColor Yellow
+}
+
+# 1. 自动探测局域网 IPv4（自动排除 Clash/Mihomo 198.18.x.x、Tailscale 100.64-127.x.x、ZeroTier、WireGuard、WSL、Hyper-V 等虚拟网卡）
+$lanCandidates = @(Select-BestLanIPv4)
+$detectedIp = if ($lanCandidates.Count -gt 0) { $lanCandidates[0].IPAddress } else { "192.168.1.100" }
+$defaultIp = if ($existingEnv.ContainsKey("HOST_LAN_IP") -and $existingEnv["HOST_LAN_IP"] -and -not (Test-IsExcludedLanIPv4 -Ip $existingEnv["HOST_LAN_IP"])) {
+    $existingEnv["HOST_LAN_IP"]
+} else {
+    $detectedIp
+}
+if ($existingEnv.ContainsKey("HOST_LAN_IP") -and $existingEnv["HOST_LAN_IP"] -and (Test-IsExcludedLanIPv4 -Ip $existingEnv["HOST_LAN_IP"])) {
+    Write-Host "`n  [提醒] 现有 .env 中 HOST_LAN_IP=$($existingEnv['HOST_LAN_IP']) 为虚拟/代理/回环地址，已建议替换为真实局域网 IP: $detectedIp" -ForegroundColor Yellow
+}
+if ($lanCandidates.Count -gt 1) {
+    Write-Host "`n  探测到多个局域网候选 IP（已自动过滤 Clash/VPN/WSL 虚拟网卡）：" -ForegroundColor DarkGray
+    foreach ($cand in ($lanCandidates | Select-Object -First 4)) {
+        Write-Host "    - $($cand.IPAddress)  [$($cand.InterfaceAlias)]" -ForegroundColor DarkGray
+    }
+}
 
 $ipIn = Read-Host "`n[1/6] 本机局域网 IP（直接回车使用 $defaultIp）"
 $hostLanIp = if ($ipIn.Trim()) { $ipIn.Trim() } else { $defaultIp }
 
 $curAllowedMacs = if ($existingEnv.ContainsKey("ESP32_ALLOWED_DEVICES")) { $existingEnv["ESP32_ALLOWED_DEVICES"] } else { "" }
-$macHint = if ($curAllowedMacs) { "直接回车保持 $curAllowedMacs" } else { "例如 aa:bb:cc:dd:ee:ff，多个用逗号分隔，留空稍后补填" }
+$macHint = if ($curAllowedMacs) { "直接回车保持 $curAllowedMacs" } else { "例如 aa:bb:cc:dd:ee:ff，可留空并在 18080 控制台一键放行" }
 $macIn = (Read-Host "ESP32 允许接入 MAC 白名单（$macHint）").Trim()
 $esp32AllowedDevices = if ($macIn) { $macIn } else { $curAllowedMacs }
 
@@ -140,6 +677,24 @@ switch ($l3Choice) {
     "4" { $l3Backend = "none" }
     default { $l3Backend = "dsh" }
 }
+if ($l3Backend -eq "dsh") {
+    $nodeInfo = Test-NodeAndNpxAvailable
+    if ($nodeInfo.NodeOk -and $nodeInfo.NpxOk) {
+        Write-Host "  [OK] 已检测到 Node.js $($nodeInfo.NodeVersion) 与 npx，DeepSeek DSH 可直接调用" -ForegroundColor Green
+    } elseif ($nodeInfo.DshOk) {
+        Write-Host "  [OK] 已检测到全局 dsh 命令" -ForegroundColor Green
+    } else {
+        Write-Host "  [提醒] 当前选择了 L3_BACKEND=dsh，但未检测到 Node.js / npx（DSH 需 Node.js LTS >= 18）。" -ForegroundColor Yellow
+        Write-Host "        请安装 Node.js: https://nodejs.org/  （或在 18080 控制台随时切为 workbuddy / 关闭 L3）" -ForegroundColor DarkYellow
+    }
+} elseif ($l3Backend -eq "workbuddy") {
+    $wbCmd = @("workbuddy", "codebuddy", "cbc") | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+    if ($wbCmd) {
+        Write-Host "  [OK] 已检测到 WorkBuddy / CodeBuddy CLI: $wbCmd" -ForegroundColor Green
+    } else {
+        Write-Host "  [提醒] 未在 PATH 中检测到 workbuddy / codebuddy / cbc，请安装并登录后使用，或在 .env 中指定 WORKBUDDY_CMD。" -ForegroundColor Yellow
+    }
+}
 
 $defaultWorkdir = if ($existingEnv.ContainsKey("XIAOZHI_L3_WORKDIR") -and $existingEnv["XIAOZHI_L3_WORKDIR"]) {
     $existingEnv["XIAOZHI_L3_WORKDIR"]
@@ -149,16 +704,97 @@ $defaultWorkdir = if ($existingEnv.ContainsKey("XIAOZHI_L3_WORKDIR") -and $exist
 $wdIn = Read-Host "L3 后台任务默认工作目录（直接回车使用 $defaultWorkdir）"
 $l3Workdir = if ($wdIn.Trim()) { $wdIn.Trim() } else { $defaultWorkdir }
 
-# 3. 选择语音合成方案
-$curGsv = if ($existingEnv.ContainsKey("ENABLE_LOCAL_GSV") -and $existingEnv["ENABLE_LOCAL_GSV"].ToLower() -eq "true") { "2" } else { "1" }
-Write-Host "`n[3/6] 请选择语音合成（TTS）方案：" -ForegroundColor Yellow
-Write-Host "  1) 免显卡 EdgeTTS（推荐无独显/轻薄本，零显存占用开箱即用）"
-Write-Host "  2) 本地 RTX GPU GPT-SoVITS（需单独部署 gpt-sovits-studio）"
-$ttsChoice = (Read-Host "请输入编号 [1-2，直接回车保持 $curGsv]").Trim()
-if (-not $ttsChoice) { $ttsChoice = $curGsv }
-$enableGsv = if ($ttsChoice -eq "2") { "true" } else { "false" }
+# 3. 选择语音识别（ASR）与语音合成（TTS）方案（支持低配纯云端模式）
+$curCfgAsr = ""
+$curCfgTts = ""
+$existingRuntimeCfg = Join-Path $serverDir "config\runtime\.config.yaml"
+if (Test-Path $existingRuntimeCfg) {
+    try {
+        $rawExistCfg = [System.IO.File]::ReadAllText($existingRuntimeCfg, [System.Text.Encoding]::UTF8)
+        $mAsr0 = [regex]::Match($rawExistCfg, '(?m)^[ \t]+ASR:[ \t]+["'']?([A-Za-z0-9_]+)["'']?\b')
+        if ($mAsr0.Success) { $curCfgAsr = $mAsr0.Groups[1].Value.Trim() }
+        $mTts0 = [regex]::Match($rawExistCfg, '(?m)^[ \t]+TTS:[ \t]+["'']?([A-Za-z0-9_]+)["'']?\b')
+        if ($mTts0.Success) { $curCfgTts = $mTts0.Groups[1].Value.Trim() }
+    } catch {}
+}
+$curGsv = if ($existingEnv.ContainsKey("ENABLE_LOCAL_GSV") -and $existingEnv["ENABLE_LOCAL_GSV"].ToLower() -eq "true") {
+    "3"
+} elseif ($curCfgAsr -and $curCfgAsr -notin @("SherpaASR", "FunASR")) {
+    "2"
+} else {
+    "1"
+}
+Write-Host "`n[3/6] 请选择语音引擎方案（适配不同配置电脑）：" -ForegroundColor Yellow
+Write-Host "  1) 轻量均衡模式：本地 SherpaASR（~350MB 内存）+ 免费免显存 EdgeTTS"
+Write-Host "  2) 极简低配纯云端模式（推荐 4-8GB 内存/弱 CPU/无独显轻薄本：0 本地模型 + 0 显存，支持硅基/百炼/豆包/OpenAI/Fish/MiniMax）"
+Write-Host "  3) 本机 RTX GPU 发烧模式：本地 SherpaASR + 本机独显 GPT-SoVITS（19880）"
+$ttsChoiceRaw = (Read-Host "请输入编号 [1-3，直接回车保持 $curGsv]").Trim()
+$ttsChoice = if ($ttsChoiceRaw) { $ttsChoiceRaw } else { $curGsv }
+$enableGsv = if ($ttsChoice -eq "3") { "true" } else { "false" }
+$selectedAsrModule = ""
+$selectedTtsModule = ""
+$cloudEnvPrompts = @()
 $gsvDir = ""
-if ($enableGsv -eq "true") {
+if ($ttsChoice -eq "1" -and ($ttsChoiceRaw -eq "1" -or $curCfgTts -eq "GPT_SOVITS_V2")) {
+    $selectedAsrModule = "SherpaASR"
+    $selectedTtsModule = "EdgeTTS"
+} elseif ($ttsChoice -eq "3" -and $ttsChoiceRaw -eq "3") {
+    $selectedAsrModule = "SherpaASR"
+    $selectedTtsModule = "GPT_SOVITS_V2"
+}
+
+if ($ttsChoice -eq "2") {
+    Write-Host "`n  请选择低配云端音频 API 组合（日后均可在 18080 控制台随时切换与试听）：" -ForegroundColor Cyan
+    Write-Host "    1) 硅基流动 SenseVoice ASR + 免费 EdgeTTS（最低成本，只需 1 个 SILICONFLOW_API_KEY）"
+    Write-Host "    2) 硅基流动全家桶：SenseVoice ASR + CosyVoice2 TTS（国内直连，单 Key 搞定）"
+    Write-Host "    3) 阿里云百炼全流式：Paraformer 实时 ASR + CosyVoice 双向流式 TTS（国内低延迟，48kHz 音响直通）"
+    Write-Host "    4) 火山引擎豆包全流式：豆包流式 ASR + 大模型双流式 V3 TTS（高拟人，48kHz 音响直通）"
+    Write-Host "    5) 通用 OpenAI 兼容协议：OpenAI / Groq / One-API / New-API"
+    Write-Host "    6) 硅基流动 ASR + Fish Audio 音色克隆 TTS"
+    Write-Host "    7) 硅基流动 ASR + MiniMax 海螺语音 TTS（44.1kHz 音响直通）"
+    $cloudSub = (Read-Host "  请输入云端方案编号 [1-7，直接回车默认 1]").Trim()
+    switch ($cloudSub) {
+        "2" {
+            $selectedAsrModule = "SiliconFlowASR"; $selectedTtsModule = "CosyVoiceSiliconflow"
+            $cloudEnvPrompts = @(@{ Name = "SILICONFLOW_API_KEY"; Label = "硅基流动 SiliconFlow API Key" })
+        }
+        "3" {
+            $selectedAsrModule = "AliyunBLStreamASR"; $selectedTtsModule = "AliBLTTS"
+            $cloudEnvPrompts = @(@{ Name = "DASHSCOPE_API_KEY"; Label = "阿里云百炼 DashScope API Key" })
+        }
+        "4" {
+            $selectedAsrModule = "DoubaoStreamASR"; $selectedTtsModule = "HuoshanDoubleStreamTTS"
+            $cloudEnvPrompts = @(
+                @{ Name = "DOUBAO_APPID"; Label = "火山引擎语音 AppID" },
+                @{ Name = "DOUBAO_ACCESS_TOKEN"; Label = "火山引擎语音 Access Token" }
+            )
+        }
+        "5" {
+            $selectedAsrModule = "OpenaiASR"; $selectedTtsModule = "OpenAITTS"
+            $cloudEnvPrompts = @(@{ Name = "OPENAI_AUDIO_API_KEY"; Label = "通用 OpenAI 兼容音频 API Key" })
+        }
+        "6" {
+            $selectedAsrModule = "SiliconFlowASR"; $selectedTtsModule = "FishSpeech"
+            $cloudEnvPrompts = @(
+                @{ Name = "SILICONFLOW_API_KEY"; Label = "硅基流动 SiliconFlow API Key（用于 ASR）" },
+                @{ Name = "FISHSPEECH_API_KEY"; Label = "Fish Audio API Key（用于 TTS）" }
+            )
+        }
+        "7" {
+            $selectedAsrModule = "SiliconFlowASR"; $selectedTtsModule = "MinimaxTTSHTTPStream"
+            $cloudEnvPrompts = @(
+                @{ Name = "SILICONFLOW_API_KEY"; Label = "硅基流动 SiliconFlow API Key（用于 ASR）" },
+                @{ Name = "MINIMAX_API_KEY"; Label = "MiniMax 海螺 API Key" },
+                @{ Name = "MINIMAX_GROUP_ID"; Label = "MiniMax GroupId" }
+            )
+        }
+        default {
+            $selectedAsrModule = "SiliconFlowASR"; $selectedTtsModule = "EdgeTTS"
+            $cloudEnvPrompts = @(@{ Name = "SILICONFLOW_API_KEY"; Label = "硅基流动 SiliconFlow API Key" })
+        }
+    }
+    Write-Host "  [已选] 云端低配模式：ASR=$selectedAsrModule | TTS=$selectedTtsModule" -ForegroundColor Green
+} elseif ($enableGsv -eq "true") {
     $candGsv = if ($existingEnv.ContainsKey("GSV_DIR") -and $existingEnv["GSV_DIR"]) {
         $existingEnv["GSV_DIR"]
     } else {
@@ -169,7 +805,7 @@ if ($enableGsv -eq "true") {
 }
 
 # 4. 选择长期记忆模型网络
-$curMem = if ($existingEnv.ContainsKey("ANIMA_LLM_BASE_URL") -and $existingEnv["ANIMA_LLM_BASE_URL"] -match "googleapis\.com") { "2" } else { "1" }
+$curMem = if ($existingEnv.ContainsKey("ANIMA_LLM_BASE_URL") -and ((Get-AnimaProviderKind -Url $existingEnv["ANIMA_LLM_BASE_URL"]) -eq "gemini")) { "2" } else { "1" }
 Write-Host "`n[4/6] 请选择 Anima Brain 长期记忆模型网络：" -ForegroundColor Yellow
 Write-Host "  1) 纯国内免梯子（DeepSeek 对话摘要 + 可选硅基流动/百炼 Embedding）"
 Write-Host "  2) Google Gemini（需代理/全局 TUN 与 GEMINI_API_KEY）"
@@ -266,24 +902,42 @@ $envUpdates = [ordered]@{
 if ($gsvDir) { $envUpdates["GSV_DIR"] = $gsvDir }
 
 $keepExistingMemCfg = ($hasExistingEnv -and $existingEnv.ContainsKey("ANIMA_LLM_BASE_URL") -and ($memChoice -eq $curMem))
+$curSumUrl = if ($existingEnv.ContainsKey("ANIMA_SUMMARY_BASE_URL")) { [string]$existingEnv["ANIMA_SUMMARY_BASE_URL"] } else { "" }
 if ($memChoice -eq "2") {
     if (-not $keepExistingMemCfg) {
         $envUpdates["ANIMA_LLM_BASE_URL"] = "https://generativelanguage.googleapis.com/v1beta/openai"
         $envUpdates["ANIMA_LLM_MODEL"] = "gemini-3.5-flash-lite"
         $envUpdates["ANIMA_EMBEDDING_BASE_URL"] = "https://generativelanguage.googleapis.com/v1beta/openai"
         $envUpdates["ANIMA_EMBEDDING_MODEL"] = "gemini-embedding-001"
+        if ($curSumUrl -and ((Get-AnimaProviderKind -Url $curSumUrl) -eq "deepseek")) {
+            $envUpdates["ANIMA_SUMMARY_BASE_URL"] = ""
+            $envUpdates["ANIMA_SUMMARY_MODEL"] = ""
+            $envUpdates["ANIMA_SUMMARY_API_KEY"] = ""
+        }
     }
 } else {
     if (-not $keepExistingMemCfg) {
         $envUpdates["ANIMA_LLM_BASE_URL"] = "https://api.deepseek.com/v1"
         $envUpdates["ANIMA_LLM_MODEL"] = "deepseek-chat"
     }
+    if ($curSumUrl -and ((Get-AnimaProviderKind -Url $curSumUrl) -eq "gemini")) {
+        $envUpdates["ANIMA_SUMMARY_BASE_URL"] = ""
+        $envUpdates["ANIMA_SUMMARY_MODEL"] = ""
+        $envUpdates["ANIMA_SUMMARY_API_KEY"] = ""
+    }
     # 仅当此前为 Gemini 向量配置或尚无自定义国内 Embedding 时才置空，避免覆盖用户自配的硅基流动/百炼 Embedding
     $curEmbUrl = if ($existingEnv.ContainsKey("ANIMA_EMBEDDING_BASE_URL")) { $existingEnv["ANIMA_EMBEDDING_BASE_URL"] } else { "" }
-    if (-not $curEmbUrl -or $curEmbUrl -match "googleapis\.com") {
+    if (-not $curEmbUrl -or ((Get-AnimaProviderKind -Url $curEmbUrl) -eq "gemini")) {
         $envUpdates["ANIMA_EMBEDDING_BASE_URL"] = ""
         $envUpdates["ANIMA_EMBEDDING_MODEL"] = ""
         $envUpdates["ANIMA_EMBEDDING_API_KEY"] = ""
+    }
+    # 纯国内模式默认注入国内 npm / PyPI 构建镜像源（仅当用户尚未手动配置时写入，加速首次 docker compose build anima-brain）
+    if (-not $existingEnv.ContainsKey("NPM_REGISTRY")) {
+        $envUpdates["NPM_REGISTRY"] = "https://registry.npmmirror.com"
+    }
+    if (-not $existingEnv.ContainsKey("PIP_INDEX_URL")) {
+        $envUpdates["PIP_INDEX_URL"] = "https://pypi.tuna.tsinghua.edu.cn/simple"
     }
 }
 
@@ -358,60 +1012,217 @@ if (-not (Test-Path $hostModePath)) {
     Write-Host "[已生成] 宿主机私有操控挡位配置（默认安全挡）: $hostModePath" -ForegroundColor Green
 }
 
-# 若用户选择免显卡 EdgeTTS，同步确保 config\runtime\.config.yaml 的 selected_module.TTS 为 EdgeTTS（不改动其余个人设定）
+# 同步更新 config\runtime\.config.yaml 的 ASR / TTS 引擎选择（绝不写入明文密钥）
 $cfgPath = Join-Path $serverDir "config\runtime\.config.yaml"
-if ($enableGsv -eq "false" -and (Test-Path $cfgPath)) {
+if (Test-Path $cfgPath) {
     $cfgRaw = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8)
-    $ttsPat = '(?m)^(\s*TTS:\s*)["'']?GPT_SOVITS_V2["'']?(\s*(?:#.*)?\r?)$'
-    if ($cfgRaw -match $ttsPat) {
-        $cfgUpdated = [regex]::Replace($cfgRaw, $ttsPat, '${1}EdgeTTS${2}')
-        [System.IO.File]::WriteAllText($cfgPath, $cfgUpdated, [System.Text.UTF8Encoding]::new($false))
-        Write-Host "[已同步] config\runtime\.config.yaml 中 TTS 已设为 EdgeTTS（免显卡模式）" -ForegroundColor Green
+    $cfgModified = $false
+    if ($selectedAsrModule -and $selectedTtsModule) {
+        $asrPat = '(?m)^(\s*ASR:\s*)["'']?[^\r\n#]+?["'']?(\s*(?:#.*)?\r?)$'
+        $ttsAnyPat = '(?m)^(\s*TTS:\s*)["'']?[^\r\n#]+?["'']?(\s*(?:#.*)?\r?)$'
+        if ($cfgRaw -match $asrPat) {
+            $cfgRaw = [regex]::Replace($cfgRaw, $asrPat, ('${1}' + $selectedAsrModule + '${2}'), 1)
+            $cfgModified = $true
+        }
+        if ($cfgRaw -match $ttsAnyPat) {
+            $cfgRaw = [regex]::Replace($cfgRaw, $ttsAnyPat, ('${1}' + $selectedTtsModule + '${2}'), 1)
+            $cfgModified = $true
+        }
+        $tplCfgPath = Join-Path $serverDir "config\.config.example.yaml"
+        if (Test-Path $tplCfgPath) {
+            $tplCfgRaw = [System.IO.File]::ReadAllText($tplCfgPath, [System.Text.Encoding]::UTF8)
+            $cfgRaw = Ensure-YamlSubBlockFromTemplate -YamlText $cfgRaw -TemplateText $tplCfgRaw -SectionName "ASR" -BlockName $selectedAsrModule
+            $cfgRaw = Ensure-YamlSubBlockFromTemplate -YamlText $cfgRaw -TemplateText $tplCfgRaw -SectionName "TTS" -BlockName $selectedTtsModule
+        }
+        if ($cfgModified) {
+            [System.IO.File]::WriteAllText($cfgPath, $cfgRaw, [System.Text.UTF8Encoding]::new($false))
+            $modeTag = if ($ttsChoice -eq "2") { "云端低配模式" } elseif ($ttsChoice -eq "3") { "本机 GPU 模式" } else { "轻量均衡模式" }
+            Write-Host "[已同步] config\runtime\.config.yaml 已设为${modeTag} (ASR=$selectedAsrModule, TTS=$selectedTtsModule)" -ForegroundColor Green
+        }
+    } elseif ($enableGsv -eq "false") {
+        $ttsPat = '(?m)^(\s*TTS:\s*)["'']?GPT_SOVITS_V2["'']?(\s*(?:#.*)?\r?)$'
+        if ($cfgRaw -match $ttsPat) {
+            $cfgUpdated = [regex]::Replace($cfgRaw, $ttsPat, '${1}EdgeTTS${2}')
+            [System.IO.File]::WriteAllText($cfgPath, $cfgUpdated, [System.Text.UTF8Encoding]::new($false))
+            Write-Host "[已同步] config\runtime\.config.yaml 中 TTS 已设为 EdgeTTS（免显卡模式）" -ForegroundColor Green
+        }
     }
 }
 
-# 6. 检查 Python 虚拟环境与 API Key 环境变量
-Write-Host "`n[6/6] 正在检查宿主机运行依赖与环境变量..." -ForegroundColor Cyan
-$venvPy = Join-Path $serverDir "pc-mcp\.venv\Scripts\python.exe"
+# 6. 检查 Python 虚拟环境、防火墙入站端口与 API Key 环境变量
+Write-Host "`n[6/6] 正在检查宿主机运行依赖、防火墙与环境变量..." -ForegroundColor Cyan
+$venvDir = Join-Path $serverDir "pc-mcp\.venv"
+$venvPy = Join-Path $venvDir "Scripts\python.exe"
+$venvPip = Join-Path $venvDir "Scripts\pip.exe"
+$reqFile = Join-Path $serverDir "pc-mcp\requirements.txt"
+$needBuildVenv = $false
+
 if (-not (Test-Path $venvPy)) {
-    $mk = (Read-Host "未检测到 pc-mcp\.venv 虚拟环境，是否立即自动创建并安装依赖？[Y/n]").Trim().ToLower()
-    if ($mk -ne "n") {
-        python -m venv (Join-Path $serverDir "pc-mcp\.venv")
-        & (Join-Path $serverDir "pc-mcp\.venv\Scripts\pip.exe") install --require-hashes -r (Join-Path $serverDir "pc-mcp\requirements.txt")
-    }
+    $needBuildVenv = $true
+    Write-Host "  [提示] 未检测到 pc-mcp\.venv 虚拟环境。" -ForegroundColor Yellow
+} elseif (-not (Test-PcMcpVenvHealthy -VenvPythonPath $venvPy)) {
+    $needBuildVenv = $true
+    Write-Host "  [警告] 检测到 pc-mcp\.venv 无法正常运行或缺少依赖（常见于直接复制其他电脑的文件夹导致 Python 路径失效）。" -ForegroundColor Yellow
 } else {
-    Write-Host "  [OK] pc-mcp\.venv 已就绪" -ForegroundColor Green
+    Write-Host "  [OK] pc-mcp\.venv 虚拟环境健康且依赖完整" -ForegroundColor Green
+}
+
+if ($needBuildVenv) {
+    if (-not $hostPyInfo.Found) {
+        Write-Host "  [错误] 无法创建 pc-mcp\.venv：本机缺少 Python 3.10～3.12（不可使用 Windows Store 占位符）。" -ForegroundColor Red
+        Write-Host "        请先安装 Python 3.11/3.12 后重新运行「一键初始化配置.bat」。" -ForegroundColor Yellow
+    } else {
+        $promptMsg = if (Test-Path $venvDir) {
+            "是否自动重建 pc-mcp\.venv 并安装哈希锁依赖？（使用 Python $($hostPyInfo.Version)）[Y/n]"
+        } else {
+            "是否立即创建 pc-mcp\.venv 并安装哈希锁依赖？（使用 Python $($hostPyInfo.Version)）[Y/n]"
+        }
+        $mk = (Read-Host $promptMsg).Trim().ToLower()
+        if ($mk -ne "n") {
+            if (Test-Path $venvDir) {
+                Write-Host "  正在清理失效的旧 pc-mcp\.venv..." -ForegroundColor DarkGray
+                Remove-Item -Path $venvDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "  正在使用 $($hostPyInfo.Executable) 创建虚拟环境..." -ForegroundColor Cyan
+            & $hostPyInfo.Executable -m venv $venvDir
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPip)) {
+                Write-Host "  [错误] 创建 pc-mcp\.venv 失败（退出码 $LASTEXITCODE），请检查 Python 安装是否包含 venv/ensurepip 模块。" -ForegroundColor Red
+            } else {
+                $pipIndex = if ($envUpdates.Contains("PIP_INDEX_URL") -and $envUpdates["PIP_INDEX_URL"]) {
+                    $envUpdates["PIP_INDEX_URL"]
+                } elseif ($existingEnv.ContainsKey("PIP_INDEX_URL") -and $existingEnv["PIP_INDEX_URL"]) {
+                    $existingEnv["PIP_INDEX_URL"]
+                } elseif ($memChoice -ne "2") {
+                    "https://pypi.tuna.tsinghua.edu.cn/simple"
+                } else {
+                    ""
+                }
+                Write-Host "  正在安装 SHA-256 哈希锁依赖 (pc-mcp\requirements.txt)..." -ForegroundColor Cyan
+                if ($pipIndex) {
+                    & $venvPip install --require-hashes -i $pipIndex -r $reqFile
+                } else {
+                    & $venvPip install --require-hashes -r $reqFile
+                }
+                if ($LASTEXITCODE -ne 0 -and $pipIndex) {
+                    Write-Host "  [提示] 镜像源安装失败，正在回退官方 PyPI 重试..." -ForegroundColor Yellow
+                    & $venvPip install --require-hashes -r $reqFile
+                }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "  [错误] pip 安装 pc-mcp 依赖失败（退出码 $LASTEXITCODE）！请检查网络/代理或 Python 版本是否为 3.10～3.12。" -ForegroundColor Red
+                } elseif (Test-PcMcpVenvHealthy -VenvPythonPath $venvPy) {
+                    Write-Host "  [OK] pc-mcp\.venv 创建并校验通过！" -ForegroundColor Green
+                } else {
+                    Write-Host "  [警告] pip 已返回，但核心模块导入自检未通过，请查看上方报错信息。" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+}
+
+# 检查 Windows Defender 防火墙入站放行规则（TCP 18000 WebSocket / 18003 OTA）
+$fwStatus = Test-XiaozhiFirewallPorts -Ports @(18000, 18003)
+if ($fwStatus.Checked) {
+    if (-not $fwStatus.FirewallActive) {
+        Write-Host "  [OK] Windows 防火墙当前未启用，无需额外放行 TCP 18000/18003" -ForegroundColor DarkGreen
+    } elseif ($fwStatus.MissingPorts.Count -eq 0) {
+        Write-Host "  [OK] Windows 防火墙已存在 TCP 18000 / 18003 入站放行规则" -ForegroundColor Green
+    } else {
+        $missStr = ($fwStatus.MissingPorts -join ", ")
+        Write-Host "  [提示] Windows Defender 防火墙已开启，但未检测到当前网络配置下 TCP $missStr 的入站放行规则，局域网 ESP32 可能无法连入！" -ForegroundColor Yellow
+        if ($fwStatus.HasPublicProfile) {
+            Write-Host "  [注意] 检测到当前网络包含「公用网络 (Public)」配置，建议在 Windows 网络设置中将家庭 Wi-Fi / 以太网切换为「专用网络 (Private)」，否则专用网络规则不会生效。" -ForegroundColor DarkYellow
+        }
+        $addFw = (Read-Host "是否立即自动添加专用网络 (Private) 防火墙放行规则（需弹出管理员 UAC 授权）？[Y/n]").Trim().ToLower()
+        if ($addFw -ne "n") {
+            $fwAdded = Add-XiaozhiFirewallRules -Ports $fwStatus.MissingPorts
+            if ($fwAdded) {
+                Write-Host "  [OK] 已添加 Windows 防火墙入站放行规则 (TCP $missStr，仅限 Private 局域网)" -ForegroundColor Green
+            } else {
+                Write-Host "  [提示] 未能自动添加防火墙规则（可能取消了 UAC 授权），你可稍后以管理员身份运行以下命令：" -ForegroundColor Yellow
+                Write-Host "        New-NetFirewallRule -DisplayName 'XiaoZhi ESP32 WebSocket (TCP 18000)' -Direction Inbound -Profile Private -Protocol TCP -LocalPort 18000 -Action Allow" -ForegroundColor DarkGray
+                Write-Host "        New-NetFirewallRule -DisplayName 'XiaoZhi ESP32 OTA/Vision (TCP 18003)' -Direction Inbound -Profile Private -Protocol TCP -LocalPort 18003 -Action Allow" -ForegroundColor DarkGray
+            }
+        } else {
+            Write-Host "  [提示] 若后续 ESP32 连不上 18000/18003，请以管理员 PowerShell 执行上述 New-NetFirewallRule 放行命令。" -ForegroundColor DarkYellow
+        }
+    }
 }
 
 $dsKey = [Environment]::GetEnvironmentVariable("DEEPSEEK_API_KEY", "User")
 if (-not $dsKey) { $dsKey = [Environment]::GetEnvironmentVariable("DEEPSEEK_API_KEY", "Machine") }
-if (-not $dsKey) {
+if (-not $dsKey -and $existingEnv.ContainsKey("DEEPSEEK_API_KEY") -and $existingEnv["DEEPSEEK_API_KEY"]) {
+    $dsKey = [string]$existingEnv["DEEPSEEK_API_KEY"]
+    Write-Host "  [OK] 已从本地 .env 检测到 DEEPSEEK_API_KEY（推荐后续迁移至 Windows 用户环境变量）" -ForegroundColor Green
+} elseif (-not $dsKey) {
     Write-Host "  [提示] 尚未检测到 DEEPSEEK_API_KEY 环境变量。" -ForegroundColor Yellow
     $inputKey = (Read-Host "可直接粘贴 DeepSeek API Key 写入当前 Windows 用户环境变量（留空跳过）").Trim()
     if ($inputKey) {
         $dsKey = $inputKey
         [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", $inputKey, "User")
+        [Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", $inputKey, "Process")
         Write-Host "  [OK] 已安全写入 DEEPSEEK_API_KEY 到 Windows 用户环境变量（零明文落盘）" -ForegroundColor Green
     }
 } else {
     Write-Host "  [OK] DEEPSEEK_API_KEY 环境变量已配置" -ForegroundColor Green
 }
 
+$effectiveAnimaUrl = if ($envUpdates.Contains("ANIMA_LLM_BASE_URL")) {
+    [string]$envUpdates["ANIMA_LLM_BASE_URL"]
+} elseif ($existingEnv.ContainsKey("ANIMA_LLM_BASE_URL") -and $existingEnv["ANIMA_LLM_BASE_URL"]) {
+    [string]$existingEnv["ANIMA_LLM_BASE_URL"]
+} else {
+    "https://api.deepseek.com/v1"
+}
+$oldAnimaKey = [Environment]::GetEnvironmentVariable("ANIMA_LLM_API_KEY", "User")
+$machineAnimaKey = [Environment]::GetEnvironmentVariable("ANIMA_LLM_API_KEY", "Machine")
+$dotEnvAnimaKey = if ($envUpdates.Contains("ANIMA_LLM_API_KEY")) {
+    [string]$envUpdates["ANIMA_LLM_API_KEY"]
+} elseif ($existingEnv.ContainsKey("ANIMA_LLM_API_KEY")) {
+    [string]$existingEnv["ANIMA_LLM_API_KEY"]
+} else {
+    ""
+}
+$oldSummaryKey = [Environment]::GetEnvironmentVariable("ANIMA_SUMMARY_API_KEY", "User")
+$machineSummaryKey = [Environment]::GetEnvironmentVariable("ANIMA_SUMMARY_API_KEY", "Machine")
+$dotEnvSummaryKey = if ($envUpdates.Contains("ANIMA_SUMMARY_API_KEY")) {
+    [string]$envUpdates["ANIMA_SUMMARY_API_KEY"]
+} elseif ($existingEnv.ContainsKey("ANIMA_SUMMARY_API_KEY")) {
+    [string]$existingEnv["ANIMA_SUMMARY_API_KEY"]
+} else {
+    ""
+}
+$animaKeyAdvice = Get-AnimaKeyConflictAdvice -MemChoice $memChoice -EffectiveAnimaUrl $effectiveAnimaUrl -DeepSeekKey $dsKey -UserAnimaKey $oldAnimaKey -MachineAnimaKey $machineAnimaKey -DotEnvAnimaKey $dotEnvAnimaKey -UserSummaryKey $oldSummaryKey -MachineSummaryKey $machineSummaryKey -DotEnvSummaryKey $dotEnvSummaryKey
+
 if ($memChoice -eq "2") {
-    # 切换至 Google Gemini 时清理可能残留的旧 ANIMA_LLM_API_KEY（避免把 DeepSeek Key 误发给 Gemini）
-    $oldAnimaKey = [Environment]::GetEnvironmentVariable("ANIMA_LLM_API_KEY", "User")
-    if ($oldAnimaKey) {
+    # 切换至 Google Gemini 时清理可能残留的旧 ANIMA_LLM_API_KEY / ANIMA_SUMMARY_API_KEY（避免把 DeepSeek Key 误发给 Gemini）
+    if ($animaKeyAdvice.UserAction -eq "auto_clear") {
         [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $null, "User")
         Write-Host "  [已清理] 已移除旧的 ANIMA_LLM_API_KEY 用户环境变量，记忆大脑将使用 GEMINI_API_KEY" -ForegroundColor Yellow
     }
     [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $null, "Process")
-    $machineAnimaKey = [Environment]::GetEnvironmentVariable("ANIMA_LLM_API_KEY", "Machine")
-    if ($machineAnimaKey) {
+    if ($animaKeyAdvice.SummaryUserAction -eq "auto_clear") {
+        [Environment]::SetEnvironmentVariable("ANIMA_SUMMARY_API_KEY", $null, "User")
+        Write-Host "  [已清理] 已移除旧的 ANIMA_SUMMARY_API_KEY 用户环境变量，后台摘要将使用 GEMINI_API_KEY" -ForegroundColor Yellow
+    }
+    [Environment]::SetEnvironmentVariable("ANIMA_SUMMARY_API_KEY", $null, "Process")
+    if ($animaKeyAdvice.WarnMachine) {
         Write-Host "  [注意] 检测到系统级 (Machine) 环境变量 ANIMA_LLM_API_KEY，请在系统环境变量中手动删除以免覆盖 GEMINI_API_KEY" -ForegroundColor Yellow
+    }
+    if ($animaKeyAdvice.WarnDotEnv) {
+        Write-Host "  [注意] 检测到 .env 中仍配置了 ANIMA_LLM_API_KEY，如不再需要请手动注释/删除，以免覆盖 GEMINI_API_KEY" -ForegroundColor Yellow
+    }
+    if ($animaKeyAdvice.WarnSummaryMachine) {
+        Write-Host "  [注意] 检测到系统级 (Machine) 环境变量 ANIMA_SUMMARY_API_KEY，请在系统环境变量中手动删除以免覆盖 GEMINI_API_KEY" -ForegroundColor Yellow
+    }
+    if ($animaKeyAdvice.WarnSummaryDotEnv) {
+        Write-Host "  [注意] 检测到 .env 中仍配置了 ANIMA_SUMMARY_API_KEY，如不再需要请手动注释/删除，以免覆盖 GEMINI_API_KEY" -ForegroundColor Yellow
     }
     $gemKey = [Environment]::GetEnvironmentVariable("GEMINI_API_KEY", "User")
     if (-not $gemKey) { $gemKey = [Environment]::GetEnvironmentVariable("GEMINI_API_KEY", "Machine") }
-    if (-not $gemKey) {
+    if (-not $gemKey -and $existingEnv.ContainsKey("GEMINI_API_KEY") -and $existingEnv["GEMINI_API_KEY"]) {
+        $gemKey = [string]$existingEnv["GEMINI_API_KEY"]
+        Write-Host "  [OK] 已从本地 .env 检测到 GEMINI_API_KEY（推荐后续迁移至 Windows 用户环境变量）" -ForegroundColor Green
+    } elseif (-not $gemKey) {
         Write-Host "  [提示] 尚未检测到 GEMINI_API_KEY 环境变量。" -ForegroundColor Yellow
         $inputGem = (Read-Host "可直接粘贴 Google Gemini API Key 写入当前 Windows 用户环境变量（留空跳过）").Trim()
         if ($inputGem) {
@@ -423,18 +1234,89 @@ if ($memChoice -eq "2") {
         Write-Host "  [OK] GEMINI_API_KEY 环境变量已配置" -ForegroundColor Green
     }
 } else {
-    if ($dsKey) {
-        [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $dsKey, "User")
-        [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $dsKey, "Process")
-        Write-Host "  [OK] 已将 ANIMA_LLM_API_KEY 同步为当前 DEEPSEEK_API_KEY（纯国内免梯子模式）" -ForegroundColor Green
+    if ($animaKeyAdvice.UserAction -eq "auto_clear") {
+        [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $null, "User")
+        [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $null, "Process")
+        Write-Host "  [已清理] 检测到用户环境变量 ANIMA_LLM_API_KEY 为旧的 Gemini Key，与当前 DeepSeek 模式冲突，已自动移除以复用 DEEPSEEK_API_KEY" -ForegroundColor Yellow
+    } elseif ($animaKeyAdvice.UserAction -eq "prompt_clear") {
+        if ($animaKeyAdvice.UserReason -eq "orphan_user_anima_key_without_deepseek_key") {
+            Write-Host "  [注意] 检测到 Windows 用户环境变量中残留旧的 ANIMA_LLM_API_KEY，后续配置 DEEPSEEK_API_KEY 时它会被旧值静默覆盖。" -ForegroundColor Yellow
+        } else {
+            Write-Host "  [注意] 检测到 Windows 用户环境变量中存在与 DEEPSEEK_API_KEY 不同的旧 ANIMA_LLM_API_KEY，它会覆盖当前的 DEEPSEEK_API_KEY。" -ForegroundColor Yellow
+        }
+        $clrAnima = (Read-Host "是否清理旧的 ANIMA_LLM_API_KEY 用户环境变量，以统一自动复用 DEEPSEEK_API_KEY？[Y/n]").Trim().ToLower()
+        if ($clrAnima -ne "n") {
+            [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $null, "User")
+            [Environment]::SetEnvironmentVariable("ANIMA_LLM_API_KEY", $null, "Process")
+            Write-Host "  [已清理] 已移除旧的 ANIMA_LLM_API_KEY 用户环境变量，记忆大脑将自动复用 DEEPSEEK_API_KEY" -ForegroundColor Green
+        } else {
+            Write-Host "  [保留] 已保留用户环境变量 ANIMA_LLM_API_KEY（将优先于 DEEPSEEK_API_KEY 生效）" -ForegroundColor DarkYellow
+        }
+    }
+    if ($animaKeyAdvice.SummaryUserAction -eq "auto_clear") {
+        [Environment]::SetEnvironmentVariable("ANIMA_SUMMARY_API_KEY", $null, "User")
+        [Environment]::SetEnvironmentVariable("ANIMA_SUMMARY_API_KEY", $null, "Process")
+        Write-Host "  [已清理] 检测到用户环境变量 ANIMA_SUMMARY_API_KEY 为旧的 Gemini Key，已自动移除以复用 DEEPSEEK_API_KEY" -ForegroundColor Yellow
+    } elseif ($animaKeyAdvice.SummaryUserAction -eq "prompt_clear") {
+        Write-Host "  [注意] 检测到 Windows 用户环境变量中存在旧的 ANIMA_SUMMARY_API_KEY，它会覆盖后台摘要默认复用的 DEEPSEEK_API_KEY。" -ForegroundColor Yellow
+        $clrSum = (Read-Host "是否清理旧的 ANIMA_SUMMARY_API_KEY 用户环境变量？[Y/n]").Trim().ToLower()
+        if ($clrSum -ne "n") {
+            [Environment]::SetEnvironmentVariable("ANIMA_SUMMARY_API_KEY", $null, "User")
+            [Environment]::SetEnvironmentVariable("ANIMA_SUMMARY_API_KEY", $null, "Process")
+            Write-Host "  [已清理] 已移除旧的 ANIMA_SUMMARY_API_KEY 用户环境变量" -ForegroundColor Green
+        }
+    }
+    if ($animaKeyAdvice.WarnMachine) {
+        Write-Host "  [注意] 检测到系统级 (Machine) 环境变量 ANIMA_LLM_API_KEY 与当前 DEEPSEEK_API_KEY 不一致，请在系统环境变量中手动删除以免覆盖 DEEPSEEK_API_KEY" -ForegroundColor Yellow
+    }
+    if ($animaKeyAdvice.WarnDotEnv) {
+        Write-Host "  [注意] 检测到 .env 中存在与当前 DEEPSEEK_API_KEY 不同的 ANIMA_LLM_API_KEY，如为旧版本残留请手动注释/删除" -ForegroundColor Yellow
+    }
+    if ($animaKeyAdvice.WarnSummaryMachine) {
+        Write-Host "  [注意] 检测到系统级 (Machine) 环境变量 ANIMA_SUMMARY_API_KEY 与当前 DEEPSEEK_API_KEY 不一致，请在系统环境变量中手动删除以免覆盖" -ForegroundColor Yellow
+    }
+    if ($animaKeyAdvice.WarnSummaryDotEnv) {
+        Write-Host "  [注意] 检测到 .env 中存在与当前 DEEPSEEK_API_KEY 不同的 ANIMA_SUMMARY_API_KEY，如为旧版本残留请手动注释/删除" -ForegroundColor Yellow
+    }
+    if (-not $animaKeyAdvice.IsDeepSeekUrl) {
+        Write-Host "  [提示] 当前保留了自定义 ANIMA_LLM_BASE_URL ($effectiveAnimaUrl)，未修改其对应的 ANIMA_LLM_API_KEY。" -ForegroundColor DarkCyan
+    } elseif ($dsKey) {
+        Write-Host "  [OK] 纯国内免梯子模式将自动复用 DEEPSEEK_API_KEY（无需重复配置 ANIMA_LLM_API_KEY）" -ForegroundColor Green
+    } else {
+        Write-Host "  [提示] 稍后配置 DEEPSEEK_API_KEY 环境变量后，对话与 Anima 长期记忆将同时自动生效。" -ForegroundColor DarkYellow
     }
 }
 
-$sherpaModel = Join-Path $serverDir "models\sherpa-onnx-sense-voice\model.int8.onnx"
-if (-not (Test-Path $sherpaModel)) {
-    Write-Host "  [提示] 尚未放入本地语音识别模型 models\sherpa-onnx-sense-voice\model.int8.onnx（首次启动时容器会自动按需下载或可手动放入）" -ForegroundColor Yellow
+foreach ($ce in $cloudEnvPrompts) {
+    $ceName = $ce.Name
+    $ceLabel = $ce.Label
+    $curVal = [Environment]::GetEnvironmentVariable($ceName, "User")
+    if (-not $curVal) { $curVal = [Environment]::GetEnvironmentVariable($ceName, "Machine") }
+    if (-not $curVal) {
+        Write-Host "  [提示] 尚未检测到 $ceName 环境变量。" -ForegroundColor Yellow
+        $inVal = (Read-Host "可直接粘贴 $ceLabel 写入当前 Windows 用户环境变量（留空跳过）").Trim()
+        if ($inVal) {
+            [Environment]::SetEnvironmentVariable($ceName, $inVal, "User")
+            [Environment]::SetEnvironmentVariable($ceName, $inVal, "Process")
+            Write-Host "  [OK] 已安全写入 $ceName 到 Windows 用户环境变量（零明文落盘）" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  [OK] $ceName 环境变量已配置" -ForegroundColor Green
+    }
+}
+
+$effectiveAsrMod = if ($selectedAsrModule) { $selectedAsrModule } elseif ($curCfgAsr) { $curCfgAsr } else { "SherpaASR" }
+if ($effectiveAsrMod -ne "SherpaASR" -and $effectiveAsrMod -ne "FunASR") {
+    Write-Host "  [OK] 当前使用云端 ASR ($effectiveAsrMod)，无需下载本地 SherpaASR 离线模型，极致省内存！" -ForegroundColor Green
 } else {
-    Write-Host "  [OK] Sherpa-ONNX 离线语音识别模型已就位" -ForegroundColor Green
+    $sherpaModel = Join-Path $serverDir "models\sherpa-onnx-sense-voice\model.int8.onnx"
+    if (-not (Test-Path $sherpaModel)) {
+        Write-Host "  [提示] 尚未检测到本地 SherpaASR 模型 models\sherpa-onnx-sense-voice\model.int8.onnx（~230MB）。" -ForegroundColor Yellow
+        Write-Host "        首次启动容器时会自动通过轻量直连 HTTPS 下载并持久化到该目录（零 PyTorch 内存暴涨）；" -ForegroundColor DarkYellow
+        Write-Host "        也可选择极简低配纯云端模式，免下载模型即时启动。" -ForegroundColor DarkYellow
+    } else {
+        Write-Host "  [OK] Sherpa-ONNX 离线语音识别模型已就位" -ForegroundColor Green
+    }
 }
 
 Write-Host "`n=========================================================" -ForegroundColor Green

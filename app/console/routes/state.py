@@ -27,25 +27,29 @@ import asr_corrections
 import mei_emotion_router
 import patch_registry
 import pc_audio_router
+import persona_versions
+import recall_guard
 import reply_length_router
 import runtime_events
 import runtime_settings
 import turn_context_router
 import xz_common
 from console import shared
-from console.routes import anima, config, gsv, l3
+from console.routes import anima, audio_api, config, gsv, l3
 
 _probe_lock = threading.Lock()
 _pc_audio_online_cache: bool = False
 _gsv_online_cache: bool = False
 _anima_backup_lock = threading.Lock()
 _anima_backup_cache: dict | None = None
+_anima_semantic_cache: dict | None = None
 _probe_fail_counts: dict[str, int] = {
     "pc_audio": 0,
     "l3": 0,
     "anima_rel": 0,
     "obsidian": 0,
     "gsv": 0,
+    "anima_health": 0,
 }
 
 
@@ -66,8 +70,54 @@ def _get_cached_anima_backup_snapshot() -> dict:
         "weekly_count": 0,
         "last_error": "",
     }
+
+
+def _set_cached_anima_semantic(snap: dict | None) -> None:
+    with _anima_backup_lock:
+        global _anima_semantic_cache
+        _anima_semantic_cache = dict(snap) if isinstance(snap, dict) else None
+
+
+def _get_cached_anima_semantic_snapshot() -> dict:
+    with _anima_backup_lock:
+        if _anima_semantic_cache is not None:
+            snap = dict(_anima_semantic_cache)
+            snap["probed"] = True
+            return snap
+    return {
+        "probed": False,
+        "configured": False,
+        "semantic_available": False,
+        "retrieval_mode": "unknown",
+        "degraded": False,
+        "degraded_reason": "",
+        "degraded_message_zh": "检测中…",
+        "active_model": "",
+        "active_space": "",
+        "active_label": "",
+        "active_dim": None,
+        "auth_breaker_open": False,
+        "circuit_open": False,
+        "cooldown_remaining_seconds": 0.0,
+        "spaces_count": 0,
+        "spaces": [],
+    }
 _PROBE_OFFLINE_THRESHOLD = 2
 _PROBE_INTERVAL_SECONDS = 3.0
+_PROBE_IDLE_INTERVAL_SECONDS = 30.0
+_PANEL_IDLE_THRESHOLD_SECONDS = 60.0
+_last_panel_request_ts: float = time.monotonic()
+_panel_wake_event = threading.Event()
+
+
+def note_panel_activity() -> None:
+    """Record active Web Console traffic and wake the background prober from idle backoff (P2-5)."""
+    global _last_panel_request_ts
+    now = time.monotonic()
+    was_idle = (now - _last_panel_request_ts) >= _PANEL_IDLE_THRESHOLD_SECONDS
+    _last_panel_request_ts = now
+    if was_idle:
+        _panel_wake_event.set()
 
 
 def _get_cached_pc_audio_online() -> bool:
@@ -263,12 +313,14 @@ def _probe_background_services_once() -> dict[str, bool]:
                 _gsv_online_cache = False
 
     # 6. 18787 Anima Health & Online Backup Status (B-2 / B-1 inbox counters)
+    anima_health_ok = False
     try:
         client = shared._get_console_http_client()
         resp = client.get(f"{anima.ANIMA_HOST}/xiaozhi/health", timeout=1.5)
         if resp.status_code in (200, 503):
             h_data = resp.json()
             if isinstance(h_data, dict):
+                anima_health_ok = True
                 if isinstance(h_data.get("backup"), dict):
                     snap_bk = dict(h_data["backup"])
                     if "inbox_pending" in h_data:
@@ -278,8 +330,19 @@ def _probe_background_services_once() -> dict[str, bool]:
                     with _anima_backup_lock:
                         global _anima_backup_cache
                         _anima_backup_cache = snap_bk
+                if isinstance(h_data.get("semantic_retrieval"), dict):
+                    _set_cached_anima_semantic(h_data["semantic_retrieval"])
     except Exception as exc:
         shared._log_rate_limited("probe_anima_health", exc)
+    with _probe_lock:
+        if anima_health_ok:
+            _probe_fail_counts["anima_health"] = 0
+            should_clear_sem = False
+        else:
+            _probe_fail_counts["anima_health"] += 1
+            should_clear_sem = _probe_fail_counts["anima_health"] >= _PROBE_OFFLINE_THRESHOLD
+    if should_clear_sem:
+        _set_cached_anima_semantic(None)
 
     # 7. Auto-retry dirty GSV voice weight rollback when GSV is online and ESP32 is idle (D-3)
     dirty_target, _dirty_err = gsv._get_voice_dirty_state()
@@ -346,7 +409,11 @@ def _service_probe_loop() -> None:
             _probe_background_services_once()
         except Exception as exc:
             shared._log_rate_limited("service_probe_loop", exc)
-        time.sleep(_PROBE_INTERVAL_SECONDS)
+        dirty_voice, _ = gsv._get_voice_dirty_state()
+        is_idle = (time.monotonic() - _last_panel_request_ts) >= _PANEL_IDLE_THRESHOLD_SECONDS and not dirty_voice
+        wait_sec = _PROBE_IDLE_INTERVAL_SECONDS if is_idle else _PROBE_INTERVAL_SECONDS
+        _panel_wake_event.wait(timeout=wait_sec)
+        _panel_wake_event.clear()
 
 
 
@@ -377,12 +444,14 @@ def handle_get_health(handler) -> None:
             "patches": health.get("patches", {}),
             "contract_self_check": health.get("contract_self_check", {}),
             "degraded_reasons": health.get("degraded_reasons", []),
+            "anima_semantic": _get_cached_anima_semantic_snapshot(),
         },
         status=http_status,
     )
 
 
 def handle_get_state(handler, parsed) -> None:
+    note_panel_activity()
     cfg = shared._read_raw_yaml()
     selected = cfg.get("selected_module", {})
     llm_key = selected.get("LLM", "DeepSeekLLM")
@@ -398,6 +467,9 @@ def handle_get_state(handler, parsed) -> None:
     gem_ok = bool(gem_env and len(gem_env) > 10 and "请在这里" not in gem_env)
 
     active_voice = gsv._get_current_voice_id(cfg)
+    active_asr_provider, active_asr_cfg = audio_api.extract_safe_asr_state(cfg)
+    active_tts_provider, active_tts_cfg = audio_api.extract_safe_tts_state(cfg)
+    audio_env_status = audio_api.get_audio_env_status()
 
     qs = parse_qs(parsed.query)
     req_cursor: int | None = None
@@ -422,22 +494,50 @@ def handle_get_state(handler, parsed) -> None:
     l3_cfg = _get_cached_l3_backend_snapshot()
     obs_cfg = anima._get_cached_obsidian_snapshot()
     backup_cfg = _get_cached_anima_backup_snapshot()
+    semantic_cfg = _get_cached_anima_semantic_snapshot()
     outbox_cfg = anima._get_anima_outbox_snapshot()
     vad_spec_cfg = config._get_vad_speculative_snapshot()
     vad_spec_stats = config._get_vad_speculative_stats_snapshot()
     asr_corr_cfg = config._get_asr_corrections_snapshot()
+    recall_style_cfg = config._get_recall_style_snapshot()
+    esp32_auth_cfg = config._get_esp32_auth_snapshot(cfg)
+    recall_guard_stats = recall_guard.get_recall_guard_stats()
+    cur_prompt_str = (cfg.get("prompt") or "").strip()
+    try:
+        persona_meta = persona_versions.list_persona_history(
+            current_prompt=cur_prompt_str,
+            char_name=anima._infer_character_name(cur_prompt_str),
+            include_full_prompt=False,
+        )
+    except Exception as pv_exc:
+        shared._log_rate_limited("state_persona_meta", pv_exc)
+        persona_meta = {
+            "current_revision": 0,
+            "current_digest": "",
+            "current_digest_short": "",
+            "snapshot_count": 0,
+            "boundary_note": persona_versions.POLICY_BOUNDARY_NOTE_ZH,
+            "snapshots": [],
+        }
     dirty_voice, dirty_voice_err = gsv._get_voice_dirty_state()
 
     handler._send_json(
         {
             "config": {
-                "prompt": (cfg.get("prompt") or "").strip(),
+                "prompt": cur_prompt_str,
+                "persona_meta": persona_meta,
                 "llm_provider": llm_key,
                 "model_name": llm_cfg.get(
                     "model_name",
                     "deepseek-flash" if llm_key == "DeepSeekLLM" else "gemini-3.5-flash-lite",
                 ),
                 "voice": active_voice,
+                "asr_provider": active_asr_provider,
+                "asr_config": active_asr_cfg,
+                "tts_provider": active_tts_provider,
+                "tts_config": active_tts_cfg,
+                "audio_env_status": audio_env_status,
+                "local_sherpa_available": bool(audio_env_status.get("local_sherpa_available")),
                 "voice_dirty": bool(dirty_voice),
                 "voice_dirty_target": dirty_voice or "",
                 "voice_dirty_error": dirty_voice_err,
@@ -456,10 +556,14 @@ def handle_get_state(handler, parsed) -> None:
                 "idle_farewell": idle_farewell_cfg,
                 "relationship": rel_cfg,
                 "anima_backup": backup_cfg,
+                "anima_semantic": semantic_cfg,
                 "anima_outbox": outbox_cfg,
                 "vad_speculative": vad_spec_cfg,
                 "vad_speculative_stats": vad_spec_stats,
                 "asr_corrections": asr_corr_cfg,
+                "recall_style": recall_style_cfg,
+                "esp32_auth": esp32_auth_cfg,
+                "recall_guard_stats": recall_guard_stats,
                 "obsidian": obs_cfg,
                 "l3_backend": l3_cfg,
                 "agy_bridge_online": l3._check_agy_bridge_online(l3_cfg),

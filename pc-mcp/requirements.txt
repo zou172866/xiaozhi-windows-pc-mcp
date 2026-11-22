@@ -714,6 +714,10 @@ rpds-py==2026.9.1 \
     # via
     #   jsonschema
     #   referencing
+socksio==1.0.0 \
+    --hash=sha256:95dc1f15f9b34e8d7b16f06d74b8ccf48f609af32ab33c608d08761c5dcbb1f3 \
+    --hash=sha256:f88beb3da5b5c38b9890469de67d0cb0f9d494b78b106ca1845f96c10b91c4ac
+    # via -r pc-mcp/requirements.in
 sse-starlette==3.7.0 \
     --hash=sha256:326416da2ab52e9a41b3f409d3ff897eda45aa68c9f3b7b17d0913aab8d219c3 \
     --hash=sha256:f1d3136caa12d129284fca3d2ded79bc9af943320b6472712955fea52a6d3eea
