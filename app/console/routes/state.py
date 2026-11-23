@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import errno
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -151,17 +152,67 @@ def _get_cached_anima_relationship_snapshot(cfg: dict | None = None) -> dict:
     return anima._default_offline_relationship(anima._get_anima_character_id(cfg))
 
 
+_SILENT_GSV_PROBE_ERRNOS = frozenset(
+    {
+        errno.ECONNREFUSED,
+        errno.ETIMEDOUT,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+        errno.EADDRNOTAVAIL,
+        getattr(errno, "WSAECONNREFUSED", 10061),
+        getattr(errno, "WSAETIMEDOUT", 10060),
+        getattr(errno, "WSAENETUNREACH", 10051),
+        getattr(errno, "WSAEHOSTUNREACH", 10065),
+    }
+)
+
+
 def _probe_gsv_tcp_once() -> bool:
-    """Lightweight TCP connect check for 19880 without touching GPU weights or locks."""
+    """Lightweight IPv4-first TCP connect check for 19880 without touching GPU weights or locks (R2 P2-1)."""
+    u = urlparse(shared.GSV_Host)
+    host = u.hostname or "host.docker.internal"
+    port = int(u.port or 19880)
+    timeout = 1.2 if _get_cached_gsv_online() else 0.5
     try:
-        u = urlparse(shared.GSV_Host)
-        host = u.hostname or "host.docker.internal"
-        port = int(u.port or 19880)
-        with socket.create_connection((host, port), timeout=0.4):
-            return True
+        infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except Exception as exc:
-        shared._log_rate_limited("probe_gsv_tcp", exc)
+        if gsv._get_configured_gsv_voice() is not None:
+            shared._log_rate_limited("probe_gsv_tcp", exc)
         return False
+
+    # Prefer IPv4 (AF_INET) over IPv6 (AF_INET6) so Docker Desktop WSL2 hosts with AAAA records
+    # never hit spurious IPv6 ENETUNREACH (Errno 101) when connecting to host.docker.internal.
+    ordered = sorted(
+        infos,
+        key=lambda item: 0 if item[0] == socket.AF_INET else (1 if item[0] == socket.AF_INET6 else 2),
+    )
+    last_exc: Exception | None = None
+    seen_targets: set[tuple[int, tuple]] = set()
+    for family, socktype, proto, _canon, sockaddr in ordered:
+        key = (family, sockaddr)
+        if key in seen_targets:
+            continue
+        seen_targets.add(key)
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return True
+        except Exception as exc:
+            last_exc = exc
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    if last_exc is not None and gsv._get_configured_gsv_voice() is not None:
+        err_no = getattr(last_exc, "errno", None)
+        if not isinstance(last_exc, (TimeoutError, socket.timeout, ConnectionRefusedError)) and err_no not in _SILENT_GSV_PROBE_ERRNOS:
+            shared._log_rate_limited("probe_gsv_tcp", last_exc)
+    return False
 
 
 def _probe_background_services_once() -> dict[str, bool]:

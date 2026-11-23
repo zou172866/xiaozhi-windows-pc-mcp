@@ -947,6 +947,8 @@ def resolve_mei_emotion(
     turn_explicit_emotion: Optional[str] = None,
     device_id: Optional[MoodKey] = None,
     character_key: str = "raiden_mei",
+    *,
+    require_ref_audio: bool = True,
 ) -> str:
     """3-layer emotion resolution:
     1. Explicit tag on current segment
@@ -977,21 +979,26 @@ def resolve_mei_emotion(
                 chosen = anima_emo if anima_emo in emotions else "calm"
 
     prof = emotions.get(chosen) or emotions["calm"]
-    if not ref_audio_exists(prof.get("ref_audio_path", "")):
+    if require_ref_audio and not ref_audio_exists(prof.get("ref_audio_path", "")):
         return "calm"
     return chosen
 
 
-def get_character_emotion_profile(character_key: str, emotion_key: str) -> Dict[str, Any]:
+def get_character_emotion_profile(
+    character_key: str,
+    emotion_key: str,
+    *,
+    require_ref_audio: bool = True,
+) -> Dict[str, Any]:
     emotions = load_character_emotions(character_key)
     prof = emotions.get(emotion_key) or emotions["calm"]
-    if not ref_audio_exists(prof.get("ref_audio_path", "")):
+    if require_ref_audio and not ref_audio_exists(prof.get("ref_audio_path", "")):
         prof = emotions["calm"]
     return dict(prof)
 
 
-def get_mei_emotion_profile(emotion_key: str) -> Dict[str, Any]:
-    return get_character_emotion_profile("raiden_mei", emotion_key)
+def get_mei_emotion_profile(emotion_key: str, *, require_ref_audio: bool = True) -> Dict[str, Any]:
+    return get_character_emotion_profile("raiden_mei", emotion_key, require_ref_audio=require_ref_audio)
 
 
 _RAIDEN_MEI_VOICE_IDS = frozenset({"raiden_mei", "__gsv_raiden_mei__"})

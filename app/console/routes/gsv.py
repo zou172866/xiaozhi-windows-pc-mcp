@@ -384,15 +384,22 @@ def _resolve_gsv_voice_id(tts_cfg: dict | None) -> str:
 
 
 def _voice_sampling_settings(existing: dict, voice_id: str) -> dict:
-    """Migrate profile defaults while retaining non-default operator tuning."""
-    old = GSV_PROFILES[_resolve_gsv_voice_id(existing)]["block"]
+    """Migrate profile defaults while retaining non-default operator tuning (R2 P1-1)."""
+    old_id = _resolve_gsv_voice_id(existing)
+    old = GSV_PROFILES[old_id]["block"]
     new = GSV_PROFILES[voice_id]["block"]
     settings = {}
-    for key, fallback in (("sample_steps", 16), ("first_segment_sample_steps", None)):
+    for key in ("sample_steps", "first_segment_sample_steps"):
         previous = existing.get(key)
+        old_defaults = {old.get(key)}
+        if key == "sample_steps" and previous == 16 and existing.get("first_segment_sample_steps") in (None, 4, 8):
+            # Treat Mei's default 16 left behind by pre-e465862 voice switches as an unmigrated default
+            old_defaults.add(16)
+        if key == "first_segment_sample_steps" and previous == 8 and existing.get("sample_steps") in (None, 4, 16):
+            old_defaults.add(8)
         settings[key] = (
-            new.get(key, fallback)
-            if previous is None or previous == old.get(key, fallback)
+            new.get(key)
+            if previous is None or previous in old_defaults
             else previous
         )
     return settings
@@ -751,11 +758,23 @@ def handle_post_tts_preview(handler) -> None:
                         req_payload["top_p"] = emo_prof["top_p"]
                     for drop_k in ("type", "url", "output_dir", "voice_id", "first_segment_sample_steps"):
                         req_payload.pop(drop_k, None)
+                    if req_payload.get("sample_steps") is None:
+                        req_payload.pop("sample_steps", None)
                     tts_timeout = _gsv_timeout_within_budget(25.0)
                     client = shared._get_console_http_client()
                     r = client.post(f"{shared.GSV_Host}/tts", json=req_payload, timeout=tts_timeout)
+                    if (
+                        r.status_code == 200
+                        and mei_emotion_router.is_gsv_placeholder_zero_wav(r.content)
+                        and req_payload.get("use_cuda_graph") is not False
+                    ):
+                        retry_payload = dict(req_payload)
+                        retry_payload["use_cuda_graph"] = False
+                        r = client.post(f"{shared.GSV_Host}/tts", json=retry_payload, timeout=_gsv_timeout_within_budget(25.0))
                     if r.status_code != 200:
                         raise RuntimeError(f"本地 GPT-SoVITS 未就绪或返回异常 ({r.status_code})")
+                    if mei_emotion_router.is_gsv_placeholder_zero_wav(r.content):
+                        raise RuntimeError("本地 GPT-SoVITS 返回 16kHz 全零异常占位音频（疑似显存/内存不足），请运行 gsv-overlay\\setup_gsv_windows.ps1 更新补丁")
                     wav_bytes = r.content
                 finally:
                     global _active_gsv_loaded

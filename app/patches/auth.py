@@ -367,13 +367,19 @@ def install_esp32_auth_hardening_patch() -> None:
                                     pass
                             try:
                                 self.logger.bind(tag="esp32_auth").warning(
-                                    f"拒绝未授权设备 OTA 请求: device_id={dev_norm}"
+                                    f"拒绝未授权设备 OTA 请求: device_id={dev_norm} "
+                                    "(请打开 http://localhost:18080 顶部白名单卡片点击「一键放行」，或在 .env 配置 ESP32_ALLOWED_DEVICES)"
                                 )
                             except Exception:
                                 pass
                             resp = _aiohttp_web.Response(
                                 text=json.dumps(
-                                    {"success": False, "message": "设备未在白名单中，拒绝下发配置"},
+                                    {
+                                        "success": False,
+                                        "error": "device_not_allowlisted",
+                                        "device_id": dev_norm,
+                                        "message": f"设备未在白名单中 ({dev_norm})，拒绝下发配置；请打开 http://localhost:18080 点击「一键放行」",
+                                    },
                                     ensure_ascii=False,
                                 ),
                                 content_type="application/json",

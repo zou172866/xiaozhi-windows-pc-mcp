@@ -8,12 +8,17 @@ $mcpWatchdogScript = Join-Path $serverDir "pc-mcp\pc_mcp_watchdog.py"
 
 Write-Host "[1/5] 正在停止小智与记忆大脑 Docker 容器..." -ForegroundColor Cyan
 $dockerInitiallyRunning = $false
-$dockerVer = docker info --format "{{.ServerVersion}}" 2>$null
-if ($LASTEXITCODE -eq 0 -and $dockerVer) {
-    $dockerInitiallyRunning = $true
-    docker compose stop
+$resolvedDockerExe = Resolve-DockerCliPath
+if (-not $resolvedDockerExe) {
+    Write-Host "  未找到 docker CLI，跳过容器停止" -ForegroundColor DarkYellow
 } else {
-    Write-Host "  Docker 引擎未运行，跳过容器停止" -ForegroundColor DarkGray
+    $dockerVer = docker info --format "{{.ServerVersion}}" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $dockerVer) {
+        $dockerInitiallyRunning = $true
+        docker compose stop
+    } else {
+        Write-Host "  Docker 引擎未运行，跳过容器停止" -ForegroundColor DarkGray
+    }
 }
 
 Write-Host "[2/5] 正在关闭 18900 看门狗、清理 L3 子进程树并停止三层电脑操控 MCP 服务..." -ForegroundColor Cyan

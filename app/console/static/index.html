@@ -65,25 +65,25 @@
     <!-- Section 0: ESP32 Device Allowlist & One-Click Onboarding -->
     <div class="config-section">
       <div class="section-head">
-        <h2 class="section-title">ESP32 设备接入白名单（免重启热放行）</h2>
+        <h2 class="section-title">设备与电脑客户端接入白名单（免重启热放行）</h2>
         <span id="esp32AuthBadge" class="rel-stage-badge num">检测中…</span>
       </div>
-      <p class="section-desc">开启双因子鉴权后，仅白名单内的 ESP32 可访问 18000 WebSocket 与 18003 OTA。新设备首次连入被拦截时会自动出现在下方，点击「一键放行」即可立即生效。</p>
+      <p class="section-desc">开启双因子鉴权后，仅白名单内的 ESP32 开发板或本地电脑对话客户端可访问 18000 WebSocket 与 18003 OTA。新设备首次连入被拦截时会自动出现在下方，点击「一键放行」即可立即生效；无 ESP32 硬件时可直接双击运行根目录 <code>电脑对话客户端.bat</code>（默认 ID：<code>pc-talk-local</code>）。</p>
 
       <div id="esp32PendingWrap" class="esp32-pending-wrap" style="display:none;">
         <div class="l3-head" style="margin-bottom:6px;">
-          <strong style="color:var(--warn);">发现待放行的新 ESP32 设备</strong>
-          <span class="num" style="font-size:12px;color:var(--ink-muted);">放行后如未自动重连，按一下开发板 RST 键即可上线</span>
+          <strong style="color:var(--warn);">发现待放行的新设备 / 客户端</strong>
+          <span class="num" style="font-size:12px;color:var(--ink-muted);">放行后如 ESP32 未自动重连，按一下开发板 RST 键即可上线</span>
         </div>
         <div id="esp32PendingList" class="esp32-device-list"></div>
       </div>
 
       <div id="esp32AllowedList" class="esp32-chip-list">
-        <div class="dream-empty">暂未放行任何设备；请让 ESP32 请求一次 OTA，或在下方手动添加 MAC 地址。</div>
+        <div class="dream-empty">暂未放行任何设备；请让 ESP32 请求一次 OTA，或在下方手动添加 MAC 地址 / 客户端 ID（如 pc-talk-local）。</div>
       </div>
 
       <div class="esp32-add-row">
-        <input type="text" id="esp32MacInput" spellcheck="false" placeholder="手动输入 ESP32 MAC 地址，例如 aa:bb:cc:dd:ee:ff" aria-label="ESP32 MAC 地址">
+        <input type="text" id="esp32MacInput" spellcheck="false" placeholder="输入 ESP32 MAC（如 aa:bb:cc:dd:ee:ff）或客户端 ID（如 pc-talk-local）" aria-label="ESP32 MAC 地址或客户端 ID">
         <button type="button" class="btn btn-primary" id="esp32AddMacBtn" style="white-space:nowrap;">加入白名单</button>
       </div>
 
@@ -214,7 +214,7 @@
 
       <div class="field-foot">
         <span>电脑音响桥接状态（18900）：<strong id="pcAudioStatusText">检测中…</strong></span>
-        <span>切换后下一句语音立即生效；桥接离线时自动回退 ESP32 喇叭</span>
+        <span>无 ESP32 硬件也可双击运行 <code>电脑对话客户端.bat</code> 打字触发 48kHz 电脑音响回复</span>
       </div>
     </div>
 

@@ -282,9 +282,14 @@ class TestBatch3ContainerPipeline(unittest.TestCase):
 
         # On clean CI runners without gitignored private voices/raiden_mei WAVs, stub ref_audio_exists
         # so pure snapshot/lock logic still executes in full; on local hosts, real FS check runs unchanged.
+        _mei_dir = os.path.join(xz_common.VOICES_DIR, "raiden_mei")
+        _has_mei_wavs = all(
+            os.path.isfile(os.path.join(_mei_dir, fn))
+            for fn in ("mei_default_ref.wav", "mei_gentle_ref.wav")
+        )
         _ref_ctx = (
             contextlib.nullcontext()
-            if os.path.isdir(os.path.join(xz_common.VOICES_DIR, "raiden_mei"))
+            if _has_mei_wavs
             else patch.object(mer, "ref_audio_exists", return_value=True)
         )
         with _ref_ctx:

@@ -210,7 +210,7 @@ def _push_streaming_emotions_from_text(tts_obj: Any, segment: str) -> Optional[s
             tts_obj._turn_explicit_emotion = emo_cand
             conn = getattr(tts_obj, "conn", None)
             if conn is not None:
-                prof = emotion_tags.get_mei_emotion_profile(emo_cand)
+                prof = emotion_tags.get_mei_emotion_profile(emo_cand, require_ref_audio=False)
                 emotion_splitter._push_esp32_emotion_async(
                     conn, prof["esp32_emoji"], prof["esp32_emotion"]
                 )
@@ -1171,7 +1171,7 @@ def _patch_minimax_httpstream_tts() -> Tuple[bool, str]:
             self._turn_explicit_emotion = seg_emo
         conn = getattr(self, "conn", None)
         if eff_emo:
-            prof = emotion_tags.get_mei_emotion_profile(eff_emo)
+            prof = emotion_tags.get_mei_emotion_profile(eff_emo, require_ref_audio=False)
             cur_sid = getattr(self, "current_sentence_id", None) or getattr(conn, "sentence_id", None)
             q = getattr(self, "_segment_emotion_queue", None)
             if q is None:

@@ -11,12 +11,124 @@ import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import yaml
 
 import patch_registry
 import runtime_events
 import runtime_settings
 import xz_common
 from patches.emotion import splitter, tags, tts_route
+
+_WAKEUP_YAML_LOCK = threading.Lock()
+_boot_wakeup_yaml_sig: Optional[Tuple[int, int]] = None
+_WAKEUP_PUNCT_RE = re.compile(r"[\s,，.。!！?？;；:：、~～·…—\-_'\"“”‘’()（）\[\]【】<>《》]+")
+
+
+def _normalize_wakeup_word(raw_item: object) -> str:
+    cleaned = _WAKEUP_PUNCT_RE.sub("", str(raw_item or "").strip())
+    return cleaned
+
+
+def _parse_wakeup_words_yaml(raw: str) -> Dict[str, Any]:
+    parsed = yaml.safe_load(raw)
+    if not isinstance(parsed, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    if isinstance(parsed.get("wakeup_words"), list):
+        seen_w: list[str] = []
+        for x in parsed["wakeup_words"]:
+            nw = _normalize_wakeup_word(x)
+            if nw and nw not in seen_w:
+                seen_w.append(nw)
+        out["wakeup_words"] = seen_w
+    if isinstance(parsed.get("interrupt_words"), list):
+        seen_i: list[str] = []
+        for x in parsed["interrupt_words"]:
+            ni = _normalize_wakeup_word(x)
+            if ni and ni not in seen_i:
+                seen_i.append(ni)
+        out["interrupt_words"] = seen_i
+    return out
+
+
+_wakeup_yaml_cache: xz_common.MtimeFileCache[Dict[str, Any]] = xz_common.MtimeFileCache(
+    parser=_parse_wakeup_words_yaml,
+    default_factory=dict,
+    retries=2,
+)
+
+
+def _stat_file_sig(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def sync_wakeup_words_from_yaml(
+    conn,
+    *,
+    config_path: Optional[str] = None,
+    force: bool = False,
+) -> bool:
+    """Hot-sync `wakeup_words` / `interrupt_words` into `conn.config` when `.config.yaml` mtime changes on disk (R1 #6).
+
+    Preserves in-memory test `conn.config` when the YAML file on disk has NOT been modified since boot/baseline.
+    """
+    global _boot_wakeup_yaml_sig
+    if conn is None or not isinstance(getattr(conn, "config", None), dict):
+        return False
+    cfg_file = config_path or os.path.join(xz_common.CONFIG_DIR, ".config.yaml")
+    cur_sig = _stat_file_sig(cfg_file)
+    if cur_sig is None:
+        return False
+
+    with _WAKEUP_YAML_LOCK:
+        if _boot_wakeup_yaml_sig is None and config_path is None:
+            _boot_wakeup_yaml_sig = cur_sig
+
+    baseline = _boot_wakeup_yaml_sig if config_path is None else None
+    prev_conn_sig = getattr(conn, "_wakeup_yaml_sig", baseline)
+    if not force and cur_sig == prev_conn_sig:
+        return False
+
+    data = _wakeup_yaml_cache.get(cfg_file)
+    changed = False
+    if "wakeup_words" in data:
+        conn.config["wakeup_words"] = list(data["wakeup_words"])
+        changed = True
+    if "interrupt_words" in data:
+        conn.config["interrupt_words"] = list(data["interrupt_words"])
+        changed = True
+    try:
+        conn._wakeup_yaml_sig = cur_sig
+    except Exception:
+        pass
+    if changed and config_path is None:
+        # Keep `_boot_wakeup_yaml_sig` pinned to the boot baseline so OTHER already-open
+        # WebSocket connections lacking `conn._wakeup_yaml_sig` also detect `cur_sig != baseline`
+        # and sync their `conn.config` on their next turn (`_wakeup_yaml_cache` avoids re-parsing YAML).
+        try:
+            for srv in runtime_events.get_ws_servers():
+                if isinstance(getattr(srv, "config", None), dict):
+                    if "wakeup_words" in data:
+                        srv.config["wakeup_words"] = list(data["wakeup_words"])
+                    if "interrupt_words" in data:
+                        srv.config["interrupt_words"] = list(data["interrupt_words"])
+                for peer in list(getattr(srv, "active_connections", None) or ()):
+                    if peer is not None and peer is not conn and isinstance(getattr(peer, "config", None), dict):
+                        if "wakeup_words" in data:
+                            peer.config["wakeup_words"] = list(data["wakeup_words"])
+                        if "interrupt_words" in data:
+                            peer.config["interrupt_words"] = list(data["interrupt_words"])
+                        try:
+                            peer._wakeup_yaml_sig = cur_sig
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    return changed
 
 MEI_WAKEUP_RESPONSES = [
     "我在呢，哥哥请说吧。",
@@ -188,6 +300,7 @@ def apply_mei_wakeup_responses_patch() -> None:
 
     @functools.wraps(_orig_check_wakeup)
     async def _mei_aware_check_wakeup_words(conn, text, *args, **kwargs):
+        sync_wakeup_words_from_yaml(conn)
         tts = getattr(conn, "tts", None)
         # Wait briefly if TTS is still initializing (same behavior as upstream)
         if tts is None:
@@ -213,7 +326,23 @@ def apply_mei_wakeup_responses_patch() -> None:
             return False
 
         _, filtered_text = hello_mod.remove_punctuation_and_length(text)
-        if filtered_text not in (conn.config.get("wakeup_words") or []):
+        configured_wakeups = {
+            _normalize_wakeup_word(w)
+            for w in (conn.config.get("wakeup_words") or [])
+            if _normalize_wakeup_word(w)
+        }
+        handoff_flag = getattr(conn, "_wakeup_rewritten_handoff", None)
+        if isinstance(handoff_flag, bool):
+            try:
+                delattr(conn, "_wakeup_rewritten_handoff")
+            except Exception:
+                conn._wakeup_rewritten_handoff = None
+            is_rewritten_handoff = handoff_flag and filtered_text == "嘿你好呀"
+        else:
+            is_rewritten_handoff = bool(getattr(conn, "just_woken_up", False)) and filtered_text == "嘿你好呀"
+        # Upstream ListenTextMessageHandler rewrites matched wakeup words to "嘿，你好呀" with conn.just_woken_up=True;
+        # accept "嘿你好呀" in that handoff even if user customized wakeup_words and removed "嘿你好呀".
+        if filtered_text not in configured_wakeups and not is_rewritten_handoff:
             return False
 
         # F-3: Trigger non-blocking GSV /prime on wakeup so memory pages warm up while user speaks
@@ -248,7 +377,7 @@ def apply_mei_wakeup_responses_patch() -> None:
         conn.client_abort = False
         conn.sentence_id = str(uuid.uuid4().hex)
 
-        prof = tags.get_character_emotion_profile(char_key, "gentle")
+        prof = tags.get_character_emotion_profile(char_key, "gentle", require_ref_audio=False)
         splitter._push_esp32_emotion_async(conn, prof["esp32_emoji"], prof["esp32_emotion"])
 
         conn.dialogue.put(Message(role="assistant", content=response.get("text")))
@@ -278,6 +407,9 @@ def apply_mei_wakeup_responses_patch() -> None:
                     await hello_mod.audio_to_data(fp, use_cache=True)
             except Exception:
                 pass
+
+    global _boot_wakeup_yaml_sig
+    _boot_wakeup_yaml_sig = _stat_file_sig(os.path.join(xz_common.CONFIG_DIR, ".config.yaml"))
 
     wk_mounted = not wk_failures
     lh_mounted = False
@@ -351,6 +483,7 @@ def apply_mei_wakeup_responses_patch() -> None:
                     except Exception:
                         pass
                 if isinstance(msg_json, dict) and msg_json.get("state") == "detect" and "text" in msg_json:
+                    sync_wakeup_words_from_yaml(conn)
                     original_text = str(msg_json.get("text") or "")
                     _, filtered_text = listen_mod.remove_punctuation_and_length(original_text)
                     cfg_words = (getattr(conn, "config", None) or {}).get("interrupt_words")
@@ -384,6 +517,14 @@ def apply_mei_wakeup_responses_patch() -> None:
                             f"收到打断词「{original_text}」，已静音并直接进入聆听模式"
                         )
                         return
+                    cfg_wakeups = (getattr(conn, "config", None) or {}).get("wakeup_words") or []
+                    norm_wakeups = {_normalize_wakeup_word(w) for w in cfg_wakeups if _normalize_wakeup_word(w)}
+                    if isinstance(getattr(conn, "config", None), dict) and isinstance(cfg_wakeups, list):
+                        conn.config["wakeup_words"] = [_normalize_wakeup_word(w) for w in cfg_wakeups if _normalize_wakeup_word(w)]
+                    try:
+                        conn._wakeup_rewritten_handoff = bool(filtered_text and filtered_text in norm_wakeups)
+                    except Exception:
+                        pass
                 return await _orig_listen_handle(self, conn, msg_json, *args, **kwargs)
 
             if not ok_lh:

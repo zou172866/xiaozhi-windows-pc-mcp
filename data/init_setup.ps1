@@ -607,6 +607,10 @@ if ($hasExistingEnv) {
 
 # 0. 开箱环境预检（Docker / Python 3.10-3.12 / 防火墙）
 Write-Host "`n[环境预检] 正在检查本机基础依赖..." -ForegroundColor DarkCyan
+if (Test-Path (Join-Path $PSScriptRoot "host_process.ps1")) {
+    . (Join-Path $PSScriptRoot "host_process.ps1")
+    [void](Resolve-DockerCliPath)
+}
 $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
 if ($dockerCmd) {
     $dInfo = docker info --format "{{.ServerVersion}}" 2>$null

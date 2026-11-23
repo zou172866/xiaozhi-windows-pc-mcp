@@ -18,6 +18,10 @@ server:
     # 也可在此直接追加真实设备 MAC，例如：- "aa:bb:cc:dd:ee:ff"
     allowed_devices:
       - ${ESP32_ALLOWED_DEVICES}
+# 注意：
+#   1. 下方 wakeup_words 仅控制「ASR 识别出该文本后播放预设应答语」，支持手工编辑本文件免重启自动热同步；
+#      设备休眠态的真正「离线语音唤醒词」存放在 ESP32 固件 0x800000 assets 分区模型中（详见 README 与运维手册）。
+#   2. 手工编辑本文件其他配置项（如 LLM/TTS/ASR）后需重启容器生效；日常建议直接在 http://localhost:18080 保存以热生效。
 wakeup_words:
   - 你好小智
   - 嘿你好呀

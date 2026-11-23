@@ -550,7 +550,7 @@
         empty.className = "dream-empty";
         empty.style.width = "100%";
         empty.textContent = authEnabled
-          ? "当前白名单为空（所有 ESP32 请求均会被拦截）。让开发板上电请求一次 OTA 即可在上方「一键放行」，或在下方手动输入 MAC。"
+          ? "当前白名单为空（所有请求均会被拦截）。让 ESP32 请求一次 OTA 即可在上方「一键放行」，或在下方输入 MAC / 电脑客户端 ID（如 pc-talk-local）。"
           : "当前已关闭 ESP32 鉴权（server.auth.enabled=false），白名单未启用。";
         els.esp32AllowedList.appendChild(empty);
       } else {
@@ -600,7 +600,7 @@
     if (esp32AuthBusy) return;
     const mac = String(deviceId || "").trim();
     if (!mac) {
-      showBanner("err", "请先输入有效的 ESP32 MAC 地址（例如 aa:bb:cc:dd:ee:ff）");
+      showBanner("err", "请先输入有效的 ESP32 MAC 地址（如 aa:bb:cc:dd:ee:ff）或客户端 ID（如 pc-talk-local）");
       return;
     }
     esp32AuthBusy = true;

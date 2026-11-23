@@ -99,16 +99,29 @@ FORBIDDEN_GLOBS: tuple[str, ...] = (
     "*.db-wal",
     "*.db-shm",
     "*.bak",
+    "*.orig",
     "*.pem",
     "*.key",
     "*.p12",
     "*.pfx",
     "*.ckpt",
     "*.pth",
+    "*.safetensors",
+    "*.gguf",
     "*.onnx",
     "*.pt",
     "*.wav",
     "*.mp3",
+    "*.zip",
+    "*.7z",
+    "*.rar",
+    "*.tar",
+    "*.gz",
+    "*.tgz",
+    "*.bz2",
+    "*.xz",
+    "*.zst",
+    "*.iso",
     "*.log",
     "*.log.*",
     "*.pyc",
@@ -118,6 +131,8 @@ FORBIDDEN_GLOBS: tuple[str, ...] = (
     "data/*.png",
     "data/*.migrated.bak",
 )
+
+MAX_AUDIT_READ_BYTES = 16 * 1024 * 1024
 
 _ALLOWED_DOTENV_FILES = frozenset({".env.example"})
 
@@ -257,8 +272,19 @@ def audit_release_files(root: Path, rel_paths: Iterable[str]) -> list[str]:
             issues.append(f"[MISSING] {rel}")
             continue
 
-        raw = fp.read_bytes()
         low = rel.lower()
+        suffix = fp.suffix.lower()
+        # Check size ceiling & binary suffix BEFORE reading file bytes to prevent OOM on stray multi-GB files (R2 P3-2)
+        file_size = fp.stat().st_size
+        if file_size > MAX_AUDIT_READ_BYTES:
+            issues.append(
+                f"[OVERSIZE] {rel}: file is {file_size / (1024 * 1024):.1f} MiB (> {MAX_AUDIT_READ_BYTES // (1024 * 1024)} MiB audit limit)"
+            )
+            continue
+        if suffix in _BINARY_SKIP_SUFFIXES and not low.endswith((".ps1", ".bat")):
+            continue
+
+        raw = fp.read_bytes()
 
         # 1. Script encoding invariants (AGENTS.md redline)
         if low.endswith(".ps1"):
@@ -273,7 +299,7 @@ def audit_release_files(root: Path, rel_paths: Iterable[str]) -> list[str]:
                 issues.append(f"[ENCODING] {rel}: .bat must use CRLF line endings")
 
         # 2. Secret scan on non-test text files
-        if fp.suffix.lower() in _BINARY_SKIP_SUFFIXES or b"\x00" in raw[:4096]:
+        if suffix in _BINARY_SKIP_SUFFIXES or b"\x00" in raw[:4096]:
             continue
         if _is_test_file(rel):
             continue

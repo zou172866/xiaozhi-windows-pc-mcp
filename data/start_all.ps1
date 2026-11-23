@@ -1,5 +1,8 @@
 ﻿$ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "host_process.ps1"))) {
+    . (Join-Path $PSScriptRoot "host_process.ps1")
+}
 
 function Test-IsExcludedLanIPv4 {
     param([string]$Ip)
@@ -215,25 +218,14 @@ function Normalize-DockerMirrorPrefix {
 
 function Find-DockerDesktopExe {
     $candidates = [System.Collections.Generic.List[string]]::new()
-    foreach ($regPath in @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop"
-    )) {
-        try {
-            if (Test-Path $regPath) {
-                $item = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
-                if ($item -and $item.InstallLocation) {
-                    $candidates.Add((Join-Path $item.InstallLocation "Docker Desktop.exe"))
-                }
-            }
-        } catch {}
-    }
-    foreach ($envBase in @($env:ProgramFiles, $env:ProgramW6432)) {
-        if ($envBase) { $candidates.Add((Join-Path $envBase "Docker\Docker\Docker Desktop.exe")) }
-    }
-    if ($env:LOCALAPPDATA) {
-        $candidates.Add((Join-Path $env:LOCALAPPDATA "Docker\Docker Desktop.exe"))
+    if (Get-Command Get-DockerInstallRoots -ErrorAction SilentlyContinue) {
+        foreach ($rootDir in (Get-DockerInstallRoots)) {
+            $candidates.Add((Join-Path $rootDir "Docker Desktop.exe"))
+        }
+    } else {
+        foreach ($envBase in @($env:ProgramFiles, $env:ProgramW6432)) {
+            if ($envBase) { $candidates.Add((Join-Path $envBase "Docker\Docker\Docker Desktop.exe")) }
+        }
     }
     try {
         $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
@@ -432,7 +424,6 @@ foreach ($relDir in @(
     "secrets",
     "backups",
     "voices",
-    "voices\raiden_mei",
     "logs",
     "anima-data",
     "data\obsidian_export",
@@ -495,6 +486,13 @@ if (-not (Test-Path $hostModeFile)) {
 }
 
 $dotEnvPath = Join-Path $serverDir ".env"
+$dotEnvExamplePath = Join-Path $serverDir ".env.example"
+Write-Host "`n[0/4] 阶段一：环境与 .env 配置预检..." -ForegroundColor Cyan
+if (-not (Test-Path $dotEnvPath) -and (Test-Path $dotEnvExamplePath)) {
+    Copy-Item -Path $dotEnvExamplePath -Destination $dotEnvPath -Force
+    Write-Host "  [初始化] 未检测到 .env，已自动从 .env.example 生成默认占位文件（零明文密钥）。" -ForegroundColor Yellow
+    Write-Host "  [下一步] 建议双击「一键初始化配置.bat」写入 API Key，或在 .env 中按需调整非敏感项。" -ForegroundColor DarkYellow
+}
 . (Join-Path $PSScriptRoot "esp32_credential.ps1")
 Initialize-Esp32SigningKey $serverDir
 $explicitEmptyEnvKeys = @{}
@@ -509,8 +507,9 @@ if (Test-Path $dotEnvPath) {
         if (-not $k) { continue }
         if ($v -eq "") {
             # Explicit `KEY=` in .env must take precedence over stale User/Process env for docker compose
+            # Use SetEnvironmentVariable($k, $null, "Process") instead of Remove-Item Env: to avoid fail-closed PS hooks (R2 P2-2)
             $explicitEmptyEnvKeys[$k] = $true
-            Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue
+            try { [Environment]::SetEnvironmentVariable($k, $null, "Process") } catch {}
         } elseif (-not [Environment]::GetEnvironmentVariable($k, "Process")) {
             Set-Item -Path "Env:$k" -Value $v
         }
@@ -564,7 +563,7 @@ $env:HOST_DATA_DIR = (Join-Path $serverDir "data").Replace("\", "/")
 $env:HOST_VOICES_DIR = (Join-Path $serverDir "voices").Replace("\", "/")
 $env:HOST_GSV_WEIGHTS_DIR = (Join-Path $serverDir "models\gsv_weights").Replace("\", "/")
 if (-not $env:ESP32_ALLOWED_DEVICES) {
-    Write-Host "[提示] .env 中尚未配置 ESP32_ALLOWED_DEVICES；服务启动后可直接在 http://localhost:18080 控制台「一键放行」新接入的 ESP32。" -ForegroundColor Yellow
+    Write-Host "  [0/4 预检提示] .env 暂未填写 ESP32_ALLOWED_DEVICES（不阻断启动）：待下方 [1/4]～[4/4] 服务启动完成后，可在 http://localhost:18080 顶部「一键放行」ESP32 或运行「电脑对话客户端.bat」。" -ForegroundColor DarkCyan
 }
 if ($env:OBSIDIAN_EXPORT_DIR -and -not (Test-Path $env:OBSIDIAN_EXPORT_DIR)) {
     try { New-Item -ItemType Directory -Path $env:OBSIDIAN_EXPORT_DIR -Force | Out-Null } catch {}
@@ -581,13 +580,16 @@ if (-not $env:HOST_LAN_IP) {
     }
 }
 if (-not $env:HOST_LAN_IP) { $env:HOST_LAN_IP = "127.0.0.1" }
-Write-Host "[环境] 局域网 IP: $($env:HOST_LAN_IP) | 数据目录: $($env:HOST_DATA_DIR)" -ForegroundColor DarkGray
+Write-Host "[0/4] 环境预检完成 | 局域网 IP: $($env:HOST_LAN_IP) | 数据目录: $($env:HOST_DATA_DIR)" -ForegroundColor Green
 
 # 1. 确保 Docker Desktop 已安装、启动并就绪（缺失或启动失败立即退出，严禁误报就绪）
+if (Get-Command Resolve-DockerCliPath -ErrorAction SilentlyContinue) {
+    [void](Resolve-DockerCliPath)
+}
 $dockerCli = Get-Command docker -ErrorAction SilentlyContinue
 if (-not $dockerCli) {
-    Write-Host "`n[错误] 未检测到 docker 命令！请先安装 Docker Desktop（启用 WSL2 后端）后再启动：" -ForegroundColor Red
-    Write-Host "       https://www.docker.com/products/docker-desktop/" -ForegroundColor Yellow
+    Write-Host "`n[1/4 阻断错误] 未检测到 docker 命令（[0/4] 配置预检已通过，请先解决本步 Docker 安装）！" -ForegroundColor Red
+    Write-Host "       请先安装 Docker Desktop（启用 WSL2 后端）后再启动: https://www.docker.com/products/docker-desktop/" -ForegroundColor Yellow
     exit 1
 }
 
@@ -760,12 +762,25 @@ $gsvDir = if ($env:GSV_DIR) { $env:GSV_DIR } else { Join-Path (Split-Path -Paren
 $gsvPy = Join-Path $gsvDir ".venv\Scripts\python.exe"
 $gsvApi = Join-Path $gsvDir "api_v2.py"
 $hasLocalGsv = $gsvEnabled -and (Test-Path $gsvPy) -and (Test-Path $gsvApi)
+$gsvSupportsLogArgs = $true
+$gsvSupportsPrime = $true
+if ($hasLocalGsv) {
+    try {
+        $gsvApiRaw = [System.IO.File]::ReadAllText($gsvApi, [System.Text.Encoding]::UTF8)
+        $gsvSupportsLogArgs = ($gsvApiRaw -match '--log_file')
+        $gsvSupportsPrime = ($gsvApiRaw -match '["'']/prime["'']')
+    } catch {}
+}
 
 if ($hasLocalGsv) {
     if (-not (Test-ProjectListener 19880 '' $gsvBootConfig)) { throw '19880 被其他进程占用，已保留该进程。' }
     $gsvListening = Get-NetTCPConnection -LocalPort 19880 -State Listen -ErrorAction SilentlyContinue
     if (-not $gsvListening) {
         Write-Host "[3/4] 正在后台启动本机 GPU GPT-SoVITS 语音引擎 (127.0.0.1:19880)..." -ForegroundColor Cyan
+        if (-not $gsvSupportsLogArgs -or -not $gsvSupportsPrime) {
+            Write-Host "  [提示] 检测到宿主机 GPT-SoVITS 尚未安装小智补丁（缺少 --log_file 或 /prime），本次已兼容回退原生参数启动；建议执行：" -ForegroundColor Yellow
+            Write-Host "         powershell -ExecutionPolicy Bypass -File `"$serverDir\gsv-overlay\setup_gsv_windows.ps1`" -GsvDir `"$gsvDir`" -SkipModels" -ForegroundColor DarkYellow
+        }
         $cfgPath = Join-Path $serverDir "config\runtime\tts_infer_xiaozhi.yaml"
         $logOut = Join-Path $serverDir "logs\gsv_19880.log"
         $gsvBootLog = Join-Path $serverDir "logs\gsv_19880_boot.log"
@@ -783,8 +798,9 @@ if ($hasLocalGsv) {
                 }
             }
         } catch {}
-        # F-3 / H-6: 空闲回收放宽至 300s 且按系统内存压力 (>=75%) 触发；日志通过 --log_file 走进程内 5 MB x 3 轮转
-        $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set PYTHONUTF8=1&& set GSV_IDLE_TRIM_SECONDS=300&& set GSV_IDLE_TRIM_MEM_THRESHOLD=75&& `"$gsvPy`" -X utf8 api_v2.py -a 127.0.0.1 -p 19880 -c `"$cfgPath`" --log_file `"$logOut`" --log_max_bytes 5242880 --log_backup_count 3 > `"$gsvBootLog`" 2>&1`""
+        # F-3 / H-6: 空闲回收放宽至 300s 且按系统内存压力 (>=75%) 触发；已打补丁时通过 --log_file 走进程内 5 MB x 3 轮转
+        $gsvLogArgStr = if ($gsvSupportsLogArgs) { " --log_file `"$logOut`" --log_max_bytes 5242880 --log_backup_count 3" } else { "" }
+        $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set PYTHONUTF8=1&& set GSV_IDLE_TRIM_SECONDS=300&& set GSV_IDLE_TRIM_MEM_THRESHOLD=75&& `"$gsvPy`" -X utf8 api_v2.py -a 127.0.0.1 -p 19880 -c `"$cfgPath`"$gsvLogArgStr > `"$gsvBootLog`" 2>&1`""
         $hideGsv = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0; WinstationDesktop = "WinSta0\Default" }
         Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine; ProcessStartupInformation = $hideGsv } | Out-Null
     } else {
@@ -951,7 +967,7 @@ if ($LASTEXITCODE -ne 0) {
 $activeAsrMod = Get-ActiveAsrModule -RuntimeConfigPath (Join-Path $serverDir "config\runtime\.config.yaml")
 $sherpaModelFile = Join-Path $serverDir "models\sherpa-onnx-sense-voice\model.int8.onnx"
 $isFirstBootModelDownload = ($activeAsrMod -eq "SherpaASR") -and (-not (Test-Path $sherpaModelFile))
-$maxReadyWaitSec = if ($isFirstBootModelDownload) { 180 } else { 45 }
+$maxReadyWaitSec = if ($isFirstBootModelDownload) { 180 } elseif ($hasLocalGsv) { 75 } else { 60 }
 if ($isFirstBootModelDownload) {
     Write-Host "检测到首次启动且本地尚未缓存 SherpaASR 模型 (~230MB)，容器正在自动轻量直连下载，最长等待 ${maxReadyWaitSec} 秒..." -ForegroundColor Yellow
 } else {
@@ -962,7 +978,7 @@ $serverReady = $false
 $containerFatalExit = $false
 for ($j = 1; $j -le $maxReadyWaitSec; $j++) {
     try {
-        $st = Invoke-RestMethod -Uri "http://localhost:18080/api/state" -TimeoutSec 2 -ErrorAction Stop
+        $st = Invoke-RestMethod -Uri "http://127.0.0.1:18080/api/state" -TimeoutSec 2 -ErrorAction Stop
         if ($st -and $st.device -and $st.device.server_ready) {
             $serverReady = $true
             break
@@ -1069,11 +1085,13 @@ if ($hasLocalGsv) {
                 }
             }
 
-            $primeBody = @{ items = $primeItems; skip_if_busy = $false; reason = "startup_7_emotions" } | ConvertTo-Json -Depth 4 -Compress
-            $primeResp = Invoke-RestMethod -Uri "http://127.0.0.1:19880/prime" -Method Post -TimeoutSec 60 `
-                -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($primeBody))
-            if ($primeResp -and $primeResp.ok) {
-                Write-Host "[预热] 语音引擎 7 情绪参考特征缓存已就绪 ($activeCharDirName, slots=$($primeResp.cache_slots), $($primeResp.elapsed_ms)ms)" -ForegroundColor DarkGreen
+            if ($gsvSupportsPrime) {
+                $primeBody = @{ items = $primeItems; skip_if_busy = $false; reason = "startup_7_emotions" } | ConvertTo-Json -Depth 4 -Compress
+                $primeResp = Invoke-RestMethod -Uri "http://127.0.0.1:19880/prime" -Method Post -TimeoutSec 60 `
+                    -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($primeBody))
+                if ($primeResp -and $primeResp.ok) {
+                    Write-Host "[预热] 语音引擎 7 情绪参考特征缓存已就绪 ($activeCharDirName, slots=$($primeResp.cache_slots), $($primeResp.elapsed_ms)ms)" -ForegroundColor DarkGreen
+                }
             }
 
             $warm = @{

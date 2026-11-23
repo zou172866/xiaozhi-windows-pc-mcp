@@ -47,6 +47,7 @@ CSS_PATH = os.path.join(STATIC_DIR, "app.css")
 JS_PATH = os.path.join(STATIC_DIR, "app.js")
 HISTORY_PATH = os.path.join(STATE_DIR, "chat_history.json")
 LOG_CURSOR_PATH = os.path.join(STATE_DIR, ".console_log_cursor.json")
+CONSOLE_TOKEN_PATH = os.path.join(STATE_DIR, ".console_token")
 _DEFAULT_MODE_PATH = os.path.join(STATE_DIR, "pc_control_mode.json")
 MODE_PATH = _DEFAULT_MODE_PATH
 LOG_PATH = os.path.join(ROOT_DIR, "tmp", "server.log")
@@ -73,6 +74,38 @@ _INTERNAL_READONLY_PATHS = frozenset({"/api/health", "/api/state"})
 
 def get_console_token() -> str:
     return _CONSOLE_WRITE_TOKEN
+
+
+def persist_console_token(path: str | None = None) -> str:
+    """Persist per-boot `_CONSOLE_WRITE_TOKEN` to host-mounted `state/.console_token` (0600) for local CLI/script automation (R1 #5).
+
+    Must ONLY be called from `server.start_console_background()` (never at import time, H-1).
+    """
+    target = path if path is not None else CONSOLE_TOKEN_PATH
+    parent = os.path.dirname(os.path.abspath(target))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{target}.{os.getpid()}.{threading.get_ident()}.tmp"
+    payload = (_CONSOLE_WRITE_TOKEN + "\n").encode("utf-8")
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, target)
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        _log_rate_limited("persist_console_token", exc)
+    return target
 
 
 def get_console_boot_id() -> str:

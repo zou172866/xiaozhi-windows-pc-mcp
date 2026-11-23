@@ -480,6 +480,16 @@ def _write_updated_yaml(
                             patch.setdefault("TTS", {})["EdgeTTS"] = edge_patch
                     else:
                         if v_id in gsv.GSV_PROFILES:
+                            existing_gsv_same = ((cfg.get("TTS") or {}).get("GPT_SOVITS_V2")) or {}
+                            if (
+                                v_id == "__gsv_luoxiaohei__"
+                                and existing_gsv_same.get("sample_steps") == 16
+                                and existing_gsv_same.get("first_segment_sample_steps") in (None, 4, 8)
+                            ):
+                                changed_fields.append("voice")
+                                patch.setdefault("TTS", {}).setdefault("GPT_SOVITS_V2", {}).update(
+                                    {"sample_steps": 4, "first_segment_sample_steps": 4}
+                                )
                             with gsv._gsv_weights_lock:
                                 dirty_target, _ = gsv._get_voice_dirty_state()
                                 is_dirty = (dirty_target is not None) or (gsv._active_gsv_loaded == "__dirty__")
@@ -516,10 +526,16 @@ def _write_updated_yaml(
                 }
 
             merged_cfg = _deep_merge_dict(cfg, patch)
+            merged_gsv = ((merged_cfg.get("TTS") or {}).get("GPT_SOVITS_V2"))
+            if isinstance(merged_gsv, dict):
+                for opt_k in ("sample_steps", "first_segment_sample_steps"):
+                    if opt_k in merged_gsv and merged_gsv[opt_k] is None:
+                        merged_gsv.pop(opt_k, None)
             header = (
                 "# =====================================================================\n"
                 "# 小智 ESP32 本地服务端精简配置（由本地 Web 控制台管理）\n"
                 "# 全部 API Key 仅通过环境变量内存展开，严禁落盘明文密钥\n"
+                "# 注意：手工修改本文件后，除 wakeup_words / interrupt_words 自动热同步外，其余字段请通过 18080 控制台保存或重启容器生效\n"
                 "# =====================================================================\n\n"
             )
             body = yaml.safe_dump(merged_cfg, allow_unicode=True, sort_keys=False, default_flow_style=False)
@@ -580,6 +596,8 @@ def _apply_tts_attrs_in_place(tts_obj, tts_module_name: str, tts_cfg: dict) -> b
                     setattr(tts_obj, f_attr, float(tts_cfg[f_attr]))
                 except Exception as exc:
                     shared._log_rate_limited(f"tts_attr_{f_attr}", exc)
+        if "sample_steps" in tts_cfg and tts_cfg["sample_steps"] is None:
+            tts_obj.sample_steps = None
         if "first_segment_sample_steps" in tts_cfg and tts_cfg["first_segment_sample_steps"] is None:
             tts_obj.first_segment_sample_steps = None
         for i_attr in ("top_k", "sample_steps", "first_segment_sample_steps"):
@@ -974,7 +992,7 @@ def _normalize_esp32_device_id(raw: object) -> str:
     if _ESP32_MAC_DASH_RE.match(s):
         s = s.replace("-", ":")
     if not (_ESP32_MAC_COLON_RE.match(s) or _ESP32_SAFE_ID_RE.match(s)):
-        raise ValueError("设备 MAC / ID 格式非法（例如 xx:xx:xx:xx:xx:xx，长度 4～64 位）")
+        raise ValueError("设备 MAC / 客户端 ID 格式非法（例如 xx:xx:xx:xx:xx:xx 或 pc-talk-local，长度 4～64 位）")
     return s
 
 

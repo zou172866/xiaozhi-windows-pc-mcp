@@ -54,7 +54,8 @@ xiaozhi-server/
 ├── docker-compose.override.yml.example  # 开发模式整目录挂载模板（可选，不入库）
 ├── .github/workflows/ci.yml             # 4-job GitHub Actions CI（Windows pc-mcp / 容器单测契约 / Anima 构建 / 文档校验）
 ├── 一键初始化配置.bat                    # 跨机开箱向导（纯 ASCII + CRLF）
-├── 启动或重启服务.bat / 关闭小智服务.bat  # 无黑框 WMI 启停入口
+├── 启动或重启服务.bat / 关闭小智服务.bat  # 无黑框 WMI 启停入口（自动识别非 C 盘 Docker 路径）
+├── 电脑对话客户端.bat                    # 免 ESP32 硬件桌面交互对话入口（48kHz 电脑音箱播报）
 ├── 打开网页控制台.bat / 查看实时日志.bat  # 18080 控制台与日志快捷入口
 ├── app/                                 # 只读挂入主容器的模块化服务端代码（零导入副作用）
 │   ├── boot.py                          # 唯一启动入口（install_all -> 契约自检 -> 安全门禁 -> 控制台 -> 上游）
@@ -70,9 +71,10 @@ xiaozhi-server/
 │   ├── l3_backends/                     # 可插拔 L3 适配器（dsh / workbuddy / antigravity / none）
 │   └── requirements.in / requirements.txt # 直接依赖声明 + SHA-256 哈希锁文件
 ├── config/                              # 公开配置模板（.config.example.yaml, runtime_settings.example.json 等）
-├── data/                                # 宿主机 PowerShell 运维脚本（start_all.ps1, stop_all.ps1, init_setup.ps1）
+├── gsv-overlay/                         # 宿主机 GPT-SoVITS 免 MSVC 一键环境配置与小智补丁套件（19880）
+├── data/                                # 宿主机 PowerShell 运维脚本（start_all.ps1, stop_all.ps1, init_setup.ps1, host_process.ps1）
 ├── tests/container/                     # 容器离线单测、契约测试与联机集成测试（不进入生产挂载）
-├── scripts/                             # run_tests.py（三层测试运行器）与 generate_patches_doc.py（补丁文档生成校验）
+├── scripts/                             # run_tests.py、pc_talk.py（电脑对话客户端）、pack_release.py、generate_patches_doc.py
 ├── docs/patches.md                      # 自动生成的 21 项补丁契约总表
 └── skills/windows-pc-mcp-automation/    # 可独立安装的 Windows 桌面操控 Agent Skill
 ```
@@ -81,16 +83,46 @@ xiaozhi-server/
 
 ## 快速上手（新 Windows 电脑开箱即用）
 
+### 0. Windows 前置检查清单（首次部署建议逐条执行）
+
+```powershell
+wsl --status            # 若报拒绝访问，检查安全软件/企业策略是否拦截了 wsl.exe；老版 Win10 报灾难性故障时先独立安装新版 WSL MSI 再重启
+docker version          # 确认 Docker Desktop 已启用 WSL2 后端（装在 D:\Docker 等非默认盘未入 PATH 也可由启停脚本自动识别）
+python --version        # 宿主机需 Python 3.10～3.12（若 winget 源异常无法安装，先执行 winget source reset --force）
+```
+
+### 1. 国内网络镜像与构建加速（可选）
+
+若首次构建 `anima-brain` 时拉取 Docker Hub 基础镜像或安装依赖缓慢/超时，在根目录 `.env` 中加入以下加速项即可：
+
+```ini
+DOCKER_MIRROR_PREFIX=docker.m.daocloud.io/library/
+NPM_REGISTRY=https://registry.npmmirror.com
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 2. 初始化、启动与设备/无硬件接入
+
 1. **双击运行 `一键初始化配置.bat`**：
    - 自动预检 Docker Desktop、宿主机 Python 3.10–3.12（排除 Windows Store 占位符）、Node.js（使用 DSH 时）与 Windows 防火墙 TCP `18000` / `18003`；
    - 自动探测真实局域网 IPv4（过滤 Clash/Mihomo `198.18.x.x`、Tailscale `100.64–127.x.x`、ZeroTier、WireGuard、WSL、Hyper-V 等虚拟网卡）；
    - 选择 L3 引擎（`DSH / WorkBuddy / Antigravity / 关闭`）与语音引擎（免显存 `EdgeTTS` / 云端低配 API / 本地 GPU `GPT-SoVITS`）、创建 `pc-mcp\.venv` 哈希锁环境并安全写入系统环境变量（密钥零明文落盘；纯国内模式下 Anima Brain 默认直连 DeepSeek 并自动复用 `DEEPSEEK_API_KEY`）。
+   - **（可选）启用本机 RTX GPU `GPT-SoVITS`（`19880`，含 V4 芽衣 / V5-Turbo 罗小黑）**：无需安装几 GB 的 Visual Studio C++ Build Tools，克隆上游 `GPT-SoVITS` 后直接执行随包脚本即可一键配齐免编译依赖并注入 `--log_file`、`/prime` 与 CUDA Graph 防静音补丁（详见 [gsv-overlay/README.md](gsv-overlay/README.md)）：
+     ```powershell
+     powershell -NoProfile -ExecutionPolicy Bypass -File .\gsv-overlay\setup_gsv_windows.ps1
+     ```
 2. **双击 `启动或重启服务.bat`**：
+   - 按 `[0/4] 环境与 .env 预检` → `[1/4] Docker 引擎` → `[2/4] 18900 电脑操控/音响桥接` → `[3/4] 19880 GPU 语音` → `[4/4] 双容器` 分阶段清晰提示；
    - 上游主镜像拉取 `ghcr.nju.edu.cn` 失败时自动回退同摘要 `ghcr.io` 镜像；首次缺少本地 SherpaASR 模型时自动通过轻量 HTTPS 直连下载（无 PyTorch 内存暴涨），也可在 `18080` 控制台切云端 ASR。
-3. **ESP32 首次一键放行**：将 ESP32 的 OTA 地址指向 `http://<你的局域网IP>:18003/xiaozhi/ota/` 并上电，打开 http://localhost:18080 顶部「ESP32 设备接入白名单」卡片即可看到被拦截的设备 MAC，点击 **「一键放行」** 免重启立即生效。
-4. **（可选）打包干净分发版**：严禁直接复制本地工作目录（避免泄露 `.env`、`secrets/`、`backups/`、`anima-data/`、`state/`、`config/runtime/` 或失效的 `pc-mcp/.venv/`），请运行：
+3. **接入方式二选一（或同时使用）**：
+   - **有 ESP32 开发板**：将 ESP32 的 OTA 地址指向 `http://<你的局域网IP>:18003/xiaozhi/ota/` 并上电，打开 http://localhost:18080 顶部「设备与电脑客户端接入白名单」卡片即可看到被拦截的设备 MAC，点击 **「一键放行」** 免重启立即生效（OTA `403` 响应亦返回机器可读 `{"error":"device_not_allowlisted","device_id":"..."}`）。
+   - **无 ESP32 硬件（纯电脑端体验）**：直接双击根目录 **`电脑对话客户端.bat`**（或运行 `python scripts/pc_talk.py`）。脚本会自动读取本机只读令牌 `state/.console_token`（`0600`）放行默认客户端 ID `pc-talk-local`、自动将输出端切至 48kHz Windows 电脑音响，即可直接在终端打字与小智语音对话（输入 `/stop` 立即打断播报，支持 `--once "你好"` 单轮脚本调用）。
+4. **唤醒词避坑提示（设备端离线模型 vs 服务端配置）**：
+   - **设备端离线唤醒词**（休眠时喊什么词亮屏连网）：固化在 ESP32 Flash `0x800000` 的 `assets` 分区模型中，服务端无法远程修改。新购开发板出厂常为 `v1.9.4`（960KB `model` 分区，`WakeNet9` 固定「你好小智」），需先升级 `v2.6.0`（16MB 分区表）再刷入自定义 MultiNet7 `assets.bin` 才能改成「你好小黑」等（详见 [.agents/skills/xiaozhi-esp32-ops/SKILL.md](.agents/skills/xiaozhi-esp32-ops/SKILL.md)）。
+   - **服务端 `wakeup_words` / `interrupt_words`**（`config/runtime/.config.yaml`）：仅用于在设备唤醒连网后匹配上报文本以播放预设秒回语或执行「听我说」零寒暄直进聆听。这两项支持手改 YAML 免重启自动热同步；修改 YAML 其余字段请通过 `18080` 控制台保存或重启容器。
+5. **（可选）打包干净分发版**：严禁直接复制本地工作目录（避免泄露 `.env`、`secrets/`、`backups/`、`anima-data/`、`state/`、`config/runtime/` 或失效的 `pc-mcp/.venv/`），请运行：
    ```powershell
-   python scripts/pack_release.py --dry-run   # 脱敏与脚本编码自检
+   python scripts/pack_release.py --dry-run   # 脱敏、超大压缩包拦截与脚本编码自检
    python scripts/pack_release.py             # 生成干净分发包 dist/xiaozhi-server-release-YYYYMMDD.zip
    ```
 

@@ -315,6 +315,7 @@ def start_console_background() -> None:
         _console_atexit_registered = True
 
     shared._load_history()
+    shared.persist_console_token()
     runtime_events.subscribe(shared._apply_runtime_event)
     shared._sync_runtime_events()
     shared.start_history_flusher()

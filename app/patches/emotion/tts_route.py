@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import io
 import json
 import os
 import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import wave
 
 import patch_registry
 import runtime_events
@@ -50,11 +52,46 @@ def _try_acquire_gsv_gpu_lock():
             GSV_GPU_LOCK.release()
 
 
-def _post_gsv_sync(url: str, request_json: Dict[str, Any], timeout: float):
-    """Run blocking GPT-SoVITS HTTP POST + GSV_GPU_LOCK on a worker thread (C-5)."""
+def is_gsv_placeholder_zero_wav(wav_bytes: bytes | None) -> bool:
+    """Return True if `wav_bytes` matches upstream TTS.py's `yield 16000, np.zeros(16000, int16)` error placeholder (R2 P0-2)."""
+    if not wav_bytes or len(wav_bytes) < 44 or not wav_bytes.startswith(b"RIFF"):
+        return False
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            sr = wf.getframerate()
+            nframes = wf.getnframes()
+            sampwidth = wf.getsampwidth()
+            if sr != 16000 or sampwidth != 2 or not (15500 <= nframes <= 16500):
+                return False
+            raw = wf.readframes(nframes)
+        return len(raw) > 0 and raw == (b"\x00" * len(raw))
+    except Exception:
+        return False
+
+
+def _post_gsv_sync(url: str, request_json: Dict[str, Any], timeout: float, *, provider=None):
+    """Run blocking GPT-SoVITS HTTP POST + GSV_GPU_LOCK on a worker thread, with CUDA Graph OOM zero-WAV retry (C-5, R2 P0-2)."""
     sess = _get_gsv_http_session()
     with GSV_GPU_LOCK:
-        return sess.post(url, json=request_json, timeout=timeout)
+        resp = sess.post(url, json=request_json, timeout=timeout)
+        if (
+            getattr(resp, "status_code", 0) == 200
+            and is_gsv_placeholder_zero_wav(getattr(resp, "content", None))
+            and request_json.get("use_cuda_graph") is not False
+        ):
+            if provider is not None:
+                try:
+                    provider._force_disable_cuda_graph = True
+                except Exception:
+                    pass
+            retry_json = dict(request_json)
+            retry_json["use_cuda_graph"] = False
+            print(
+                "[GPT-SoVITS] 检测到 16kHz 全零异常占位帧（疑似 CUDA Graph 内存不足），已自动切换 use_cuda_graph=False 重试",
+                flush=True,
+            )
+            resp = sess.post(url, json=retry_json, timeout=timeout)
+        return resp
 
 
 def _synthesize_gsv_wakeup_snapshot_sync(
@@ -70,8 +107,19 @@ def _synthesize_gsv_wakeup_snapshot_sync(
             return None
         sess = _get_gsv_http_session()
         resp = sess.post(url, json=request_json, timeout=timeout)
+        if (
+            getattr(resp, "status_code", 0) == 200
+            and is_gsv_placeholder_zero_wav(getattr(resp, "content", None))
+            and request_json.get("use_cuda_graph") is not False
+        ):
+            retry_json = dict(request_json)
+            retry_json["use_cuda_graph"] = False
+            resp = sess.post(url, json=retry_json, timeout=timeout)
         if getattr(resp, "status_code", 0) == 200 and getattr(resp, "content", None):
-            return bytes(resp.content)
+            content = bytes(resp.content)
+            if is_gsv_placeholder_zero_wav(content):
+                return None
+            return content
         return None
 
 
@@ -179,6 +227,8 @@ def build_gsv_request_snapshot(
     )
     if sample_steps is not None:
         request_json["sample_steps"] = sample_steps
+    if getattr(provider, "_force_disable_cuda_graph", False):
+        request_json["use_cuda_graph"] = False
 
     url = str(getattr(provider, "url", "") or "").strip()
     return url, request_json, chosen_prof, emo_key
@@ -223,10 +273,23 @@ def _resolve_gsv_sample_steps(
         base_steps = 16 if is_mei else None
     if base_steps is None:
         return None
+    # R2 P1-1: Auto-heal legacy unmigrated V5-Turbo config where sample_steps remained Mei's 16
+    # alongside default/unmigrated first_segment_sample_steps (None, 4, or Mei's 8)
+    healed_lxh_legacy = False
+    if base_steps == 16 and tags.is_luoxiaohei_voice(tts=provider):
+        cfg_d = getattr(provider, "config", None)
+        fast_raw = getattr(provider, "first_segment_sample_steps", None)
+        if fast_raw is None and isinstance(cfg_d, dict):
+            fast_raw = cfg_d.get("first_segment_sample_steps")
+        if fast_raw in (None, "", 4, 8):
+            base_steps = 4
+            healed_lxh_legacy = True
 
     # P1-10: Lower first-segment DiT sample_steps (default 8) to cut first-audio latency while keeping
     # full quality on segment 2+ (which synthesize concurrently while segment 1 plays).
     if is_first_segment and not getattr(provider, "_suppress_first_seg_fast_steps", False):
+        if healed_lxh_legacy:
+            return 4
         fast_cand = getattr(provider, "first_segment_sample_steps", None)
         if fast_cand is None and isinstance(getattr(provider, "config", None), dict):
             fast_cand = provider.config.get("first_segment_sample_steps")
@@ -457,7 +520,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
                         and getattr(self, "tts_audio_first_sentence", True)
                         and getattr(conn, "_last_pushed_mei_sid", None) != cur_sid
                     ):
-                        prof = tags.get_mei_emotion_profile(emo_cand)
+                        prof = tags.get_mei_emotion_profile(emo_cand, require_ref_audio=False)
                         splitter._push_esp32_emotion_async(
                             conn,
                             prof["esp32_emoji"],
@@ -544,10 +607,12 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         if not eff_emo and conn is not None:
             prompt_str = str((getattr(conn, "config", None) or {}).get("prompt") or "")
             if tags.has_voice_emotion_tag_rule(prompt_str):
-                eff_emo = tags.resolve_mei_emotion(clean_text, device_id=_connection_mood_key(conn))
+                eff_emo = tags.resolve_mei_emotion(
+                    clean_text, device_id=_connection_mood_key(conn), require_ref_audio=False
+                )
         if not eff_emo:
             return
-        prof = tags.get_mei_emotion_profile(eff_emo)
+        prof = tags.get_mei_emotion_profile(eff_emo, require_ref_audio=False)
         cur_sid = getattr(tts_obj, "current_sentence_id", None) or getattr(conn, "sentence_id", None)
         q = getattr(tts_obj, "_segment_emotion_queue", None)
         if q is None:
@@ -654,6 +719,10 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
 
     def _finalize_gsv_response(self, resp, clean_text, conn, cur_sid, is_first_segment, chosen_prof) -> bytes:
         if resp.status_code == 200:
+            if is_gsv_placeholder_zero_wav(getattr(resp, "content", None)):
+                err_zero = "GPT_SoVITS_V2 返回 16kHz 全零异常占位音频（疑似 CUDA Graph 或显存/内存不足），已拦截静音废音"
+                base_logger.bind(tag=gsv_mod.TAG).error(err_zero)
+                raise RuntimeError(err_zero)
             self._pending_segment_emotion = None
             if cur_sid and is_first_segment:
                 self._first_segment_done_sid = cur_sid
@@ -695,7 +764,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         with _gsv_inflight_lock:
             _gsv_live_inflight += 1
         try:
-            resp = _post_gsv_sync(req_url or self.url, request_json, timeout_sec)
+            resp = _post_gsv_sync(req_url or self.url, request_json, timeout_sec, provider=self)
         finally:
             with _gsv_inflight_lock:
                 _gsv_live_inflight = max(0, _gsv_live_inflight - 1)
@@ -712,7 +781,9 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         with _gsv_inflight_lock:
             _gsv_live_inflight += 1
         try:
-            resp = await asyncio.to_thread(_post_gsv_sync, req_url or self.url, request_json, timeout_sec)
+            resp = await asyncio.to_thread(
+                functools.partial(_post_gsv_sync, req_url or self.url, request_json, timeout_sec, provider=self)
+            )
         finally:
             with _gsv_inflight_lock:
                 _gsv_live_inflight = max(0, _gsv_live_inflight - 1)
@@ -792,7 +863,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
             return
         seg_emo, stripped = tags.extract_and_strip_emotion(text or "", flush_incomplete=False)
         if seg_emo:
-            prof = tags.get_mei_emotion_profile(seg_emo)
+            prof = tags.get_mei_emotion_profile(seg_emo, require_ref_audio=False)
             splitter._push_esp32_emotion_async(conn, prof["esp32_emoji"], prof["esp32_emotion"])
             return
         if conn and tags.has_voice_emotion_tag_rule(str((getattr(conn, "config", None) or {}).get("prompt") or "")):

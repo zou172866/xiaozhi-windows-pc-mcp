@@ -11,26 +11,39 @@ description: >-
 
 ## 一、免编译源码定制 ESP32-S3 离线中文唤醒词（`v2.x` + `MultiNet7`）
 
-### 1. 适用前提与必查项
-1. **芯片与 Flash 核验**：用 `esptool --chip esp32s3 --port <COMx> flash-id` 确认具备 **16MB Flash + 8MB PSRAM**（`partitions/v2/16m.csv` 的 `assets` 分区位于 `0x800000`，大小 `8 MB`）。
+### 1. 适用前提与必查项（一切以串口启动日志为准）
+1. **先抓串口区分出厂 `v1.9.x` 与 `v2.x`**：新购开发板出厂常为 `xiaozhi 1.9.4` + `WakeNet9`（`wn9_nihaoxiaozhi_tts`，旧分区表 `model` 仅 `960 KB`，装不下 MultiNet7）。切勿对 `v1.9.x` 直接单刷 `0x800000`；需先升级 `v2.6.0`（`partitions/v2/16m.csv`，`0x800000` 为 `8 MB assets` 分区）。用 `esptool --chip esp32s3 --port <COMx> flash-id` 确认具备 **16MB Flash + 8MB PSRAM**。
 2. **屏幕尺寸绝不盲猜**：`bread-compact-wifi` 官方预编译包区分 **`128×32`（0.91 寸细长屏）** 与 **`128×64`（0.96 寸方屏）**，刷主固件前必须与用户确认屏幕规格。
-3. **刷前强备份（防丢 Wi-Fi 与本地 OTA）**：
+3. **刷前强备份（防丢 Wi-Fi 与本地 OTA，存入被忽略的 `backups/`）**：
    ```powershell
-   esptool --chip esp32s3 --port <COMx> --baud 460800 read-flash 0x9000 0x4000 data\nvs_local_backup.bin
-   esptool --chip esp32s3 --port <COMx> --baud 460800 read-flash 0x0 0x10000 data\esp32_boot_pt_nvs_backup.bin
+   esptool --chip esp32s3 --port <COMx> --baud 460800 read-flash 0x9000 0x4000 backups\nvs_local_backup.bin
+   esptool --chip esp32s3 --port <COMx> --baud 460800 read-flash 0x0 0x10000 backups\esp32_boot_pt_nvs_backup.bin
    ```
 
-### 2. 打包自定义 `assets.bin` 的 4 个关键不变量
-1. **模型版本与 `fst` 必配**：从乐鑫组件库下载与固件 `idf_component.yml` 匹配的 `espressif/esp-sr`（如 `2.4.7`），在 `srmodels.bin` 中**必须同时打包 `mn7_cn`（或 `mn6_cn`）与 `model/multinet_model/fst/` 目录**；漏打 `fst/` 会直接报错 `no (null)/fst/commands_cn.txt ... cannot build fst`。
-2. **拼音校验**：中文唤醒词使用无声调小写空格分隔拼音（如 `ni hao ya yi`），打包前核对每个音节前加 SentencePiece 下划线（如 `▁ni`）存在于 `mn7_cn/vocab`。
-3. **保留原字体 + 正确打包格式**：保留官方默认 `assets` 中的 `font_noto_sans_common_14_1.bin` 与 `text_font_meta`，在 `index.json` 写入 `multinet_model`（`language: "cn"`, `duration: 3000`, `threshold: 0.2`, `commands: [{"command": "...", "text": "...", "action": "wake"}]`）；按 `esp_mmap_assets` 格式封装（12 字节头 `count, sum(payload)&0xFFFF, len` + 44 字节/项文件表 + 每项前导 `0x5A 0x5A`）。
-4. **免重配网刷写与 10 秒热调灵敏度**：
-   - 首次从 v1 升 v2 时，从 `merged-binary.bin` 分片拆出 `bootloader` (`0x0`)、`partition-table` (`0x8000`)、`ota_data` (`0xd000`)、`app` (`0x20000`)，配合原位备份的 `0x9000` NVS 与 `0x800000` 自定义 `assets.bin` 一次写入；
-   - 后续仅微调唤醒灵敏度（`threshold` 越小越灵敏，范围 `0.05~0.50`）或增改词条时，**只需 10 秒单刷 `0x800000` 的 `assets.bin`**，不碰主固件与 NVS。
+### 2. 打包自定义 `assets.bin` 与免变砖刷写的 5 个关键不变量
+1. **模型最小化获取与 `fst` 必配**：
+   - 在 `srmodels.bin` 中**必须同时打包 `mn7_cn`（约 `2.67 MB`）与 `model/multinet_model/fst/` 目录**；漏打 `fst/` 会直接报错 `no (null)/fst/commands_cn.txt ... cannot build fst`。
+   - 无需盲目硬下 149MB 整包：注意 `components-file.espressif.cn` 直拼路径会返回 `403`，需先查乐鑫官方 API 获取真实签名下载地址：`curl -s https://components.espressif.com/api/components/espressif/esp-sr`；或仅从 `espressif/esp-sr` GitHub 仓库（国内可走 GitHub raw 加速代理）单取 `model/multinet_model/mn7_cn/` 与 `model/multinet_model/fst/` 两个子目录。
+2. **拼音校验**：中文唤醒词使用无声调小写空格分隔拼音（如 `ni hao xiao hei`、`ni hao ya yi`），打包前核对每个音节前加 SentencePiece 下划线（如 `▁ni`）存在于 `mn7_cn/vocab`。
+3. **严禁写 `"action": "abort"`（必须统一填 `"action": "wake"`）**：
+   - 上游固件 `main/audio/wake_words/custom_wake_word.cc` 虽然解析并打印了 `action` 字段，但**全文件仅判断 `action == "wake"`**！若给「听我说」写成 `{"command":"ting wo shuo","text":"听我说","action":"abort"}`，串口虽显示加载成功但**永不触发**。
+   - 正确做法：主唤醒词与打断词 `ting wo shuo` 在 `index.json` 的 `commands` 数组中**必须全部填 `"action": "wake"`**（播报中喊「听我说」由固件按唤醒重入上报文本，再由服务端 `ListenTextMessageHandler` 的 `interrupt_words` 补丁在 ~11ms 内静音电脑音响并零寒暄直进聆听）。
+   - 保留官方默认 `assets` 中的 `font_noto_sans_common_14_1.bin` 与 `text_font_meta`，可直接使用上游固件仓库 `scripts/build_default_assets.py`（传入 `--multinet_model_info` + `srmodels.bin` + 自定义 `index.json`）或按 `esp_mmap_assets` 格式封装（12 字节头 `count, sum(payload)&0xFFFF, len` + 44 字节/项文件表 + 每项前导 `0x5A 0x5A`）。
+4. **强制 `--flash-mode keep --flash-size keep` + 三步分刷（防重叠报错与看门狗死循环）**：
+   - **严禁指定 `--flash-mode qio`**：在 Octal PSRAM 机型上覆写 header flash mode 会导致无报错刷入后陷入看门狗重启死循环；统一使用 `--flash-mode keep --flash-size keep`。
+   - **三步顺序写入**：官方 `v2.6.0` `merged-binary.bin` 覆盖 `0x0`～`0x888FCD`，与 `0x800000` 的 `assets` 分区存在重叠，esptool 会拒绝单条命令同写；必须分三步执行，且**最后一步回写 NVS** 才能保住原有 Wi-Fi 与 OTA 配置：
+     ```powershell
+     esptool --chip esp32s3 --port <COMx> --baud 460800 write-flash --flash-mode keep --flash-size keep 0x0 merged-binary.bin
+     esptool --chip esp32s3 --port <COMx> --baud 460800 write-flash --flash-mode keep --flash-size keep 0x800000 custom_assets.bin
+     esptool --chip esp32s3 --port <COMx> --baud 460800 write-flash --flash-mode keep --flash-size keep 0x9000 backups\nvs_local_backup.bin
+     ```
+5. **后续 10 秒热调灵敏度与双端概念区分**：
+   - 升级到 `v2.6.0` 后，后续仅微调灵敏度（`threshold` 越小越灵敏，范围 `0.05~0.50`；首次上电麦克风偏置建立时偶发一次瞬态唤醒属正常现象，若日常环境误唤醒可调至 `0.25~0.30`）或换唤醒词时，**只需单刷第 2 步 `0x800000` 的 `custom_assets.bin`**。
+   - **切勿混淆双端配置**：设备休眠态靠固件 `assets.bin` 离线唤醒；服务端 `config/runtime/.config.yaml` 的 `wakeup_words` 仅用于唤醒连网后匹配文本播放秒回问候语（支持手改 YAML 按 `mtime` 免重启自动热同步）。
 
 ### 3. 串口与服务端双端验收
 - 复位抓串口 7 秒日志，必见：`Successfully load srmodels` → `CustomWakeWord: Command: ...` → `1 active speech commands` → `Initialized FD AFE, detector: MultiNet` → `Got IP` 与本地 OTA 握手成功。
-- 服务端同步在 `data/.config.yaml` 的 `wakeup_words` 加入新唤醒词与常见同音词（如 `你好芽衣` / `你好牙医`），保留 `嘿你好呀` / `你好小智` 兜底；若定制唤醒秒回短 WAV（GPT-SoVITS V4），用 RMS 能量阈值裁剪前导软气声（留 ~40ms 起音缓冲）以消除开头喘气延迟。
+- 服务端同步在 `config/runtime/.config.yaml`（容器内 `/opt/xiaozhi-esp32-server/data/.config.yaml`）的 `wakeup_words` 加入新唤醒词与常见同音词（如 `你好小黑` / `你好芽衣` / `你好牙医`），保留 `嘿你好呀` / `你好小智` 兜底；若定制唤醒秒回短 WAV（GPT-SoVITS V4/V5-Turbo），用 RMS 能量阈值裁剪前导软气声（留 ~40ms 起音缓冲）以消除开头喘气延迟。
 
 ---
 
