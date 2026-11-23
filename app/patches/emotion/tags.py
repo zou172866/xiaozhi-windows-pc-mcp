@@ -510,7 +510,8 @@ _LEXICAL_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 
 _DEFAULT_MOOD_DEVICE_KEY = "__default__"
 _anima_lock = threading.Lock()
-_last_anima_emotion_by_device: Dict[str, str] = {}
+MoodKey = str | tuple[str, str]
+_last_anima_emotion_by_device: Dict[MoodKey, str] = {}
 _last_anima_emotion: str = "calm"
 _cached_manifest: Optional[Dict[str, Dict[str, Any]]] = None
 
@@ -888,12 +889,14 @@ def infer_emotion_from_text(text: str, allow_soft_wave_cue: bool = True) -> Opti
     return None
 
 
-def _normalize_mood_device_key(device_id: Optional[str] = None) -> str:
+def _normalize_mood_device_key(device_id: Optional[MoodKey] = None) -> MoodKey:
+    if isinstance(device_id, tuple):
+        return device_id
     dev = str(device_id or "").strip().lower()
     return dev if dev else _DEFAULT_MOOD_DEVICE_KEY
 
 
-def set_anima_mood(mood_summary: str, device_id: Optional[str] = None) -> None:
+def set_anima_mood(mood_summary: str, device_id: Optional[MoodKey] = None) -> None:
     """Update cached Anima Brain emotion from `/xiaozhi/recall` mood summary string, isolated per device_id (C-6)."""
     global _last_anima_emotion
     if not mood_summary:
@@ -914,15 +917,17 @@ def set_anima_mood(mood_summary: str, device_id: Optional[str] = None) -> None:
                         break
 
 
-def get_anima_mood(device_id: Optional[str] = None) -> str:
+def get_anima_mood(device_id: Optional[MoodKey] = None) -> str:
     dev_key = _normalize_mood_device_key(device_id)
     with _anima_lock:
         if dev_key in _last_anima_emotion_by_device:
             return _last_anima_emotion_by_device[dev_key]
+        if isinstance(dev_key, tuple):
+            return "calm"
         return _last_anima_emotion_by_device.get(_DEFAULT_MOOD_DEVICE_KEY, _last_anima_emotion)
 
 
-def clear_anima_mood(device_id: Optional[str] = None) -> None:
+def clear_anima_mood(device_id: Optional[MoodKey] = None) -> None:
     """Reset cached Anima mood for one device_id or all devices (for cleanup/tests)."""
     global _last_anima_emotion
     with _anima_lock:
@@ -940,7 +945,7 @@ def resolve_mei_emotion(
     clean_text: str,
     explicit_segment_emotion: Optional[str] = None,
     turn_explicit_emotion: Optional[str] = None,
-    device_id: Optional[str] = None,
+    device_id: Optional[MoodKey] = None,
     character_key: str = "raiden_mei",
 ) -> str:
     """3-layer emotion resolution:

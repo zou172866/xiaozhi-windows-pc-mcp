@@ -92,6 +92,25 @@ xiaozhi-server/
    python scripts/pack_release.py             # 生成干净分发包 dist/xiaozhi-server-release-YYYYMMDD.zip
    ```
 
+### 日常记忆与酒馆剧情
+
+在 [小智控制台](http://localhost:18080/) 的「对话记忆存档」选择设备，可以在「日常陪伴」和「酒馆剧情」之间切换。结束当前语音连接，再唤醒小智，新连接会使用选中的存档。已有日常对话继续沿用原来的 Anima 角色。
+
+安装[「用小智继续」酒馆扩展](integrations/sillytavern/README.md)后，可以从单人聊天导出最近 1 至 3 轮对白。在控制台选择文件，核对设备和对白，再点「导入并切换到酒馆」。同一设备可以继续同一份酒馆聊天，不同聊天分别保存。想继续较早的聊天，可重新导入该聊天最新的导出文件。
+
+### 切换本地中文陪伴与 DeepSeek
+
+打开 [小智控制台](http://localhost:18080)，在 **对话模型 → 对话模式** 选择 **本地陪伴 · Huihui Qwen3 14B** 或 **DeepSeek 国内直连**，点击右上角 **保存并立即生效**。下一轮对话沿用当前人设和记忆。语音识别、合成、看屏和 Anima 后台有各自的服务设置。
+
+本地模式连接宿主机 LM Studio 的 `19340` 端口，使用模型标识 `huihui-qwen3-14b-companion`。在新电脑上，先导入 Huihui Qwen3 14B Abliterated v2 的 GGUF，然后执行以下命令。将 `<模型键>` 替换为 `lms ls` 中对应的模型。
+
+```powershell
+lms load <模型键> --identifier huihui-qwen3-14b-companion --context-length 16384 --parallel 1
+lms server start --port 19340
+```
+
+若模型会替用户接话或念出思考过程，请检查 GGUF 的 `tokenizer.chat_template`。本机的陪伴版本复用原始权重，在 GGUF 副本中写入作者的工具调用模板，并在模板首行设置 `{%- set enable_thinking = false %}`。可用 llama.cpp 的 `gguf-new-metadata 原文件.gguf 副本.gguf --chat-template-file 模板.jinja` 制作同样的副本。[Huihui 官方对话模板](https://huggingface.co/huihui-ai/Huihui-Qwen3-14B-abliterated-v2/blob/3b79629fdd65004d3b9cdf5beb0739e8c7e1becd/chat_template.jinja)
+
 ### 本地自检与延伸文档
 
 ```powershell

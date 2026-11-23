@@ -67,6 +67,31 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
         self.brain.close()
         self._tmp.cleanup()
 
+    def test_tavern_cannot_fall_back_to_daily_on_limit_or_provision_failure(self):
+        story = "starc_" + "c" * 40
+        existing = self.brain.characters()
+        with patch.object(self.brain, "characters", return_value=existing * 32):
+            with self.assertRaises(ValueError):
+                svc.build_fast_recall_context(self.brain, story, "旧书店")
+            with self.assertRaises(ValueError):
+                svc.extract_and_commit_turn(self.brain, story, "story-turn", "去旧书店", "好的")
+            with self.assertRaises(ValueError):
+                svc.enqueue_inbox_turn(self.brain, story, "rejected-story-turn", "去旧书店", "好的")
+        with patch.object(self.brain, "create_character", side_effect=RuntimeError("unavailable")):
+            with self.assertRaises(RuntimeError):
+                svc.ensure_character_exists(self.brain, story)
+        self.assertEqual(svc.ensure_character_exists(self.brain, story), story)
+        self.assertEqual(svc.build_fast_recall_context(self.brain, story, "")["character_id"], story)
+
+    def test_tavern_turn_recalled_only_in_the_matching_story(self):
+        story = svc.ensure_character_exists(self.brain, "starc_" + "a" * 40)
+        engine = self.brain.engine
+        turn = engine.prepare_turn(story, "明天九点去旧书店", request_id="story-fixture")
+        engine.commit_turn(story, turn.turn_id, CommitRequest(assistant_reply="在门口见"))
+        for character in (story, svc.DEFAULT_CHARACTER_ID, "starc_" + "b" * 40):
+            result = svc.build_fast_recall_context(self.brain, character, "几点见")
+            self.assertEqual("九点去旧书店" in result["context_text"], character == story)
+
     def _insert_job(self, jid: str, state: str, created: float, error: str | None = None, kind: str = "maintenance"):
         eng = self.brain.engine
         with eng._transaction():

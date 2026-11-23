@@ -17,10 +17,12 @@ import sqlite3
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 import httpx
 import mei_emotion_router
+import memory_archives
 import xz_common
 from core.providers.memory.base import MemoryProviderBase, logger
 
@@ -57,6 +59,36 @@ _GLOBAL_CONFIG = {
 }
 
 _SAFE_CHAR_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+
+
+@dataclass(frozen=True)
+class MemoryTarget:
+    """The device and character selected when this connection opened."""
+
+    device_key: str
+    archive: str
+    character_id: str
+    chat_key: str = ""
+    handoff: tuple[tuple[str, str], ...] = field(default=(), compare=False, repr=False)
+    handoff_index: int = field(default=-1, compare=False)
+
+    @property
+    def mood_key(self):
+        if self.archive == "daily":
+            return None if self.device_key == "__default__" else self.device_key
+        return (self.device_key, self.character_id)
+
+    def acknowledge_handoff(self):
+        if self.handoff:
+            memory_archives.acknowledge_handoff(self.device_key, self.chat_key, self.handoff, self.handoff_index)
+
+
+def connection_memory_target(device_key: str, base_character_id: str) -> MemoryTarget:
+    if device_key == "__default__":
+        return MemoryTarget(device_key, "daily", base_character_id)
+    archive, chat_key, turns, index = memory_archives.selected_binding(device_key)
+    character_id = memory_archives.scoped_character_id(base_character_id, archive, device_key, chat_key)
+    return MemoryTarget(device_key, archive, character_id, chat_key, turns, index)
 
 
 def _parse_device_character_map(raw: Any) -> dict[str, str]:
@@ -355,17 +387,20 @@ class AnimaOutbox:
                 item = _canonical_turn_payload(raw)
                 if item is None:
                     continue
-                cid = (
-                    explicit_cid
-                    if explicit_cid
-                    else resolve_character_id_for_device(item.get("device_id"), base_character_id=default_cid)
-                )
+                cid = explicit_cid or raw.get("_anima_character_id")
+                if not cid:
+                    device_key = str(item.get("device_id") or "").strip().lower() or "__default__"
+                    base = resolve_character_id_for_device(item.get("device_id"), base_character_id=default_cid)
+                    cid = connection_memory_target(device_key, base).character_id
                 req_id = item["request_id"]
                 existing = db.execute(
-                    "SELECT payload_json, payload_hash, status FROM outbox_turns WHERE request_id=?",
+                    "SELECT character_id, payload_json, payload_hash, status FROM outbox_turns WHERE request_id=?",
                     (req_id,),
                 ).fetchone()
                 if existing is not None:
+                    if existing["character_id"] != cid:
+                        logger.bind(tag=TAG).warning("Anima 本地发件箱拒绝将已有回合移动到其他角色")
+                        continue
                     try:
                         prev_payload = json.loads(existing["payload_json"])
                     except Exception:
@@ -872,15 +907,16 @@ def get_default_outbox(*, auto_start: bool = True) -> AnimaOutbox:
         return _default_outbox
 
 
-def push_turns_async(turns_payload: list):
+def push_turns_async(turns_payload: list) -> bool:
     """Persist turns into durable local SQLite outbox and wake background delivery worker."""
     if not turns_payload:
-        return
+        return False
     try:
         outbox = get_default_outbox(auto_start=True)
-        outbox.enqueue(turns_payload)
+        return outbox.enqueue(turns_payload) > 0
     except Exception as exc:
         logger.bind(tag=TAG).warning(f"写入 Anima 本地发件箱失败: {exc}")
+        return False
 
 
 def flush_outbox(timeout: float = 4.0) -> dict[str, Any]:
@@ -949,7 +985,7 @@ def _read_occurred_at(msg: Any) -> float | None:
     return None
 
 
-def extract_clean_pairs(messages, *, device_id: str = "", source: str = "esp32") -> list:
+def extract_clean_pairs(messages, *, device_id: str = "", source: str = "esp32", target: MemoryTarget | None = None) -> list:
     """Pair genuine non-temporary user utterances with full assistant replies and turn metadata."""
     pairs = []
     cur_user_msg = None
@@ -986,6 +1022,8 @@ def extract_clean_pairs(messages, *, device_id: str = "", source: str = "esp32")
             pair["occurred_at"] = cur_occurred_at
         if device_id:
             pair["device_id"] = str(device_id).strip()[:64]
+        if target is not None:
+            pair["_anima_character_id"] = target.character_id
         pairs.append(pair)
 
     for m in messages or []:
@@ -1029,7 +1067,8 @@ class MemoryProvider(MemoryProviderBase):
         _GLOBAL_CONFIG["service_url"] = str(
             cfg.get("service_url") or "http://anima-brain:18787"
         ).rstrip("/")
-        _GLOBAL_CONFIG["character_id"] = str(cfg.get("character_id") or "xiaozhi").strip()
+        self._base_character_id = str(cfg.get("character_id") or "xiaozhi").strip()
+        _GLOBAL_CONFIG["character_id"] = self._base_character_id
         raw_dev_map = cfg.get("device_character_map")
         if raw_dev_map is None:
             raw_dev_map = os.environ.get("ANIMA_DEVICE_CHARACTER_MAP", "")
@@ -1080,11 +1119,11 @@ class MemoryProvider(MemoryProviderBase):
         self._cb_consecutive_failures = 0
         self._cb_open_until = 0.0
 
-        # C-6: Per-device isolated recall cache & background refresh tasks (keyed by normalized device_id)
-        self._recall_cache: dict[str, tuple[str, float]] = {}
-        self._recall_gen: dict[str, int] = {}
-        self._bg_refresh_tasks: dict[str, asyncio.Task] = {}
-        self._pending_refresh_queries: dict[str, tuple[str, int] | None] = {}
+        # A delayed refresh can only publish to its original device and archive.
+        self._recall_cache: dict[MemoryTarget, tuple[str, float]] = {}
+        self._recall_gen: dict[MemoryTarget, int] = {}
+        self._bg_refresh_tasks: dict[MemoryTarget, asyncio.Task] = {}
+        self._pending_refresh_queries: dict[MemoryTarget, tuple[str, int] | None] = {}
 
         self._recall_stats: dict[str, Any] = {
             "sync_calls": 0,
@@ -1117,17 +1156,17 @@ class MemoryProvider(MemoryProviderBase):
         if raw is None:
             ctx_dev = _CURRENT_DEVICE_ID_VAR.get()
             raw = ctx_dev if ctx_dev else getattr(self, "role_id", None)
-        cleaned = str(raw or "").strip().lower()[:64]
+        cleaned = str(raw or "").strip().lower()
         return cleaned or "__default__"
 
     @property
     def _cached_context(self) -> str | None:
-        entry = self._recall_cache.get(self._resolve_device_key())
+        entry = self._recall_cache.get(self.memory_target())
         return entry[0] if entry is not None else None
 
     @property
     def _bg_refresh_task(self) -> asyncio.Task | None:
-        return self._bg_refresh_tasks.get(self._resolve_device_key())
+        return self._bg_refresh_tasks.get(self.memory_target())
 
     def _get_async_client(self):
         cur_loop = asyncio.get_running_loop()
@@ -1146,7 +1185,7 @@ class MemoryProvider(MemoryProviderBase):
 
     def _record_recall_success(
         self,
-        dev_key: str,
+        target: MemoryTarget,
         ctx: str,
         elapsed_ms: float,
         *,
@@ -1155,11 +1194,11 @@ class MemoryProvider(MemoryProviderBase):
         self._cb_consecutive_failures = 0
         self._cb_open_until = 0.0
         self._recall_stats["last_latency_ms"] = round(elapsed_ms, 2)
-        if gen is None or gen >= self._recall_gen.get(dev_key, 0):
-            self._recall_cache[dev_key] = (ctx, time.monotonic())
+        if gen is None or gen >= self._recall_gen.get(target, 0):
+            self._recall_cache[target] = (ctx, time.monotonic())
             if len(self._recall_cache) > self._max_cached_devices:
                 oldest_dev = min(self._recall_cache.items(), key=lambda kv: kv[1][1])[0]
-                if oldest_dev != dev_key:
+                if oldest_dev != target:
                     self._recall_cache.pop(oldest_dev, None)
 
     def _record_recall_failure(self, *, is_timeout: bool = False) -> None:
@@ -1174,51 +1213,47 @@ class MemoryProvider(MemoryProviderBase):
                 f"Anima Brain recall 连续失败 {self._cb_consecutive_failures} 次，熔断开启 {self._cb_cooldown_seconds:.0f}s"
             )
 
-    def get_recall_stats(self, device_id: str | None = None) -> dict[str, Any]:
-        dev_key = self._resolve_device_key(device_id)
+    def get_recall_stats(self, device_id: str | None = None, *, target: MemoryTarget | None = None) -> dict[str, Any]:
+        target = target or self.memory_target(device_id)
         return {
             **self._recall_stats,
             "circuit_open": self._is_circuit_open(),
             "consecutive_failures": self._cb_consecutive_failures,
-            "cache_warm": dev_key in self._recall_cache,
-            "cached_devices": len(self._recall_cache),
+            "cache_warm": target in self._recall_cache,
+            "cached_devices": len({key.device_key for key in self._recall_cache}),
             "budget_seconds": self._recall_budget_seconds,
             "warm_budget_seconds": self._warm_recall_budget_seconds,
             "stale_while_revalidate": self._stale_while_revalidate,
         }
 
-    def _set_device_anima_mood(self, mood_str: str, dev_key: str) -> None:
-        eff_dev = None if dev_key == "__default__" else dev_key
-        try:
-            mei_emotion_router.set_anima_mood(mood_str, device_id=eff_dev)
-        except TypeError:
-            mei_emotion_router.set_anima_mood(mood_str)
-
     def _resolve_character_id(self, dev_key: str) -> str:
         return resolve_character_id_for_device(
             None if dev_key == "__default__" else dev_key,
-            base_character_id=_GLOBAL_CONFIG["character_id"],
+            base_character_id=self._base_character_id,
             device_map=self._device_character_map,
             isolate_by_device=self._isolate_character_by_device,
         )
+
+    def memory_target(self, device_id: str | None = None) -> MemoryTarget:
+        device_key = self._resolve_device_key(device_id)
+        return connection_memory_target(device_key, self._resolve_character_id(device_key))
 
     async def _fetch_recall_once(
         self,
         query: str,
         token: str,
-        dev_key: str,
+        target: MemoryTarget,
         *,
         gen: int | None = None,
     ) -> str:
         url = _GLOBAL_CONFIG["service_url"] + "/xiaozhi/recall"
         client = self._get_async_client()
-        target_cid = self._resolve_character_id(dev_key)
         t0 = time.monotonic()
         resp = await client.post(
             url,
             headers={"Authorization": f"Bearer {token}"},
             json={
-                "character_id": target_cid,
+                "character_id": target.character_id,
                 "query": query or "",
             },
         )
@@ -1226,6 +1261,8 @@ class MemoryProvider(MemoryProviderBase):
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}")
         data = resp.json()
+        if target.archive == "tavern" and data.get("character_id") != target.character_id:
+            raise ValueError("Anima 召回返回了不匹配的酒馆存档")
         mood_str = str(data.get("mood") or "")
         ctx = (data.get("context_text") or "").strip()
         # 剥离重复的【角色身份设定】段落，以小智主配置 prompt 为唯一人设权威，避免双倍 Token 与人设冲突
@@ -1245,10 +1282,10 @@ class MemoryProvider(MemoryProviderBase):
         except Exception:
             pass
         # 4.1 #4: Check generation freshness BEFORE mutating device Anima mood so stale recalls never overwrite newer mood
-        is_current_gen = gen is None or gen >= self._recall_gen.get(dev_key, 0)
+        is_current_gen = gen is None or gen >= self._recall_gen.get(target, 0)
         if is_current_gen:
-            self._set_device_anima_mood(mood_str, dev_key)
-        self._record_recall_success(dev_key, ctx, elapsed_ms, gen=gen)
+            mei_emotion_router.set_anima_mood(mood_str, device_id=target.mood_key)
+        self._record_recall_success(target, ctx, elapsed_ms, gen=gen)
         redact_note = f", 已拦截敏感实体={redacted_cnt}" if redacted_cnt else ""
         logger.bind(tag=TAG).info(
             f"Anima Brain 极速召回成功 ({elapsed_ms:.0f}ms): 事实={data.get('facts_count', 0)}, "
@@ -1256,24 +1293,24 @@ class MemoryProvider(MemoryProviderBase):
         )
         return ctx
 
-    async def _bg_refresh_loop(self, dev_key: str, initial_query: str, initial_gen: int) -> None:
+    async def _bg_refresh_loop(self, target: MemoryTarget, initial_query: str, initial_gen: int) -> None:
         next_item: tuple[str, int] | None = (initial_query, initial_gen)
         try:
             while next_item is not None:
                 q, req_gen = next_item
                 next_item = None
                 if self._is_circuit_open():
-                    self._pending_refresh_queries.pop(dev_key, None)
+                    self._pending_refresh_queries.pop(target, None)
                     self._recall_stats["cb_short_circuits"] += 1
                     return
                 token = _read_token()
                 if not token:
-                    self._pending_refresh_queries.pop(dev_key, None)
+                    self._pending_refresh_queries.pop(target, None)
                     return
                 self._recall_stats["bg_refreshes"] += 1
                 try:
                     await asyncio.wait_for(
-                        self._fetch_recall_once(q, token, dev_key, gen=req_gen),
+                        self._fetch_recall_once(q, token, target, gen=req_gen),
                         timeout=self._bg_budget_seconds,
                     )
                 except asyncio.TimeoutError:
@@ -1287,26 +1324,26 @@ class MemoryProvider(MemoryProviderBase):
                     self._record_recall_failure(is_timeout=False)
                     logger.bind(tag=TAG).warning(f"Anima Brain 后台召回刷新失败: {e}")
 
-                queued_next = self._pending_refresh_queries.pop(dev_key, None)
+                queued_next = self._pending_refresh_queries.pop(target, None)
                 if queued_next is not None:
                     next_item = queued_next
         finally:
             cur_task = asyncio.current_task()
-            if self._bg_refresh_tasks.get(dev_key) is cur_task:
-                self._bg_refresh_tasks.pop(dev_key, None)
+            if self._bg_refresh_tasks.get(target) is cur_task:
+                self._bg_refresh_tasks.pop(target, None)
 
-    def _schedule_bg_refresh(self, query: str, dev_key: str, *, gen: int | None = None) -> None:
+    def _schedule_bg_refresh(self, query: str, target: MemoryTarget, *, gen: int | None = None) -> None:
         if self._is_circuit_open():
             self._recall_stats["cb_short_circuits"] += 1
             return
-        req_gen = self._recall_gen.get(dev_key, 0) if gen is None else gen
-        existing = self._bg_refresh_tasks.get(dev_key)
+        req_gen = self._recall_gen.get(target, 0) if gen is None else gen
+        existing = self._bg_refresh_tasks.get(target)
         if existing is not None and not existing.done():
-            self._pending_refresh_queries[dev_key] = (query, req_gen)
+            self._pending_refresh_queries[target] = (query, req_gen)
             return
         try:
-            task = asyncio.create_task(self._bg_refresh_loop(dev_key, query, req_gen))
-            self._bg_refresh_tasks[dev_key] = task
+            task = asyncio.create_task(self._bg_refresh_loop(target, query, req_gen))
+            self._bg_refresh_tasks[target] = task
 
             def _consume_exc(t: asyncio.Task) -> None:
                 try:
@@ -1318,14 +1355,17 @@ class MemoryProvider(MemoryProviderBase):
         except RuntimeError:
             pass
 
-    async def query_memory(self, query: str, *, device_id: str | None = None) -> str:
+    async def query_memory(self, query: str, *, device_id: str | None = None, target: MemoryTarget | None = None) -> str:
         token = _read_token()
         if not token:
             return ""
 
         now = time.monotonic()
-        dev_key = self._resolve_device_key(device_id)
-        cache_entry = self._recall_cache.get(dev_key)
+        target = target or self.memory_target(device_id)
+        if target.handoff:
+            # Keep private handoff text out of the shared, longer-lived cache keys.
+            target = replace(target, handoff=())
+        cache_entry = self._recall_cache.get(target)
         has_valid_cache = (
             cache_entry is not None and (now - cache_entry[1]) <= self._cache_ttl_seconds
         )
@@ -1338,9 +1378,9 @@ class MemoryProvider(MemoryProviderBase):
             and cached_ctx is not None
         ):
             self._recall_stats["cache_hits"] += 1
-            gen = self._recall_gen.get(dev_key, 0) + 1
-            self._recall_gen[dev_key] = gen
-            self._schedule_bg_refresh(query or "", dev_key, gen=gen)
+            gen = self._recall_gen.get(target, 0) + 1
+            self._recall_gen[target] = gen
+            self._schedule_bg_refresh(query or "", target, gen=gen)
             return cached_ctx
 
         # Circuit breaker open: degrade immediately to this device's cached context (never cross-device)
@@ -1350,8 +1390,8 @@ class MemoryProvider(MemoryProviderBase):
                 self._recall_stats["cache_hits"] += 1
             return cached_ctx or ""
 
-        gen = self._recall_gen.get(dev_key, 0) + 1
-        self._recall_gen[dev_key] = gen
+        gen = self._recall_gen.get(target, 0) + 1
+        self._recall_gen[target] = gen
 
         # C-6: Even when cache hits, attempt a short-budget synchronous recall (default 300ms)
         # and fall back to this device's cached value on timeout/error, avoiding "always 1 turn late".
@@ -1360,7 +1400,7 @@ class MemoryProvider(MemoryProviderBase):
             self._recall_stats["sync_calls"] += 1
             try:
                 fresh = await asyncio.wait_for(
-                    self._fetch_recall_once(query or "", token, dev_key, gen=gen),
+                    self._fetch_recall_once(query or "", token, target, gen=gen),
                     timeout=warm_budget,
                 )
                 self._recall_stats["warm_sync_hits"] += 1
@@ -1375,7 +1415,7 @@ class MemoryProvider(MemoryProviderBase):
                     f"Anima Brain 温缓存短预算召回超时 (>{warm_budget:.2f}s)，回退缓存并后台刷新"
                 )
                 if not self._is_circuit_open():
-                    self._schedule_bg_refresh(query or "", dev_key, gen=gen)
+                    self._schedule_bg_refresh(query or "", target, gen=gen)
                 return cached_ctx
             except Exception as e:
                 self._record_recall_failure(is_timeout=False)
@@ -1388,7 +1428,7 @@ class MemoryProvider(MemoryProviderBase):
         self._recall_stats["sync_calls"] += 1
         try:
             return await asyncio.wait_for(
-                self._fetch_recall_once(query or "", token, dev_key, gen=gen),
+                self._fetch_recall_once(query or "", token, target, gen=gen),
                 timeout=self._recall_budget_seconds,
             )
         except asyncio.TimeoutError:
@@ -1401,24 +1441,26 @@ class MemoryProvider(MemoryProviderBase):
             logger.bind(tag=TAG).warning(f"Anima Brain recall 超时或暂不可用，降级直接回复: {e}")
         return ""
 
-    async def save_memory(self, msgs, session_id=None, *, device_id: str | None = None):
+    async def save_memory(self, msgs, session_id=None, *, device_id: str | None = None, target: MemoryTarget | None = None):
         if device_id is not None:
             dev_id = str(device_id or "").strip()
         else:
             ctx_dev = _CURRENT_DEVICE_ID_VAR.get()
             dev_id = str(ctx_dev or getattr(self, "role_id", "") or "").strip()
-        pairs = extract_clean_pairs(msgs, device_id=dev_id)
-        if pairs:
-            push_turns_async(pairs)
+        target = target or self.memory_target(dev_id)
+        pairs = extract_clean_pairs(msgs, device_id=dev_id, target=target)
+        if pairs and push_turns_async(pairs):
+            target.acknowledge_handoff()
         return "ok"
 
 
 class _DeviceBoundMemoryProxy:
     """Lightweight per-connection proxy binding an immutable device_id over a shared MemoryProvider singleton (P0-5)."""
 
-    def __init__(self, base: MemoryProvider, device_id: str | None = None):
+    def __init__(self, base: MemoryProvider, device_id: str | None = None, *, target: MemoryTarget):
         self._base = base
         self._device_id = str(device_id or "").strip()
+        self.target = target
 
     @property
     def role_id(self) -> str:
@@ -1430,14 +1472,12 @@ class _DeviceBoundMemoryProxy:
 
     @property
     def _cached_context(self) -> str | None:
-        dev_key = self._base._resolve_device_key(self._device_id or None)
-        entry = self._base._recall_cache.get(dev_key)
+        entry = self._base._recall_cache.get(self.target)
         return entry[0] if entry is not None else None
 
     @property
     def _bg_refresh_task(self) -> asyncio.Task | None:
-        dev_key = self._base._resolve_device_key(self._device_id or None)
-        return self._base._bg_refresh_tasks.get(dev_key)
+        return self._base._bg_refresh_tasks.get(self.target)
 
     def init_memory(self, role_id=None, *args, **kwargs):
         if role_id:
@@ -1451,25 +1491,27 @@ class _DeviceBoundMemoryProxy:
 
     async def query_memory(self, query: str, *, device_id: str | None = None) -> str:
         eff_dev = device_id if device_id is not None else (self._device_id or None)
-        return await self._base.query_memory(query, device_id=eff_dev)
+        return await self._base.query_memory(query, device_id=eff_dev, target=self.target)
 
     async def save_memory(self, msgs, session_id=None, *, device_id: str | None = None):
         eff_dev = device_id if device_id is not None else (self._device_id or None)
-        return await self._base.save_memory(msgs, session_id=session_id, device_id=eff_dev)
+        return await self._base.save_memory(msgs, session_id=session_id, device_id=eff_dev, target=self.target)
 
     def get_recall_stats(self, device_id: str | None = None) -> dict[str, Any]:
         eff_dev = device_id if device_id is not None else (self._device_id or None)
-        return self._base.get_recall_stats(device_id=eff_dev)
+        return self._base.get_recall_stats(device_id=eff_dev, target=self.target)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
 
 
-def bind_memory_provider(memory_obj: Any, device_id: str | None) -> Any:
+def bind_memory_provider(memory_obj: Any, device_id: str | None, *, target: MemoryTarget | None = None) -> Any:
     """Wrap a shared MemoryProvider singleton in a per-connection _DeviceBoundMemoryProxy (P0-5)."""
     dev = str(device_id or "").strip()
     if isinstance(memory_obj, _DeviceBoundMemoryProxy):
-        return _DeviceBoundMemoryProxy(memory_obj._base, dev or memory_obj._device_id)
+        if (not dev or memory_obj._device_id == dev) and (target is None or target is memory_obj.target):
+            return memory_obj
+        memory_obj = memory_obj._base
     if isinstance(memory_obj, MemoryProvider):
-        return _DeviceBoundMemoryProxy(memory_obj, dev)
+        return _DeviceBoundMemoryProxy(memory_obj, dev, target=target or memory_obj.memory_target(dev))
     return memory_obj

@@ -33,6 +33,8 @@ data/anima/
 data/anima_outbox.sqlite
 data/anima_outbox.sqlite-wal
 data/anima_outbox.sqlite-shm
+data/memory_archives.sqlite*
+xiaozhi-tavern*.json
 data/obsidian_export/
 data/agy_tasks/
 data/bin/

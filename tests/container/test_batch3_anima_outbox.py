@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import httpx
 
@@ -50,6 +51,136 @@ class TestBatch3AnimaOutboxAndRecall(unittest.TestCase):
             if amp._default_outbox is not None and amp._default_outbox.db_path != self._orig_global_cfg.get("outbox_db"):
                 amp._default_outbox.close()
                 amp._default_outbox = None
+
+    def test_same_device_reconnect_pins_recall_mood_and_late_writes_to_the_original_archive(self):
+        from patches import memory_hooks
+
+        async def run(td):
+            outbox = amp.AnimaOutbox(os.path.join(td, "outbox.sqlite"), auto_start=False)
+            delayed = asyncio.Event()
+            started = asyncio.Event()
+
+            class Client:
+                async def post(self, url, *, headers, json):
+                    cid = json["character_id"]
+                    if json["query"] == "delayed":
+                        started.set()
+                        await delayed.wait()
+                    if json["query"] == "wrong":
+                        cid = "daily-persona"
+                    return _FakeResp(200, {
+                        "character_id": cid, "context_text": cid,
+                        "mood": "happy" if cid == "daily-persona" else "gentle",
+                    })
+
+            with (
+                patch.object(amp.memory_archives.xz_common, "STATE_DIR", td),
+                patch.object(amp, "get_default_outbox", return_value=outbox),
+                patch.object(amp, "_read_token", return_value="token"),
+            ):
+                device = "test-device"
+                shared = amp.MemoryProvider({"character_id": "daily-persona", "recall_budget_seconds": 10})
+                await shared._client.aclose()
+                shared._client = Client()
+
+                def connect():
+                    conn = SimpleNamespace(device_id=device, memory=shared, dialogue=SimpleNamespace(dialogue=[]))
+                    memory_hooks._bind_connection_memory(conn)
+                    return conn
+
+                daily = connect()
+                delayed_recall = asyncio.create_task(daily.memory.query_memory("delayed"))
+                await started.wait()
+                amp.memory_archives.select_archive(device, "tavern")
+                tavern = connect()
+                cid = tavern._anima_memory_target.character_id
+                self.assertNotEqual(daily._anima_memory_target.character_id, cid)
+                self.assertEqual(await tavern.memory.query_memory("wrong"), "")
+                self.assertIsNone(tavern.memory._cached_context)
+                self.assertEqual(await tavern.memory.query_memory("ok"), cid)
+                delayed.set()
+                self.assertEqual(await delayed_recall, "daily-persona")
+                self.assertEqual(tavern.memory._cached_context, cid)
+                self.assertEqual(mei_emotion_router.get_anima_mood(tavern._anima_memory_target.mood_key), "gentle")
+                self.assertEqual(mei_emotion_router.get_anima_mood(device), "happy")
+
+                messages = [SimpleNamespace(role="user", content="真实提问", uniq_id="late-close"),
+                            SimpleNamespace(role="assistant", content="回答")]
+                await daily.memory.save_memory(messages)
+                # An old snapshot and a later extended duplicate must never be moved to the new archive.
+                messages[1].content += "更多"
+                await tavern.memory.save_memory(messages)
+                messages[0].uniq_id = "new-story"
+                tavern.dialogue.dialogue = messages
+                self.assertTrue(memory_hooks._flush_dialogue_latest_pair(tavern.dialogue))
+                with outbox._lock:
+                    rows = outbox._ensure_db().execute("SELECT request_id, character_id FROM outbox_turns").fetchall()
+                self.assertEqual(dict(rows), {"xz-late-close": "daily-persona", "xz-new-story": cid})
+                outbox.close()
+                mei_emotion_router.clear_anima_mood()
+
+        with tempfile.TemporaryDirectory() as td:
+            asyncio.run(run(td))
+
+    def test_handoff_is_quoted_only_for_first_user_and_acknowledged_after_durable_write(self):
+        from patches import memory_hooks as hooks
+
+        story = (("约定使用蓝色门票" + "雪" * 800, "我记住了。号码 13800138000。"),)
+        target = amp.MemoryTarget("dev", "tavern", "story", "a" * 64, story, 5)
+        user = SimpleNamespace(role="user", content="继续", uniq_id="first")
+        dialogue = SimpleNamespace(_anima_memory_target=target, _device_id="dev", dialogue=[user])
+        original = [{"role": "system", "content": "人设"}, {"role": "user", "content": "继续"}]
+        with patch.object(amp.memory_archives, "acknowledge_handoff") as ack:
+            result = hooks._with_tavern_handoff(dialogue, original, user)
+            self.assertEqual(len(original), 2)
+            self.assertEqual(result[-1], original[-1])
+            self.assertIn(story[0][0], result[-2]["content"])
+            self.assertNotIn("13800138000", result[-2]["content"])
+            self.assertEqual(result[-2]["role"], "assistant")
+            self.assertEqual(hooks._with_tavern_handoff(dialogue, original, object()), original)
+            dialogue.dialogue.append(SimpleNamespace(role="assistant", content="走吧"))
+            with patch.object(amp, "push_turns_async", return_value=False):
+                self.assertFalse(hooks._flush_dialogue_latest_pair(dialogue))
+                ack.assert_not_called()
+            with patch.object(amp, "push_turns_async", return_value=True) as send:
+                self.assertTrue(hooks._flush_dialogue_latest_pair(dialogue))
+                self.assertEqual(len(send.call_args.args[0]), 1)
+                turn = send.call_args.args[0][0]
+                self.assertEqual((turn["user_message"], turn["assistant_reply"]), ("继续", "走吧"))
+            ack.assert_called_once_with("dev", "a" * 64, story, 5)
+            self.assertEqual(hooks._with_tavern_handoff(dialogue, original, user), original)
+
+    def test_damaged_selection_disables_all_writes_even_on_close(self):
+        from patches import memory_hooks as hooks
+
+        with tempfile.TemporaryDirectory() as td, patch.object(amp.memory_archives.xz_common, "STATE_DIR", td):
+            with open(os.path.join(td, "memory_archives.sqlite"), "wb") as handle:
+                handle.write(b"This is not a SQLite database.")
+            conn = SimpleNamespace(device_id="dev", memory=None, dialogue=SimpleNamespace(dialogue=[]))
+            with self.assertRaises(amp.sqlite3.DatabaseError):
+                hooks._bind_connection_memory(conn)
+            self.assertIsNone(conn.memory)
+            self.assertTrue(conn.dialogue._anima_memory_unavailable)
+            with patch.object(amp, "push_turns_async") as send:
+                self.assertFalse(hooks._flush_dialogue_latest_pair(conn.dialogue))
+                send.assert_not_called()
+
+    def test_tavern_rejects_unscoped_provider_without_touching_daily_connections(self):
+        from patches import memory_hooks as hooks
+
+        with tempfile.TemporaryDirectory() as td, patch.object(amp.memory_archives.xz_common, "STATE_DIR", td):
+            provider = object()
+            daily = SimpleNamespace(device_id="dev", memory=provider, dialogue=SimpleNamespace(dialogue=[]))
+            hooks._bind_connection_memory(daily)
+            self.assertIs(daily.memory, provider)
+            amp.memory_archives.select_archive("dev", "tavern")
+            story = SimpleNamespace(device_id="dev", memory=provider, dialogue=SimpleNamespace(dialogue=[]))
+            with self.assertRaisesRegex(hooks.UnsupportedArchiveProvider, "Anima Brain"):
+                hooks._bind_connection_memory(story)
+            self.assertIsNone(story.memory)
+            self.assertTrue(story.dialogue._anima_memory_unavailable)
+            hooks._bind_connection_memory(daily)
+            self.assertIs(daily.memory, provider)
 
     def test_unconfirmed_success_stays_pending(self):
         for body in (b"", b"broken", b"{}", b'{"rejected_ids":[]}', b'{"queued":true}'):
@@ -732,7 +863,8 @@ class TestBatch3AnimaOutboxAndRecall(unittest.TestCase):
 
         # 2. Stale recall generation returning late must NOT overwrite newer device Anima mood
         prov = amp.MemoryProvider({"role_id": "dev-mood-gen"}, summary_memory=None)
-        prov._recall_gen["dev-mood-gen"] = 5
+        target = prov.memory_target("dev-mood-gen")
+        prov._recall_gen[target] = 5
         mood_writes = []
 
         class _FakeResp:
@@ -751,10 +883,10 @@ class TestBatch3AnimaOutboxAndRecall(unittest.TestCase):
                 patch.object(mer, "set_anima_mood", side_effect=lambda m, **kw: mood_writes.append((m, kw))),
             ):
                 # Stale gen=2 < current gen=5 -> mood MUST NOT be updated
-                await prov._fetch_recall_once("q_old", "tok", "dev-mood-gen", gen=2)
+                await prov._fetch_recall_once("q_old", "tok", target, gen=2)
                 self.assertEqual(mood_writes, [], "Stale recall gen must NOT mutate device Anima mood")
                 # Fresh gen=5 >= current gen=5 -> mood IS updated
-                await prov._fetch_recall_once("q_new", "tok", "dev-mood-gen", gen=5)
+                await prov._fetch_recall_once("q_new", "tok", target, gen=5)
                 self.assertEqual(len(mood_writes), 1)
                 self.assertEqual(mood_writes[0][0], "angry_stale")
 
@@ -769,7 +901,7 @@ class TestBatch3AnimaOutboxAndRecall(unittest.TestCase):
                 },
                 summary_memory=None,
             )
-            prov_w._recall_cache["dev-warm"] = ("缓存记忆内容", time.monotonic())
+            prov_w._recall_cache[prov_w.memory_target("dev-warm")] = ("缓存记忆内容", time.monotonic())
 
             async def _slow_fetch(*a, **kw):
                 await asyncio.sleep(0.25)

@@ -118,6 +118,12 @@ LLM:
     model_name: deepseek-flash
     api_key: ${DEEPSEEK_API_KEY}
     max_tokens: 1024
+  HuihuiLocal:
+    type: openai
+    base_url: http://host.docker.internal:19340/v1
+    model_name: huihui-qwen3-14b-companion
+    api_key: lm-studio  # Local SDK placeholder
+    max_tokens: 1024
   GeminiOpenAI:
     type: openai
     base_url: https://generativelanguage.googleapis.com/v1beta/openai/

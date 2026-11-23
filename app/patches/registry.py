@@ -115,9 +115,9 @@ PATCH_CATALOG: List[Dict[str, Any]] = [
     {
         "name": "anima_turn_flush",
         "module": "app/patches/memory_hooks.py",
-        "target": "core.connection.ConnectionHandler.{_initialize_memory,chat,_handle_function_result,close}",
+        "target": "core.connection.ConnectionHandler.{_background_initialize,_initialize_memory,chat,_handle_function_result,close}",
         "category": "experience",
-        "contract": "sync _initialize_memory / chat / _handle_function_result and async close(self, ...)",
+        "contract": "async _background_initialize(self) / close(self, ...) and sync _initialize_memory / chat / _handle_function_result; pin the archive before handling device messages",
         "failure_behavior": "fail-soft (falls back to debounced loop flush, marks /api/health degraded)",
         "tests": ["tests/container/test_mei_emotion_and_prosody.py", "tests/container/test_batch3_pipeline_vad.py"],
     },

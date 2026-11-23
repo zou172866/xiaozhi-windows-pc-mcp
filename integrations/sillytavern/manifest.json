@@ -1,0 +1,7 @@
+{
+    "display_name": "用小智继续",
+    "js": "index.js",
+    "loading_order": 100,
+    "author": "xiaozhi-server",
+    "version": "1.0.0"
+}

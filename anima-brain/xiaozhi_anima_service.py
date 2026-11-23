@@ -813,7 +813,11 @@ def ensure_character_exists(brain: CompanionBrain, character_id: str) -> str:
     by_id = {c.id: c for c in chars}
     if cid in by_id:
         return cid
+    # A separate story must never recall or commit the daily character's memories.
+    archive = cid.startswith("starc_")
     if not _SAFE_CHAR_KEY_RE.match(cid) or len(chars) >= 32:
+        if archive:
+            raise ValueError("无法建立酒馆存档，请检查角色数量上限（32）")
         return DEFAULT_CHARACTER_ID
     base = by_id.get(DEFAULT_CHARACTER_ID)
     try:
@@ -830,6 +834,8 @@ def ensure_character_exists(brain: CompanionBrain, character_id: str) -> str:
         log.info("Auto-provisioned mapped multi-device Anima character: %s", cid)
         return cid
     except Exception:
+        if archive:
+            raise
         return DEFAULT_CHARACTER_ID
 
 
@@ -2049,6 +2055,14 @@ def enqueue_inbox_turn(
     payload_json = json.dumps(incoming_payload, ensure_ascii=False)
 
     with engine._lock:
+        # Confirm the story exists before acknowledging a queued turn. If provisioning
+        # fails the sender retains the turn in its durable outbox for retry/replay.
+        if cid.startswith("starc_"):
+            existing_character = engine.db.execute(
+                "SELECT 1 FROM characters WHERE owner=? AND id=?", (engine.owner, cid)
+            ).fetchone()
+            if not existing_character:
+                ensure_character_exists(brain, cid)
         with engine._transaction():
             existing = engine.db.execute(
                 "SELECT character_id, payload, status, attempts FROM xiaozhi_inbox WHERE request_id=?",

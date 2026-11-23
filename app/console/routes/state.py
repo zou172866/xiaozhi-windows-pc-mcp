@@ -455,7 +455,11 @@ def handle_get_state(handler, parsed) -> None:
     cfg = shared._read_raw_yaml()
     selected = cfg.get("selected_module", {})
     llm_key = selected.get("LLM", "DeepSeekLLM")
-    llm_cfg = cfg.get("LLM", {}).get(llm_key, {})
+    llm_blocks = cfg.get("LLM") or {}
+    saved_models = {
+        provider: (llm_blocks.get(provider) or {}).get("model_name") or defaults["model_name"]
+        for provider, defaults in config._LLM_PROVIDER_DEFAULTS.items()
+    }
     srv_cfg = cfg.get("server", {})
     raw_ws = str(srv_cfg.get("websocket") or f"ws://{shared.HOST_LAN_IP}:18000/xiaozhi/v1/")
     ws_url = raw_ws.replace("${HOST_LAN_IP}", shared.HOST_LAN_IP)
@@ -527,10 +531,8 @@ def handle_get_state(handler, parsed) -> None:
                 "prompt": cur_prompt_str,
                 "persona_meta": persona_meta,
                 "llm_provider": llm_key,
-                "model_name": llm_cfg.get(
-                    "model_name",
-                    "deepseek-flash" if llm_key == "DeepSeekLLM" else "gemini-3.5-flash-lite",
-                ),
+                "model_name": (llm_blocks.get(llm_key) or {}).get("model_name") or saved_models.get(llm_key, ""),
+                "saved_llm_models": saved_models,
                 "voice": active_voice,
                 "asr_provider": active_asr_provider,
                 "asr_config": active_asr_cfg,

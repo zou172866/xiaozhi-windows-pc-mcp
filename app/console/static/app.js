@@ -11,6 +11,9 @@
   };
 
   const PROVIDER_MODELS = {
+    HuihuiLocal: [
+      { value: "huihui-qwen3-14b-companion", label: "Huihui Qwen3 14B Abliterated v2" }
+    ],
     DeepSeekLLM: [
       { value: "deepseek-flash", label: "deepseek-flash（推荐 · 国内极速直连）" },
       { value: "deepseek-chat", label: "deepseek-chat（标准对话别名）" },
@@ -45,6 +48,13 @@
     esp32MacInput: document.getElementById("esp32MacInput"),
     esp32AddMacBtn: document.getElementById("esp32AddMacBtn"),
     esp32AuthHint: document.getElementById("esp32AuthHint"),
+    archiveDevice: document.getElementById("archiveDevice"),
+    archiveChoices: document.getElementById("archiveChoices"),
+    archiveStatus: document.getElementById("archiveStatus"),
+    handoffFile: document.getElementById("handoffFile"),
+    handoffPreview: document.getElementById("handoffPreview"),
+    handoffStatus: document.getElementById("handoffStatus"),
+    handoffSubmit: document.getElementById("handoffSubmit"),
     modeGrid: document.getElementById("modeGrid"),
     agyStatusText: document.getElementById("agyStatusText"),
     l3BackendBar: document.getElementById("l3BackendBar"),
@@ -260,6 +270,7 @@
   }
 
   let savedConfig = null;
+  let savedLlmModels = {};
   let isRestarting = false;
   let lastChatJson = "";
   let logCursor = null;
@@ -295,6 +306,154 @@
     }
     bannerHideTimer = setTimeout(() => hideBanner(), ms);
   }
+
+  let selectedArchive = "";
+  let archiveWriting = false;
+  let archiveReadEpoch = 0;
+  let archiveRefreshAt = 0;
+  let handoff = null;
+
+  function renderArchiveControls() {
+    const device = els.archiveDevice.value;
+    els.archiveDevice.disabled = archiveWriting || !device;
+    for (const button of els.archiveChoices.querySelectorAll("button")) {
+      const selected = selectedArchive === button.dataset.archive;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-pressed", String(selected));
+      button.disabled = archiveWriting || !device || selected;
+    }
+    els.handoffFile.disabled = archiveWriting;
+    els.handoffSubmit.disabled = archiveWriting || !device || !handoff;
+    if (handoff) {
+      els.handoffStatus.textContent = device
+        ? `将把这 ${handoff.turns.length} 轮对白导入设备 ${device} 的酒馆剧情存档。`
+        : "请先连接设备或将设备加入白名单。";
+    }
+  }
+
+  async function readArchive() {
+    const device = els.archiveDevice.value;
+    const epoch = ++archiveReadEpoch;
+    archiveRefreshAt = Date.now() + 10000;
+    if (!device || archiveWriting) return;
+    try {
+      const resp = await fetch(`/api/memory-archive?device_id=${encodeURIComponent(device)}`, { cache: "no-store" });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+      if (epoch !== archiveReadEpoch) return;
+      selectedArchive = data.archive;
+      els.archiveStatus.textContent = `下次连接使用${selectedArchive === "daily" ? "日常陪伴" : "酒馆剧情"}存档。`;
+    } catch (err) {
+      if (epoch !== archiveReadEpoch) return;
+      selectedArchive = "";
+      els.archiveStatus.textContent = `读取存档设置失败：${err.message}`;
+    }
+    renderArchiveControls();
+  }
+
+  function updateArchiveDevices(allowed, recent) {
+    if (archiveWriting) return;
+    const select = els.archiveDevice;
+    const previous = select.value;
+    const devices = [...new Set([recent, ...allowed].filter(Boolean).map(id => id.toLowerCase()))].sort();
+    const ids = Array.from(select.options, option => option.value).filter(Boolean);
+    if (devices.join(",") !== ids.join(",")) {
+      select.replaceChildren(...devices.map(id => new Option(id, id)));
+      if (devices.length) {
+        select.value = devices.includes(previous) ? previous : (recent || devices[0]).toLowerCase();
+      } else {
+        select.add(new Option("等待设备接入", ""));
+      }
+    }
+    if (select.value !== previous) {
+      selectedArchive = "";
+      archiveReadEpoch++;
+      archiveRefreshAt = 0;
+      els.archiveStatus.textContent = select.value ? "正在读取存档设置…" : "设备接入后可以选择存档。";
+    }
+    renderArchiveControls();
+    if (select.value && Date.now() >= archiveRefreshAt) readArchive();
+  }
+
+  els.archiveDevice.addEventListener("change", () => {
+    selectedArchive = "";
+    els.archiveStatus.textContent = "正在读取存档设置…";
+    renderArchiveControls();
+    readArchive();
+  });
+
+  async function writeArchive(archive, transfer = null) {
+    const device = els.archiveDevice.value;
+    if (!device || archiveWriting) return;
+    archiveWriting = true;
+    archiveReadEpoch++;
+    renderArchiveControls();
+    try {
+      const resp = transfer
+        ? await consolePost("/api/tavern-handoff", { device_id: device, handoff: transfer })
+        : await consolePost("/api/memory-archive", { device_id: device, archive });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+      selectedArchive = archive;
+      if (transfer) {
+        handoff = null;
+        els.handoffFile.value = "";
+        els.handoffPreview.textContent = "";
+        els.handoffStatus.textContent = `已导入到 ${device}。请结束当前语音会话，再重新唤醒小智。`;
+      }
+      els.archiveStatus.textContent = "已保存，下次语音连接生效。";
+    } catch (err) {
+      els.archiveStatus.textContent = `存档操作失败：${err.message}`;
+      if (transfer) showBanner("err", els.archiveStatus.textContent);
+      archiveRefreshAt = Date.now() + 10000;
+      return;
+    } finally {
+      archiveWriting = false;
+      renderArchiveControls();
+    }
+    readArchive();
+  }
+
+  els.archiveChoices.addEventListener("click", e => {
+    const button = e.target.closest("button[data-archive]");
+    if (button) writeArchive(button.dataset.archive);
+  });
+  els.handoffSubmit.addEventListener("click", () => {
+    if (handoff) writeArchive("tavern", handoff);
+  });
+  els.handoffFile.addEventListener("change", async () => {
+    const file = els.handoffFile.files[0];
+    handoff = null;
+    els.handoffPreview.textContent = "";
+    els.handoffStatus.textContent = "";
+    renderArchiveControls();
+    if (!file) return;
+    try {
+      if (file.size > 64 * 1024) throw new Error("文件超过 64 KiB，请重新导出。");
+      const data = JSON.parse(await file.text());
+      if (file !== els.handoffFile.files[0]) return;
+      if (data?.format !== "xiaozhi-tavern-v1" || Object.keys(data).length !== 3
+          || typeof data.chat_key !== "string" || !/^[0-9a-f]{64}$/.test(data.chat_key)
+          || !Array.isArray(data.turns) || data.turns.length < 1 || data.turns.length > 3) {
+        throw new Error("请选择由小智酒馆扩展导出的接续文件。");
+      }
+      let previousIndex = -1;
+      for (const turn of data.turns) {
+        if (!Number.isSafeInteger(turn?.index) || turn.index <= previousIndex || Object.keys(turn).length !== 3 ||
+            ![turn.user_message, turn.assistant_reply].every(s =>
+              typeof s === "string" && s.trim() && [...s].length <= 2000)) {
+          throw new Error("对白格式有误，每段最多 2000 个字符。");
+        }
+        previousIndex = turn.index;
+      }
+      handoff = data;
+      els.handoffPreview.textContent = data.turns.map(t => `你：${t.user_message}\n角色：${t.assistant_reply}`).join("\n\n");
+    } catch (err) {
+      if (file !== els.handoffFile.files[0]) return;
+      els.handoffStatus.textContent = err instanceof SyntaxError ? "文件不是有效的 JSON。" : err.message;
+    }
+    renderArchiveControls();
+  });
 
   let esp32AuthBusy = false;
   let lastEsp32AuthJson = "";
@@ -2748,6 +2907,7 @@
 
   function populateModelOptions(provider, selectedModel) {
     const list = PROVIDER_MODELS[provider] || PROVIDER_MODELS.DeepSeekLLM;
+    els.modelCustomInput.readOnly = provider === "HuihuiLocal";
     els.modelSelect.innerHTML = "";
     for (const item of list) {
       const opt = document.createElement("option");
@@ -2802,7 +2962,7 @@
   }
 
   els.providerSelect.addEventListener("change", () => {
-    populateModelOptions(els.providerSelect.value, null);
+    populateModelOptions(els.providerSelect.value, savedLlmModels[els.providerSelect.value]);
     checkDirty();
   });
 
@@ -3088,6 +3248,7 @@
         throw new Error(res.error || "保存失败");
       }
       stateEpoch += 1;
+      savedLlmModels[payload.llm_provider] = payload.model_name;
       if (res.prompt_revision) {
         editorPersonaRevision = Number(res.prompt_revision);
         serverPersonaRevision = Number(res.prompt_revision);
@@ -3235,12 +3396,14 @@
       const data = await resp.json();
       const cfg = data.config || {};
       const dev = data.device || {};
+      updateArchiveDevices(cfg.esp32_auth?.allowed_devices || [], dev.device_id);
 
       if (cfg.audio_env_status) {
         latestAudioEnvStatus = cfg.audio_env_status;
       }
 
       if (!savedConfig) {
+        savedLlmModels = Object.assign({}, cfg.saved_llm_models);
         const initAsrProv = cfg.asr_provider || "SherpaASR";
         const initAsrCfg = Object.assign({}, cfg.asr_config || {});
         const initTtsProv = cfg.tts_provider || (String(cfg.voice || "").startsWith("__gsv_") ? "GPT_SOVITS_V2" : "EdgeTTS");
@@ -3459,7 +3622,7 @@
           els.statusText.textContent = "正在语音回复 / 执行指令…";
         } else {
           els.statusPill.className = "status-pill";
-          const llmTag = cfg.llm_provider === "GeminiOpenAI" ? "Gemini" : "DeepSeek";
+          const llmTag = { GeminiOpenAI: "Gemini", DeepSeekLLM: "DeepSeek", HuihuiLocal: "本地 Huihui Qwen3 14B" }[cfg.llm_provider] || cfg.llm_provider;
           const asrMeta = getAsrMeta(cfg.asr_provider);
           const ttsMeta = getTtsMeta(cfg.tts_provider);
           const audioTag = (asrMeta || ttsMeta)

@@ -93,6 +93,29 @@
       </div>
     </div>
 
+    <div class="config-section">
+      <div class="section-head">
+        <h2 class="section-title">对话记忆存档</h2>
+      </div>
+      <p class="section-desc">给设备选择下次语音连接使用的存档。正在对话时，请先结束会话，再重新唤醒小智。</p>
+      <label class="field-label" for="archiveDevice">设备</label>
+      <select id="archiveDevice" disabled><option value="">等待设备接入</option></select>
+      <div class="preset-bar" id="archiveChoices" role="group" aria-label="选择记忆存档" style="margin-top:12px;">
+        <button type="button" class="preset-pill" data-archive="daily" aria-pressed="false" disabled>日常陪伴</button>
+        <button type="button" class="preset-pill" data-archive="tavern" aria-pressed="false" disabled>酒馆剧情</button>
+      </div>
+      <div class="field-foot"><span id="archiveStatus" role="status">设备接入后可以选择存档。</span></div>
+      <details class="l3-adv">
+        <summary>从酒馆接续聊天</summary>
+        <p class="section-desc">在 SillyTavern 扩展中导出当前聊天，再选择导出的 JSON 文件。先核对设备和对白，再导入最近最多三轮。</p>
+        <label class="field-label" for="handoffFile">酒馆接续文件</label>
+        <input id="handoffFile" type="file" accept=".json,application/json">
+        <div id="handoffPreview" style="white-space:pre-wrap;overflow-wrap:anywhere;"></div>
+        <p class="section-desc" id="handoffStatus" role="status"></p>
+        <button type="button" class="btn btn-primary" id="handoffSubmit" disabled>导入并切换到酒馆</button>
+      </details>
+    </div>
+
     <!-- Section 1: 3-Tier PC Control Mode (Instant Switch, No Restart Required) -->
     <div class="config-section">
       <div class="section-head">
@@ -576,16 +599,17 @@
       </div>
     </div>
 
-    <!-- Section 2: LLM Provider Switch (DeepSeek <-> Gemini) -->
+    <!-- Section 2: LLM provider -->
     <div class="config-section">
-      <h2 class="section-title" style="margin-bottom:6px;">对话与调度大模型 API（DeepSeek / Gemini 双模切换）</h2>
-      <p class="section-desc">默认使用国内极速直连的 DeepSeek 环境变量，保留一键切回 Google Gemini 入口（L1 屏幕看图始终自动调用 Gemini 多模态）。</p>
+      <h2 class="section-title" style="margin-bottom:6px;">对话模型</h2>
+      <p class="section-desc">本地陪伴使用电脑上 LM Studio 加载的 Huihui Qwen3 14B。保存后，下一轮对话会使用所选模型，沿用当前角色和记忆。语音、看屏和长期记忆服务各自配置。</p>
 
       <div class="form-grid-3">
         <div>
-          <label class="field-label" for="providerSelect">API 服务商</label>
+          <label class="field-label" for="providerSelect">对话模式</label>
           <select id="providerSelect">
             <option value="DeepSeekLLM">DeepSeek 国内直连（DEEPSEEK_API_KEY）</option>
+            <option value="HuihuiLocal">本地陪伴 · Huihui Qwen3 14B（LM Studio）</option>
             <option value="GeminiOpenAI">Google Gemini（GEMINI_API_KEY）</option>
           </select>
         </div>

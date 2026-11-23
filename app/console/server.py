@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 import persona_versions
 import runtime_events
 from console import shared
-from console.routes import anima, audio_api, config, gsv, l3, logs, state
+from console.routes import anima, archives, audio_api, config, gsv, l3, logs, state, tavern
 
 _console_atexit_registered = False
 
@@ -190,6 +190,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             anima.handle_get_dream(self, parsed)
             return
 
+        if path == "/api/memory-archive":
+            archives.handle_get_memory_archive(self, parsed)
+            return
+
         get_route = _GET_ROUTES.get(path)
         if get_route is not None:
             get_route(self)
@@ -233,6 +237,8 @@ _GET_ROUTES = {
 }
 
 _POST_ROUTES = {
+    "/api/memory-archive": archives.handle_post_memory_archive,
+    "/api/tavern-handoff": tavern.handle_post_handoff,
     "/api/pc-mode": l3.handle_post_pc_mode,
     "/api/audio-output": state.handle_post_audio_output,
     "/api/reply-length": config.handle_post_reply_length,

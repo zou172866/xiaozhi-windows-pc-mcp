@@ -99,13 +99,18 @@ def _write_file_bytes(file_path: str, data: bytes) -> None:
         f.write(data)
 
 
+def _connection_mood_key(conn):
+    target = getattr(conn, "_anima_memory_target", None)
+    return target.mood_key if target else (str(getattr(conn, "device_id", "") or "").strip() or None)
+
+
 def build_gsv_request_snapshot(
     provider,
     clean_text: str,
     *,
     explicit_segment_emotion: Optional[str] = None,
     turn_explicit_emotion: Optional[str] = None,
-    device_id: Optional[str] = None,
+    device_id: Optional[tags.MoodKey] = None,
     is_first_segment: bool = False,
     suppress_first_seg_fast_steps: bool = False,
 ) -> Tuple[str, Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
@@ -539,8 +544,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         if not eff_emo and conn is not None:
             prompt_str = str((getattr(conn, "config", None) or {}).get("prompt") or "")
             if tags.has_voice_emotion_tag_rule(prompt_str):
-                dev_id = str(getattr(conn, "device_id", "") or "").strip() or None
-                eff_emo = tags.infer_mei_emotion(clean_text, device_id=dev_id)
+                eff_emo = tags.resolve_mei_emotion(clean_text, device_id=_connection_mood_key(conn))
         if not eff_emo:
             return
         prof = tags.get_mei_emotion_profile(eff_emo)
@@ -633,14 +637,12 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
         pending_emo = getattr(self, "_pending_segment_emotion", None)
         explicit_seg = seg_emo or pending_emo
         turn_emo = getattr(self, "_turn_explicit_emotion", None)
-        dev_id = str(getattr(conn, "device_id", "") or "").strip() or None
-
         req_url, request_json, chosen_prof, emo_key = build_gsv_request_snapshot(
             self,
             clean_text,
             explicit_segment_emotion=explicit_seg,
             turn_explicit_emotion=turn_emo,
-            device_id=dev_id,
+            device_id=_connection_mood_key(conn),
             is_first_segment=is_first_segment,
             suppress_first_seg_fast_steps=bool(getattr(self, "_suppress_first_seg_fast_steps", False)),
         )

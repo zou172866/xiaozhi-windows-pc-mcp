@@ -11,6 +11,7 @@ import re
 import threading
 import time
 
+import httpx
 import yaml
 
 from patches import auth as auth_patch
@@ -119,6 +120,13 @@ _LLM_PROVIDER_DEFAULTS = {
         "model_name": "deepseek-flash",
         "api_key": "${DEEPSEEK_API_KEY}",
     },
+    "HuihuiLocal": {
+        "type": "openai",
+        "base_url": "http://host.docker.internal:19340/v1",
+        "model_name": "huihui-qwen3-14b-companion",
+        "api_key": "lm-studio",  # Non-secret SDK placeholder for the local server.
+        "max_tokens": 1024,
+    },
     "GeminiOpenAI": {
         "type": "openai",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -129,6 +137,7 @@ _LLM_PROVIDER_DEFAULTS = {
 
 ALLOWED_LLM_PROVIDERS = frozenset(_LLM_PROVIDER_DEFAULTS.keys())
 ALLOWED_LLM_MODELS: dict[str, frozenset[str]] = {
+    "HuihuiLocal": frozenset({_LLM_PROVIDER_DEFAULTS["HuihuiLocal"]["model_name"]}),
     "DeepSeekLLM": frozenset(
         {
             "deepseek-flash",
@@ -151,6 +160,19 @@ ALLOWED_LLM_MODELS: dict[str, frozenset[str]] = {
         }
     ),
 }
+
+def _check_huihui_available() -> None:
+    local = _LLM_PROVIDER_DEFAULTS["HuihuiLocal"]
+    try:
+        response = httpx.get(f"{local['base_url']}/models", timeout=3.0, trust_env=False)
+        response.raise_for_status()
+        models = response.json()["data"]
+        if not isinstance(models, list):
+            raise ValueError("invalid model list")
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError("无法读取本机模型列表，请确认 LM Studio 的本地服务已在 19340 端口启动。") from exc
+    if not any(isinstance(model, dict) and model.get("id") == local["model_name"] for model in models):
+        raise ValueError(f"请先在 LM Studio 加载模型 {local['model_name']}，再切换到本地陪伴。")
 
 # D-2: Module-level lock serializing all .config.yaml read-modify-write operations
 _config_write_lock = threading.RLock()
@@ -315,6 +337,8 @@ def _write_updated_yaml(
                 changed_fields.append("prompt")
 
         provider_changed = target_provider != cur_llm_provider
+        if provider_changed and target_provider == "HuihuiLocal":
+            _check_huihui_available()
         if provider_changed:
             changed_fields.append("llm_provider")
             patch.setdefault("selected_module", {})["LLM"] = target_provider

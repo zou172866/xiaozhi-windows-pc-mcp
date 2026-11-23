@@ -313,6 +313,36 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
                         self.assertEqual(unchanged["selected_module"]["LLM"], "DeepSeekLLM")
                         self.assertEqual(unchanged["LLM"]["DeepSeekLLM"]["model_name"], "deepseek-flash")
 
+                        # Upgrade a legacy YAML with no local provider block, then switch back.
+                        local_id = "huihui-qwen3-14b-companion"
+                        local_body = {"llm_provider": "HuihuiLocal", "model_name": local_id, "restart": False}
+                        config_url = f"http://127.0.0.1:{port}/api/config"
+                        models_url = "http://host.docker.internal:19340/v1/models"
+                        def model_list(ids):
+                            return httpx.Response(200, request=httpx.Request("GET", models_url),
+                                                  json={"data": [{"id": model_id} for model_id in ids]})
+
+                        with patch("console.routes.config.httpx.get", return_value=model_list([])):
+                            self.assertEqual(client.post(config_url, json=local_body, headers=hdrs).status_code, 400)
+                            with open(cfg_path, encoding="utf-8") as f:
+                                self.assertEqual(yaml.safe_load(f), initial_cfg)
+                        with patch("console.routes.config.httpx.get", return_value=model_list([local_id])) as probe:
+                            self.assertEqual(client.post(config_url, json=local_body, headers=hdrs).status_code, 200)
+                            probe.assert_called_once_with(models_url, timeout=3.0, trust_env=False)
+                        with open(cfg_path, encoding="utf-8") as f:
+                            switched = yaml.safe_load(f)
+                        self.assertEqual(switched["selected_module"]["LLM"], "HuihuiLocal")
+                        self.assertEqual(switched["LLM"]["HuihuiLocal"]["base_url"] + "/models", models_url)
+                        self.assertEqual(switched["LLM"]["HuihuiLocal"]["api_key"], "lm-studio")
+                        with patch("console.routes.config.httpx.get", side_effect=AssertionError("local is offline")):
+                            back = client.post(config_url, json={"llm_provider": "DeepSeekLLM"}, headers=hdrs)
+                            self.assertEqual(back.status_code, 200)
+                        with open(cfg_path, encoding="utf-8") as f:
+                            restored = yaml.safe_load(f)
+                        self.assertEqual(restored["selected_module"], initial_cfg["selected_module"])
+                        self.assertEqual(restored["LLM"]["DeepSeekLLM"], initial_cfg["LLM"]["DeepSeekLLM"])
+                        self.assertEqual(restored["prompt"], initial_cfg["prompt"])
+
                         # 2. Valid allowlisted provider/model/voice update succeeds (200)
                         r_ok = client.post(
                             f"http://127.0.0.1:{port}/api/config",
@@ -2140,6 +2170,81 @@ class TestBatch3ConsoleHardening(unittest.TestCase):
             finally:
                 gsv_mod._active_gsv_loaded = orig_loaded
                 gsv_mod._preserved_boot_mei_weights.pop(infer_p, None)
+
+
+class TestMemoryArchiveRoutes(unittest.TestCase):
+    def test_confirmed_handoff_switches_only_the_selected_device(self):
+        from unittest.mock import Mock
+
+        import memory_archives
+
+        httpd, port = _start_test_console_server()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        outbox = Mock()
+        outbox.enqueue.return_value = 1
+        fake_provider = types.SimpleNamespace(get_default_outbox=lambda: outbox)
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch.object(xz_common, "STATE_DIR", td),
+            patch.object(cs, "CONSOLE_PORT", port),
+            patch.dict(sys.modules, {"anima_memory_provider": fake_provider}),
+            httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=4) as client,
+        ):
+            device = "device-a"
+            headers = _post_headers(port, token=cs.get_console_token())
+            transfer = {
+                "format": "xiaozhi-tavern-v1",
+                "chat_key": "a" * 64,
+                "turns": [{"index": 3, "user_message": "明天去哪？", "assistant_reply": "旧书店。"}],
+            }
+            body = {"device_id": device, "handoff": transfer}
+            outbox.enqueue.side_effect = OSError("暂时无法写入队列")
+            self.assertEqual(client.post("/api/tavern-handoff", json=body, headers=headers).status_code, 503)
+            self.assertEqual(client.get("/api/memory-archive", params={"device_id": device}).json()["archive"], "daily")
+            outbox.enqueue.side_effect = None
+            for expected_count in (1, 0):
+                result = client.post("/api/tavern-handoff", json=body, headers=headers)
+                self.assertEqual(result.json(), {"ok": True, "archive": "tavern", "imported": expected_count})
+            self.assertEqual(outbox.enqueue.call_count, 2)  # one failed enqueue and one successful retry
+            self.assertEqual(memory_archives.selected_binding(device)[2], (("明天去哪？", "旧书店。"),))
+            self.assertEqual(client.get("/api/memory-archive", params={"device_id": "device-b"}).json()["archive"], "daily")
+            daily = client.post("/api/memory-archive", json={"device_id": device, "archive": "daily"}, headers=headers)
+            self.assertEqual(daily.json()["archive"], "daily")
+            self.assertEqual(memory_archives.selected_binding(device)[2], ())
+
+    def test_archive_http_validation_and_security(self):
+        import memory_archives
+
+        httpd, port = _start_test_console_server()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with (
+            patch.object(cs, "CONSOLE_PORT", port),
+            patch.object(memory_archives, "chosen_archive", return_value="daily") as read,
+            patch.object(memory_archives, "select_archive", return_value="tavern") as write,
+            httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=4) as client,
+        ):
+            path = "/api/memory-archive"
+            device_id = "02:00:00:00:00:01"
+            body = {"device_id": device_id, "archive": "tavern"}
+            auth = _post_headers(port, token=cs.get_console_token())
+            self.assertEqual(client.get(path, params={"device_id": device_id}).json()["archive"], "daily")
+            read.assert_called_once_with(device_id)
+            for query in ("", "?device_id=", "?other=x", "?device_id=a&device_id=b"):
+                self.assertEqual(client.get(path + query).status_code, 400, query)
+            for endpoint in (path, "/api/tavern-handoff"):
+                self.assertEqual(client.post(endpoint, headers=_post_headers(port)).status_code, 401)
+                internal = {**auth, "Host": f"xiaozhi-esp32-server:{port}"}
+                self.assertEqual(client.post(endpoint, headers=internal).status_code, 403)
+            for bad in ({}, {**body, "archive": []}, {**body, "character_id": "other"}, {**body, "device_id": {}}):
+                self.assertEqual(client.post(path, json=bad, headers=auth).status_code, 400)
+            write.assert_not_called()
+            saved = client.post(path, headers=auth, json=body)
+            self.assertEqual(saved.json(), {"ok": True, "device_id": device_id, "archive": "tavern"})
+            write.assert_called_once_with(device_id, "tavern")
+            write.side_effect = OSError("disk unavailable")
+            self.assertEqual(client.post(path, headers=auth, json=body).status_code, 503)
 
 
 if __name__ == "__main__":

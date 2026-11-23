@@ -217,11 +217,12 @@ def _build_plan(
         plan.append(
             (
                 "unit",
-                "Container offline suites x6 (single ephemeral docker run --rm, subprocess-isolated)",
+                "Container offline suites (single ephemeral docker run --rm, subprocess-isolated)",
                 _ephemeral_container_cmd(
                     [
                         "test_mei_emotion_and_prosody.py",
                         "test_batch3_anima_outbox.py",
+                        "test_memory_archives.py",
                         "test_batch3_pipeline_vad.py",
                         "test_batch3_console.py",
                         "test_cloud_audio_api.py",
