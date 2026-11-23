@@ -495,6 +495,8 @@ if (-not (Test-Path $hostModeFile)) {
 }
 
 $dotEnvPath = Join-Path $serverDir ".env"
+. (Join-Path $PSScriptRoot "esp32_credential.ps1")
+Initialize-Esp32SigningKey $serverDir
 $explicitEmptyEnvKeys = @{}
 if (Test-Path $dotEnvPath) {
     foreach ($rawLine in (Get-Content -Path $dotEnvPath -Encoding UTF8)) {
@@ -561,31 +563,6 @@ $env:HOST_PROJECT_DIR = $serverDir.Replace("\", "/")
 $env:HOST_DATA_DIR = (Join-Path $serverDir "data").Replace("\", "/")
 $env:HOST_VOICES_DIR = (Join-Path $serverDir "voices").Replace("\", "/")
 $env:HOST_GSV_WEIGHTS_DIR = (Join-Path $serverDir "models\gsv_weights").Replace("\", "/")
-if (-not $env:ESP32_AUTH_KEY) {
-    try {
-        $randBytes = New-Object byte[] 32
-        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-        $rng.GetBytes($randBytes)
-        $rng.Dispose()
-        $genKey = ([System.BitConverter]::ToString($randBytes)).Replace("-", "").ToLowerInvariant()
-        $env:ESP32_AUTH_KEY = $genKey
-        if (Test-Path $dotEnvPath) {
-            $curEnvText = [System.IO.File]::ReadAllText($dotEnvPath, [System.Text.Encoding]::UTF8)
-            if ($curEnvText -match '(?m)^[ \t]*ESP32_AUTH_KEY[ \t]*=[ \t]*(\r?)$') {
-                $updatedEnvText = [regex]::Replace($curEnvText, '(?m)^[ \t]*ESP32_AUTH_KEY[ \t]*=[ \t]*(\r?)$', "ESP32_AUTH_KEY=$genKey`$1", 1)
-                [System.IO.File]::WriteAllText($dotEnvPath, $updatedEnvText, [System.Text.UTF8Encoding]::new($false))
-            } elseif ($curEnvText -notmatch '(?m)^\s*ESP32_AUTH_KEY\s*=') {
-                $sep = if ($curEnvText.EndsWith("`n")) { "" } else { "`r`n" }
-                [System.IO.File]::AppendAllText($dotEnvPath, "${sep}ESP32_AUTH_KEY=$genKey`r`n", [System.Text.UTF8Encoding]::new($false))
-            }
-        } else {
-            [System.IO.File]::WriteAllText($dotEnvPath, "ESP32_AUTH_KEY=$genKey`r`n", [System.Text.UTF8Encoding]::new($false))
-        }
-        Write-Host "[安全] 已自动生成 ESP32 通道签名密钥并写入本地 .env（已被 .gitignore 隔离）" -ForegroundColor Green
-    } catch {
-        Write-Host "[提示] 自动生成 ESP32_AUTH_KEY 失败，将由容器内存随机生成: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-}
 if (-not $env:ESP32_ALLOWED_DEVICES) {
     Write-Host "[提示] .env 中尚未配置 ESP32_ALLOWED_DEVICES；服务启动后可直接在 http://localhost:18080 控制台「一键放行」新接入的 ESP32。" -ForegroundColor Yellow
 }
@@ -698,32 +675,24 @@ function Test-PcMcpAlive {
     }
 }
 
+. (Join-Path $PSScriptRoot "host_process.ps1")
+$gsvBootConfig = Join-Path $serverDir "config\runtime\tts_infer_xiaozhi.yaml"
+if (-not (Test-ProjectListener 18900 $mcpScript)) { throw '18900 被其他进程占用，已保留该进程。' }
+
 # 先停止旧看门狗，避免重启 18900 过程中并发拉起
 try {
     New-Item -ItemType File -Path $watchdogStopFlag -Force -ErrorAction SilentlyContinue | Out-Null
     $oldWatchdogs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^python(w)?(\.exe)?$' -and $_.CommandLine -and $_.CommandLine -like '*pc_mcp_watchdog.py*' }
+        Where-Object { Test-ProjectPythonProcess $_ $mcpWatchdogScript }
     foreach ($ow in $oldWatchdogs) {
-        Stop-Process -Id $ow.ProcessId -Force -ErrorAction SilentlyContinue
+        Stop-ProjectPythonProcess $ow $mcpWatchdogScript
     }
 } catch {}
 
 $mcpListening = Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue
-$oldMcpPidSet = @{}
-if ($mcpListening) {
-    foreach ($omp in ($mcpListening | Select-Object -ExpandProperty OwningProcess -Unique)) {
-        if ($omp) { $oldMcpPidSet[[int]$omp] = $true }
-    }
-}
-try {
-    $oldMcpPyProcs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^python(w)?(\.exe)?$' -and $_.CommandLine -and $_.CommandLine -like '*pc_control_mcp.py*' }
-    foreach ($op in $oldMcpPyProcs) {
-        if ($op.ProcessId) { $oldMcpPidSet[[int]$op.ProcessId] = $true }
-    }
-} catch {}
-
-if ($mcpListening -or $oldMcpPidSet.Count -gt 0) {
+$oldMcpProcs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { Test-ProjectPythonProcess $_ $mcpScript })
+if ($mcpListening -or $oldMcpProcs.Count) {
     $wasAlive = Test-PcMcpAlive -TokenPath $mcpTokenFile
     if ($wasAlive) {
         Write-Host "[2/4] 检测到旧 18900 MCP 服务在线，正在平滑重启以加载最新代码与配置..." -ForegroundColor Cyan
@@ -733,8 +702,8 @@ if ($mcpListening -or $oldMcpPidSet.Count -gt 0) {
     if ($mcpPyReady -and (Test-Path $mcpWatchdogScript)) {
         try { & $mcpPy -X utf8 $mcpWatchdogScript --cleanup-l3 2>$null | Out-Null } catch {}
     }
-    foreach ($omp in $oldMcpPidSet.Keys) {
-        Stop-Process -Id $omp -Force -ErrorAction SilentlyContinue
+    foreach ($oldProc in $oldMcpProcs) {
+        Stop-ProjectPythonProcess $oldProc $mcpScript
     }
     for ($w = 0; $w -lt 12; $w++) {
         if (-not (Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue)) { break }
@@ -748,7 +717,7 @@ if (-not $mcpPyReady) {
     Write-Host "[2/4] 已跳过宿主机 18900 MCP 启动（缺少可用的 Python 虚拟环境，仅影响电脑操控与电脑音响直通，ESP32 语音对话可继续运行）。" -ForegroundColor Yellow
 } else {
     $mcpCmd = "cmd.exe /c `"set PYTHONUTF8=1&& `"$mcpPy`" -X utf8 `"$mcpScript`" > `"$mcpBootLog`" 2>&1`""
-    $hideSi = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+    $hideSi = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0; WinstationDesktop = "WinSta0\Default" }
     Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $mcpCmd; ProcessStartupInformation = $hideSi } | Out-Null
 
     $mcpHealthy = $false
@@ -765,7 +734,7 @@ if (-not $mcpPyReady) {
         Remove-Item -Path $watchdogStopFlag -Force -ErrorAction SilentlyContinue
         if (Test-Path $mcpWatchdogScript) {
             $wdCmd = "cmd.exe /c `"set PYTHONUTF8=1&& `"$mcpPy`" -X utf8 `"$mcpWatchdogScript`" --port 18900 --interval 8`""
-            $hideWd = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+            $hideWd = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0; WinstationDesktop = "WinSta0\Default" }
             Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $wdCmd; ProcessStartupInformation = $hideWd } | Out-Null
             Write-Host "[2/4] 已启动宿主机 18900 无黑框看门狗守护进程 (pc_mcp_watchdog.py)" -ForegroundColor DarkGreen
         }
@@ -793,6 +762,7 @@ $gsvApi = Join-Path $gsvDir "api_v2.py"
 $hasLocalGsv = $gsvEnabled -and (Test-Path $gsvPy) -and (Test-Path $gsvApi)
 
 if ($hasLocalGsv) {
+    if (-not (Test-ProjectListener 19880 '' $gsvBootConfig)) { throw '19880 被其他进程占用，已保留该进程。' }
     $gsvListening = Get-NetTCPConnection -LocalPort 19880 -State Listen -ErrorAction SilentlyContinue
     if (-not $gsvListening) {
         Write-Host "[3/4] 正在后台启动本机 GPU GPT-SoVITS 语音引擎 (127.0.0.1:19880)..." -ForegroundColor Cyan
@@ -815,7 +785,7 @@ if ($hasLocalGsv) {
         } catch {}
         # F-3 / H-6: 空闲回收放宽至 300s 且按系统内存压力 (>=75%) 触发；日志通过 --log_file 走进程内 5 MB x 3 轮转
         $cmdLine = "cmd.exe /c `"cd /d `"$gsvDir`" && set PYTHONUTF8=1&& set GSV_IDLE_TRIM_SECONDS=300&& set GSV_IDLE_TRIM_MEM_THRESHOLD=75&& `"$gsvPy`" -X utf8 api_v2.py -a 127.0.0.1 -p 19880 -c `"$cfgPath`" --log_file `"$logOut`" --log_max_bytes 5242880 --log_backup_count 3 > `"$gsvBootLog`" 2>&1`""
-        $hideGsv = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+        $hideGsv = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0; WinstationDesktop = "WinSta0\Default" }
         Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine; ProcessStartupInformation = $hideGsv } | Out-Null
     } else {
         Write-Host "[3/4] 本机 GPU GPT-SoVITS 语音引擎已在运行中" -ForegroundColor Green
@@ -1017,13 +987,41 @@ if ($containerFatalExit) {
     exit 1
 }
 
-# 5. 若启用了本地 GPU 语音引擎，则通过 /prime 预热全部 7 种情绪参考缓存，再短句预热一次 CUDA 算子 (F-3)
+# 5. 若启用了本地 GPU 语音引擎，则按当前激活角色通过 /prime 预热全部 7 种情绪参考缓存，再短句预热一次 CUDA 算子 (F-3)
 if ($hasLocalGsv) {
-    $voicesMeiDir = Join-Path $serverDir "voices\raiden_mei"
-    $warmRef = Join-Path $voicesMeiDir "mei_default_ref.wav"
+    $activeCharDirName = "raiden_mei"
+    $activeDefaultWav = "mei_default_ref.wav"
+    $activeManifestName = "mei_emotions.json"
+    $activeDefaultPrompt = "今夜月色很美，呵...适合与朋友小聚一番。"
+    $activeWarmSteps = 8
+    $rtCfgForWarm = Join-Path $serverDir "config\runtime\.config.yaml"
+    if (Test-Path $rtCfgForWarm) {
+        $rtRawWarm = Get-Content -Path $rtCfgForWarm -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ($rtRawWarm -match 'voice_id:\s*["'']?__gsv_luoxiaohei__["'']?') {
+            $activeCharDirName = "luoxiaohei"
+            $activeDefaultWav = "luoxiaohei_default_ref.wav"
+            $activeManifestName = "luoxiaohei_emotions.json"
+            $activeDefaultPrompt = "这桌子好高啊，还是变成原形跳上去比较方便。"
+            $activeWarmSteps = 4
+        }
+    }
+    $voicesMeiDir = Join-Path $serverDir "voices\$activeCharDirName"
+    $warmRef = Join-Path $voicesMeiDir $activeDefaultWav
     if (-not (Test-Path $warmRef)) {
-        $warmRef = Join-Path $serverDir "data\voices\raiden_mei\mei_default_ref.wav"
+        $warmRef = Join-Path $serverDir "data\voices\$activeCharDirName\$activeDefaultWav"
         $voicesMeiDir = Split-Path -Parent $warmRef
+    }
+    if (-not (Test-Path $warmRef) -and $activeCharDirName -ne "luoxiaohei") {
+        $candLxhRef = Join-Path $serverDir "voices\luoxiaohei\luoxiaohei_default_ref.wav"
+        if (Test-Path $candLxhRef) {
+            $activeCharDirName = "luoxiaohei"
+            $activeDefaultWav = "luoxiaohei_default_ref.wav"
+            $activeManifestName = "luoxiaohei_emotions.json"
+            $activeDefaultPrompt = "这桌子好高啊，还是变成原形跳上去比较方便。"
+            $activeWarmSteps = 4
+            $warmRef = $candLxhRef
+            $voicesMeiDir = Split-Path -Parent $warmRef
+        }
     }
     if (Test-Path $warmRef) {
         try {
@@ -1034,7 +1032,7 @@ if ($hasLocalGsv) {
 
             $primeItems = @()
             $shortShapeItems = @()
-            $emoManifest = Join-Path $voicesMeiDir "mei_emotions.json"
+            $emoManifest = Join-Path $voicesMeiDir $activeManifestName
             if (Test-Path $emoManifest) {
                 try {
                     $mObj = (Get-Content -Path $emoManifest -Raw -Encoding UTF8) | ConvertFrom-Json
@@ -1066,7 +1064,7 @@ if ($hasLocalGsv) {
             if ($primeItems.Count -eq 0) {
                 $primeItems += @{
                     ref_audio_path = $warmRef.Replace("\", "/")
-                    prompt_text    = "今夜月色很美，呵...适合与朋友小聚一番。"
+                    prompt_text    = $activeDefaultPrompt
                     prompt_lang    = "zh"
                 }
             }
@@ -1075,13 +1073,13 @@ if ($hasLocalGsv) {
             $primeResp = Invoke-RestMethod -Uri "http://127.0.0.1:19880/prime" -Method Post -TimeoutSec 60 `
                 -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($primeBody))
             if ($primeResp -and $primeResp.ok) {
-                Write-Host "[预热] 语音引擎 7 情绪参考特征缓存已就绪 (slots=$($primeResp.cache_slots), $($primeResp.elapsed_ms)ms)" -ForegroundColor DarkGreen
+                Write-Host "[预热] 语音引擎 7 情绪参考特征缓存已就绪 ($activeCharDirName, slots=$($primeResp.cache_slots), $($primeResp.elapsed_ms)ms)" -ForegroundColor DarkGreen
             }
 
             $warm = @{
-                text = "预热测试，银行行长今天很开心。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"; sample_steps = 8
+                text = "预热测试，银行行长今天很开心。"; text_lang = "zh"; text_split_method = "cut0"; batch_size = 1; media_type = "wav"; sample_steps = $activeWarmSteps
                 ref_audio_path = $warmRef.Replace("\", "/")
-                prompt_text = "今夜月色很美，呵...适合与朋友小聚一番。"; prompt_lang = "zh"
+                prompt_text = $activeDefaultPrompt; prompt_lang = "zh"
             } | ConvertTo-Json -Compress
             Invoke-WebRequest -Uri "http://127.0.0.1:19880/tts" -Method Post -UseBasicParsing -TimeoutSec 60 `
                 -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($warm)) | Out-Null

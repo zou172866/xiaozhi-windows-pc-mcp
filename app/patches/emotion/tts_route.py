@@ -124,15 +124,17 @@ def build_gsv_request_snapshot(
 
     chosen_prof: Optional[Dict[str, Any]] = None
     emo_key: Optional[str] = None
-    is_mei = tags.is_raiden_mei_voice(ref_audio_path, tts=provider)
-    if is_mei:
+    char_key = tags.resolve_emotion_character_key(ref_audio_path, tts=provider)
+    is_mei = char_key == "raiden_mei"
+    if char_key is not None:
         emo_key = tags.resolve_mei_emotion(
             clean_text,
             explicit_segment_emotion=explicit_segment_emotion,
             turn_explicit_emotion=turn_explicit_emotion,
             device_id=device_id,
+            character_key=char_key,
         )
-        prof = tags.get_mei_emotion_profile(emo_key)
+        prof = tags.get_character_emotion_profile(char_key, emo_key)
         chosen_prof = prof
         ref_audio_path = prof["ref_audio_path"]
         aux_ref_audio_paths = []
@@ -249,7 +251,7 @@ def prime_gsv_async(tts=None, *, reason: str = "wakeup", min_interval_sec: float
     global _gsv_last_prime_ts
     if tts is not None:
         cls_mod = str(getattr(type(tts), "__module__", "") or "").lower()
-        if cls_mod and "gpt_sovits" not in cls_mod and not tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts):
+        if cls_mod and "gpt_sovits" not in cls_mod and not tags.is_emotion_routed_gsv_voice(getattr(tts, "ref_audio_path", ""), tts=tts):
             return False
 
     now = time.monotonic()
@@ -723,7 +725,7 @@ def apply_xiaozhi_emotion_and_prosody_patches() -> None:
     gsv_mod.TTSProvider.text_to_speak = _patched_gsv_text_to_speak
     gsv_mod.TTSProvider._patched_tts_speak_ref = _patched_gsv_text_to_speak
     gsv_mod.TTSProvider.voice = property(
-        lambda self: "raiden_mei" if tags.is_raiden_mei_voice(getattr(self, "ref_audio_path", ""), tts=self) else "default"
+        lambda self: tags.resolve_emotion_character_key(getattr(self, "ref_audio_path", ""), tts=self) or "default"
     )
 
     # 3. Subtitle firewall + playback-synchronized ESP32 emotion update + P1-11 ring buffer event

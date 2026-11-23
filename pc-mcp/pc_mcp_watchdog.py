@@ -142,11 +142,9 @@ def _is_pc_mcp_python_cmdline(proc_name: str, cmd: list[str], script_path: Path 
         a_clean = a.strip('"').strip("'")
         if os.path.basename(a_clean).lower() == target_name:
             try:
-                if str(Path(a_clean).resolve()).lower() == target_resolved:
-                    return True
-            except Exception:
-                pass
-            return True
+                return Path(a_clean).is_absolute() and str(Path(a_clean).resolve()).lower() == target_resolved
+            except (OSError, ValueError):
+                return False
         # First positional argument is the executed script; if it isn't pc_control_mcp.py, stop checking
         return False
     return False
@@ -188,6 +186,8 @@ def stop_pc_mcp_only(port: int = 18900, log: Optional[logging.Logger] = None) ->
     for pid in find_pc_mcp_pids(port=port):
         try:
             proc = psutil.Process(pid)
+            if not _is_pc_mcp_python_cmdline(proc.name(), proc.cmdline()):
+                continue
             proc.terminate()
             try:
                 proc.wait(timeout=2.0)

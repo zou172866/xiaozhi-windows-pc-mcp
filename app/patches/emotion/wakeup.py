@@ -29,6 +29,25 @@ MEI_WAKEUP_RESPONSES = [
 MEI_WAKEUP_FALLBACK_TEXT = "我在呢，哥哥请说吧。"
 MEI_WAKEUP_FALLBACK_WAV = os.path.join(tags.CONTAINER_VOICES_PREFIX, "raiden_mei", "wakeup_mei_default.wav")
 
+LUOXIAOHEI_WAKEUP_RESPONSES = [
+    "嗯？我在呢，有什么事跟我说吧。",
+    "我在听呢，怎么啦？",
+    "叫我吗？我一直都在呢。",
+    "嗯，我在，需要我帮忙吗？",
+    "来啦来啦，有什么事快说吧。",
+    "我在呢，不会是有好吃的留给我吧？",
+]
+LUOXIAOHEI_WAKEUP_FALLBACK_TEXT = "嗯？我在呢，有什么事跟我说吧。"
+LUOXIAOHEI_WAKEUP_FALLBACK_WAV = os.path.join(
+    tags.CONTAINER_VOICES_PREFIX, "luoxiaohei", "wakeup_luoxiaohei_default.wav"
+)
+
+
+def _get_character_wakeup_spec(char_key: str) -> Tuple[List[str], str, str]:
+    if char_key == "luoxiaohei":
+        return list(LUOXIAOHEI_WAKEUP_RESPONSES), LUOXIAOHEI_WAKEUP_FALLBACK_TEXT, LUOXIAOHEI_WAKEUP_FALLBACK_WAV
+    return list(MEI_WAKEUP_RESPONSES), MEI_WAKEUP_FALLBACK_TEXT, MEI_WAKEUP_FALLBACK_WAV
+
 
 def _trim_wav_leading_breath(wav_bytes: bytes) -> bytes:
     """Trim soft leading breath/silence from short GPT-SoVITS wakeup clips for instant response."""
@@ -71,8 +90,11 @@ def _trim_wav_leading_breath(wav_bytes: bytes) -> bytes:
 
 
 def get_wakeup_responses_for_tts(tts) -> list:
-    if tts is not None and tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts):
-        return list(MEI_WAKEUP_RESPONSES)
+    if tts is not None:
+        char_key = tags.resolve_emotion_character_key(getattr(tts, "ref_audio_path", ""), tts=tts)
+        if char_key is not None:
+            pool, _, _ = _get_character_wakeup_spec(char_key)
+            return pool
     return []
 
 
@@ -112,7 +134,12 @@ def apply_mei_wakeup_responses_patch() -> None:
     @functools.wraps(_orig_wakeup_response)
     async def _mei_aware_wakeup_words_response(conn, *args, **kwargs):
         tts = getattr(conn, "tts", None)
-        if tts is None or not tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts):
+        char_key = (
+            tags.resolve_emotion_character_key(getattr(tts, "ref_audio_path", ""), tts=tts)
+            if tts is not None
+            else None
+        )
+        if tts is None or char_key is None:
             return await _orig_wakeup_response(conn, *args, **kwargs)
 
         # C-4: Run wakeup cache refresh ONLY when GSV is idle and lock is uncontended,
@@ -124,8 +151,11 @@ def apply_mei_wakeup_responses_patch() -> None:
             if tts_route.is_live_gsv_busy():
                 return
 
-            pool = [r for r in MEI_WAKEUP_RESPONSES if r != _last_mei_reply["text"]] or list(MEI_WAKEUP_RESPONSES)
+            full_pool, _, _ = _get_character_wakeup_spec(char_key)
+            last_txt = _last_mei_reply.get(char_key, "")
+            pool = [r for r in full_pool if r != last_txt] or full_pool
             result = random.choice(pool)
+            _last_mei_reply[char_key] = result
             _last_mei_reply["text"] = result
 
             url, req_json, _, _ = tts_route.build_gsv_request_snapshot(
@@ -149,7 +179,7 @@ def apply_mei_wakeup_responses_patch() -> None:
             if not raw_wav:
                 return
 
-            voice = getattr(tts, "voice", "raiden_mei") or "raiden_mei"
+            voice = getattr(tts, "voice", char_key) or char_key
             wav_bytes = await asyncio.to_thread(_trim_wav_leading_breath, raw_wav)
             file_path = hello_mod.wakeup_words_config.generate_file_path(voice)
             await asyncio.to_thread(tts_route._write_bytes_atomic, file_path, wav_bytes)
@@ -168,7 +198,12 @@ def apply_mei_wakeup_responses_patch() -> None:
                     break
                 await asyncio.sleep(0.1)
 
-        if tts is None or not tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts):
+        char_key = (
+            tags.resolve_emotion_character_key(getattr(tts, "ref_audio_path", ""), tts=tts)
+            if tts is not None
+            else None
+        )
+        if tts is None or char_key is None:
             matched = await _orig_check_wakeup(conn, text, *args, **kwargs)
             if matched and tts is not None:
                 tts_route.prime_gsv_async(tts, reason="wakeup")
@@ -186,24 +221,25 @@ def apply_mei_wakeup_responses_patch() -> None:
         conn.just_woken_up = True
         await hello_mod.send_tts_message(conn, "start")
 
-        voice = getattr(tts, "voice", "raiden_mei") or "raiden_mei"
+        _, char_fallback_text, char_fallback_wav = _get_character_wakeup_spec(char_key)
+        voice = getattr(tts, "voice", char_key) or char_key
         response = hello_mod.wakeup_words_config.get_wakeup_response(voice)
         if not response or not response.get("file_path"):
             fallback_wav = (
-                MEI_WAKEUP_FALLBACK_WAV
-                if os.path.isfile(MEI_WAKEUP_FALLBACK_WAV)
+                char_fallback_wav
+                if os.path.isfile(char_fallback_wav)
                 else "config/assets/wakeup_words_short.wav"
             )
             response = {
                 "voice": voice,
                 "file_path": fallback_wav,
                 "time": 0,
-                "text": MEI_WAKEUP_FALLBACK_TEXT,
+                "text": char_fallback_text,
             }
-            if os.path.isfile(MEI_WAKEUP_FALLBACK_WAV):
+            if os.path.isfile(char_fallback_wav):
                 try:
                     hello_mod.wakeup_words_config.update_wakeup_response(
-                        voice, MEI_WAKEUP_FALLBACK_WAV, MEI_WAKEUP_FALLBACK_TEXT
+                        voice, char_fallback_wav, char_fallback_text
                     )
                 except Exception:
                     pass
@@ -212,12 +248,12 @@ def apply_mei_wakeup_responses_patch() -> None:
         conn.client_abort = False
         conn.sentence_id = str(uuid.uuid4().hex)
 
-        prof = tags.get_mei_emotion_profile("gentle")
+        prof = tags.get_character_emotion_profile(char_key, "gentle")
         splitter._push_esp32_emotion_async(conn, prof["esp32_emoji"], prof["esp32_emotion"])
 
         conn.dialogue.put(Message(role="assistant", content=response.get("text")))
         hello_mod._wakeup_logger.bind(tag=hello_mod.TAG).info(
-            f"播放芽衣唤醒词回复: {response.get('text')}"
+            f"播放角色唤醒词回复 ({char_key}): {response.get('text')}"
         )
 
         await hello_mod.sendAudioMessage(conn, SentenceType.FIRST, opus_packets, response.get("text"))
@@ -231,15 +267,17 @@ def apply_mei_wakeup_responses_patch() -> None:
     @functools.wraps(_orig_preheat)
     async def _mei_aware_preheat(*args, **kwargs):
         await _orig_preheat(*args, **kwargs)
-        try:
-            resp = hello_mod.wakeup_words_config.get_wakeup_response("raiden_mei")
-            fp = (resp or {}).get("file_path") or (
-                MEI_WAKEUP_FALLBACK_WAV if os.path.isfile(MEI_WAKEUP_FALLBACK_WAV) else None
-            )
-            if fp and os.path.isfile(fp):
-                await hello_mod.audio_to_data(fp, use_cache=True)
-        except Exception:
-            pass
+        for ck, fb_wav in (
+            ("raiden_mei", MEI_WAKEUP_FALLBACK_WAV),
+            ("luoxiaohei", LUOXIAOHEI_WAKEUP_FALLBACK_WAV),
+        ):
+            try:
+                resp = hello_mod.wakeup_words_config.get_wakeup_response(ck)
+                fp = (resp or {}).get("file_path") or (fb_wav if os.path.isfile(fb_wav) else None)
+                if fp and os.path.isfile(fp):
+                    await hello_mod.audio_to_data(fp, use_cache=True)
+            except Exception:
+                pass
 
     wk_mounted = not wk_failures
     lh_mounted = False

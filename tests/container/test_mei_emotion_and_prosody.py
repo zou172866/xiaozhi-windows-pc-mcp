@@ -306,6 +306,151 @@ class TestMeiEmotionAndProsody(unittest.TestCase):
                 f"Mismatch esp32_emotion in mei_emotions.json for {key}",
             )
 
+    def test_voice_preview_restores_seven_reference_slots(self):
+        from unittest.mock import MagicMock, patch
+        from console.routes import gsv
+
+        mei, lxh = "__gsv_raiden_mei__", "__gsv_luoxiaohei__"
+        client = MagicMock()
+        client.get.return_value.status_code = 200
+        client.post.return_value.json.return_value = {"primed": 7}
+        with (
+            patch.object(gsv, "_active_gsv_loaded", mei),
+            patch.object(gsv, "_get_configured_gsv_voice", return_value=mei),
+            patch.object(gsv, "_snapshot_boot_mei_weights"),
+            patch.object(gsv, "_resolve_gsv_weights", return_value=("v4", "gpt", "sovits")),
+            patch.object(gsv.shared, "_get_console_http_client", return_value=client),
+            patch.object(router, "load_character_emotions", return_value=router.DEFAULT_MEI_EMOTIONS),
+            patch.object(router, "ref_audio_exists", return_value=True),
+        ):
+            gsv._ensure_gsv_weights(lxh)
+            client.post.assert_not_called()
+            gsv._ensure_gsv_weights(mei)
+            client.post.assert_called_once()
+            items = client.post.call_args.kwargs["json"]["items"]
+            self.assertEqual(len({item["ref_audio_path"] for item in items}), 7)
+            self.assertTrue(all("raiden_mei" in item["ref_audio_path"] for item in items))
+
+    def test_luoxiaohei_v5_slot_emotion_routing_and_mei_isolation(self):
+        """Verify independent __gsv_luoxiaohei__ V5-Turbo 7-emotion routing, wakeup pool, and custom Mei weight protection."""
+        import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import console_server as cs
+        from console.routes import anima as anima_route
+        from console.routes import gsv as gsv_route
+
+        # 1. Character resolution & strict separation from Raiden Mei
+        lxh_tts = SimpleNamespace(
+            voice_id="__gsv_luoxiaohei__",
+            ref_audio_path=f"{router.HOST_VOICES_PREFIX}/luoxiaohei/luoxiaohei_default_ref.wav",
+            url="http://host.docker.internal:19880/tts",
+            text_lang="zh",
+            prompt_text="这桌子好高啊，还是变成原形跳上去比较方便。",
+            prompt_lang="zh",
+            top_k=12,
+            top_p=0.98,
+            temperature=0.92,
+            speed_factor=1.0,
+            sample_steps=4,
+            first_segment_sample_steps=4,
+            config={"voice_id": "__gsv_luoxiaohei__", "sample_steps": 4, "first_segment_sample_steps": 4},
+        )
+        self.assertEqual(router.resolve_emotion_character_key(tts=lxh_tts), "luoxiaohei")
+        self.assertTrue(router.is_luoxiaohei_voice(tts=lxh_tts))
+        self.assertTrue(router.is_emotion_routed_gsv_voice(tts=lxh_tts))
+        self.assertFalse(router.is_raiden_mei_voice(tts=lxh_tts))
+
+        # 2. 7-emotion snapshot routing with V5-Turbo 4-step sampling
+        with patch.object(router, "ref_audio_exists", return_value=True):
+            _, snap_playful, prof_p, emo_p = router.build_gsv_request_snapshot(
+                lxh_tts,
+                "我嘴巴上面有东西吗？",
+                explicit_segment_emotion="playful",
+                is_first_segment=True,
+            )
+            self.assertEqual(emo_p, "playful")
+            self.assertIn("/luoxiaohei/luoxiaohei_playful_ref.wav", snap_playful["ref_audio_path"])
+            self.assertEqual(snap_playful["sample_steps"], 4)
+            self.assertIsNotNone(prof_p)
+
+        # 3. Wakeup responses use Luo Xiaohei pool (never calling user '哥哥')
+        wk_pool = router.get_wakeup_responses_for_tts(lxh_tts)
+        self.assertTrue(len(wk_pool) >= 4)
+        for line in wk_pool:
+            self.assertNotIn("哥哥", line)
+
+        # 4. Anima character name inference recognizes 罗小黑
+        from console.routes import gsv
+
+        mei = "__gsv_raiden_mei__"
+        lxh = "__gsv_luoxiaohei__"
+        steps = gsv._voice_sampling_settings({"voice_id": mei, "sample_steps": 16}, lxh)
+        self.assertEqual(steps, {"sample_steps": 4, "first_segment_sample_steps": 4})
+        self.assertEqual(
+            gsv._voice_sampling_settings({"voice_id": lxh, **steps}, mei),
+            {"sample_steps": 16, "first_segment_sample_steps": None},
+        )
+        custom = {"sample_steps": 24, "first_segment_sample_steps": 6}
+        self.assertEqual(gsv._voice_sampling_settings({"voice_id": mei, **custom}, lxh), custom)
+        self.assertEqual(anima_route._infer_character_name("你是无限，是罗小黑的师父。"), "无限")
+        self.assertEqual(
+            anima_route._infer_character_name("你是《罗小黑战记》中的小黑妖精罗小黑，性格干净纯真。"),
+            "罗小黑",
+        )
+
+        # 5. Custom Raiden Mei weights MUST NOT be overwritten when boot YAML holds Luo Xiaohei weights
+        self.assertIn("__gsv_luoxiaohei__", gsv_route.ALLOWED_GSV_VOICES)
+        lxh_ver, lxh_gpt, lxh_sov = gsv_route._resolve_gsv_weights("__gsv_luoxiaohei__")
+        self.assertEqual(lxh_ver, "v5turbo")
+        self.assertFalse(gsv_route._is_custom_mei_weights(lxh_gpt, lxh_sov))
+        self.assertFalse(
+            gsv_route._is_custom_mei_weights(
+                "D:/custom/models/gsv_weights/luoxiaohei/v5turbo/gpt.ckpt",
+                "D:/custom/models/gsv_weights/luoxiaohei/v5turbo/sovits.pth",
+            )
+        )
+        self.assertTrue(
+            gsv_route._is_custom_mei_weights(
+                "D:/custom/models/gsv_weights/raiden_mei/v4/custom_mei.ckpt",
+                "D:/custom/models/gsv_weights/raiden_mei/v4/custom_mei.pth",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_yaml = os.path.join(tmpdir, "tts_infer_xiaozhi.yaml")
+            with open(fake_yaml, "w", encoding="utf-8") as wf:
+                wf.write(
+                    "custom:\n"
+                    "  version: v4\n"
+                    "  t2s_weights_path: D:/models/gsv_weights/raiden_mei/v4/my_mei.ckpt\n"
+                    "  vits_weights_path: D:/models/gsv_weights/raiden_mei/v4/my_mei.pth\n"
+                )
+            with (
+                patch.object(cs, "GSV_INFER_YAML", fake_yaml),
+                patch.dict(gsv_route._preserved_boot_mei_weights, {}, clear=True),
+                patch.dict(
+                    os.environ,
+                    {"GSV_MEI_GPT_WEIGHTS": "", "GSV_MEI_SOVITS_WEIGHTS": "", "GSV_MEI_VERSION": ""},
+                    clear=False,
+                ),
+            ):
+                snap = gsv_route._snapshot_boot_mei_weights(persist_backup=True)
+                self.assertEqual(
+                    snap,
+                    ("v4", "D:/models/gsv_weights/raiden_mei/v4/my_mei.ckpt", "D:/models/gsv_weights/raiden_mei/v4/my_mei.pth"),
+                )
+                with open(fake_yaml, "w", encoding="utf-8") as wf:
+                    wf.write(
+                        f"custom:\n  version: v5turbo\n  t2s_weights_path: {lxh_gpt}\n  vits_weights_path: {lxh_sov}\n"
+                    )
+                gsv_route._preserved_boot_mei_weights.clear()
+                restored = gsv_route._resolve_gsv_weights("__gsv_raiden_mei__")
+                self.assertEqual(
+                    restored,
+                    ("v4", "D:/models/gsv_weights/raiden_mei/v4/my_mei.ckpt", "D:/models/gsv_weights/raiden_mei/v4/my_mei.pth"),
+                )
+
 
 try:
     if "/opt/xiaozhi-esp32-server" not in sys.path and os.path.isdir("/opt/xiaozhi-esp32-server"):

@@ -11,6 +11,7 @@ import base64
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -400,6 +401,27 @@ class TestCloudAudioRuntimePatches(unittest.TestCase):
 
 
 class TestCloudAudioConsoleAPI(unittest.TestCase):
+    def setUp(self):
+        from console.routes import audio_api
+
+        # Provider requests are mocked. Give URL validation deterministic DNS
+        # answers too, without changing resolution for the local HTTP server.
+        resolver = patch.object(audio_api, "socket", wraps=socket)
+        self.validation_socket = resolver.start()
+        self.addCleanup(resolver.stop)
+        self.validation_socket.getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 443))
+        ]
+
+    def test_provider_resolving_to_private_network_is_rejected(self):
+        from console.routes import audio_api
+
+        self.validation_socket.getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("192.168.1.2", 443))
+        ]
+        with self.assertRaises(ValueError):
+            audio_api.validate_safe_api_url("https://audio.example.com", allow_local_gateway=False)
+
     @classmethod
     def setUpClass(cls) -> None:
         import boot

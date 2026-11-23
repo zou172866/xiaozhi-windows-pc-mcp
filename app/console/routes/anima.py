@@ -430,14 +430,12 @@ def _trigger_obsidian_rebuild() -> tuple[bool, dict | str]:
 
 def _infer_character_name(prompt: str) -> str:
     p = (prompt or "").strip()
-    if "雷电芽衣" in p:
-        return "雷电芽衣"
-    if "芽衣" in p:
-        return "芽衣"
     m = re.search(r"你是(?:《[^》]+》中的)?([\u4e00-\u9fa5A-Za-z0-9]{2,8}?)(?:[，,。！!、\s]|$)", p)
     if m:
         cand = m.group(1).strip()
         if cand and not cand.startswith(("一个", "一名", "一位", "住在")):
+            if cand == "小黑妖精罗小黑":
+                return "罗小黑"
             return cand
     return "小智"
 

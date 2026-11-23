@@ -442,8 +442,7 @@ def _write_updated_yaml(
                                 if ik in prof_blk:
                                     gsv_patch[ik] = prof_blk[ik]
                             gsv_patch["voice_id"] = v_id
-                            if "sample_steps" in prof_blk and "sample_steps" not in existing_gsv:
-                                gsv_patch["sample_steps"] = prof_blk["sample_steps"]
+                            gsv_patch.update(gsv._voice_sampling_settings(existing_gsv, v_id))
                             patch.setdefault("TTS", {})["GPT_SOVITS_V2"] = gsv_patch
                         else:
                             gsv._set_voice_dirty(None, "")
@@ -557,7 +556,9 @@ def _apply_tts_attrs_in_place(tts_obj, tts_module_name: str, tts_cfg: dict) -> b
                     setattr(tts_obj, f_attr, float(tts_cfg[f_attr]))
                 except Exception as exc:
                     shared._log_rate_limited(f"tts_attr_{f_attr}", exc)
-        for i_attr in ("top_k", "sample_steps"):
+        if "first_segment_sample_steps" in tts_cfg and tts_cfg["first_segment_sample_steps"] is None:
+            tts_obj.first_segment_sample_steps = None
+        for i_attr in ("top_k", "sample_steps", "first_segment_sample_steps"):
             if i_attr in tts_cfg and tts_cfg[i_attr] is not None:
                 try:
                     setattr(tts_obj, i_attr, int(tts_cfg[i_attr]))

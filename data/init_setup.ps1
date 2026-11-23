@@ -871,15 +871,8 @@ if ($obsSyncEnabled -eq "true" -and $obsExportDir -and -not (Test-Path $obsExpor
     }
 }
 
-$esp32AuthKey = if ($existingEnv.ContainsKey("ESP32_AUTH_KEY") -and $existingEnv["ESP32_AUTH_KEY"]) {
-    $existingEnv["ESP32_AUTH_KEY"]
-} else {
-    $randBytes = New-Object byte[] 32
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $rng.GetBytes($randBytes)
-    $rng.Dispose()
-    ([System.BitConverter]::ToString($randBytes)).Replace("-", "").ToLowerInvariant()
-}
+. (Join-Path $PSScriptRoot "esp32_credential.ps1")
+Initialize-Esp32SigningKey $serverDir
 $wbAutoApprove = if ($existingEnv.ContainsKey("WORKBUDDY_AUTO_APPROVE") -and $existingEnv["WORKBUDDY_AUTO_APPROVE"] -ne "") {
     $existingEnv["WORKBUDDY_AUTO_APPROVE"]
 } else {
@@ -892,7 +885,6 @@ $envUpdates = [ordered]@{
     "HOST_DATA_DIR" = (Join-Path $serverDir "data").Replace("\", "/")
     "HOST_VOICES_DIR" = (Join-Path $serverDir "voices").Replace("\", "/")
     "HOST_GSV_WEIGHTS_DIR" = (Join-Path $serverDir "models\gsv_weights").Replace("\", "/")
-    "ESP32_AUTH_KEY" = $esp32AuthKey
     "ESP32_ALLOWED_DEVICES" = $esp32AllowedDevices
     "L3_BACKEND" = $l3Backend
     "XIAOZHI_L3_WORKDIR" = $l3Workdir

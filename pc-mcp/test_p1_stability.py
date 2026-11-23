@@ -182,7 +182,11 @@ class TestP1HostStability(unittest.TestCase):
         stop_ps1 = (SERVER_DIR / "data" / "stop_all.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("pc_mcp_watchdog.py", stop_ps1)
         self.assertIn("--cleanup-l3", stop_ps1)
-        self.assertIn("Stop-Process -Id $mp -Force", stop_ps1)
+        self.assertIn("Stop-ProjectPythonProcess $proc $mcpScript", stop_ps1)
+        process_guard = (SERVER_DIR / "data" / "host_process.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("Stop-Process -Id $current.ProcessId -Force", process_guard)
+        other_copy = self.tmp_root / wd.MCP_SCRIPT.name
+        self.assertFalse(wd._is_pc_mcp_python_cmdline("python.exe", ["python.exe", str(other_copy)]))
         self.assertIn(r"pc-mcp\state\agy_tasks\worker_heartbeat.json", stop_ps1)
 
     # ------------------------------------------------------------------

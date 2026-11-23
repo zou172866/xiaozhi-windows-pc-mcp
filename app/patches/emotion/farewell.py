@@ -228,7 +228,7 @@ def apply_idle_farewell_patch() -> None:
             await conn.close()
             return
 
-        mei_active = tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts)
+        mei_active = tags.is_emotion_routed_gsv_voice(getattr(tts, "ref_audio_path", ""), tts=tts)
         tts_payload_text = format_idle_farewell_for_tts(
             chosen,
             is_mei_voice=mei_active,
@@ -318,7 +318,7 @@ def apply_idle_farewell_patch() -> None:
 
         if mode == "llm_summary":
             tts = getattr(conn, "tts", None)
-            mei_active = tags.is_raiden_mei_voice(getattr(tts, "ref_audio_path", ""), tts=tts) if tts is not None else False
+            mei_active = tags.is_emotion_routed_gsv_voice(getattr(tts, "ref_audio_path", ""), tts=tts) if tts is not None else False
             has_turns = bool(extract_session_dialogue_snippet(conn, max_turns=1))
             if has_turns and getattr(conn, "llm", None) is not None:
                 trigger_activity_ts = float(conn.last_activity_time)

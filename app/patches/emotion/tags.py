@@ -20,6 +20,94 @@ HOST_DATA_PREFIX = _HOST_DIRS["HOST_DATA_DIR"]
 _HOST_PROJECT_PREFIX = _HOST_DIRS["HOST_PROJECT_DIR"]
 HOST_VOICES_PREFIX = _HOST_DIRS["HOST_VOICES_DIR"]
 MEI_DIR_HOST = f"{HOST_VOICES_PREFIX}/raiden_mei"
+LUOXIAOHEI_DIR_HOST = f"{HOST_VOICES_PREFIX}/luoxiaohei"
+
+DEFAULT_LUOXIAOHEI_EMOTIONS: Dict[str, Dict[str, Any]] = {
+    "calm": {
+        "label_zh": "平静默认",
+        "ref_audio_path": f"{LUOXIAOHEI_DIR_HOST}/luoxiaohei_default_ref.wav",
+        "prompt_text": "这桌子好高啊，还是变成原形跳上去比较方便。",
+        "prompt_lang": "zh",
+        "speed_factor": 1.00,
+        "temperature": 0.92,
+        "top_k": 12,
+        "top_p": 0.98,
+        "esp32_emotion": "relaxed",
+        "esp32_emoji": "😌",
+    },
+    "gentle": {
+        "label_zh": "温柔关怀",
+        "ref_audio_path": f"{LUOXIAOHEI_DIR_HOST}/luoxiaohei_gentle_ref.wav",
+        "prompt_text": "虽然还是不太明白，但是谢谢博士。",
+        "prompt_lang": "zh",
+        "speed_factor": 0.98,
+        "temperature": 0.90,
+        "top_k": 12,
+        "top_p": 0.96,
+        "esp32_emotion": "loving",
+        "esp32_emoji": "😍",
+    },
+    "happy": {
+        "label_zh": "欣喜明朗",
+        "ref_audio_path": f"{LUOXIAOHEI_DIR_HOST}/luoxiaohei_happy_ref.wav",
+        "prompt_text": "博士，我们算是朋友了吗？那以后有机会，你也到我们那边去玩吧！",
+        "prompt_lang": "zh",
+        "speed_factor": 1.03,
+        "temperature": 0.96,
+        "top_k": 15,
+        "top_p": 1.00,
+        "esp32_emotion": "happy",
+        "esp32_emoji": "😆",
+    },
+    "playful": {
+        "label_zh": "俏皮打趣",
+        "ref_audio_path": f"{LUOXIAOHEI_DIR_HOST}/luoxiaohei_playful_ref.wav",
+        "prompt_text": "博士，你是不是在偷偷吃好吃的？",
+        "prompt_lang": "zh",
+        "speed_factor": 1.02,
+        "temperature": 0.98,
+        "top_k": 15,
+        "top_p": 1.00,
+        "esp32_emotion": "winking",
+        "esp32_emoji": "😉",
+    },
+    "shy": {
+        "label_zh": "羞赧微嗔",
+        "ref_audio_path": f"{LUOXIAOHEI_DIR_HOST}/luoxiaohei_shy_ref.wav",
+        "prompt_text": "博士……如果我看不懂这些录像的话，能来找你吗？",
+        "prompt_lang": "zh",
+        "speed_factor": 0.98,
+        "temperature": 0.94,
+        "top_k": 14,
+        "top_p": 0.98,
+        "esp32_emotion": "embarrassed",
+        "esp32_emoji": "😳",
+    },
+    "serious": {
+        "label_zh": "沉稳认真",
+        "ref_audio_path": f"{LUOXIAOHEI_DIR_HOST}/luoxiaohei_serious_ref.wav",
+        "prompt_text": "博士，抓紧我，我要用能力传送过去，这样快一点。",
+        "prompt_lang": "zh",
+        "speed_factor": 1.01,
+        "temperature": 0.88,
+        "top_k": 10,
+        "top_p": 0.95,
+        "esp32_emotion": "confident",
+        "esp32_emoji": "😏",
+    },
+    "tender": {
+        "label_zh": "轻柔抚慰",
+        "ref_audio_path": f"{LUOXIAOHEI_DIR_HOST}/luoxiaohei_tender_ref.wav",
+        "prompt_text": "这里这么多天灾……所以你们的城市只能不停地四处流浪吗？",
+        "prompt_lang": "zh",
+        "speed_factor": 0.96,
+        "temperature": 0.90,
+        "top_k": 12,
+        "top_p": 0.96,
+        "esp32_emotion": "sad",
+        "esp32_emoji": "😔",
+    },
+}
 
 DEFAULT_MEI_EMOTIONS: Dict[str, Dict[str, Any]] = {
     "calm": {
@@ -489,6 +577,9 @@ def ref_audio_exists(host_ref_path: str) -> bool:
     return bool(local_p and os.path.isfile(local_p))
 
 
+_cached_character_manifests: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+
 def load_mei_emotions(force_reload: bool = False) -> Dict[str, Dict[str, Any]]:
     global _cached_manifest
     if _cached_manifest is not None and not force_reload:
@@ -523,6 +614,48 @@ def load_mei_emotions(force_reload: bool = False) -> Dict[str, Dict[str, Any]]:
             prof["ref_audio_path"] = _rewrite_host_data_path(str(prof["ref_audio_path"]))
 
     _cached_manifest = merged
+    return merged
+
+
+def load_character_emotions(
+    character_key: str = "raiden_mei", force_reload: bool = False
+) -> Dict[str, Dict[str, Any]]:
+    norm_char = str(character_key or "raiden_mei").strip().lower()
+    if norm_char != "luoxiaohei":
+        return load_mei_emotions(force_reload=force_reload)
+
+    if norm_char in _cached_character_manifests and not force_reload:
+        return _cached_character_manifests[norm_char]
+
+    merged: Dict[str, Dict[str, Any]] = {
+        k: dict(v) for k, v in DEFAULT_LUOXIAOHEI_EMOTIONS.items()
+    }
+    manifest_candidates = [
+        _to_local_fs_path(f"{LUOXIAOHEI_DIR_HOST}/luoxiaohei_emotions.json"),
+        os.path.join(CONTAINER_VOICES_PREFIX, "luoxiaohei", "luoxiaohei_emotions.json"),
+        os.path.join(xz_common.APP_DIR, "voices", "luoxiaohei", "luoxiaohei_emotions.json"),
+    ]
+    for mp in manifest_candidates:
+        if os.path.isfile(mp):
+            try:
+                with open(mp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                emo_map = data.get("emotions") if isinstance(data, dict) else None
+                if isinstance(emo_map, dict):
+                    for k, val in emo_map.items():
+                        if isinstance(val, dict) and k in merged:
+                            merged[k].update(val)
+                        elif isinstance(val, dict):
+                            merged[k] = dict(val)
+                break
+            except Exception:
+                pass
+
+    for prof in merged.values():
+        if isinstance(prof, dict) and prof.get("ref_audio_path"):
+            prof["ref_audio_path"] = _rewrite_host_data_path(str(prof["ref_audio_path"]))
+
+    _cached_character_manifests[norm_char] = merged
     return merged
 
 
@@ -808,6 +941,7 @@ def resolve_mei_emotion(
     explicit_segment_emotion: Optional[str] = None,
     turn_explicit_emotion: Optional[str] = None,
     device_id: Optional[str] = None,
+    character_key: str = "raiden_mei",
 ) -> str:
     """3-layer emotion resolution:
     1. Explicit tag on current segment
@@ -816,7 +950,7 @@ def resolve_mei_emotion(
     3. Anima Brain PAD / turn_appraisals `last_emotion` continuity (isolated per device_id)
     4. Default 'calm'
     """
-    emotions = load_mei_emotions()
+    emotions = load_character_emotions(character_key)
     if explicit_segment_emotion and explicit_segment_emotion in emotions:
         chosen = explicit_segment_emotion
     else:
@@ -843,15 +977,20 @@ def resolve_mei_emotion(
     return chosen
 
 
-def get_mei_emotion_profile(emotion_key: str) -> Dict[str, Any]:
-    emotions = load_mei_emotions()
+def get_character_emotion_profile(character_key: str, emotion_key: str) -> Dict[str, Any]:
+    emotions = load_character_emotions(character_key)
     prof = emotions.get(emotion_key) or emotions["calm"]
     if not ref_audio_exists(prof.get("ref_audio_path", "")):
         prof = emotions["calm"]
     return dict(prof)
 
 
+def get_mei_emotion_profile(emotion_key: str) -> Dict[str, Any]:
+    return get_character_emotion_profile("raiden_mei", emotion_key)
+
+
 _RAIDEN_MEI_VOICE_IDS = frozenset({"raiden_mei", "__gsv_raiden_mei__"})
+_LUOXIAOHEI_VOICE_IDS = frozenset({"luoxiaohei", "__gsv_luoxiaohei__"})
 
 
 def resolve_tts_voice_id(tts: Any) -> str:
@@ -869,6 +1008,52 @@ def resolve_tts_voice_id(tts: Any) -> str:
     return ""
 
 
+def resolve_emotion_character_key(
+    ref_audio_path: Optional[str] = None,
+    *,
+    voice_id: Optional[str] = None,
+    tts: Any = None,
+) -> Optional[str]:
+    """Resolve canonical 7-emotion GSV character key ('raiden_mei' | 'luoxiaohei' | None) with D-7 priority."""
+    eff_vid = str(voice_id or "").strip() if isinstance(voice_id, str) else ""
+    if not eff_vid and tts is not None:
+        eff_vid = resolve_tts_voice_id(tts)
+    if eff_vid:
+        low_vid = eff_vid.lower()
+        if low_vid in _RAIDEN_MEI_VOICE_IDS:
+            return "raiden_mei"
+        if low_vid in _LUOXIAOHEI_VOICE_IDS:
+            return "luoxiaohei"
+        return None
+    eff_ref = ref_audio_path
+    if not eff_ref and tts is not None:
+        eff_ref = getattr(tts, "ref_audio_path", "")
+    norm_ref = str(eff_ref or "").replace("\\", "/").lower()
+    if "raiden_mei" in norm_ref:
+        return "raiden_mei"
+    if "luoxiaohei" in norm_ref:
+        return "luoxiaohei"
+    return None
+
+
+def is_emotion_routed_gsv_voice(
+    ref_audio_path: Optional[str] = None,
+    *,
+    voice_id: Optional[str] = None,
+    tts: Any = None,
+) -> bool:
+    return resolve_emotion_character_key(ref_audio_path, voice_id=voice_id, tts=tts) is not None
+
+
+def is_luoxiaohei_voice(
+    ref_audio_path: Optional[str] = None,
+    *,
+    voice_id: Optional[str] = None,
+    tts: Any = None,
+) -> bool:
+    return resolve_emotion_character_key(ref_audio_path, voice_id=voice_id, tts=tts) == "luoxiaohei"
+
+
 def is_raiden_mei_voice(
     ref_audio_path: Optional[str] = None,
     *,
@@ -876,15 +1061,7 @@ def is_raiden_mei_voice(
     tts: Any = None,
 ) -> bool:
     """Return True if the active voice is Raiden Mei (D-7: prefer explicit `voice_id`, fallback to `ref_audio_path`)."""
-    eff_vid = str(voice_id or "").strip() if isinstance(voice_id, str) else ""
-    if not eff_vid and tts is not None:
-        eff_vid = resolve_tts_voice_id(tts)
-    if eff_vid:
-        return eff_vid.lower() in _RAIDEN_MEI_VOICE_IDS
-    eff_ref = ref_audio_path
-    if not eff_ref and tts is not None:
-        eff_ref = getattr(tts, "ref_audio_path", "")
-    return "raiden_mei" in str(eff_ref or "").replace("\\", "/").lower()
+    return resolve_emotion_character_key(ref_audio_path, voice_id=voice_id, tts=tts) == "raiden_mei"
 
 
 def has_voice_emotion_tag_rule(prompt: str) -> bool:

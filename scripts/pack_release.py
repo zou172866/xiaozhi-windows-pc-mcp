@@ -203,7 +203,7 @@ def _git_ls_files(root: Path, *, tracked_only: bool = False) -> list[str]:
     cmd = ["git", "-C", str(root), "ls-files", "-z", "--cached"]
     if not tracked_only:
         cmd.extend(["--others", "--exclude-standard"])
-    proc = subprocess.run(cmd, capture_output=True, check=False)
+    proc = subprocess.run(cmd, capture_output=True, check=False, env=os.environ.copy())
     if proc.returncode != 0:
         raise RuntimeError(f"git ls-files failed (rc={proc.returncode}): {proc.stderr.decode('utf-8', 'replace')}")
     raw_items = [p.decode("utf-8", errors="surrogateescape") for p in proc.stdout.split(b"\x00") if p]

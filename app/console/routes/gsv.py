@@ -31,6 +31,10 @@ _PORTABLE_MEI_GPT_WEIGHTS = f"{shared.HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/gpt.ck
 _PORTABLE_MEI_SOVITS_WEIGHTS = f"{shared.HOST_GSV_WEIGHTS_DIR}/raiden_mei/v4/sovits.pth"
 _PORTABLE_MEI_VERSION = "v4"
 
+_PORTABLE_LXH_GPT_WEIGHTS = f"{shared.HOST_GSV_WEIGHTS_DIR}/luoxiaohei/v5turbo/gpt.ckpt"
+_PORTABLE_LXH_SOVITS_WEIGHTS = f"{shared.HOST_GSV_WEIGHTS_DIR}/luoxiaohei/v5turbo/sovits.pth"
+_PORTABLE_LXH_VERSION = "v5turbo"
+
 _DEFAULT_MEI_GPT_WEIGHTS = (
     os.environ.get("GSV_MEI_GPT_WEIGHTS", "").strip()
     or _PORTABLE_MEI_GPT_WEIGHTS
@@ -40,6 +44,16 @@ _DEFAULT_MEI_SOVITS_WEIGHTS = (
     or _PORTABLE_MEI_SOVITS_WEIGHTS
 )
 _DEFAULT_MEI_VERSION = os.environ.get("GSV_MEI_VERSION", "").strip() or _PORTABLE_MEI_VERSION
+
+_DEFAULT_LXH_GPT_WEIGHTS = (
+    os.environ.get("GSV_LXH_GPT_WEIGHTS", "").strip()
+    or _PORTABLE_LXH_GPT_WEIGHTS
+)
+_DEFAULT_LXH_SOVITS_WEIGHTS = (
+    os.environ.get("GSV_LXH_SOVITS_WEIGHTS", "").strip()
+    or _PORTABLE_LXH_SOVITS_WEIGHTS
+)
+_DEFAULT_LXH_VERSION = os.environ.get("GSV_LXH_VERSION", "").strip() or _PORTABLE_LXH_VERSION
 
 GSV_PROFILES = {
     "__gsv_raiden_mei__": {
@@ -68,6 +82,35 @@ GSV_PROFILES = {
             "parallel_infer": True,
             "repetition_penalty": 1.35,
             "sample_steps": 16,
+        },
+    },
+    "__gsv_luoxiaohei__": {
+        "version": _DEFAULT_LXH_VERSION,
+        "gpt_weights": _DEFAULT_LXH_GPT_WEIGHTS,
+        "sovits_weights": _DEFAULT_LXH_SOVITS_WEIGHTS,
+        "block": {
+            "type": "gpt_sovits_v2",
+            "voice_id": "__gsv_luoxiaohei__",
+            "url": f"{shared.GSV_Host}/tts",
+            "output_dir": "tmp/",
+            "text_lang": "zh",
+            "ref_audio_path": "${HOST_VOICES_DIR}/luoxiaohei/luoxiaohei_default_ref.wav",
+            "aux_ref_audio_paths": [],
+            "prompt_text": "这桌子好高啊，还是变成原形跳上去比较方便。",
+            "prompt_lang": "zh",
+            "top_k": 12,
+            "top_p": 0.98,
+            "temperature": 0.92,
+            "text_split_method": "cut0",
+            "batch_size": 1,
+            "return_fragment": False,
+            "speed_factor": 1.0,
+            "streaming_mode": False,
+            "seed": -1,
+            "parallel_infer": True,
+            "repetition_penalty": 1.35,
+            "sample_steps": 4,
+            "first_segment_sample_steps": 4,
         },
     },
     "__gsv_xiaozhi_tw__": {
@@ -231,11 +274,19 @@ def _is_custom_mei_weights(t2s: str, vits: str) -> bool:
         return False
     low_t2s = _norm_weight_path(t2s).lower()
     low_vits = _norm_weight_path(vits).lower()
-    tw_prof = GSV_PROFILES["__gsv_xiaozhi_tw__"]
-    if (
-        low_t2s == _norm_weight_path(tw_prof["gpt_weights"]).lower()
-        and low_vits == _norm_weight_path(tw_prof["sovits_weights"]).lower()
-    ):
+    if "luoxiaohei" in low_t2s or "luoxiaohei" in low_vits:
+        return False
+    for other_vid, other_prof in GSV_PROFILES.items():
+        if other_vid == "__gsv_raiden_mei__":
+            continue
+        if (
+            low_t2s == _norm_weight_path(other_prof["gpt_weights"]).lower()
+            and low_vits == _norm_weight_path(other_prof["sovits_weights"]).lower()
+        ):
+            return False
+    env_lxh_gpt = _norm_weight_path(os.environ.get("GSV_LXH_GPT_WEIGHTS", "")).lower()
+    env_lxh_sov = _norm_weight_path(os.environ.get("GSV_LXH_SOVITS_WEIGHTS", "")).lower()
+    if (env_lxh_gpt and low_t2s == env_lxh_gpt) or (env_lxh_sov and low_vits == env_lxh_sov):
         return False
     if "raiden_mei" in low_t2s or "raiden_mei" in low_vits:
         return True
@@ -276,6 +327,11 @@ def _resolve_gsv_weights(voice_id: str) -> tuple[str, str, str]:
       2. Existing custom fine-tuned weights from `tts_infer_xiaozhi.yaml` (preserved across switches & restarts)
       3. Portable default profile weights under `HOST_GSV_WEIGHTS_DIR/raiden_mei/v4`
     """
+    if voice_id == "__gsv_luoxiaohei__":
+        ver_lxh = os.environ.get("GSV_LXH_VERSION", "").strip() or _PORTABLE_LXH_VERSION
+        gpt_lxh = os.environ.get("GSV_LXH_GPT_WEIGHTS", "").strip() or _PORTABLE_LXH_GPT_WEIGHTS
+        sov_lxh = os.environ.get("GSV_LXH_SOVITS_WEIGHTS", "").strip() or _PORTABLE_LXH_SOVITS_WEIGHTS
+        return ver_lxh, gpt_lxh, sov_lxh
     if voice_id != "__gsv_raiden_mei__":
         prof = GSV_PROFILES[voice_id]
         return str(prof["version"]), str(prof["gpt_weights"]), str(prof["sovits_weights"])
@@ -321,8 +377,25 @@ def _resolve_gsv_voice_id(tts_cfg: dict | None) -> str:
     if explicit in GSV_PROFILES:
         return explicit
     # Legacy fallback ONLY for older configs lacking explicit voice_id
-    ref_p = str(cfg_d.get("ref_audio_path") or "")
+    ref_p = str(cfg_d.get("ref_audio_path") or "").lower()
+    if "luoxiaohei" in ref_p:
+        return "__gsv_luoxiaohei__"
     return "__gsv_raiden_mei__" if "raiden_mei" in ref_p else "__gsv_xiaozhi_tw__"
+
+
+def _voice_sampling_settings(existing: dict, voice_id: str) -> dict:
+    """Migrate profile defaults while retaining non-default operator tuning."""
+    old = GSV_PROFILES[_resolve_gsv_voice_id(existing)]["block"]
+    new = GSV_PROFILES[voice_id]["block"]
+    settings = {}
+    for key, fallback in (("sample_steps", 16), ("first_segment_sample_steps", None)):
+        previous = existing.get(key)
+        settings[key] = (
+            new.get(key, fallback)
+            if previous is None or previous == old.get(key, fallback)
+            else previous
+        )
+    return settings
 
 
 def _get_configured_gsv_voice() -> str | None:
@@ -335,6 +408,30 @@ def _get_configured_gsv_voice() -> str | None:
     except Exception as exc:
         shared._log_rate_limited("get_configured_gsv_voice", exc)
         return None
+
+
+def _prime_voice_references(client, voice_id: str) -> None:
+    character = mei_emotion_router.resolve_emotion_character_key(voice_id=voice_id)
+    if not character:
+        return
+    try:
+        items = [
+            {key: profile[key] for key in ("ref_audio_path", "prompt_text", "prompt_lang")}
+            for profile in mei_emotion_router.load_character_emotions(character).values()
+            if mei_emotion_router.ref_audio_exists(profile.get("ref_audio_path", ""))
+        ]
+        if items:
+            resp = client.post(
+                f"{shared.GSV_Host}/prime",
+                json={"items": items, "skip_if_busy": False, "reason": "voice_switch"},
+                timeout=_gsv_timeout_within_budget(12.0),
+            )
+            resp.raise_for_status()
+            if resp.json().get("primed") != len(items):
+                raise RuntimeError("部分情绪参考音未成功预热")
+    except Exception as exc:
+        # Warmup is optional after a successful swap. Keep the loaded weights usable.
+        shared._log_rate_limited("gsv_prime_after_switch", exc)
 
 
 def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
@@ -367,6 +464,8 @@ def _ensure_gsv_weights(voice_id: str, persist_boot_yaml: bool = False):
                     "若未放入本地自定义权重，请在 .env 配置 GSV_MEI_SOVITS_WEIGHTS 或切换为 EdgeTTS / 云端 TTS"
                 )
             _active_gsv_loaded = voice_id
+            if persist_boot_yaml or voice_id == _get_configured_gsv_voice():
+                _prime_voice_references(client, voice_id)
         if persist_boot_yaml:
             boot_cfg = {}
             if os.path.exists(shared.GSV_INFER_YAML):
@@ -613,6 +712,8 @@ def handle_post_tts_preview(handler) -> None:
                 try:
                     _ensure_gsv_weights(voice, persist_boot_yaml=False)
                     req_payload = dict(GSV_PROFILES[voice]["block"])
+                    existing = (shared._read_raw_yaml().get("TTS") or {}).get("GPT_SOVITS_V2") or {}
+                    req_payload.update(_voice_sampling_settings(existing, voice))
                     if isinstance(req_payload.get("ref_audio_path"), str):
                         req_payload["ref_audio_path"] = req_payload["ref_audio_path"].replace(
                             "${HOST_VOICES_DIR}", shared.HOST_VOICES_DIR
@@ -626,7 +727,8 @@ def handle_post_tts_preview(handler) -> None:
                         ]
                     req_payload["text"] = clean_text[:120]
                     req_payload["text_split_method"] = "cut0"
-                    if voice == "__gsv_raiden_mei__":
+                    emo_char = mei_emotion_router.resolve_emotion_character_key(voice_id=voice)
+                    if emo_char is not None:
                         explicit_emo = None
                         if req_emotion and req_emotion != "auto":
                             norm_emo, _ = mei_emotion_router.normalize_emotion_name(req_emotion)
@@ -636,8 +738,9 @@ def handle_post_tts_preview(handler) -> None:
                         emo_key = mei_emotion_router.resolve_mei_emotion(
                             clean_text,
                             explicit_segment_emotion=explicit_emo,
+                            character_key=emo_char,
                         )
-                        emo_prof = mei_emotion_router.get_mei_emotion_profile(emo_key)
+                        emo_prof = mei_emotion_router.get_character_emotion_profile(emo_char, emo_key)
                         req_payload["ref_audio_path"] = emo_prof["ref_audio_path"]
                         req_payload["aux_ref_audio_paths"] = []
                         req_payload["prompt_text"] = emo_prof["prompt_text"]
@@ -646,7 +749,7 @@ def handle_post_tts_preview(handler) -> None:
                         req_payload["temperature"] = emo_prof["temperature"]
                         req_payload["top_k"] = emo_prof["top_k"]
                         req_payload["top_p"] = emo_prof["top_p"]
-                    for drop_k in ("type", "url", "output_dir", "voice_id"):
+                    for drop_k in ("type", "url", "output_dir", "voice_id", "first_segment_sample_steps"):
                         req_payload.pop(drop_k, None)
                     tts_timeout = _gsv_timeout_within_budget(25.0)
                     client = shared._get_console_http_client()

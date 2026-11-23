@@ -51,6 +51,21 @@ class TestBatch3AnimaOutboxAndRecall(unittest.TestCase):
                 amp._default_outbox.close()
                 amp._default_outbox = None
 
+    def test_unconfirmed_success_stays_pending(self):
+        for body in (b"", b"broken", b"{}", b'{"rejected_ids":[]}', b'{"queued":true}'):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as td:
+                transport = httpx.MockTransport(lambda req: httpx.Response(200, content=body))
+                box = amp.AnimaOutbox(
+                    os.path.join(td, "ack.sqlite"), token_getter=lambda: "fixture",
+                    client_factory=lambda: httpx.Client(transport=transport), auto_start=False,
+                )
+                try:
+                    box.enqueue([{"request_id": "test-ack", "user_message": "u", "assistant_reply": "a"}])
+                    result = box.drain_once()
+                    self.assertEqual((result["sent"], result["remaining"]), (0, 1))
+                finally:
+                    box.close()
+
     def test_b5_http_4xx_marks_dead_immediately_and_stops_retrying(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = os.path.join(td, "outbox_4xx.sqlite")

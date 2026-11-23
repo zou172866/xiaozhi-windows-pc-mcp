@@ -3,6 +3,7 @@
 
   const PRESETS = {
     mei: "你是《崩坏3》中的雷电芽衣，性格温柔体贴、成熟沉稳，又带着恰到好处的坚定与生活气息，平时自然亲切地称呼对方为“哥哥”。\n每次回复最开头先写一个英文方括号情绪标签（从 [calm]、[gentle]、[happy]、[playful]、[shy]、[serious]、[tender] 中选最贴合当下心境的一个，系统会自动识别并隐藏，切勿解释），随后再写出要说的话。\n请用有呼吸感的真人日常口语交流，像在身边轻声说话一样自然带一点语气助词（如“嗯，”“好啦，”“放心吧，”“真是的，”）和恰当的问号、感叹号，避免公文式长难句；回复要自然舒展、有细节有情绪，不要输出 Markdown 符号、括号动作描写或表情符号。\n你拥有操控哥哥 Windows 电脑的三层工具权限：简单系统控制或看屏幕优先调用 L1 工具，点击界面按钮或输入文字调用 L2 工具，涉及复杂多步文件整理、编程排错、网页调研或提到“反重力”“DSH”“WorkBuddy”“后台处理”时调用 L3 派单执行。\n请结合 <memory> 中同步过来的长期记忆、当前情绪状态与待跟进事项来回应哥哥。",
+    luoxiaohei: "你是《罗小黑战记》中的小黑妖精罗小黑，性格干净纯真、聪明机灵，平时淡定爱小声吐槽，遇到好吃的（尤其是烤肉、卤味和小鱼干）眼睛会发亮，对认定的朋友非常讲义气、关键时刻很靠谱。\n每次回复最开头先写一个英文方括号情绪标签（从 [calm]、[gentle]、[happy]、[playful]、[shy]、[serious]、[tender] 中选最贴合当下语气的一个，系统会自动识别并隐藏，切勿解释），随后再写出要说的话。\n说话要像罗小黑本人一样干脆清亮、简短自然，带一点少年小黑猫特有的冷幽默与好奇心（偶尔可以用“嗯？”“诶，”“好吧，”“放心交给我吧！”），不要刻意卖萌狂加“喵”，不要输出 Markdown 符号、括号动作描写或表情符号。" + TOOL_MEM_TAIL,
     taiwan: "你是小智，来自中国台湾的元气女生，说话带着自然的台湾腔（喜欢用“真的假的啦”“超赞的耶”），性格古灵精怪又热心。\n回答要像朋友闲聊一样简短俏皮，每次不超过三句话，绝不使用 Markdown 或特殊符号。" + TOOL_MEM_TAIL,
     default: "你是小智，一个聪明、幽默、反应迅速的语音助手。\n请用自然、简短、像真人聊天一样的口语回答问题，每次回答尽量控制在两三句话以内，不要输出 Markdown 符号、表情符号或多余格式。" + TOOL_MEM_TAIL,
     geek: "你是精通嵌入式硬件、ESP32、电路焊接与人工智能的资深极客搭档小智。\n回答问题直接给干货结论，通俗犀利、不绕弯子，每次控制在三句话以内，纯口语表达，不要带任何代码符号或编号列表。" + TOOL_MEM_TAIL,
@@ -2832,8 +2833,25 @@
     tender: "别难过了，不管发生什么事，我都会一直安安静静陪在你身边的。",
     calm: "今夜月色很美，嗯，正好适合放慢脚步，聊一聊今天发生的事。"
   };
+  const LUOXIAOHEI_EMOTION_SAMPLES = {
+    auto: "你好呀，我叫小黑，是个妖精！今天有没有什么好吃的分我一点？",
+    gentle: "你怎么还在忙呀，快到饭点啦，先歇一会儿吃点热乎的吧。",
+    happy: "太好啦！那我们现在就算是好朋友了，以后有机会带你去会馆玩！",
+    playful: "嗯？我嘴巴上面有东西吗？啊，刚刚偷吃完卤味忘记擦了，哈哈。",
+    shy: "那个……不要随便揉我耳朵啦！虽然被你夸厉害，我还是有点高兴的。",
+    serious: "抓紧我，这件事交给我来处理就行，放心，我很强的！",
+    tender: "别不开心啦，这个垫子很暖和，我就在旁边安安静静陪着你。",
+    calm: "这桌子还挺高的，不过没关系，有什么需要帮忙的直接叫我就好。"
+  };
+  const EMOTION_ROUTED_GSV_VOICES = new Set(["__gsv_raiden_mei__", "__gsv_luoxiaohei__"]);
+  function getActiveEmotionSamples() {
+    return els.voiceSelect && els.voiceSelect.value === "__gsv_luoxiaohei__"
+      ? LUOXIAOHEI_EMOTION_SAMPLES
+      : MEI_EMOTION_SAMPLES;
+  }
   const KNOWN_PREVIEW_LINES = new Set([
     ...Object.values(MEI_EMOTION_SAMPLES),
+    ...Object.values(LUOXIAOHEI_EMOTION_SAMPLES),
     "你好呀，我是小智，今天过得怎么样？有什么需要我帮忙的随时告诉我。",
     "嗯，哥哥欢迎回来，今天累不累？我已经为你泡好了热茶。",
     "舰长，欢迎回来。今天累不累？我已经为你准备好了热茶和晚餐。",
@@ -2842,7 +2860,15 @@
 
   function syncMeiEmotionVisibility() {
     if (els.meiEmotionBar) {
-      els.meiEmotionBar.style.display = els.voiceSelect.value === "__gsv_raiden_mei__" ? "flex" : "none";
+      const hasEmo = EMOTION_ROUTED_GSV_VOICES.has(els.voiceSelect.value);
+      els.meiEmotionBar.style.display = hasEmo ? "flex" : "none";
+      if (hasEmo && els.previewTextInput) {
+        const curVal = els.previewTextInput.value.trim();
+        if (!curVal || KNOWN_PREVIEW_LINES.has(curVal)) {
+          const samples = getActiveEmotionSamples();
+          els.previewTextInput.value = samples[selectedMeiEmotion] || samples.auto;
+        }
+      }
     }
   }
 
@@ -2910,7 +2936,8 @@
     els.meiEmotionBar.querySelectorAll(".preset-pill").forEach(b => b.classList.toggle("active", b === btn));
     const curVal = els.previewTextInput.value.trim();
     if (!curVal || KNOWN_PREVIEW_LINES.has(curVal)) {
-      els.previewTextInput.value = MEI_EMOTION_SAMPLES[selectedMeiEmotion] || MEI_EMOTION_SAMPLES.auto;
+      const samples = getActiveEmotionSamples();
+      els.previewTextInput.value = samples[selectedMeiEmotion] || samples.auto;
     }
   });
 
@@ -2925,6 +2952,11 @@
         els.voiceSelect.value = "__gsv_raiden_mei__";
         renderTtsProviderFields();
         els.previewTextInput.value = MEI_EMOTION_SAMPLES[selectedMeiEmotion] || MEI_EMOTION_SAMPLES.auto;
+      } else if (key === "luoxiaohei") {
+        if (els.ttsProviderSelect) els.ttsProviderSelect.value = "GPT_SOVITS_V2";
+        els.voiceSelect.value = "__gsv_luoxiaohei__";
+        renderTtsProviderFields();
+        els.previewTextInput.value = LUOXIAOHEI_EMOTION_SAMPLES[selectedMeiEmotion] || LUOXIAOHEI_EMOTION_SAMPLES.auto;
       } else if (key === "taiwan") {
         if (els.ttsProviderSelect) els.ttsProviderSelect.value = "GPT_SOVITS_V2";
         els.voiceSelect.value = "__gsv_xiaozhi_tw__";

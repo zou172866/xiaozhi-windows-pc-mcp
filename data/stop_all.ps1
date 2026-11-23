@@ -3,6 +3,8 @@
 
 $serverDir = Split-Path -Parent $PSScriptRoot
 Set-Location $serverDir
+. (Join-Path $PSScriptRoot "host_process.ps1")
+$mcpWatchdogScript = Join-Path $serverDir "pc-mcp\pc_mcp_watchdog.py"
 
 Write-Host "[1/5] 正在停止小智与记忆大脑 Docker 容器..." -ForegroundColor Cyan
 $dockerInitiallyRunning = $false
@@ -19,13 +21,9 @@ $watchdogStopFlag = Join-Path $serverDir "pc-mcp\state\watchdog_stop.flag"
 try {
     New-Item -ItemType File -Path $watchdogStopFlag -Force -ErrorAction SilentlyContinue | Out-Null
     $wdProcs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -match '^python(w)?(\.exe)?$' -and
-            $_.CommandLine -and
-            $_.CommandLine -like '*pc_mcp_watchdog.py*'
-        }
+        Where-Object { Test-ProjectPythonProcess $_ $mcpWatchdogScript }
     foreach ($wp in $wdProcs) {
-        Stop-Process -Id $wp.ProcessId -Force -ErrorAction SilentlyContinue
+        Stop-ProjectPythonProcess $wp $mcpWatchdogScript
         Write-Host "  已关闭 18900 看门狗进程 PID=$($wp.ProcessId)" -ForegroundColor DarkGray
     }
 } catch {}
@@ -40,28 +38,18 @@ if ((Test-Path $mcpPy) -and (Test-Path $mcpWatchdogScript)) {
     } catch {}
 }
 
-$mcpPidSet = @{}
-$mcpListenPids = Get-NetTCPConnection -LocalPort 18900 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
-foreach ($mp in $mcpListenPids) {
-    if ($mp) { $mcpPidSet[[int]$mp] = $true }
-}
-try {
-    $mcpPyProcs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^python(w)?(\.exe)?$' -and $_.CommandLine -and $_.CommandLine -like '*pc_control_mcp.py*' }
-    foreach ($p in $mcpPyProcs) {
-        if ($p.ProcessId) { $mcpPidSet[[int]$p.ProcessId] = $true }
-    }
-} catch {}
-foreach ($mp in $mcpPidSet.Keys) {
-    Stop-Process -Id $mp -Force -ErrorAction SilentlyContinue
-    Write-Host "  已精准关闭电脑操控进程 PID=$mp（已保护用户浏览器窗口）" -ForegroundColor DarkGray
+$mcpScript = Join-Path $serverDir "pc-mcp\pc_control_mcp.py"
+if (-not (Test-ProjectListener 18900 $mcpScript)) { Write-Warning '18900 被其他进程占用，已保留该进程。' }
+foreach ($proc in (Get-CimInstance Win32_Process | Where-Object { Test-ProjectPythonProcess $_ $mcpScript })) {
+    Stop-ProjectPythonProcess $proc $mcpScript
 }
 
-Write-Host "[3/5] 正在关闭本地 19880 语音合成进程并释放显卡显存..." -ForegroundColor Cyan
-$pids = Get-NetTCPConnection -LocalPort 19880 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique
-foreach ($p in $pids) {
-    Stop-Process -Id $p -Force -ErrorAction SilentlyContinue
-    Write-Host "  已关闭语音合成进程 PID=$p" -ForegroundColor DarkGray
+Write-Host "[3/5] 正在关闭本地 19880 语音合成进程..." -ForegroundColor Cyan
+$gsvConfig = Join-Path $serverDir "config\runtime\tts_infer_xiaozhi.yaml"
+foreach ($listener in (Get-NetTCPConnection -LocalPort 19880 -State Listen -ErrorAction SilentlyContinue)) {
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
+    if (Test-ProjectPythonProcess $proc '' $gsvConfig) { Stop-ProjectPythonProcess $proc '' $gsvConfig }
+    else { Write-Warning '19880 被其他进程占用，已保留该进程。' }
 }
 
 Write-Host "[4/5] 正在检查并清理残留的 Antigravity Sidecar 桥接进程..." -ForegroundColor Cyan

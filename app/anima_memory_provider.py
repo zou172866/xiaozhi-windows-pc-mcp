@@ -621,11 +621,14 @@ class AnimaOutbox:
                         json={"character_id": cid, "turns": turns_batch},
                     )
                 if resp.status_code == 200:
-                    data = {}
-                    try:
-                        data = resp.json() if resp.content else {}
-                    except Exception:
-                        data = {}
+                    data = resp.json()
+                    if not isinstance(data, dict):
+                        raise ValueError("invalid ingest acknowledgement")
+                    for field in ("accepted_ids", "rejected_ids"):
+                        if field in data and not (
+                            isinstance(data[field], list) and all(isinstance(i, str) for i in data[field])
+                        ):
+                            raise ValueError("invalid ingest acknowledgement IDs")
                     rejected = set(data.get("rejected_ids") or [])
                     if "accepted_ids" in data:
                         accepted_set = set(data.get("accepted_ids") or [])
@@ -636,17 +639,9 @@ class AnimaOutbox:
                         ]
                         ok_set = set(ok_ids)
                         fail_rows = [r for r in valid_rows if r["request_id"] not in ok_set]
-                    elif "rejected_ids" in data:
-                        ok_ids = [
-                            r["request_id"]
-                            for r in valid_rows
-                            if r["request_id"] not in rejected
-                        ]
-                        ok_set = set(ok_ids)
-                        fail_rows = [r for r in valid_rows if r["request_id"] not in ok_set]
                     else:
-                        queued_n = int(data.get("queued", len(valid_rows)))
-                        if queued_n >= len(valid_rows):
+                        queued_n = data.get("queued")
+                        if type(queued_n) is int and queued_n == len(valid_rows) and not rejected:
                             ok_ids = [r["request_id"] for r in valid_rows]
                             fail_rows = []
                         else:
