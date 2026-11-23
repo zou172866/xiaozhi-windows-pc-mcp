@@ -8,15 +8,16 @@
 
 ## 更新说明
 
-### 2026-11-23 · SillyTavern 剧情与日常记忆分档
+### 2026-11-23 · 酒馆剧情分档、本地中文陪伴模型与罗小黑多情绪音色
 
-**开发进度**　已完成本地实现和自动化验证，代码待合入 `main`。
+已合入 `main`：
 
-- **日常与剧情分开记忆。** 现有日常记忆沿用原存档。同一台 ESP32 可以切换到酒馆剧情，同一角色的不同酒馆聊天各自保存进度。
-- **把酒馆里的一段对话带到音箱。** 「用小智继续」扩展可以从单人聊天导出最近 1 至 3 轮选定的对白。在小智控制台选择设备、预览文件并确认导入，结束当前语音连接后重新唤醒，就能用小智现有的人设和音色接着聊。
-- **切换时，旧对话写回原存档。** 即使上一轮在切换后才完成后台保存，也会回到当时的存档。重复导入同一份对白只记一次。
+- **SillyTavern 剧情与日常记忆分档**：日常陪伴沿用原 Anima 角色，同一台 ESP32 可按设备独立切换至酒馆剧情，不同酒馆聊天各自独立存档，Anima 侧严禁 `starc_*` 剧情角色回落到日常人格。
+- **「用小智继续」酒馆扩展交接**：新增 [integrations/sillytavern/](integrations/sillytavern/README.md) 扩展，支持从单人聊天导出最近 1 至 3 轮选定对白；在 `18080` 控制台预览确认并导入后，重新唤醒即可用现有音色和人设接着聊。连接建立时即锁定归属存档，切换后旧连接的延迟召回、情绪状态和后台写回均不串档，重复导入自动去重并拦截过期或被修改的历史对白。
+- **本地中文陪伴模型与 DeepSeek 一键切换**：`18080` 控制台新增 **本地陪伴 · Huihui Qwen3 14B**（连接宿主机 LM Studio `19340` 端口），切换前自动校验本机模型列表可用性，沿用当前人设与长期记忆，可随时切回 DeepSeek 或 Gemini。
+- **罗小黑本地多情绪音色与启动/交付加固**：新增罗小黑（`GPT-SoVITS v5turbo`）7 情绪参考配置、专属唤醒回复与音色切换容错；加固 Anima Outbox 投递回执校验；Windows 端将 `ESP32_AUTH_KEY` 迁入当前用户 DPAPI 加密存储，并新增宿主机进程与监听端口精准归属校验。
 
-验证覆盖了剧情隔离、跨连接延迟写入、重复导入和浏览器文件交接。项目三层回归通过 281 项，Anima 镜像内测试通过 263 项。实体 ESP32 语音接续待实机验证。
+自动化验证：三层回归通过 **281 项**（`unit` 265 + `contract` 7 + `live` 9），Anima 镜像内 `pytest` 通过 **263 项**，SillyTavern 扩展测试通过 **3 项**。实体 ESP32 语音接续待实机验证。
 
 ## 核心特性
 
@@ -41,7 +42,7 @@
 - **高位端口（`>15000`）**：`18000`（WS）、`18003`（OTA/Vision）、`18080`（控制台）、`18787`（Anima Brain）、`18900`（PC MCP + 48kHz 音频）、`19880`（可选 GPU `GPT-SoVITS`），彻底避开 Windows Hyper-V 保留段冲突；
 - **低延迟与防抢话**：`SileroVAD` `1100ms` 防抢话上限 + 可热关投机性句末早判（实测 34 条句中换气零误截断、完整句平均省 `~0.48s` 尾延迟）+ ESP32-S3 离线唤醒/打断词；
 - **轻量内存与免 Key 天气**：默认 `SherpaASR`（int8 ONNX）+ 异步独立 ASR 线程 + 空闲冷内存回收，实测双容器合计常驻 `~480–500 MiB`（`xiaozhi-esp32-server ~415 MiB` + `xiaozhi-anima-brain ~67–84 MiB`，较 PyTorch `FunASR` `3.54 GB` 压降约 88%）；内置中央气象台 `nmc.cn` 免 Key 全国实时与 7 天天气；
-- **可复现构建与自动化 CI**：`anima-brain` 锁定双阶段镜像 digest、Py3.12 依赖约束与非 root `USER app`，宿主机 `pc-mcp` 使用 `requirements.in` + SHA-256 哈希锁依赖，自带 GitHub Actions CI（含 `ruff` 门禁、编码门禁与 257 项 Anima `pytest` 全量回归）及三层 250 项自动化测试套件。
+- **可复现构建与自动化 CI**：`anima-brain` 锁定双阶段镜像 digest、Py3.12 依赖约束与非 root `USER app`，宿主机 `pc-mcp` 使用 `requirements.in` + SHA-256 哈希锁依赖，自带 GitHub Actions CI（含 `ruff` 门禁、编码门禁与 263 项 Anima `pytest` 全量回归）及三层 281 项自动化测试套件。
 
 ---
 
@@ -59,8 +60,9 @@ xiaozhi-server/
 │   ├── boot.py                          # 唯一启动入口（install_all -> 契约自检 -> 安全门禁 -> 控制台 -> 上游）
 │   ├── patches/                         # 21 项契约补丁（registry, contracts, auth, cloud_audio, memory_hooks, asr, pc_audio, reply_length, weather, emotion/*）
 │   ├── console/                         # 18080 Web 控制台（server, shared, routes/*, static/{index.html,app.css,app.js}）
-│   └── ...                              # anima_memory_provider, vad_speculative_router, turn_context_router, xz_common 等
+│   └── ...                              # anima_memory_provider, memory_archives, vad_speculative_router, turn_context_router, xz_common 等
 ├── anima-brain/                         # 可复现非 root Docker 镜像（锁定 digest + Py3.12 constraints + 构建期 UI 打包）
+├── integrations/sillytavern/            # 「用小智继续」SillyTavern 酒馆剧情交接扩展与 Node 测试
 ├── pc-mcp/                              # 宿主机 Windows 三层操控 MCP (18900)
 │   ├── pc_control_mcp.py                # 薄入口；核心拆分为 pc_mcp_modules/* 与 common/*
 │   ├── pc_mcp_watchdog.py               # 无黑框看门狗（探活、熔断、重启保活 L3 子进程）
@@ -116,7 +118,7 @@ lms server start --port 19340
 ```powershell
 python scripts/run_tests.py --layer unit       # 离线单元测试（含临时 docker run --rm，不依赖运行中容器）
 python scripts/run_tests.py --layer contract   # 上游镜像契约校验（升级镜像必跑）
-python scripts/run_tests.py --layer all        # 全链路三层回归（235 项）
+python scripts/run_tests.py --layer all        # 全链路三层回归（281 项）
 python scripts/generate_patches_doc.py --check # 校验 docs/patches.md 与代码同步
 ```
 
@@ -129,3 +131,26 @@ python scripts/generate_patches_doc.py --check # 校验 docs/patches.md 与代�
 ```bash
 npx skills add zou172866/xiaozhi-windows-pc-mcp
 ```
+
+---
+
+## 致敬开源项目
+
+本项目站在众多优秀开源项目与社区的肩膀之上，谨向以下上游项目及维护者致以诚挚敬意（各组件均保留其原始开源协议）：
+
+- **小智硬件与服务端核心底座**
+  - [xiaozhi-esp32 (`78/xiaozhi-esp32`)](https://github.com/78/xiaozhi-esp32)：小智 ESP32 开源 AI 语音硬件与固件生态，让低成本端侧设备拥有了流畅的语音交互与表情陪伴体验。
+  - [xiaozhi-esp32-server (`xinnan-tech/xiaozhi-esp32-server`)](https://github.com/xinnan-tech/xiaozhi-esp32-server)：核心私有化服务端架构与上游 Docker 镜像底座。
+  - [ESP-SR (`espressif/esp-sr`)](https://github.com/espressif/esp-sr)：乐鑫开源端侧语音前处理与 MultiNet7 离线中文唤醒/命令词框架。
+- **长期情感记忆、酒馆剧情与本地大模型生态**
+  - [Anima Brain (`spearsheep/anima-brain`)](https://github.com/spearsheep/anima-brain)：由 Jun Yu Chen（`@spearsheep`）与 `@kayllla` 开源的本地优先长期记忆与情绪连续性引擎（MIT），赋予小智跨日记忆、关系演进与情绪共鸣。
+  - [SillyTavern (`SillyTavern/SillyTavern`)](https://github.com/SillyTavern/SillyTavern)：开源 AI 角色扮演前端与扩展体系，「用小智继续」酒馆剧情交接依托其官方扩展 API 实现。
+  - [Qwen3 (`QwenLM/Qwen3`)](https://github.com/QwenLM/Qwen3)、[Huihui-Qwen3-14B-abliterated-v2](https://huggingface.co/huihui-ai/Huihui-Qwen3-14B-abliterated-v2) 与 [llama.cpp (`ggml-org/llama.cpp`)](https://github.com/ggml-org/llama.cpp)：为本地中文陪伴对话模式提供开源权重、对话模板与 GGUF 推理工具链支持。
+- **语音识别、端点检测与语音合成**
+  - [GPT-SoVITS (`RVC-Boss/GPT-SoVITS`)](https://github.com/RVC-Boss/GPT-SoVITS)：强大的少样本语音克隆与本地 GPU 多情绪语音合成引擎。
+  - [sherpa-onnx (`k2-fsa/sherpa-onnx`)](https://github.com/k2-fsa/sherpa-onnx) 与 [SenseVoice (`FunAudioLLM/SenseVoice`)](https://github.com/FunAudioLLM/SenseVoice)：让本地离线中文语音识别以 int8 ONNX 轻量常驻成为可能。
+  - [Silero VAD (`snakers4/silero-vad`)](https://github.com/snakers4/silero-vad)：高精度、低开销的本地语音端点检测。
+  - [edge-tts (`rany2/edge-tts`)](https://github.com/rany2/edge-tts)：为无独显设备提供开箱即用的轻量语音合成兜底。
+- **协议与 Windows 桌面操控基础设施**
+  - [Model Context Protocol Python SDK (`modelcontextprotocol/python-sdk`)](https://github.com/modelcontextprotocol/python-sdk)：标准化 MCP 工具接入协议。
+  - [PyAutoGUI (`asweigart/pyautogui`)](https://github.com/asweigart/pyautogui) 与 [Python-UIAutomation-for-Windows (`yinkaisheng/Python-UIAutomation-for-Windows`)](https://github.com/yinkaisheng/Python-UIAutomation-for-Windows)：支撑 Windows 高分屏键鼠操控与 UIA 无障碍控件树定位。
