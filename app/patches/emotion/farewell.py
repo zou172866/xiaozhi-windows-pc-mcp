@@ -119,7 +119,7 @@ async def generate_llm_idle_farewell(
         "严格遵循下方用户的字数与语气要求直接说出告别台词。"
     )
     if is_mei_voice:
-        sys_parts.append("请在开头附上最贴合依恋温柔心境的一个英文方括号情绪标签（如 [tender]、[gentle] 或 [shy]）。")
+        sys_parts.append("请在开头附上最贴合依恋温柔心境的一个英文方括号情绪标签（如 [gentle]、[shy] 或 [calm]）。")
 
     instr = str(summary_prompt or "").strip() or runtime_settings.DEFAULT_IDLE_FAREWELL_SUMMARY_PROMPT
     user_msg = (
@@ -353,7 +353,7 @@ def apply_idle_farewell_patch() -> None:
                                 conn,
                                 generated,
                                 timeout_sec=timeout_sec,
-                                default_emotion="tender",
+                                default_emotion="gentle",
                                 reason="AI总结依恋告别",
                             )
                         else:

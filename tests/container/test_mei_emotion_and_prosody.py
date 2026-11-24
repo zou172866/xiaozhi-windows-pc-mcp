@@ -344,6 +344,33 @@ class TestMeiEmotionAndProsody(unittest.TestCase):
                 f"Mismatch esp32_emotion in mei_emotions.json for {key}",
             )
 
+    def test_tender_semantic_guard_and_softened_profile(self):
+        # 1. Tender profile uses soothing relaxed expression & 0.96 speed instead of gloomy sad/0.93
+        mei_emotions = router.load_mei_emotions(force_reload=True)
+        self.assertEqual(mei_emotions["tender"]["esp32_emotion"], "relaxed")
+        self.assertEqual(mei_emotions["tender"]["esp32_emoji"], "😌")
+        self.assertAlmostEqual(float(mei_emotions["tender"]["speed_factor"]), 0.96, places=2)
+
+        lxh_emotions = router.load_character_emotions("luoxiaohei", force_reload=True)
+        self.assertEqual(lxh_emotions["tender"]["esp32_emotion"], "relaxed")
+        self.assertEqual(lxh_emotions["tender"]["esp32_emoji"], "😌")
+        self.assertAlmostEqual(float(lxh_emotions["tender"]["speed_factor"]), 0.96, places=2)
+
+        # 2. Anima positive last_emotion=tender falls back to gentle; sad/hurt still map to tender
+        router.clear_anima_mood()
+        try:
+            router.set_anima_mood("stage=close, last_emotion=tender", device_id="dev-tender-01")
+            router.set_anima_mood("stage=close, last_emotion=sad", device_id="dev-tender-02")
+            self.assertEqual(router.get_anima_mood("dev-tender-01"), "gentle")
+            self.assertEqual(router.get_anima_mood("dev-tender-02"), "tender")
+        finally:
+            router.clear_anima_mood()
+
+        # 3. Harmonized prompt explicitly restricts [tender] to comforting sadness/distress
+        sample_base = 'NEVER use brackets to express inner thoughts or actions (e.g. ”[无奈地叹气]”,”(笑着说)”).'
+        harmonized = router.apply_prompt_harmony_replacements(sample_base, record_registry=False)
+        self.assertIn("reserve [tender] strictly for comforting sadness or distress", harmonized)
+
     def test_voice_preview_restores_seven_reference_slots(self):
         from unittest.mock import MagicMock, patch
         from console.routes import gsv

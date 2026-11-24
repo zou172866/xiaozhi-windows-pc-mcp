@@ -21,7 +21,7 @@ _PROMPT_REPLACEMENTS: Tuple[Tuple[str, str, str], ...] = (
     (
         "brackets_rule",
         'NEVER use brackets to express inner thoughts or actions (e.g. ”[无奈地叹气]”,”(笑着说)”).',
-        'Start every spoken reply (including direct_answer.response) with ONE hidden English emotion tag from [calm], [gentle], [happy], [playful], [shy], [serious], [tender] (optional second tag only if mood genuinely shifts mid-reply). NEVER use stage-direction brackets like ”[无奈地叹气]” or ”(笑着说)”.',
+        'Start every spoken reply (including direct_answer.response) with ONE hidden English emotion tag from [calm], [gentle], [happy], [playful], [shy], [serious], [tender] (use [calm]/[gentle] for everyday chat, [happy] for good news or cheer, [playful] for teasing, [shy] for blushing, [serious] for focus, and reserve [tender] strictly for comforting sadness or distress; optional second tag only if mood genuinely shifts mid-reply). NEVER use stage-direction brackets like ”[无奈地叹气]” or ”(笑着说)”.',
     ),
     (
         "get_to_the_point",

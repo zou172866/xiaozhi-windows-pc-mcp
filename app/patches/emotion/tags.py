@@ -104,8 +104,8 @@ DEFAULT_LUOXIAOHEI_EMOTIONS: Dict[str, Dict[str, Any]] = {
         "temperature": 0.90,
         "top_k": 12,
         "top_p": 0.96,
-        "esp32_emotion": "sad",
-        "esp32_emoji": "😔",
+        "esp32_emotion": "relaxed",
+        "esp32_emoji": "😌",
     },
 }
 
@@ -187,12 +187,12 @@ DEFAULT_MEI_EMOTIONS: Dict[str, Dict[str, Any]] = {
         "ref_audio_path": f"{MEI_DIR_HOST}/mei_tender_ref.wav",
         "prompt_text": "那些美好温暖的回忆，会永远留在我的心中。",
         "prompt_lang": "zh",
-        "speed_factor": 0.93,
+        "speed_factor": 0.96,
         "temperature": 0.92,
         "top_k": 12,
         "top_p": 0.98,
-        "esp32_emotion": "sad",
-        "esp32_emoji": "😔",
+        "esp32_emotion": "relaxed",
+        "esp32_emoji": "😌",
     },
 }
 
@@ -903,7 +903,13 @@ def set_anima_mood(mood_summary: str, device_id: Optional[MoodKey] = None) -> No
         return
     m = re.search(r"last_emotion\s*=\s*([A-Za-z_]+)", mood_summary)
     raw = m.group(1).strip().lower() if m else mood_summary.strip().lower()
-    emo, _ = normalize_emotion_name(raw)
+    # Anima's PAD table models "tender" as positive affection (+0.5 pleasure), whereas TTS "tender"
+    # is reserved for comforting sadness/distress. Map Anima's positive "tender" fallback to "gentle"
+    # while keeping explicit "sad"/"hurt" mapped to "tender".
+    if raw == "tender":
+        emo = "gentle"
+    else:
+        emo, _ = normalize_emotion_name(raw)
     if emo:
         dev_key = _normalize_mood_device_key(device_id)
         with _anima_lock:

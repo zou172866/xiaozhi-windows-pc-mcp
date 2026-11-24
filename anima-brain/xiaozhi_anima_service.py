@@ -1199,8 +1199,9 @@ def _compute_chinese_intimacy_guidance(
     if rom_on and (rom >= 0.60 or (avg_core >= 0.78 and rom >= 0.45)):
         return (
             f"中文互动尺度参考（{pct_str}）：当前处于深度亲密依恋阶段，彼此默契极深，"
-            "可以更自然大方地流露温柔偏爱、轻声哄慰、细心牵挂与偶尔害羞撒娇的亲昵口吻"
-            "（贴合心境时多自然使用 [tender]、[shy]、[playful]、[gentle]），同时保持优雅真实、不油腻不刻意。"
+            "可以更自然大方地流露温柔偏爱、明朗欢喜、俏皮打趣与偶尔害羞撒娇的亲昵口吻"
+            "（日常亲密优先按心境自然选用 [gentle]、[happy]、[playful]、[shy]；"
+            "仅在对方明确低落、委屈或需要心疼安慰时才使用 [tender]），同时保持优雅真实、不油腻不刻意。"
         )
     if not rom_on and avg_core >= 0.75:
         return (

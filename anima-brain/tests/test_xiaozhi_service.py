@@ -403,7 +403,11 @@ class TestXiaozhiAnimaServiceHardening(unittest.TestCase):
                     headers=headers,
                     json={"character_id": svc.DEFAULT_CHARACTER_ID, "query": "晚安"},
                 ).json()
-                self.assertIn("深度亲密依恋", rec2.get("context_text", ""))
+                ctx2 = rec2.get("context_text", "")
+                self.assertIn("深度亲密依恋", ctx2)
+                self.assertIn("[gentle]、[happy]、[playful]、[shy]", ctx2)
+                self.assertIn("仅在对方明确低落、委屈或需要心疼安慰时才使用 [tender]", ctx2)
+                self.assertNotIn("多自然使用 [tender]", ctx2)
                 self.assertIn("stage=close", rec2.get("mood", ""))
 
                 r3 = client.post(
