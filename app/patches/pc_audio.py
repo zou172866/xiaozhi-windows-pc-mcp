@@ -56,6 +56,7 @@ _silent_opus_lock = threading.Lock()
 # without setting queue_empty_event if send_audio_callback raises or pending_send_task cancels).
 QUEUE_EMPTY_WAIT_TIMEOUT = 10.0
 QUEUE_EMPTY_POLL_SLICE = 1.0
+QUEUE_EMPTY_HARD_CAP_MARGIN = 20.0
 
 _sync_client_lock = threading.Lock()
 _sync_client: Optional[httpx.Client] = None
@@ -269,6 +270,10 @@ def _ensure_conn_pc_state(conn):
         conn._pc_audio_active_sid = None
     if not hasattr(conn, "_pc_audio_queued_ms"):
         conn._pc_audio_queued_ms = 0
+    if not hasattr(conn, "_pc_audio_enqueued_ms"):
+        conn._pc_audio_enqueued_ms = 0
+    if not hasattr(conn, "_pc_audio_enqueued_sid"):
+        conn._pc_audio_enqueued_sid = None
     if not hasattr(conn, "_pc_audio_skip_wait_once"):
         conn._pc_audio_skip_wait_once = None
 
@@ -276,6 +281,10 @@ def _ensure_conn_pc_state(conn):
 def _enqueue_pc_clip(conn, sid, text: str, wav_bytes: bytes, dur_ms: int, volume: float) -> None:
     _ensure_conn_pc_state(conn)
     with conn._pc_audio_queue_lock:
+        if conn._pc_audio_enqueued_sid != sid:
+            conn._pc_audio_enqueued_ms = 0
+            conn._pc_audio_enqueued_sid = sid
+        conn._pc_audio_enqueued_ms += max(0, int(dur_ms or 0))
         conn._pc_audio_clip_queue.append((sid, text, wav_bytes, dur_ms, volume))
         if len(conn._pc_audio_clip_queue) > 64:
             del conn._pc_audio_clip_queue[:-64]
@@ -384,8 +393,13 @@ def _enqueue_pc_stream_wav(conn, cur_sid, wav_bytes: bytes, dur_ms: int, volume:
     with conn._pc_audio_queue_lock:
         if conn._pc_audio_active_sid != cur_sid:
             conn._pc_audio_queued_ms = 0
+        if conn._pc_audio_enqueued_sid != cur_sid:
+            conn._pc_audio_enqueued_ms = 0
+            conn._pc_audio_enqueued_sid = cur_sid
         conn._pc_audio_active_sid = cur_sid
-        conn._pc_audio_queued_ms += max(0, int(dur_ms or 0))
+        add_ms = max(0, int(dur_ms or 0))
+        conn._pc_audio_queued_ms += add_ms
+        conn._pc_audio_enqueued_ms += add_ms
         abort_gen = int(getattr(conn, "_pc_audio_abort_gen", 0) or 0)
         conn._pc_stream_pending_chunks.append((cur_sid, abort_gen, wav_bytes, float(volume)))
         while len(conn._pc_stream_pending_chunks) > 256:
@@ -916,14 +930,37 @@ async def _wait_rate_controller_empty(
         return True
 
     eff_stall = max(0.05, float(QUEUE_EMPTY_WAIT_TIMEOUT if stall_timeout is None else stall_timeout))
-    queued_ms = max(0, int(getattr(conn, "_pc_audio_queued_ms", 0) or 0))
-    hard_cap = max(eff_stall, min(600.0, (queued_ms / 1000.0) + max(15.0, eff_stall)))
-
-    now = time.monotonic()
-    hard_deadline = now + hard_cap
-    last_progress = now
     q_obj = getattr(rc, "queue", None)
+    frame_ms = max(1, int(getattr(rc, "interval_ms", 60) or 60))
+    margin_sec = max(float(QUEUE_EMPTY_HARD_CAP_MARGIN), eff_stall)
+    q_lock = getattr(conn, "_pc_audio_queue_lock", None)
+
+    def _compute_hard_cap() -> float:
+        if q_lock is not None:
+            with q_lock:
+                act_sid = getattr(conn, "_pc_audio_active_sid", None)
+                raw_q_ms = getattr(conn, "_pc_audio_queued_ms", 0)
+                enq_sid = getattr(conn, "_pc_audio_enqueued_sid", None)
+                raw_e_ms = getattr(conn, "_pc_audio_enqueued_ms", 0)
+        else:
+            act_sid = getattr(conn, "_pc_audio_active_sid", None)
+            raw_q_ms = getattr(conn, "_pc_audio_queued_ms", 0)
+            enq_sid = getattr(conn, "_pc_audio_enqueued_sid", None)
+            raw_e_ms = getattr(conn, "_pc_audio_enqueued_ms", 0)
+        queued_ms = max(0, int(raw_q_ms or 0)) if act_sid in (None, cur_sid) else 0
+        enqueued_ms = max(0, int(raw_e_ms or 0)) if enq_sid in (None, cur_sid) else 0
+        q_rem_ms = (len(q_obj) * frame_ms) if q_obj is not None else 0
+        est_ms = max(queued_ms, enqueued_ms, q_rem_ms)
+        return max(eff_stall, min(600.0, (est_ms / 1000.0) + margin_sec))
+
+    start_ts = time.monotonic()
+    hard_cap = _compute_hard_cap()
+    hard_deadline = start_ts + hard_cap
+    max_hard_deadline = start_ts + max(600.0, eff_stall)
+    last_progress = start_ts
     prev_qlen = len(q_obj) if q_obj is not None else -1
+    raw_play_pos = getattr(rc, "play_position", None)
+    prev_play_pos = float(raw_play_pos) if isinstance(raw_play_pos, (int, float)) else None
 
     while not ev.is_set():
         if getattr(conn, "client_abort", False) or getattr(conn, "sentence_id", None) != cur_sid:
@@ -937,11 +974,17 @@ async def _wait_rate_controller_empty(
             return False
 
         now = time.monotonic()
+        cur_cap = _compute_hard_cap()
+        if cur_cap > hard_cap:
+            hard_cap = cur_cap
+            hard_deadline = min(max_hard_deadline, start_ts + hard_cap)
+
         rem_stall = eff_stall - (now - last_progress)
         rem_hard = hard_deadline - now
         if rem_stall <= 0 or rem_hard <= 0:
+            reason_desc = f"{eff_stall:.1f}s 无进展" if rem_stall <= 0 else f"总时长上限 {hard_cap:.1f}s"
             print(
-                f"[PCAudioRouter] 等待 AudioRateController.queue_empty_event 超时 ({eff_stall:.1f}s 无进展)，强制继续收尾 (C-5)",
+                f"[PCAudioRouter] 等待 AudioRateController.queue_empty_event 超时 ({reason_desc})，强制继续收尾 (C-5)",
                 flush=True,
             )
             return False
@@ -951,11 +994,22 @@ async def _wait_rate_controller_empty(
             await asyncio.wait_for(ev.wait(), timeout=step)
             return True
         except asyncio.TimeoutError:
+            progressed = False
+            cur_play_pos = getattr(rc, "play_position", None)
+            if isinstance(cur_play_pos, (int, float)):
+                cur_pos_f = float(cur_play_pos)
+                if prev_play_pos is None:
+                    prev_play_pos = cur_pos_f
+                elif cur_pos_f > prev_play_pos:
+                    prev_play_pos = cur_pos_f
+                    progressed = True
             if q_obj is not None:
                 cur_qlen = len(q_obj)
                 if cur_qlen < prev_qlen:
-                    prev_qlen = cur_qlen
-                    last_progress = time.monotonic()
+                    progressed = True
+                prev_qlen = cur_qlen
+            if progressed:
+                last_progress = time.monotonic()
     return True
 
 
@@ -1217,43 +1271,77 @@ def apply_pc_audio_playback_patches() -> None:
                 clip = _pop_pc_clip_for_sentence(conn, cur_sid, text)
                 if clip is not None:
                     clip_sid, _clip_txt, wav_bytes, dur_ms, vol = clip
-                    if conn._pc_audio_active_sid != clip_sid:
-                        conn._pc_audio_queued_ms = 0
-                    conn._pc_audio_active_sid = clip_sid
-                    conn._pc_audio_queued_ms += max(0, int(dur_ms or 0))
+                    with conn._pc_audio_queue_lock:
+                        if conn._pc_audio_active_sid != clip_sid:
+                            conn._pc_audio_queued_ms = 0
+                        conn._pc_audio_active_sid = clip_sid
+                        conn._pc_audio_queued_ms += max(0, int(dur_ms or 0))
                     # Enqueue on host 18900 non-blockingly (~2-5ms) right as OLED subtitle/emotion updates
                     await _post_play_to_pc(conn, clip_sid, wav_bytes, vol)
 
-            elif state == "stop" and conn._pc_audio_active_sid == cur_sid:
-                # Ensure any queued streaming PCM WAV chunks finished submitting to 18900 before draining.
-                await _wait_pc_stream_drain(conn, cur_sid)
-                # Drain AudioRateController queue ONLY (no extra 240ms ESP32 speaker sleep!) so every
-                # queued sentence_start callback submits its WAV clip to 18900, then dynamically poll
-                # /audio/wait until Windows speakers finish the exact last millisecond of audio.
-                rc = getattr(conn, "audio_rate_controller", None)
-                if rc is not None and hasattr(rc, "queue_empty_event"):
-                    await _wait_rate_controller_empty(conn, rc, cur_sid)
-                await _wait_pc_stream_drain(conn, cur_sid)
-                if not getattr(conn, "client_abort", False) and getattr(conn, "sentence_id", None) == cur_sid:
-                    async with conn._pc_audio_send_lock:
-                        pass
-                    est_sec = max(30.0, min(600.0, (conn._pc_audio_queued_ms / 1000.0) + 30.0))
-                    await _wait_pc_audio_done(conn=conn, cur_sid=cur_sid, max_total_wait=est_sec)
-                # Abort or a newer turn may have taken over while we awaited completion;
-                # NEVER wipe the newer turn's PC audio state or emit a stale `stop` that kills it!
-                if getattr(conn, "sentence_id", None) != cur_sid or getattr(conn, "client_abort", False):
-                    if conn._pc_audio_active_sid == cur_sid:
-                        conn._pc_audio_active_sid = None
-                        conn._pc_audio_queued_ms = 0
-                    return
-                conn._pc_audio_active_sid = None
-                conn._pc_audio_queued_ms = 0
-                conn._pc_audio_skip_wait_once = cur_sid
-                try:
-                    return await _orig_send_tts_message(conn, state, text, *args, **kwargs)
-                finally:
-                    if getattr(conn, "_pc_audio_skip_wait_once", None) == cur_sid:
-                        conn._pc_audio_skip_wait_once = None
+            elif state == "stop":
+                with conn._pc_audio_queue_lock:
+                    if cur_sid is not None:
+                        is_pc_stop = (
+                            conn._pc_audio_active_sid == cur_sid
+                            or conn._pc_audio_enqueued_sid == cur_sid
+                        )
+                    else:
+                        is_pc_stop = (
+                            (conn._pc_audio_active_sid is None and int(getattr(conn, "_pc_audio_queued_ms", 0) or 0) > 0)
+                            or (conn._pc_audio_enqueued_sid is None and int(getattr(conn, "_pc_audio_enqueued_ms", 0) or 0) > 0)
+                        )
+                if is_pc_stop:
+                    # Ensure any queued streaming PCM WAV chunks finished submitting to 18900 before draining.
+                    await _wait_pc_stream_drain(conn, cur_sid)
+                    # Drain AudioRateController queue ONLY (no extra 240ms ESP32 speaker sleep!) so every
+                    # queued sentence_start callback submits its WAV clip to 18900, then dynamically poll
+                    # /audio/wait until Windows speakers finish the exact last millisecond of audio.
+                    rc = getattr(conn, "audio_rate_controller", None)
+                    if rc is not None and hasattr(rc, "queue_empty_event"):
+                        await _wait_rate_controller_empty(conn, rc, cur_sid)
+                    await _wait_pc_stream_drain(conn, cur_sid)
+                    if not getattr(conn, "client_abort", False) and getattr(conn, "sentence_id", None) == cur_sid:
+                        async with conn._pc_audio_send_lock:
+                            pass
+                        with conn._pc_audio_queue_lock:
+                            act_ms = (
+                                max(0, int(getattr(conn, "_pc_audio_queued_ms", 0) or 0))
+                                if getattr(conn, "_pc_audio_active_sid", None) in (None, cur_sid)
+                                else 0
+                            )
+                            enq_ms = (
+                                max(0, int(getattr(conn, "_pc_audio_enqueued_ms", 0) or 0))
+                                if getattr(conn, "_pc_audio_enqueued_sid", None) in (None, cur_sid)
+                                else 0
+                            )
+                        total_ms = max(act_ms, enq_ms)
+                        est_sec = max(30.0, min(600.0, (total_ms / 1000.0) + 30.0))
+                        await _wait_pc_audio_done(conn=conn, cur_sid=cur_sid, max_total_wait=est_sec)
+                    # Abort or a newer turn may have taken over while we awaited completion;
+                    # NEVER wipe the newer turn's PC audio state or emit a stale `stop` that kills it!
+                    if getattr(conn, "sentence_id", None) != cur_sid or getattr(conn, "client_abort", False):
+                        with conn._pc_audio_queue_lock:
+                            if conn._pc_audio_active_sid == cur_sid:
+                                conn._pc_audio_active_sid = None
+                                conn._pc_audio_queued_ms = 0
+                            if conn._pc_audio_enqueued_sid == cur_sid:
+                                conn._pc_audio_enqueued_ms = 0
+                                conn._pc_audio_enqueued_sid = None
+                        return
+                    with conn._pc_audio_queue_lock:
+                        if conn._pc_audio_active_sid in (None, cur_sid):
+                            conn._pc_audio_active_sid = None
+                            conn._pc_audio_queued_ms = 0
+                        if conn._pc_audio_enqueued_sid in (None, cur_sid):
+                            conn._pc_audio_enqueued_ms = 0
+                            conn._pc_audio_enqueued_sid = None
+                    conn._pc_audio_skip_wait_once = cur_sid
+                    try:
+                        return await _orig_send_tts_message(conn, state, text, *args, **kwargs)
+                    finally:
+                        if getattr(conn, "_pc_audio_skip_wait_once", None) == cur_sid:
+                            conn._pc_audio_skip_wait_once = None
 
         return await _orig_send_tts_message(conn, state, text, *args, **kwargs)
 
@@ -1300,9 +1388,16 @@ def apply_pc_audio_playback_patches() -> None:
             _ensure_conn_pc_state(conn)
             _clear_pc_clips(conn)
             _clear_pc_stream_chunks(conn)
-            was_pc = conn._pc_audio_active_sid is not None or read_audio_output_config()["target"] == "pc"
-            conn._pc_audio_active_sid = None
-            conn._pc_audio_queued_ms = 0
+            was_pc = (
+                conn._pc_audio_active_sid is not None
+                or conn._pc_audio_enqueued_sid is not None
+                or read_audio_output_config()["target"] == "pc"
+            )
+            with conn._pc_audio_queue_lock:
+                conn._pc_audio_active_sid = None
+                conn._pc_audio_queued_ms = 0
+                conn._pc_audio_enqueued_ms = 0
+                conn._pc_audio_enqueued_sid = None
             if was_pc:
                 await _post_stop_to_pc()
         try:

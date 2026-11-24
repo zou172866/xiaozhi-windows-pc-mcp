@@ -524,6 +524,365 @@ class TestBatch3ContainerPipeline(unittest.TestCase):
 
         asyncio.run(_check_queue_empty_bounds())
 
+    def test_self_echo_long_reply_hard_cap_and_health_esp32_sessions(self):
+        import io
+        import core.handle.abortHandle as abort_mod
+        import core.handle.sendAudioHandle as send_audio_mod
+        import runtime_events
+        from console.routes import state as state_mod
+
+        par.apply_pc_audio_playback_patches()
+
+        # 1. _enqueue_pc_clip tracks per-sid _pc_audio_enqueued_ms and resets on turn change
+        conn_track = SimpleNamespace(sentence_id="sid-a", client_abort=False)
+        par._enqueue_pc_clip(conn_track, "sid-a", "第一句", b"RIFF0000WAVE", 4200, 1.0)
+        par._enqueue_pc_clip(conn_track, "sid-a", "第二句", b"RIFF0000WAVE", 8300, 1.0)
+        self.assertEqual(conn_track._pc_audio_enqueued_sid, "sid-a")
+        self.assertEqual(conn_track._pc_audio_enqueued_ms, 12500)
+        par._enqueue_pc_clip(conn_track, "sid-b", "新轮次", b"RIFF0000WAVE", 1500, 1.0)
+        self.assertEqual(conn_track._pc_audio_enqueued_sid, "sid-b")
+        self.assertEqual(conn_track._pc_audio_enqueued_ms, 1500)
+
+        # _enqueue_pc_stream_wav also resets _pc_audio_enqueued_ms cleanly on turn change
+        with patch.object(par, "play_wav_on_pc_sync", return_value=(True, "ok")):
+            par._enqueue_pc_stream_wav(conn_track, "sid-stream", b"RIFF0000WAVE", 3100, 1.0)
+        self.assertEqual(conn_track._pc_audio_enqueued_sid, "sid-stream")
+        self.assertEqual(conn_track._pc_audio_enqueued_ms, 3100)
+
+        async def _check_long_reply_hard_cap():
+            # 2a. Multi-segment reply: _pc_audio_queued_ms is tiny (50ms from seg1), while
+            #     _pc_audio_enqueued_ms is large (800ms across all segments) -> must NOT hit hard_cap early!
+            q_long = deque([("audio", b"x")] * 8)
+            ev_long = asyncio.Event()
+            rc_long = SimpleNamespace(
+                queue=q_long,
+                interval_ms=10,
+                queue_empty_event=ev_long,
+                pending_send_task=None,
+            )
+            conn_long = SimpleNamespace(
+                sentence_id="sid-long",
+                client_abort=False,
+                _pc_audio_active_sid="sid-long",
+                _pc_audio_queued_ms=50,
+                _pc_audio_enqueued_sid="sid-long",
+                _pc_audio_enqueued_ms=800,
+            )
+
+            async def _drain_long():
+                for _ in range(8):
+                    await asyncio.sleep(0.03)
+                    q_long.popleft()
+                ev_long.set()
+
+            with (
+                patch.object(par, "QUEUE_EMPTY_WAIT_TIMEOUT", 0.12),
+                patch.object(par, "QUEUE_EMPTY_POLL_SLICE", 0.02),
+                patch.object(par, "QUEUE_EMPTY_HARD_CAP_MARGIN", 0.05),
+            ):
+                t_dr = asyncio.create_task(_drain_long())
+                ok_long = await par._wait_rate_controller_empty(conn_long, rc_long, "sid-long")
+                await t_dr
+            self.assertTrue(ok_long, "Multi-segment reply with large _pc_audio_enqueued_ms must not hit hard_cap early")
+
+            # 2b. Even if _pc_audio_enqueued_ms is 0, remaining rc.queue frames * interval_ms prevent early hard_cap
+            q_rem = deque([("audio", b"y")] * 10)
+            ev_rem = asyncio.Event()
+            rc_rem = SimpleNamespace(
+                queue=q_rem,
+                interval_ms=60,  # 10 * 60 = 600ms
+                queue_empty_event=ev_rem,
+                pending_send_task=None,
+            )
+            conn_rem = SimpleNamespace(
+                sentence_id="sid-qrem",
+                client_abort=False,
+                _pc_audio_queued_ms=40,
+                _pc_audio_enqueued_sid=None,
+                _pc_audio_enqueued_ms=0,
+            )
+
+            async def _drain_rem():
+                for _ in range(10):
+                    await asyncio.sleep(0.025)
+                    q_rem.popleft()
+                ev_rem.set()
+
+            with (
+                patch.object(par, "QUEUE_EMPTY_WAIT_TIMEOUT", 0.12),
+                patch.object(par, "QUEUE_EMPTY_POLL_SLICE", 0.02),
+                patch.object(par, "QUEUE_EMPTY_HARD_CAP_MARGIN", 0.05),
+            ):
+                t_dr2 = asyncio.create_task(_drain_rem())
+                ok_rem = await par._wait_rate_controller_empty(conn_rem, rc_rem, "sid-qrem")
+                await t_dr2
+            self.assertTrue(ok_rem, "Remaining rc.queue duration must protect actively draining queue from early hard_cap")
+
+            # 2c. Dynamic hard_deadline extension when _pc_audio_enqueued_ms grows mid-wait
+            q_grow = deque([("audio", b"g")] * 8)
+            ev_grow = asyncio.Event()
+            rc_grow = SimpleNamespace(
+                queue=q_grow,
+                interval_ms=5,
+                queue_empty_event=ev_grow,
+                pending_send_task=None,
+            )
+            conn_grow = SimpleNamespace(
+                sentence_id="sid-grow",
+                client_abort=False,
+                _pc_audio_queued_ms=40,
+                _pc_audio_enqueued_sid="sid-grow",
+                _pc_audio_enqueued_ms=40,
+            )
+
+            async def _drain_and_grow():
+                await asyncio.sleep(0.03)
+                q_grow.popleft()
+                conn_grow._pc_audio_enqueued_ms = 900  # trailing clip arrives mid-wait
+                for _ in range(7):
+                    await asyncio.sleep(0.03)
+                    q_grow.popleft()
+                ev_grow.set()
+
+            with (
+                patch.object(par, "QUEUE_EMPTY_WAIT_TIMEOUT", 0.12),
+                patch.object(par, "QUEUE_EMPTY_POLL_SLICE", 0.02),
+                patch.object(par, "QUEUE_EMPTY_HARD_CAP_MARGIN", 0.05),
+            ):
+                t_gr = asyncio.create_task(_drain_and_grow())
+                ok_grow = await par._wait_rate_controller_empty(conn_grow, rc_grow, "sid-grow")
+                await t_gr
+            self.assertTrue(ok_grow, "Growing _pc_audio_enqueued_ms mid-wait must extend hard_deadline")
+
+            # 2d. Stale _pc_audio_enqueued_sid is ignored and hard_cap timeout logs '总时长上限'
+            q_cap = deque([("audio", b"c")] * 12)
+            ev_cap = asyncio.Event()
+            rc_cap = SimpleNamespace(
+                queue=q_cap,
+                interval_ms=1,
+                queue_empty_event=ev_cap,
+                pending_send_task=None,
+            )
+            conn_cap = SimpleNamespace(
+                sentence_id="sid-cap",
+                client_abort=False,
+                _pc_audio_queued_ms=30,
+                _pc_audio_enqueued_sid="sid-other-stale",
+                _pc_audio_enqueued_ms=60000,
+            )
+
+            async def _drain_too_slow():
+                for _ in range(12):
+                    await asyncio.sleep(0.04)
+                    if q_cap:
+                        q_cap.popleft()
+                ev_cap.set()
+
+            cap_buf = io.StringIO()
+            with (
+                patch.object(par, "QUEUE_EMPTY_WAIT_TIMEOUT", 0.12),
+                patch.object(par, "QUEUE_EMPTY_POLL_SLICE", 0.02),
+                patch.object(par, "QUEUE_EMPTY_HARD_CAP_MARGIN", 0.05),
+                contextlib.redirect_stdout(cap_buf),
+            ):
+                t_cap = asyncio.create_task(_drain_too_slow())
+                ok_cap = await par._wait_rate_controller_empty(conn_cap, rc_cap, "sid-cap")
+                t_cap.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t_cap
+            self.assertFalse(ok_cap)
+            self.assertIn("总时长上限", cap_buf.getvalue())
+
+            # 2e. send_tts_message("stop") uses max(queued_ms, enqueued_ms) for _wait_pc_audio_done
+            #     and resets _pc_audio_enqueued_ms / _pc_audio_enqueued_sid on stop and abort
+            class _Ws:
+                def __init__(self):
+                    self.sent = []
+
+                async def send(self, msg):
+                    self.sent.append(msg)
+
+            ev_done = asyncio.Event()
+            ev_done.set()
+            seen_wait_kwargs = {}
+
+            async def _spy_wait_done(**kw):
+                seen_wait_kwargs.update(kw)
+                return True
+
+            conn_stop = SimpleNamespace(
+                session_id="s-stop",
+                sentence_id="sid-stop",
+                client_abort=False,
+                config={"enable_stop_tts_notify": False},
+                websocket=_Ws(),
+                audio_rate_controller=SimpleNamespace(
+                    queue=deque(),
+                    interval_ms=60,
+                    queue_empty_event=ev_done,
+                    pending_send_task=None,
+                    stop_sending=lambda: None,
+                ),
+                _pc_audio_active_sid="sid-stop",
+                _pc_audio_queued_ms=4000,
+                _pc_audio_enqueued_sid="sid-stop",
+                _pc_audio_enqueued_ms=90000,
+                clearSpeakStatus=lambda: None,
+            )
+            with patch.object(par, "_wait_pc_audio_done", side_effect=_spy_wait_done):
+                await send_audio_mod.send_tts_message(conn_stop, "stop", None)
+            self.assertAlmostEqual(seen_wait_kwargs.get("max_total_wait", 0.0), 120.0, places=2)
+            self.assertEqual(conn_stop._pc_audio_enqueued_ms, 0)
+            self.assertIsNone(conn_stop._pc_audio_enqueued_sid)
+
+            # Abort resets _pc_audio_enqueued_ms and _pc_audio_enqueued_sid cleanly
+            conn_abort = SimpleNamespace(
+                session_id="s-ab",
+                sentence_id="sid-ab",
+                device_id="dev-ab",
+                client_abort=False,
+                websocket=_Ws(),
+                clearSpeakStatus=lambda: None,
+                clear_queues=lambda: None,
+                logger=MagicMock(),
+            )
+            par._enqueue_pc_clip(conn_abort, "sid-ab", "打断测试", b"RIFF0000WAVE", 7500, 1.0)
+            self.assertEqual(conn_abort._pc_audio_enqueued_ms, 7500)
+            with patch.object(par, "_post_stop_to_pc", new=AsyncMock()):
+                await abort_mod.handleAbortMessage(conn_abort)
+            self.assertEqual(conn_abort._pc_audio_enqueued_ms, 0)
+            self.assertIsNone(conn_abort._pc_audio_enqueued_sid)
+
+            # 2f. ESP32 / post-abort stop with sentence_id=None MUST NOT enter PC audio wait branch
+            conn_esp_none = SimpleNamespace(
+                session_id="s-esp-none",
+                sentence_id=None,
+                client_abort=False,
+                config={"enable_stop_tts_notify": False},
+                websocket=_Ws(),
+                clearSpeakStatus=lambda: None,
+            )
+            m_wait_none = AsyncMock(return_value=True)
+            with patch.object(par, "_wait_pc_audio_done", new=m_wait_none):
+                await send_audio_mod.send_tts_message(conn_esp_none, "stop", None)
+            m_wait_none.assert_not_awaited()
+
+            # 2g. Stale _pc_audio_active_sid != cur_sid must NOT leak stale _pc_audio_queued_ms into max_total_wait
+            seen_stale_wait = {}
+
+            async def _spy_stale_wait(**kw):
+                seen_stale_wait.update(kw)
+                return True
+
+            ev_stale = asyncio.Event()
+            ev_stale.set()
+            conn_stale_act = SimpleNamespace(
+                session_id="s-stale-act",
+                sentence_id="sid-new",
+                client_abort=False,
+                config={"enable_stop_tts_notify": False},
+                websocket=_Ws(),
+                audio_rate_controller=SimpleNamespace(
+                    queue=deque(),
+                    interval_ms=60,
+                    queue_empty_event=ev_stale,
+                    pending_send_task=None,
+                    stop_sending=lambda: None,
+                ),
+                _pc_audio_active_sid="sid-old",
+                _pc_audio_queued_ms=120000,
+                _pc_audio_enqueued_sid="sid-new",
+                _pc_audio_enqueued_ms=2000,
+                clearSpeakStatus=lambda: None,
+            )
+            with patch.object(par, "_wait_pc_audio_done", side_effect=_spy_stale_wait):
+                await send_audio_mod.send_tts_message(conn_stale_act, "stop", None)
+            self.assertAlmostEqual(seen_stale_wait.get("max_total_wait", 0.0), 32.0, places=2)
+
+            # 2h. Advancing rc.play_position counts as progress even when queue length stays steady
+            q_pos = deque([("audio", b"p")] * 6)
+            ev_pos = asyncio.Event()
+            rc_pos = SimpleNamespace(
+                queue=q_pos,
+                interval_ms=60,
+                play_position=0,
+                queue_empty_event=ev_pos,
+                pending_send_task=None,
+            )
+            conn_pos = SimpleNamespace(
+                sentence_id="sid-pos",
+                client_abort=False,
+                _pc_audio_enqueued_sid="sid-pos",
+                _pc_audio_enqueued_ms=1000,
+            )
+
+            async def _push_and_drain_with_pos():
+                for _ in range(5):
+                    await asyncio.sleep(0.03)
+                    q_pos.popleft()
+                    rc_pos.play_position += 60
+                    q_pos.append(("audio", b"q"))
+                while q_pos:
+                    await asyncio.sleep(0.02)
+                    q_pos.popleft()
+                    rc_pos.play_position += 60
+                ev_pos.set()
+
+            with (
+                patch.object(par, "QUEUE_EMPTY_WAIT_TIMEOUT", 0.12),
+                patch.object(par, "QUEUE_EMPTY_POLL_SLICE", 0.02),
+                patch.object(par, "QUEUE_EMPTY_HARD_CAP_MARGIN", 0.05),
+            ):
+                t_pos = asyncio.create_task(_push_and_drain_with_pos())
+                ok_pos = await par._wait_rate_controller_empty(conn_pos, rc_pos, "sid-pos")
+                await t_pos
+            self.assertTrue(ok_pos, "Advancing rc.play_position must prevent false stall timeout")
+
+        asyncio.run(_check_long_reply_hard_cap())
+
+        # 3. handle_get_health exposes active_esp32_sessions and esp32_activity from runtime_events
+        class _FakeHealthHandler:
+            def __init__(self):
+                self.payload = None
+                self.status = None
+
+            def _send_json(self, obj, status=None):
+                self.payload = obj
+                self.status = status
+
+        class _DummyConn:
+            def __init__(self):
+                self.device_id = "aa:bb:cc:dd:ee:01"
+                self.client_is_speaking = True
+
+        prev_activity = runtime_events.get_latest_runtime_snapshot().get("activity", "idle")
+        base_sessions = int(runtime_events.get_latest_runtime_snapshot().get("active_connections") or 0)
+        dummy_conn = _DummyConn()
+        try:
+            h0 = _FakeHealthHandler()
+            state_mod.handle_get_health(h0)
+            self.assertEqual(h0.payload["active_esp32_sessions"], base_sessions)
+            self.assertIn("esp32_activity", h0.payload)
+
+            runtime_events.register_connection(dummy_conn)
+            runtime_events.publish_event("tts_state", state="start", device_id=dummy_conn.device_id)
+            h1 = _FakeHealthHandler()
+            state_mod.handle_get_health(h1)
+            self.assertEqual(h1.payload["active_esp32_sessions"], base_sessions + 1)
+            self.assertEqual(h1.payload["esp32_activity"], "speaking")
+        finally:
+            dummy_conn.client_is_speaking = False
+            runtime_events.unregister_connection(dummy_conn)
+            runtime_events.publish_event("tts_state", state="stop", device_id=dummy_conn.device_id)
+            if prev_activity != "idle":
+                with runtime_events._runtime_lock:
+                    runtime_events._latest_activity = prev_activity
+
+        h2 = _FakeHealthHandler()
+        state_mod.handle_get_health(h2)
+        self.assertEqual(h2.payload["active_esp32_sessions"], base_sessions)
+        self.assertEqual(h2.payload["esp32_activity"], prev_activity)
+
     def test_c7_nmc_weather_exponential_backoff_client_reuse_and_local_cache_preference(self):
         import httpx
 

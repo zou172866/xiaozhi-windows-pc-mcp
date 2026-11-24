@@ -472,6 +472,7 @@ def handle_get_health(handler) -> None:
     shared._sync_runtime_events()
     with shared._state_lock:
         ready = bool(shared._device_info.get("server_ready"))
+    rt_snap = runtime_events.get_latest_runtime_snapshot() or {}
     health = patch_registry.get_health_summary()
     degraded_list = list(health.get("degraded") or [])
     security_ok = bool(health.get("security_ok", True))
@@ -488,6 +489,8 @@ def handle_get_health(handler) -> None:
             "insecure_boot": bool(health.get("insecure_boot", False)),
             "insecure_boot_env": bool(health.get("insecure_boot_env", False)),
             "server_ready": ready,
+            "active_esp32_sessions": int(rt_snap.get("active_connections") or 0),
+            "esp32_activity": str(rt_snap.get("activity") or "idle"),
             "server_version": health.get("server_version", ""),
             "expected_server_version": health.get("expected_server_version", ""),
             "version_match": bool(health.get("version_match", True)),
