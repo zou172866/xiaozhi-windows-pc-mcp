@@ -132,7 +132,7 @@ _SECRET_PATTERNS = (
     ),
     (
         re.compile(
-            r"(\b(?:x-goog-api-key|x-api-key|x-api-access-key|x-api-app-key|x-console-token|api_key|apikey|access_token|refresh_token|auth_token|auth_key|token|appid|group_id|pc_mcp_token|anima_studio_token|esp32_auth_key|deepseek_api_key|gemini_api_key|siliconflow_api_key|openai_audio_api_key|dashscope_api_key|doubao_appid|doubao_asr_appid|doubao_tts_appid|doubao_access_token|doubao_asr_access_token|doubao_tts_access_token|fishspeech_api_key|minimax_api_key|minimax_group_id)\b\s*[\"']?\s*[:=]\s*[\"']?)(?!None\b|null\b|true\b|false\b)[^\s&\"',;)}\]]+",
+            r"(\b(?:x-goog-api-key|x-api-key|x-api-access-key|x-api-app-key|x-console-token|api_key|apikey|access_token|refresh_token|auth_token|auth_key|token|appid|group_id|pc_mcp_token|anima_studio_token|esp32_auth_key|deepseek_api_key|glm_api_key|gemini_api_key|siliconflow_api_key|openai_audio_api_key|dashscope_api_key|doubao_appid|doubao_asr_appid|doubao_tts_appid|doubao_access_token|doubao_asr_access_token|doubao_tts_access_token|fishspeech_api_key|minimax_api_key|minimax_group_id)\b\s*[\"']?\s*[:=]\s*[\"']?)(?!None\b|null\b|true\b|false\b)[^\s&\"',;)}\]]+",
             re.IGNORECASE,
         ),
         r"\1***",

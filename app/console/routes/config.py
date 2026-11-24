@@ -114,6 +114,14 @@ def _deep_merge_dict(base: dict, overlay: dict) -> dict:
 
 
 _LLM_PROVIDER_DEFAULTS = {
+    "GLMLLM": {
+        "type": "openai",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "model_name": "glm-5.3",
+        "thinking": "low",
+        "api_key": "${GLM_API_KEY}",
+        "max_tokens": 1024,
+    },
     "DeepSeekLLM": {
         "type": "openai",
         "base_url": "https://api.deepseek.com",
@@ -137,6 +145,7 @@ _LLM_PROVIDER_DEFAULTS = {
 
 ALLOWED_LLM_PROVIDERS = frozenset(_LLM_PROVIDER_DEFAULTS.keys())
 ALLOWED_LLM_MODELS: dict[str, frozenset[str]] = {
+    "GLMLLM": frozenset({_LLM_PROVIDER_DEFAULTS["GLMLLM"]["model_name"]}),
     "HuihuiLocal": frozenset({_LLM_PROVIDER_DEFAULTS["HuihuiLocal"]["model_name"]}),
     "DeepSeekLLM": frozenset(
         {

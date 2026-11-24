@@ -517,7 +517,7 @@ if (Test-Path $dotEnvPath) {
 }
 
 foreach ($envName in @(
-    "DEEPSEEK_API_KEY", "GEMINI_API_KEY",
+    "DEEPSEEK_API_KEY", "GEMINI_API_KEY", "GLM_API_KEY",
     "ANIMA_LLM_API_KEY", "ANIMA_SUMMARY_API_KEY", "ANIMA_EMBEDDING_API_KEY",
     "SILICONFLOW_API_KEY", "OPENAI_AUDIO_API_KEY", "DASHSCOPE_API_KEY",
     "DOUBAO_APPID", "DOUBAO_ACCESS_TOKEN",
@@ -864,8 +864,8 @@ try {
 
 # 4. 启动小智与 Anima Brain 双容器
 Write-Host "[4/4] 正在启动小智主服务与长期记忆大脑容器..." -ForegroundColor Cyan
-if (-not $env:DEEPSEEK_API_KEY -and -not $env:GEMINI_API_KEY) {
-    Write-Host "[警告] 未检测到 DEEPSEEK_API_KEY 或 GEMINI_API_KEY 环境变量，请先配置！" -ForegroundColor Yellow
+if (-not $env:DEEPSEEK_API_KEY -and -not $env:GEMINI_API_KEY -and -not $env:GLM_API_KEY) {
+    Write-Host "[警告] 未检测到 DEEPSEEK_API_KEY、GEMINI_API_KEY 或 GLM_API_KEY 环境变量，请先配置！" -ForegroundColor Yellow
 }
 
 $gitShortSha = "dev"

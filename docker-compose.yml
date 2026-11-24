@@ -124,6 +124,7 @@ services:
       - ESP32_AUTH_KEY=${ESP32_AUTH_KEY:-}
       - ESP32_ALLOWED_DEVICES=${ESP32_ALLOWED_DEVICES:-}
       - L3_BACKEND=${L3_BACKEND:-dsh}
+      - GLM_API_KEY=${GLM_API_KEY:-}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       # 云端音频 API 密钥与参数（仅注入主容器，绝不注入 anima-brain，维持 A-1 最小权限隔离）
@@ -143,8 +144,8 @@ services:
       - PC_AUDIO_STREAM_SAMPLE_RATE=${PC_AUDIO_STREAM_SAMPLE_RATE:-}
       - ANIMA_DEVICE_CHARACTER_MAP=${ANIMA_DEVICE_CHARACTER_MAP:-}
       - ANIMA_ISOLATE_CHARACTER_BY_DEVICE=${ANIMA_ISOLATE_CHARACTER_BY_DEVICE:-}
-      - NO_PROXY=localhost,127.0.0.1,anima-brain,xiaozhi-anima-brain,xiaozhi-esp32-server,host.docker.internal,.deepseek.com,.siliconflow.cn,.aliyuncs.com,.bytedance.com,.minimaxi.com,.nmc.cn,.modelscope.cn
-      - no_proxy=localhost,127.0.0.1,anima-brain,xiaozhi-anima-brain,xiaozhi-esp32-server,host.docker.internal,.deepseek.com,.siliconflow.cn,.aliyuncs.com,.bytedance.com,.minimaxi.com,.nmc.cn,.modelscope.cn
+      - NO_PROXY=localhost,127.0.0.1,anima-brain,xiaozhi-anima-brain,xiaozhi-esp32-server,host.docker.internal,.deepseek.com,.siliconflow.cn,.aliyuncs.com,.bytedance.com,.minimaxi.com,.nmc.cn,.modelscope.cn,open.bigmodel.cn
+      - no_proxy=localhost,127.0.0.1,anima-brain,xiaozhi-anima-brain,xiaozhi-esp32-server,host.docker.internal,.deepseek.com,.siliconflow.cn,.aliyuncs.com,.bytedance.com,.minimaxi.com,.nmc.cn,.modelscope.cn,open.bigmodel.cn
       # 如果容器内无法直连 Google API（未开启全局 TUN 模式），取消下面两行注释并改成你本地软件的代理端口：
       # - HTTP_PROXY=http://host.docker.internal:7890
       # - HTTPS_PROXY=http://host.docker.internal:7890

@@ -596,6 +596,7 @@ def handle_get_state(handler, parsed) -> None:
                 "voice_dirty_error": dirty_voice_err,
                 "websocket": ws_url,
                 "ota_url": ota_url,
+                "glm_key_ok": bool(os.environ.get("GLM_API_KEY", "").strip()),
                 "deepseek_key_ok": ds_ok,
                 "gemini_key_ok": gem_ok,
                 "llm_cache": turn_context_router.get_llm_cache_stats(),

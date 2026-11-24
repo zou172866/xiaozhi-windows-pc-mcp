@@ -14,6 +14,9 @@
     HuihuiLocal: [
       { value: "huihui-qwen3-14b-companion", label: "Huihui Qwen3 14B Abliterated v2" }
     ],
+    GLMLLM: [
+      { value: "glm-5.3", label: "GLM-5.3" }
+    ],
     DeepSeekLLM: [
       { value: "deepseek-flash", label: "deepseek-flash（推荐 · 国内极速直连）" },
       { value: "deepseek-chat", label: "deepseek-chat（标准对话别名）" },
@@ -165,6 +168,7 @@
     providerSelect: document.getElementById("providerSelect"),
     modelSelect: document.getElementById("modelSelect"),
     modelCustomInput: document.getElementById("modelCustomInput"),
+    glmKeyBadge: document.getElementById("glmKeyBadge"),
     dsKeyBadge: document.getElementById("dsKeyBadge"),
     gemKeyBadge: document.getElementById("gemKeyBadge"),
     llmCacheRateBadge: document.getElementById("llmCacheRateBadge"),
@@ -2907,7 +2911,7 @@
 
   function populateModelOptions(provider, selectedModel) {
     const list = PROVIDER_MODELS[provider] || PROVIDER_MODELS.DeepSeekLLM;
-    els.modelCustomInput.readOnly = provider === "HuihuiLocal";
+    els.modelCustomInput.readOnly = !list.some(item => item.value === "__custom__");
     els.modelSelect.innerHTML = "";
     for (const item of list) {
       const opt = document.createElement("option");
@@ -3525,6 +3529,8 @@
         }
       }
 
+      els.glmKeyBadge.textContent = cfg.glm_key_ok ? "已就绪" : "未设置";
+      els.glmKeyBadge.style.color = cfg.glm_key_ok ? "var(--accent)" : "var(--danger)";
       els.dsKeyBadge.textContent = cfg.deepseek_key_ok ? "已就绪" : "未设置";
       els.dsKeyBadge.style.color = cfg.deepseek_key_ok ? "var(--accent)" : "var(--danger)";
       els.gemKeyBadge.textContent = cfg.gemini_key_ok ? "已就绪" : "未设置";
@@ -3622,7 +3628,7 @@
           els.statusText.textContent = "正在语音回复 / 执行指令…";
         } else {
           els.statusPill.className = "status-pill";
-          const llmTag = { GeminiOpenAI: "Gemini", DeepSeekLLM: "DeepSeek", HuihuiLocal: "本地 Huihui Qwen3 14B" }[cfg.llm_provider] || cfg.llm_provider;
+          const llmTag = { GeminiOpenAI: "Gemini", DeepSeekLLM: "DeepSeek", GLMLLM: "智谱 GLM", HuihuiLocal: "本地 Huihui Qwen3 14B" }[cfg.llm_provider] || cfg.llm_provider;
           const asrMeta = getAsrMeta(cfg.asr_provider);
           const ttsMeta = getTtsMeta(cfg.tts_provider);
           const audioTag = (asrMeta || ttsMeta)

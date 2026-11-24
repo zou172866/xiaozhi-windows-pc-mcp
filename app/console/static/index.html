@@ -608,6 +608,7 @@
         <div>
           <label class="field-label" for="providerSelect">对话模式</label>
           <select id="providerSelect">
+            <option value="GLMLLM">智谱 GLM（GLM_API_KEY）</option>
             <option value="DeepSeekLLM">DeepSeek 国内直连（DEEPSEEK_API_KEY）</option>
             <option value="HuihuiLocal">本地陪伴 · Huihui Qwen3 14B（LM Studio）</option>
             <option value="GeminiOpenAI">Google Gemini（GEMINI_API_KEY）</option>
@@ -624,7 +625,7 @@
       </div>
 
       <div class="field-foot">
-        <span>环境变量状态：DeepSeek <strong id="dsKeyBadge">--</strong> · Gemini <strong id="gemKeyBadge">--</strong> · 前缀缓存 <strong id="llmCacheRateBadge" class="num">--</strong></span>
+        <span>环境变量状态：DeepSeek <strong id="dsKeyBadge">--</strong> · 智谱 GLM <strong id="glmKeyBadge">--</strong> · Gemini <strong id="gemKeyBadge">--</strong> · 前缀缓存 <strong id="llmCacheRateBadge" class="num">--</strong></span>
         <span>修改后点击右上角「保存并立即生效」（支持免重启热更新）</span>
       </div>
     </div>
