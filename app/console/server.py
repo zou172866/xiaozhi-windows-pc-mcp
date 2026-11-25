@@ -29,6 +29,7 @@ from console.routes import (
     l3,
     logs,
     mobile_push as mobile_push_routes,
+    pc_mic,
     proactive,
     state,
     tavern,
@@ -40,6 +41,7 @@ _console_atexit_registered = False
 _STATIC_ASSETS = {
     "/static/app.css": ("CSS_PATH", "text/css; charset=utf-8"),
     "/static/app.js": ("JS_PATH", "application/javascript; charset=utf-8"),
+    "/static/pcm_worklet.js": ("WORKLET_JS_PATH", "application/javascript; charset=utf-8"),
 }
 
 
@@ -77,7 +79,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; media-src 'self' blob: data:; font-src 'self' data:; "
-            "connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+            f"connect-src 'self' ws://127.0.0.1:{shared.CONSOLE_PORT} ws://localhost:{shared.CONSOLE_PORT}; "
+            "object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
         )
         self.send_header("X-Content-Type-Options", "nosniff")
         super().end_headers()
@@ -194,6 +197,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._serve_static_file(attr_name, ctype)
             return
 
+        if path == "/ws/pc-mic":
+            pc_mic.handle_ws_pc_mic(self, parsed)
+            return
+
         if path == "/api/state":
             state.handle_get_state(self, parsed)
             return
@@ -296,6 +303,7 @@ _POST_ROUTES = {
     "/api/mobile-push/config": mobile_push_routes.handle_post_mobile_push_config,
     "/api/mobile-push/test": mobile_push_routes.handle_post_mobile_push_test,
     "/api/mobile-push/briefing": mobile_push_routes.handle_post_mobile_push_briefing,
+    "/api/pc-mic/session": pc_mic.handle_post_pc_mic_session,
 }
 
 

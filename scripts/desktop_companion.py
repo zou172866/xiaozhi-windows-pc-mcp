@@ -425,6 +425,191 @@ class WidgetApiClient:
             pass
 
 
+class WidgetMicController:
+    """Opt-in desktop microphone controller for the corner companion widget (default OFF, zero idle cost)."""
+
+    def __init__(
+        self,
+        *,
+        console_url: str = DEFAULT_CONSOLE_URL,
+        token_file: Path = DEFAULT_TOKEN_FILE,
+        on_event=None,
+    ) -> None:
+        self._console_url = console_url
+        self._token_file = token_file
+        self._on_event = on_event
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
+        self._ws = None
+        self._bridge = None
+        self._rx_thread: Optional[threading.Thread] = None
+        self._active = False
+        self._full_duplex = False
+
+    @property
+    def is_active(self) -> bool:
+        with self._lock:
+            return self._active
+
+    @property
+    def full_duplex(self) -> bool:
+        with self._lock:
+            return self._full_duplex
+
+    def set_full_duplex(self, enabled: bool) -> bool:
+        with self._lock:
+            self._full_duplex = bool(enabled)
+            bridge = self._bridge
+        if bridge is not None:
+            bridge.set_full_duplex(self._full_duplex)
+        return self._full_duplex
+
+    def _emit(self, kind: str, text: str = "") -> None:
+        if self._on_event is not None:
+            try:
+                self._on_event(kind, text)
+            except Exception:
+                pass
+
+    def start_async(self) -> None:
+        with self._lock:
+            if self._active:
+                return
+            self._active = True
+            self._stop_evt.clear()
+        self._emit("connecting", "正在打开电脑麦克风并连接语音通道…")
+
+        def _boot() -> None:
+            ws = None
+            bridge = None
+            try:
+                scripts_dir = str(Path(__file__).resolve().parent)
+                if scripts_dir not in sys.path:
+                    sys.path.insert(0, scripts_dir)
+                import pc_talk
+
+                sess = pc_talk.negotiate_ota_session(
+                    ota_url=pc_talk.DEFAULT_OTA_URL,
+                    console_url=self._console_url,
+                    device_id=pc_talk.DEFAULT_DEVICE_ID,
+                    client_id="xiaozhi-desktop-widget",
+                    token_file=self._token_file,
+                    auto_allow=True,
+                    ensure_pc_audio=True,
+                )
+                if self._stop_evt.is_set():
+                    return
+                ws, _sid = pc_talk.open_xiaozhi_ws_session(sess, audio_format="pcm")
+                if self._stop_evt.is_set():
+                    ws.close()
+                    return
+                bridge = pc_talk.PcMicBridge(
+                    ws,
+                    full_duplex=self.full_duplex,
+                    on_error=lambda exc: self._emit("error", f"麦克风异常：{exc}"),
+                )
+                bridge.start()
+                with self._lock:
+                    if self._stop_evt.is_set():
+                        self._active = False
+                        bridge.stop()
+                        ws.close()
+                        return
+                    self._ws = ws
+                    self._bridge = bridge
+                self._emit("listening", "已开麦聆听中 · 直接说话即可")
+                self._rx_loop(ws, bridge)
+            except Exception as exc:
+                if bridge is not None:
+                    try:
+                        bridge.stop()
+                    except Exception:
+                        pass
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                with self._lock:
+                    self._ws = None
+                    self._bridge = None
+                    self._active = False
+                if not self._stop_evt.is_set():
+                    self._emit("error", f"开麦失败：{exc}")
+
+        t = threading.Thread(target=_boot, name="widget-pc-mic", daemon=True)
+        with self._lock:
+            self._rx_thread = t
+        t.start()
+
+    def _rx_loop(self, ws, bridge) -> None:
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    op, payload = ws.recv_message(timeout=0.8)
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                if op == 0x8:
+                    break
+                if op != 0x1:
+                    continue
+                try:
+                    msg = json.loads(payload.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                mtype = msg.get("type")
+                if mtype == "stt":
+                    txt = str(msg.get("text") or "").strip()
+                    if txt:
+                        self._emit("stt", txt)
+                elif mtype == "tts":
+                    st = str(msg.get("state") or "")
+                    seg = str(msg.get("text") or "").strip()
+                    bridge.notify_tts_state(st)
+                    if st == "sentence_start" and seg:
+                        self._emit("tts", seg)
+                    elif st == "stop":
+                        self._emit("listening", "已开麦聆听中 · 直接说话即可")
+        finally:
+            self.stop(notify=not self._stop_evt.is_set(), reason="语音会话已结束，点击可重新开麦")
+
+    def interrupt(self) -> None:
+        with self._lock:
+            bridge = self._bridge
+        if bridge is not None:
+            try:
+                bridge.interrupt()
+                self._emit("listening", "已打断播报 · 请继续说话")
+            except Exception as exc:
+                self._emit("error", f"打断失败：{exc}")
+
+    def stop(self, *, notify: bool = True, reason: str = "电脑麦克风已关闭") -> None:
+        with self._lock:
+            self._stop_evt.set()
+            was_active = self._active
+            self._active = False
+            bridge = self._bridge
+            ws = self._ws
+            self._bridge = None
+            self._ws = None
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:
+                pass
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        if notify and was_active:
+            self._emit("stopped", reason)
+
+
 def _apply_windows_no_activate(hwnd: int) -> None:
     """Apply `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` with Win64-safe ctypes and SWP_FRAMECHANGED."""
     if os.name != "nt" or not hwnd:
@@ -700,8 +885,65 @@ def _run_widget_ui_loop(
     def _open_console() -> None:
         webbrowser.open(console_url)
 
+    mic_btn_holder: Dict[str, Any] = {"btn": None}
+
+    def _on_mic_event(kind: str, text: str) -> None:
+        def _apply() -> None:
+            btn = mic_btn_holder.get("btn")
+            is_on = mic_ctrl.is_active
+            if btn is not None:
+                btn.configure(
+                    text=("闭麦" if is_on else "开麦"),
+                    bg=("#0f766e" if is_on else "#2b2644"),
+                    fg=("#ffffff" if is_on else "#dcd6f7"),
+                )
+            if text:
+                feedback_hold["until"] = time.monotonic() + (5.0 if kind in ("error", "stopped") else 4.0)
+                prefix = {
+                    "stt": "你说",
+                    "tts": "回复",
+                    "error": "麦克风",
+                    "stopped": "麦克风",
+                    "connecting": "麦克风",
+                    "listening": "麦克风",
+                }.get(kind, "麦克风")
+                _set_bubble(f"[{prefix}] {text}", accent=(kind in ("listening", "stt", "connecting")))
+
+        if not stop_flag.is_set():
+            try:
+                root.after(0, _apply)
+            except Exception:
+                pass
+
+    mic_ctrl = WidgetMicController(
+        console_url=console_url,
+        token_file=token_file,
+        on_event=_on_mic_event,
+    )
+
+    def _on_toggle_mic() -> None:
+        if mic_ctrl.is_active:
+            mic_ctrl.stop(notify=True)
+        else:
+            mic_ctrl.start_async()
+
+    def _on_toggle_mic_duplex() -> None:
+        nxt = mic_ctrl.set_full_duplex(not mic_ctrl.full_duplex)
+        feedback_hold["until"] = time.monotonic() + 5.0
+        _set_bubble(
+            "[麦克风] 已切换为耳机全双工（允许随时插话）"
+            if nxt
+            else "[麦克风] 已切换为外放防回声（播报时自动闭麦）",
+            accent=True,
+        )
+
+    def _on_mic_interrupt() -> None:
+        if mic_ctrl.is_active:
+            mic_ctrl.interrupt()
+
     def _quit_app() -> None:
         stop_flag.set()
+        mic_ctrl.stop(notify=False)
         try:
             save_widget_position(pos_file, root.winfo_x(), root.winfo_y())
         except Exception:
@@ -711,6 +953,7 @@ def _run_widget_ui_loop(
         root.destroy()
 
     for label, cmd in (
+        ("开麦", _on_toggle_mic),
         ("看一眼屏幕", _on_screen_peek),
         ("试跑关怀", _on_proactive_dry_run),
         ("控制台", _open_console),
@@ -731,10 +974,16 @@ def _run_widget_ui_loop(
             cursor="hand2",
         )
         b.pack(side="left", padx=(0, 6))
+        if label == "开麦":
+            mic_btn_holder["btn"] = b
 
     # Context menu
     menu = tk.Menu(root, tearoff=0)
     menu.add_command(label="展开 / 折叠迷你浮球", command=lambda: _toggle_collapse())
+    menu.add_command(label="开启 / 关闭电脑麦克风", command=_on_toggle_mic)
+    menu.add_command(label="切换外放防回声 / 耳机插话", command=_on_toggle_mic_duplex)
+    menu.add_command(label="立即打断小智说话", command=_on_mic_interrupt)
+    menu.add_separator()
     menu.add_command(label="让芽衣看一眼屏幕", command=_on_screen_peek)
     menu.add_command(label="立即试跑主动关怀", command=_on_proactive_dry_run)
     menu.add_separator()

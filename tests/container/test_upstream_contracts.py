@@ -44,12 +44,12 @@ class TestUpstreamImageContracts(unittest.TestCase):
             f"Upstream SERVER_VERSION mismatch: got {info.get('actual')!r}, expected {info.get('expected')!r}",
         )
 
-    def test_all_22_patches_registered_ok_and_match_catalog(self):
+    def test_all_23_patches_registered_ok_and_match_catalog(self):
         catalog = self.patch_registry.get_patch_catalog()
         catalog_names = [p["name"] for p in catalog]
         self.assertEqual(len(catalog_names), len(set(catalog_names)), "Duplicate names in PATCH_CATALOG")
         expected_patches = set(catalog_names)
-        self.assertEqual(len(expected_patches), 22, f"Expected 22 cataloged patches, got {len(expected_patches)}")
+        self.assertEqual(len(expected_patches), 23, f"Expected 23 cataloged patches, got {len(expected_patches)}")
 
         # Verify security category metadata matches SECURITY_PATCH_NAMES 1-to-1
         for entry in catalog:
@@ -150,6 +150,10 @@ class TestUpstreamImageContracts(unittest.TestCase):
 
         self.assertTrue(getattr(ServerMCPManager, "_voiceprint_mcp_guard_patched", False))
         self.assertTrue(inspect.iscoroutinefunction(ServerMCPManager.execute_tool))
+
+        # Raw 16kHz PCM mic input passthrough (23rd patch: pc_pcm_audio_input)
+        self.assertTrue(getattr(ConnectionHandler, "_pc_pcm_input_patched", False))
+        self.assertTrue(callable(getattr(ConnectionHandler, "_decode_opus_packet", None)))
 
         for coro_fn in (
             OpenaiASR.speech_to_text,

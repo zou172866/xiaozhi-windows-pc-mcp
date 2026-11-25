@@ -393,7 +393,22 @@ def negotiate_ota_session(
     }
 
 
-def open_xiaozhi_ws_session(session_info: dict[str, Any], *, timeout: float = 8.0) -> tuple[MinimalWsClient, str]:
+def _load_winmm_mic_module():
+    """Import sibling `scripts/pc_mic_winmm.py` without requiring `scripts/` on sys.path."""
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import pc_mic_winmm
+
+    return pc_mic_winmm
+
+
+def open_xiaozhi_ws_session(
+    session_info: dict[str, Any],
+    *,
+    timeout: float = 8.0,
+    audio_format: str = "opus",
+) -> tuple[MinimalWsClient, str]:
     """Open authenticated 18000 WebSocket, complete `hello` handshake, and return `(ws, session_id)`."""
     hdrs = {
         "Device-Id": str(session_info["device_id"]),
@@ -402,6 +417,7 @@ def open_xiaozhi_ws_session(session_info: dict[str, Any], *, timeout: float = 8.
     if session_info.get("ws_token"):
         hdrs["Authorization"] = f"Bearer {session_info['ws_token']}"
 
+    fmt = "pcm" if str(audio_format or "opus").strip().lower() == "pcm" else "opus"
     ws = MinimalWsClient(str(session_info["ws_url"]), headers=hdrs, timeout=timeout)
     ws.send_json(
         {
@@ -410,7 +426,7 @@ def open_xiaozhi_ws_session(session_info: dict[str, Any], *, timeout: float = 8.
             "transport": "websocket",
             "features": {"mcp": False},
             "audio_params": {
-                "format": "opus",
+                "format": fmt,
                 "sample_rate": 16000,
                 "channels": 1,
                 "frame_duration": 60,
@@ -483,11 +499,114 @@ def run_single_turn(ws: MinimalWsClient, text: str, *, timeout: float = 45.0) ->
     return sentences
 
 
+class PcMicBridge:
+    """Streams Windows WinMM 16kHz PCM frames over an authenticated `MinimalWsClient` with anti-echo gating."""
+
+    def __init__(
+        self,
+        ws: MinimalWsClient,
+        *,
+        device_id: int = -1,
+        full_duplex: bool = False,
+        tail_guard_sec: float = 0.35,
+        on_error=None,
+        recorder_factory=None,
+    ) -> None:
+        self._ws = ws
+        self._device_id = int(device_id)
+        self._full_duplex = bool(full_duplex)
+        self._tail_guard_sec = max(0.0, float(tail_guard_sec))
+        self._on_error = on_error
+        self._recorder_factory = recorder_factory
+        self._lock = threading.Lock()
+        self._recorder = None
+        self._assistant_speaking = False
+        self._unmute_after = 0.0
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return bool(self._recorder is not None and self._recorder.is_running)
+
+    @property
+    def full_duplex(self) -> bool:
+        with self._lock:
+            return self._full_duplex
+
+    def set_full_duplex(self, enabled: bool) -> None:
+        with self._lock:
+            self._full_duplex = bool(enabled)
+
+    def notify_tts_state(self, state: str) -> None:
+        st = str(state or "").strip().lower()
+        with self._lock:
+            if st in ("start", "sentence_start"):
+                self._assistant_speaking = True
+                self._unmute_after = 0.0
+            elif st == "stop":
+                self._assistant_speaking = False
+                self._unmute_after = time.monotonic() + (0.0 if self._full_duplex else self._tail_guard_sec)
+
+    def interrupt(self) -> None:
+        with self._lock:
+            self._assistant_speaking = False
+            self._unmute_after = 0.0
+        self._ws.send_json({"type": "abort", "reason": "wake_word_detected"})
+        if self.is_running:
+            self._ws.send_json({"type": "listen", "state": "start", "mode": "auto"})
+
+    def _handle_frame(self, pcm_bytes: bytes) -> None:
+        if not pcm_bytes:
+            return
+        with self._lock:
+            if not self._full_duplex:
+                if self._assistant_speaking or time.monotonic() < self._unmute_after:
+                    return
+        try:
+            self._ws.send_frame(0x2, pcm_bytes)
+        except Exception as exc:
+            if self._on_error is not None:
+                self._on_error(exc)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._recorder is not None and self._recorder.is_running:
+                return
+            if self._recorder_factory is not None:
+                rec = self._recorder_factory(self._handle_frame, self._on_error)
+            else:
+                mic_mod = _load_winmm_mic_module()
+                dev = mic_mod.WAVE_MAPPER if self._device_id < 0 else self._device_id
+                rec = mic_mod.WinMMMicRecorder(
+                    self._handle_frame,
+                    sample_rate=16000,
+                    channels=1,
+                    frame_ms=60,
+                    device_id=dev,
+                    on_error=self._on_error,
+                )
+            self._recorder = rec
+        rec.start()
+        self._ws.send_json({"type": "listen", "state": "start", "mode": "auto"})
+
+    def stop(self) -> None:
+        with self._lock:
+            rec = self._recorder
+            self._recorder = None
+            self._assistant_speaking = False
+            self._unmute_after = 0.0
+        if rec is not None:
+            rec.stop()
+
+
 def run_interactive_loop(
     ws: MinimalWsClient,
     *,
     stdin_stream=None,
     turn_timeout: float = 60.0,
+    mic_enabled: bool = False,
+    mic_device: int = -1,
+    full_duplex: bool = False,
 ) -> int:
     in_stream = stdin_stream if stdin_stream is not None else sys.stdin
     turn_done = threading.Event()
@@ -495,6 +614,12 @@ def run_interactive_loop(
     stop_evt = threading.Event()
     wakeup_evt = threading.Event()
     in_q: queue.Queue[str | None] = queue.Queue()
+    mic_bridge = PcMicBridge(
+        ws,
+        device_id=mic_device,
+        full_duplex=full_duplex,
+        on_error=lambda exc: print(f"\n[麦克风异常] {exc}", flush=True) if not stop_evt.is_set() else None,
+    )
 
     def _rx_worker():
         while not stop_evt.is_set():
@@ -524,9 +649,15 @@ def run_interactive_loop(
                 continue
             if not isinstance(msg, dict):
                 continue
-            if msg.get("type") == "tts":
+            mtype = msg.get("type")
+            if mtype == "stt":
+                stt_txt = str(msg.get("text") or "").strip()
+                if stt_txt:
+                    print(f"\r你(语音) > {stt_txt}", flush=True)
+            elif mtype == "tts":
                 st = msg.get("state")
                 seg = str(msg.get("text") or "").strip()
+                mic_bridge.notify_tts_state(st)
                 if st in ("start", "sentence_start"):
                     turn_done.clear()
                 if st == "sentence_start" and seg:
@@ -553,9 +684,18 @@ def run_interactive_loop(
     threading.Thread(target=_rx_worker, name="pc-talk-rx", daemon=True).start()
     threading.Thread(target=_stdin_worker, name="pc-talk-stdin", daemon=True).start()
 
+    if mic_enabled:
+        try:
+            mic_bridge.start()
+        except Exception as mic_exc:
+            print(f"[麦克风启动失败] {mic_exc}（仍可继续打字对话）", flush=True)
+
     print("=========================================================")
     print("  小智电脑端对话客户端已连接！（无需 ESP32 硬件）")
-    print("  直接输入文字回车即可对话；输入 /stop 立即打断播报；输入 /quit 退出")
+    if mic_bridge.is_running:
+        mode_desc = "耳机全双工（随时语音插话）" if mic_bridge.full_duplex else "外放防回声（播报时自动闭麦）"
+        print(f"  [电脑麦克风已开启 · {mode_desc}] 直接说话即可！")
+    print("  指令：/mic 开关麦 | /duplex 切换防回声/耳机 | /stop 立刻打断 | /quit 退出")
     print("=========================================================")
 
     try:
@@ -586,8 +726,27 @@ def run_interactive_loop(
                     except Exception:
                         pass
                 break
+            if low == "/mic":
+                if mic_bridge.is_running:
+                    mic_bridge.stop()
+                    print("  [电脑麦克风已关闭]", flush=True)
+                else:
+                    try:
+                        mic_bridge.start()
+                        print("  [电脑麦克风已开启] 直接对着电脑说话即可！", flush=True)
+                    except Exception as mic_exc:
+                        print(f"  [开麦失败] {mic_exc}", flush=True)
+                continue
+            if low == "/duplex":
+                next_dup = not mic_bridge.full_duplex
+                mic_bridge.set_full_duplex(next_dup)
+                print(
+                    f"  [回声模式] 已切换为：{'耳机全双工（允许随时插话）' if next_dup else '外放防回声（播报时自动闭麦）'}",
+                    flush=True,
+                )
+                continue
             if low in ("/stop", "/abort"):
-                ws.send_json({"type": "abort", "reason": "wake_word_detected"})
+                mic_bridge.interrupt()
                 turn_done.wait(timeout=0.15)
                 turn_done.set()
                 print("  [已发送打断指令]", flush=True)
@@ -611,6 +770,7 @@ def run_interactive_loop(
     except KeyboardInterrupt:
         print("\n[已退出]", flush=True)
     finally:
+        mic_bridge.stop()
         if not turn_done.is_set():
             try:
                 ws.send_json({"type": "abort", "reason": "wake_word_detected"})
@@ -641,7 +801,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-audio-target", action="store_true", help="Do not auto-switch audio output target to PC speakers")
     parser.add_argument("--once", default="", help="Send a single message, wait for reply completion, and exit")
     parser.add_argument("--timeout", type=float, default=45.0, help="Turn timeout in seconds for --once mode")
+    parser.add_argument("--mic", action="store_true", help="Enable Windows native WinMM 16kHz microphone capture on startup")
+    parser.add_argument("--mic-device", type=int, default=-1, help="Windows recording device index (-1 = system default)")
+    parser.add_argument("--full-duplex", action="store_true", help="Allow barge-in voice interruption while TTS is playing (use with headphones)")
+    parser.add_argument("--list-mics", action="store_true", help="List available Windows microphone input devices and exit")
     args = parser.parse_args(argv)
+
+    if args.list_mics:
+        try:
+            mic_mod = _load_winmm_mic_module()
+            devs = mic_mod.list_input_devices()
+            if not devs:
+                print("未检测到可用的 Windows 麦克风设备。", flush=True)
+            else:
+                print("可用 Windows 麦克风设备列表：", flush=True)
+                for d in devs:
+                    print(f"  [{d['id']}] {d['name']} (channels={d['channels']})", flush=True)
+            return 0
+        except Exception as exc:
+            print(f"[枚举麦克风失败] {exc}", file=sys.stderr, flush=True)
+            return 1
 
     try:
         sess = negotiate_ota_session(
@@ -660,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
         if pc_st and not pc_st.get("pc_audio_online", True):
             print("[提示] 宿主机 18900 电脑音响桥接当前未在线，仅显示文字回复；运行「启动或重启服务.bat」可开启 48kHz 电脑音箱播报。", flush=True)
 
-        ws, _sid = open_xiaozhi_ws_session(sess)
+        ws, _sid = open_xiaozhi_ws_session(sess, audio_format=("opus" if args.once else "pcm"))
     except Exception as exc:
         print(f"[连接失败] {exc}", file=sys.stderr, flush=True)
         return 1
@@ -672,7 +851,12 @@ def main(argv: list[str] | None = None) -> int:
             ws.close()
         return 0
 
-    return run_interactive_loop(ws)
+    return run_interactive_loop(
+        ws,
+        mic_enabled=bool(args.mic),
+        mic_device=int(args.mic_device),
+        full_duplex=bool(args.full_duplex),
+    )
 
 
 if __name__ == "__main__":

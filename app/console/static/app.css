@@ -186,12 +186,13 @@
   }
 
   .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-  .config-section { padding: 20px 24px; border-bottom: 1px solid var(--border); }
+  .config-panel { overflow: clip; }
+  .config-section { padding: 16px 20px; border-bottom: 1px solid var(--border); }
   .config-section:last-child { border-bottom: none; }
 
-  .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+  .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 5px; }
   .section-title { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -0.015em; color: var(--ink); }
-  .section-desc { margin: 0 0 13px; font-size: 13px; color: var(--ink-secondary); max-width: 70ch; }
+  .section-desc { margin: 0 0 10px; font-size: 12.8px; color: var(--ink-secondary); max-width: 72ch; }
 
   /* PC Control Mode Selector */
   .mode-grid {
@@ -753,4 +754,199 @@
     padding: 3px 9px;
     font-size: 11.5px;
     white-space: nowrap;
+  }
+
+  /* Config Category Tabs & Collapsible Drawers */
+  .config-tabbar {
+    position: sticky;
+    top: 61px;
+    z-index: 15;
+    display: flex;
+    align-items: stretch;
+    gap: 4px;
+    padding: 8px 16px 0;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    border-radius: var(--radius) var(--radius) 0 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .config-tabbar::-webkit-scrollbar { display: none; }
+  .config-tab-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px 10px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    background: transparent;
+    color: var(--ink-secondary);
+    font-family: inherit;
+    font-size: 13.5px;
+    font-weight: 550;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color 0.14s ease, background-color 0.14s ease, border-color 0.14s ease;
+  }
+  .config-tab-btn:hover {
+    color: var(--ink);
+    background: var(--surface-subtle);
+  }
+  .config-tab-btn.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    background: var(--accent-tint);
+    font-weight: 650;
+  }
+  .tab-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 6px;
+    border-radius: 99px;
+    font-size: 11px;
+    font-weight: 650;
+    line-height: 1;
+    background: var(--accent);
+    color: #FFFFFF;
+  }
+  .tab-badge-warn {
+    background: #D97706;
+    color: #FFFFFF;
+  }
+  .config-tab-pane { display: none; }
+  .config-tab-pane.active { display: block; }
+
+  .section-fold {
+    margin-top: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-subtle);
+    overflow: hidden;
+  }
+  .section-fold-summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    font-size: 12.5px;
+    font-weight: 550;
+    color: var(--ink-secondary);
+    transition: background-color 0.14s ease, color 0.14s ease;
+  }
+  .section-fold-summary::-webkit-details-marker { display: none; }
+  .section-fold-summary::before {
+    content: "\25B8";
+    display: inline-block;
+    font-size: 11px;
+    color: var(--ink-muted);
+    transition: transform 0.15s ease, color 0.15s ease;
+    flex: none;
+  }
+  .section-fold-summary > span:first-child { flex: 1; min-width: 0; }
+  .section-fold-summary:hover {
+    color: var(--ink);
+    background: rgba(15, 118, 110, 0.04);
+  }
+  .section-fold[open] > .section-fold-summary {
+    border-bottom: 1px solid var(--border);
+    color: var(--ink);
+  }
+  .section-fold[open] > .section-fold-summary::before {
+    transform: rotate(90deg);
+    color: var(--accent);
+  }
+  .section-fold-body {
+    padding: 11px 12px 12px;
+    background: var(--surface);
+  }
+  @media (max-width: 980px) {
+    .config-tabbar { position: static; padding: 6px 12px 0; }
+    .config-section { padding: 14px 16px; }
+  }
+
+  /* PC Browser Microphone Bar (Monitor Panel Footer) */
+  .pc-mic-bar {
+    padding: 9px 14px;
+    border-top: 1px solid var(--border);
+    background: var(--surface-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .pc-mic-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .pc-mic-btn {
+    padding: 5px 10px;
+    font-size: 12.5px;
+    white-space: nowrap;
+  }
+  .pc-mic-btn.is-live {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #FFFFFF;
+  }
+  .pc-mic-btn.is-live:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+  }
+  .pc-mic-btn.is-ptt {
+    background: var(--warn-tint);
+    border-color: #D97706;
+    color: var(--warn);
+  }
+  .pc-mic-duplex-opt {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--ink-secondary);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .pc-mic-duplex-opt input {
+    width: auto;
+    margin: 0;
+    accent-color: var(--accent);
+  }
+  .pc-mic-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .pc-mic-status {
+    flex: 1;
+    min-width: 0;
+    font-size: 11.5px;
+    color: var(--ink-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .pc-mic-meter {
+    width: 66px;
+    height: 5px;
+    border-radius: 99px;
+    background: var(--border);
+    overflow: hidden;
+    flex: none;
+  }
+  .pc-mic-meter-fill {
+    width: 0%;
+    height: 100%;
+    border-radius: 99px;
+    background: var(--accent);
+    transition: width 0.08s linear;
   }

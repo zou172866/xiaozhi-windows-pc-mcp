@@ -124,6 +124,7 @@ def run_lightweight_contract_checks() -> Dict[str, Any]:
         sync_checks = (
             ("ConnectionHandler.chat", getattr(ConnectionHandler, "chat", None)),
             ("ConnectionHandler._handle_function_result", getattr(ConnectionHandler, "_handle_function_result", None)),
+            ("ConnectionHandler._decode_opus_packet", getattr(ConnectionHandler, "_decode_opus_packet", None)),
             ("OpenAILLM.response", getattr(OpenAILLM, "response", None)),
             ("OpenAILLM.response_with_functions", getattr(OpenAILLM, "response_with_functions", None)),
             ("AliyunBLStreamASR.__init__", getattr(AliyunBLStreamASR, "__init__", None)),
@@ -137,7 +138,7 @@ def run_lightweight_contract_checks() -> Dict[str, Any]:
         callable_errors.append(str(exc))
 
     call_ok = len(callable_errors) == 0
-    total_callables = 25
+    total_callables = 26
     checks["callable_contracts"] = {
         "ok": call_ok,
         "detail": f"{total_callables}/{total_callables} upstream callables verified"

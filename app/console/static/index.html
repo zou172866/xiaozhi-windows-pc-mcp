@@ -61,1008 +61,1087 @@
 </div>
 
 <main class="workspace">
-  <section class="panel" aria-label="电脑操控与 AI 模型配置">
-    <!-- Section 0: ESP32 Device Allowlist & One-Click Onboarding -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">设备与电脑客户端接入白名单（免重启热放行）</h2>
-        <span id="esp32AuthBadge" class="rel-stage-badge num">检测中…</span>
-      </div>
-      <p class="section-desc">开启双因子鉴权后，仅白名单内的 ESP32 开发板或本地电脑对话客户端可访问 18000 WebSocket 与 18003 OTA。新设备首次连入被拦截时会自动出现在下方，点击「一键放行」即可立即生效；无 ESP32 硬件时可直接双击运行根目录 <code>电脑对话客户端.bat</code>（默认 ID：<code>pc-talk-local</code>）。</p>
+  <section class="panel config-panel" aria-label="电脑操控与 AI 模型配置">
+    <nav class="config-tabbar" id="configTabBar" role="tablist" aria-label="控制台配置分类">
+      <button type="button" class="config-tab-btn active" role="tab" aria-selected="true" data-config-tab="daily">
+        <span>常用</span>
+      </button>
+      <button type="button" class="config-tab-btn" role="tab" aria-selected="false" data-config-tab="companion">
+        <span>陪伴</span>
+      </button>
+      <button type="button" class="config-tab-btn" role="tab" aria-selected="false" data-config-tab="memory">
+        <span>记忆与外联</span>
+        <span id="tabMemoryBadge" class="tab-badge num" style="display:none;"></span>
+      </button>
+      <button type="button" class="config-tab-btn" role="tab" aria-selected="false" data-config-tab="system">
+        <span>系统与调优</span>
+        <span id="tabSystemBadge" class="tab-badge tab-badge-warn num" style="display:none;"></span>
+      </button>
+    </nav>
 
-      <div id="esp32PendingWrap" class="esp32-pending-wrap" style="display:none;">
-        <div class="l3-head" style="margin-bottom:6px;">
-          <strong style="color:var(--warn);">发现待放行的新设备 / 客户端</strong>
-          <span class="num" style="font-size:12px;color:var(--ink-muted);">放行后如 ESP32 未自动重连，按一下开发板 RST 键即可上线</span>
+    <!-- ======================== TAB 1: 常用 (Default) ======================== -->
+    <div class="config-tab-pane active" data-config-pane="daily" role="tabpanel">
+      <!-- 1. 3-Tier PC Control Mode -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">三层电脑操控权限挡位（点击即刻生效，免重启）</h2>
         </div>
-        <div id="esp32PendingList" class="esp32-device-list"></div>
+        <p class="section-desc">控制小智对这台 Windows 电脑的操作范围；打游戏时保持「日常 / 游戏安全挡」即可放心语音。</p>
+
+        <div class="mode-grid" id="modeGrid">
+          <button type="button" class="mode-btn" data-mode="off">
+            <strong>关闭电脑操控</strong>
+            <span>纯语音对话模式，禁用全部 L1 / L2 / L3 电脑工具</span>
+          </button>
+          <button type="button" class="mode-btn active" data-mode="safe">
+            <strong>日常 / 游戏安全挡（推荐）</strong>
+            <span>仅开启 L1 音量/开软件/看屏幕；锁定 L2 鼠标键盘与 L3 后台 Agent 派单防误触</span>
+          </button>
+          <button type="button" class="mode-btn" data-mode="full">
+            <strong>全权操控挡（解锁键鼠与 L3）</strong>
+            <span>L1 + L2 窗口按钮点击/打字输入（含安全护栏）+ L3 后台 Agent 派单全权限开放</span>
+          </button>
+        </div>
+
+        <details class="l3-adv section-fold" id="l3BoxFoldDetails">
+          <summary class="section-fold-summary">
+            <span>L3 后台 Agent 引擎（复杂任务派单 · 仅「全权操控挡」放行）</span>
+            <span id="l3BackendBadge" class="rel-stage-badge">检测中…</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="preset-bar" id="l3BackendBar" style="margin-bottom:6px;">
+              <button type="button" class="preset-pill" data-l3-backend="antigravity">Antigravity（反重力）</button>
+              <button type="button" class="preset-pill" data-l3-backend="dsh">DeepSeek DSH</button>
+              <button type="button" class="preset-pill" data-l3-backend="workbuddy">腾讯 WorkBuddy</button>
+              <button type="button" class="preset-pill" data-l3-backend="none">关闭 L3</button>
+            </div>
+            <div class="field-foot" style="margin-top:4px;">
+              <span>后端探测状态：<strong id="agyStatusText">检测中…</strong></span>
+              <span id="l3ModeGateHint" style="color:var(--warn);">当前挡位已锁定 L3（需切至「全权操控挡」才允许派单）</span>
+            </div>
+            <details class="l3-adv" id="l3AdvDetails">
+              <summary>高级设置与宿主机环境信息（超时热调 / 宿主机 .env 只读配置）</summary>
+              <div class="l3-adv-grid">
+                <div>
+                  <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3TimeoutInput">任务超时秒数（30～1800 秒 · 免重启生效）</label>
+                  <input type="number" id="l3TimeoutInput" min="30" max="1800" step="30" value="300" style="font-size:12.5px;padding:6px 9px;">
+                </div>
+                <div>
+                  <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WorkdirInput">宿主机工作目录（只读 · 仅限宿主机 .env）</label>
+                  <input type="text" id="l3WorkdirInput" readonly placeholder="自动取项目上级目录（宿主机 .env XIAOZHI_L3_WORKDIR）">
+                </div>
+                <div>
+                  <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3DshCmdInput">DSH 命令路径（只读 · 仅限宿主机 .env）</label>
+                  <input type="text" id="l3DshCmdInput" readonly placeholder="自动探测或由宿主机 .env DSH_CMD 指定">
+                </div>
+                <div>
+                  <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WbCmdInput">WorkBuddy / CodeBuddy 命令（只读 · 仅限宿主机 .env）</label>
+                  <input type="text" id="l3WbCmdInput" readonly placeholder="自动探测或由宿主机 .env WORKBUDDY_CMD 指定">
+                </div>
+                <div style="display:flex;align-items:flex-end;">
+                  <label style="display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink-muted);">
+                    <input type="checkbox" id="l3WbAutoApprove" disabled style="width:auto;accent-color:var(--accent);">
+                    <span>WorkBuddy 自动确认 -y（默认关闭 · 仅限宿主机 .env WORKBUDDY_AUTO_APPROVE）</span>
+                  </label>
+                </div>
+              </div>
+              <div class="l3-adv-foot">
+                <span style="font-size:12px;color:var(--ink-muted);" id="l3EffectiveWorkdirText">当前生效目录：--</span>
+                <button type="button" class="btn" id="l3SaveAdvBtn" style="padding:5px 12px;font-size:12.5px;">保存超时设置</button>
+              </div>
+            </details>
+          </div>
+        </details>
       </div>
 
-      <div id="esp32AllowedList" class="esp32-chip-list">
-        <div class="dream-empty">暂未放行任何设备；请让 ESP32 请求一次 OTA，或在下方手动添加 MAC 地址 / 客户端 ID（如 pc-talk-local）。</div>
+      <!-- 2. Audio Output Target -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">语音播报输出端（点击即刻生效，免重启）</h2>
+        </div>
+        <p class="section-desc">ESP32 负责收音与表情显示；选择「Windows 电脑音响」直出 48kHz 原声并自动与桌面混音。</p>
+
+        <div class="mode-grid-2" id="audioOutGrid">
+          <button type="button" class="mode-btn" data-target="esp32">
+            <strong>ESP32 本机喇叭</strong>
+            <span>声音从开发板自带的 MAX98357A 小喇叭播出，适合脱离桌面独立使用</span>
+          </button>
+          <button type="button" class="mode-btn active" data-target="pc">
+            <strong>Windows 电脑音响（推荐 · 48kHz 原声）</strong>
+            <span>零硬件直连电脑默认音箱/耳机，高保真满血音质，ESP32 屏幕表情照常同步</span>
+          </button>
+        </div>
+
+        <div class="audio-vol-bar" id="pcAudioVolBar">
+          <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;">电脑播报增益</span>
+          <input type="range" id="pcAudioVolRange" min="20" max="150" step="5" value="100" aria-label="电脑播报音量增益">
+          <strong id="pcAudioVolVal" class="num" style="font-size:12.5px;min-width:38px;text-align:right;">100%</strong>
+          <button type="button" class="btn" id="pcAudioTestBtn" style="padding:5px 11px;font-size:12.5px;">电脑音响试播</button>
+        </div>
+
+        <div class="field-foot">
+          <span>电脑音响桥接状态（18900）：<strong id="pcAudioStatusText">检测中…</strong></span>
+          <span>无硬件可双击 <code>电脑对话客户端.bat</code> 打字触发 48kHz 回复</span>
+        </div>
       </div>
 
-      <div class="esp32-add-row">
-        <input type="text" id="esp32MacInput" spellcheck="false" placeholder="输入 ESP32 MAC（如 aa:bb:cc:dd:ee:ff）或客户端 ID（如 pc-talk-local）" aria-label="ESP32 MAC 地址或客户端 ID">
-        <button type="button" class="btn btn-primary" id="esp32AddMacBtn" style="white-space:nowrap;">加入白名单</button>
+      <!-- 3. LLM Provider -->
+      <div class="config-section">
+        <h2 class="section-title" style="margin-bottom:6px;">对话模型</h2>
+        <p class="section-desc">保存后下一轮对话生效，沿用当前角色和记忆；本地陪伴使用 LM Studio 加载的 Huihui Qwen3 14B。</p>
+
+        <div class="form-grid-3">
+          <div>
+            <label class="field-label" for="providerSelect">对话模式</label>
+            <select id="providerSelect">
+              <option value="GLMLLM">智谱 GLM（GLM_API_KEY）</option>
+              <option value="DeepSeekLLM">DeepSeek 国内直连（DEEPSEEK_API_KEY）</option>
+              <option value="HuihuiLocal">本地陪伴 · Huihui Qwen3 14B（LM Studio）</option>
+              <option value="GeminiOpenAI">Google Gemini（GEMINI_API_KEY）</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="modelSelect">推荐模型</label>
+            <select id="modelSelect"></select>
+          </div>
+          <div>
+            <label class="field-label" for="modelCustomInput">当前生效模型名</label>
+            <input type="text" id="modelCustomInput" spellcheck="false">
+          </div>
+        </div>
+
+        <div class="field-foot">
+          <span>环境变量状态：DeepSeek <strong id="dsKeyBadge">--</strong> · 智谱 GLM <strong id="glmKeyBadge">--</strong> · Gemini <strong id="gemKeyBadge">--</strong> · 前缀缓存 <strong id="llmCacheRateBadge" class="num">--</strong></span>
+          <span>修改后点击右上角「保存并立即生效」（免重启热更新）</span>
+        </div>
       </div>
 
-      <div class="field-foot">
-        <span id="esp32AuthHint">鉴权采用 fail-closed 默认拒绝策略；控制台放行的设备将自动持久化并实时同步</span>
-        <span>OTA 端口 18003 · WS 端口 18000</span>
+      <!-- 4. Voice & TTS Engine Selection -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">语音合成引擎与音色（TTS · 云端 / EdgeTTS / 本机 GPU）</h2>
+          <span id="ttsEngineBadge" class="rel-stage-badge num">检测中…</span>
+        </div>
+        <p class="section-desc" id="ttsSectionDesc">全部 7 家云端 TTS、EdgeTTS 与本机 GPU GPT-SoVITS 均支持在线试听与电脑高保真（48kHz / 44.1kHz）音响直通；若配置了本地自定义多情绪模型，同步支持 7 情绪动态路由。</p>
+
+        <label class="field-label" for="ttsProviderSelect">合成引擎</label>
+        <div class="voice-row" style="margin-bottom:10px;">
+          <select id="ttsProviderSelect">
+            <optgroup label="免显存免费">
+              <option value="EdgeTTS">微软 EdgeTTS（免费免显存 · 开箱即用）</option>
+            </optgroup>
+            <optgroup label="云端高拟真音频 API（零显存 · 全兼容电脑高保真音响直通）">
+              <option value="CosyVoiceSiliconflow">硅基流动 CosyVoice2（国内直连推荐 · 48kHz）</option>
+              <option value="OpenAITTS">通用 OpenAI 兼容 TTS（OpenAI / One-API / 自建 · 48kHz）</option>
+              <option value="AliBLTTS">阿里云百炼 CosyVoice 双向流式（国内直连 · 48kHz）</option>
+              <option value="DoubaoTTS">火山引擎豆包 HTTP TTS（中文自然 · 48kHz）</option>
+              <option value="HuoshanDoubleStreamTTS">火山引擎豆包大模型双流式 V3（高拟人 · 48kHz）</option>
+              <option value="FishSpeech">Fish Audio / FishSpeech（高拟真克隆 · 48kHz）</option>
+              <option value="MinimaxTTSHTTPStream">MiniMax 海螺语音 T2A V2（多情绪流式 · 44.1kHz）</option>
+            </optgroup>
+            <optgroup label="本机独显专精引擎">
+              <option value="GPT_SOVITS_V2">本机 RTX GPU GPT-SoVITS V4（需独显 19880）</option>
+            </optgroup>
+          </select>
+          <button type="button" class="btn" id="previewBtn" style="white-space:nowrap;">
+            <svg class="icon" viewBox="0 0 24 24">
+              <polygon points="6 4 20 12 6 20 6 4"/>
+            </svg>
+            <span id="previewBtnText">试听音色</span>
+          </button>
+        </div>
+
+        <div id="legacyVoiceWrap">
+          <label class="field-label" for="voiceSelect">播报音色</label>
+          <div class="voice-row">
+            <select id="voiceSelect">
+              <option value="__gsv_raiden_mei__">崩坏三 · 雷电芽衣（本机 GPU 满血 V4 · 7 情绪动态声线）</option>
+              <option value="__gsv_luoxiaohei__">罗小黑战记 · 罗小黑（本机 GPU 满血 V5-Turbo · 7 情绪动态声线）</option>
+              <option value="__gsv_xiaozhi_tw__">小智原版台湾腔 · 湾湾小何（本机 GPU 复刻）</option>
+              <option value="zh-TW-HsiaoChenNeural">晓辰 · 微软台湾腔甜美女声（免显存）</option>
+              <option value="zh-TW-YunJheNeural">云哲 · 微软台湾腔温和男声（免显存）</option>
+              <option value="zh-CN-XiaoxiaoNeural" selected>晓晓 · 自然温柔女声</option>
+              <option value="zh-CN-XiaoyiNeural">晓伊 · 活泼甜美少女音</option>
+              <option value="zh-CN-YunxiNeural">云希 · 清朗阳光少年音</option>
+              <option value="zh-CN-YunjianNeural">云健 · 沉稳磁性男声</option>
+              <option value="zh-CN-YunxiaNeural">云夏 · 元气可爱童声</option>
+              <option value="zh-HK-HiuGaaiNeural">晓佳 · 粤语自然女声</option>
+              <option value="zh-CN-liaoning-XiaobeiNeural">晓北 · 幽默东北话女声</option>
+              <option value="zh-CN-shaanxi-XiaoniNeural">晓妮 · 亲切陕西话女声</option>
+            </select>
+          </div>
+
+          <div id="meiEmotionBar" class="preset-bar" style="display:none;margin-top:10px;margin-bottom:0;">
+            <button type="button" class="preset-pill active" data-emotion="auto">自动情绪识别</button>
+            <button type="button" class="preset-pill" data-emotion="gentle">温柔关怀</button>
+            <button type="button" class="preset-pill" data-emotion="happy">欣喜明朗</button>
+            <button type="button" class="preset-pill" data-emotion="playful">俏皮打趣</button>
+            <button type="button" class="preset-pill" data-emotion="shy">羞赧微嗔</button>
+            <button type="button" class="preset-pill" data-emotion="serious">沉稳认真</button>
+            <button type="button" class="preset-pill" data-emotion="tender">轻柔抚慰</button>
+            <button type="button" class="preset-pill" data-emotion="calm">平静默认</button>
+          </div>
+        </div>
+
+        <div id="cloudTtsFieldsWrap" class="audio-fields-grid" style="display:none;"></div>
+
+        <div class="preview-text-row">
+          <input type="text" id="previewTextInput" value="你好呀，我是小智，今天过得怎么样？有什么需要我帮忙的随时告诉我。" aria-label="试听台词">
+        </div>
+
+        <div class="field-foot">
+          <span>环境变量：<strong id="ttsEnvBadge">--</strong></span>
+          <span id="ttsCompatNote">已支持 ESP32 喇叭与电脑 48kHz 音响直通</span>
+        </div>
+      </div>
+
+      <!-- 5. System Prompt -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">角色人设提示词（Prompt）</h2>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span id="personaRevBadge" class="rel-stage-badge num">rev.0</span>
+            <span class="num" style="font-size:12px;color:var(--ink-muted);" id="charCount">0 字</span>
+          </div>
+        </div>
+        <p class="section-desc">决定性格口吻与风格；保存时强制 CAS 校验并留存快照，<strong>人设绝不授予工具权限、不替代操控挡位</strong>。</p>
+
+        <div class="preset-bar" id="presetBar">
+          <button type="button" class="preset-pill" data-preset="mei">崩坏三 · 雷电芽衣</button>
+          <button type="button" class="preset-pill" data-preset="luoxiaohei">罗小黑战记 · 罗小黑</button>
+          <button type="button" class="preset-pill" data-preset="taiwan">台湾机车女孩</button>
+          <button type="button" class="preset-pill" data-preset="default">默认机智助手</button>
+          <button type="button" class="preset-pill" data-preset="geek">硬核电子极客</button>
+          <button type="button" class="preset-pill" data-preset="warm">温柔陪伴知己</button>
+        </div>
+
+        <textarea id="promptInput" spellcheck="false"></textarea>
+
+        <details class="l3-adv" id="personaHistoryDetails" style="margin-top:10px;">
+          <summary>人设版本快照（CAS 摘要校验 · Diff 对比 · 一键回滚）<span id="personaSyncTag" class="num" style="margin-left:6px;color:var(--ink-muted);"></span></summary>
+          <div id="personaHistoryList" class="persona-snap-list" style="margin-top:8px;">
+            <div class="dream-empty">暂无历史快照。</div>
+          </div>
+          <pre id="personaDiffViewer" class="diff-pre" style="display:none;"></pre>
+        </details>
       </div>
     </div>
 
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">对话记忆存档</h2>
-      </div>
-      <p class="section-desc">给设备选择下次语音连接使用的存档。正在对话时，请先结束会话，再重新唤醒小智。</p>
-      <label class="field-label" for="archiveDevice">设备</label>
-      <select id="archiveDevice" disabled><option value="">等待设备接入</option></select>
-      <div class="preset-bar" id="archiveChoices" role="group" aria-label="选择记忆存档" style="margin-top:12px;">
-        <button type="button" class="preset-pill" data-archive="daily" aria-pressed="false" disabled>日常陪伴</button>
-        <button type="button" class="preset-pill" data-archive="tavern" aria-pressed="false" disabled>酒馆剧情</button>
-      </div>
-      <div class="field-foot"><span id="archiveStatus" role="status">设备接入后可以选择存档。</span></div>
-      <details class="l3-adv">
-        <summary>从酒馆接续聊天</summary>
-        <p class="section-desc">在 SillyTavern 扩展中导出当前聊天，再选择导出的 JSON 文件。先核对设备和对白，再导入最近最多三轮。</p>
-        <label class="field-label" for="handoffFile">酒馆接续文件</label>
-        <input id="handoffFile" type="file" accept=".json,application/json">
-        <div id="handoffPreview" style="white-space:pre-wrap;overflow-wrap:anywhere;"></div>
-        <p class="section-desc" id="handoffStatus" role="status"></p>
-        <button type="button" class="btn btn-primary" id="handoffSubmit" disabled>导入并切换到酒馆</button>
-      </details>
-    </div>
-
-    <!-- Section 1: 3-Tier PC Control Mode (Instant Switch, No Restart Required) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">三层电脑操控权限挡位（点击即刻生效，免重启）</h2>
-      </div>
-      <p class="section-desc">控制小智对这台 Windows 电脑的操作范围。打游戏时保持「日常 / 游戏安全挡」即可放心使用语音。</p>
-
-      <div class="mode-grid" id="modeGrid">
-        <button type="button" class="mode-btn" data-mode="off">
-          <strong>关闭电脑操控</strong>
-          <span>纯语音对话模式，禁用全部 L1 / L2 / L3 电脑工具</span>
-        </button>
-        <button type="button" class="mode-btn active" data-mode="safe">
-          <strong>日常 / 游戏安全挡（推荐）</strong>
-          <span>仅开启 L1 音量/开软件/看屏幕；锁定 L2 鼠标键盘与 L3 后台 Agent 派单防误触</span>
-        </button>
-        <button type="button" class="mode-btn" data-mode="full">
-          <strong>全权操控挡（解锁键鼠与 L3）</strong>
-          <span>L1 + L2 窗口按钮点击/打字输入（含安全护栏）+ L3 后台 Agent 派单全权限开放</span>
-        </button>
-      </div>
-
-      <div class="l3-box">
-        <div class="l3-head">
-          <strong>L3 后台 Agent 引擎（复杂任务派单 · 仅「全权操控挡」放行）</strong>
-          <span id="l3BackendBadge" class="rel-stage-badge">检测中…</span>
+    <!-- ======================== TAB 2: 陪伴 ======================== -->
+    <div class="config-tab-pane" data-config-pane="companion" role="tabpanel">
+      <!-- 1. Relationship & Intimacy -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">亲密度与关系热度（拖动即刻生效，免重启）</h2>
+          <span id="relStageBadge" class="rel-stage-badge num">检测中…</span>
         </div>
-        <div class="preset-bar" id="l3BackendBar" style="margin-bottom:6px;">
-          <button type="button" class="preset-pill" data-l3-backend="antigravity">Antigravity（反重力）</button>
-          <button type="button" class="preset-pill" data-l3-backend="dsh">DeepSeek DSH</button>
-          <button type="button" class="preset-pill" data-l3-backend="workbuddy">腾讯 WorkBuddy</button>
-          <button type="button" class="preset-pill" data-l3-backend="none">关闭 L3</button>
+        <p class="section-desc">实时调节 Anima Brain 中 AI 伙伴的熟悉、温暖、信任与浪漫尺度，下一句话立即按新关系注入。</p>
+
+        <div class="preset-bar" id="relPresetBar" style="margin-bottom:10px;">
+          <button type="button" class="preset-pill" data-rel-preset="restrained">克制助手（礼貌分寸 · 无浪漫）</button>
+          <button type="button" class="preset-pill" data-rel-preset="confidant">温柔知己（熟识贴心 · 轻浪漫）</button>
+          <button type="button" class="preset-pill" data-rel-preset="intimate">亲密依恋（深度默契 · 偏爱哄慰）</button>
         </div>
-        <div class="field-foot" style="margin-top:4px;">
-          <span>后端探测状态：<strong id="agyStatusText">检测中…</strong></span>
-          <span id="l3ModeGateHint" style="color:var(--warn);">当前挡位已锁定 L3（需切至「全权操控挡」才允许派单）</span>
+
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>允许浪漫亲昵互动（Romance 开关）</strong>
+            <span id="relRomanceHint">开启后允许顺应你的亲昵与撒娇表达，并激活下方浪漫值刻度</span>
+          </div>
+          <label class="toggle-switch" aria-label="允许浪漫亲昵互动开关">
+            <input type="checkbox" id="relRomanceToggle" checked>
+            <span class="toggle-slider"></span>
+          </label>
         </div>
-        <details class="l3-adv" id="l3AdvDetails">
-          <summary>高级设置与宿主机环境信息（超时热调 / 宿主机 .env 只读配置）</summary>
-          <div class="l3-adv-grid">
-            <div>
-              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3TimeoutInput">任务超时秒数（30～1800 秒 · 免重启生效）</label>
-              <input type="number" id="l3TimeoutInput" min="30" max="1800" step="30" value="300" style="font-size:12.5px;padding:6px 9px;">
+
+        <div class="audio-vol-bar" style="margin-top:0;">
+          <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">熟悉度（Familiarity）</span>
+          <input type="range" id="relFamRange" min="0" max="100" step="1" value="62" aria-label="熟悉度">
+          <strong id="relFamVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">62% · Lv.2</strong>
+        </div>
+
+        <div class="audio-vol-bar" style="margin-top:8px;">
+          <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">温暖度（Warmth）</span>
+          <input type="range" id="relWarmRange" min="0" max="100" step="1" value="66" aria-label="温暖度">
+          <strong id="relWarmVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">66% · Lv.2</strong>
+        </div>
+
+        <div class="audio-vol-bar" style="margin-top:8px;">
+          <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">信任度（Trust）</span>
+          <input type="range" id="relTrustRange" min="0" max="100" step="1" value="62" aria-label="信任度">
+          <strong id="relTrustVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">62% · Lv.2</strong>
+        </div>
+
+        <div class="audio-vol-bar" id="relRomRow" style="margin-top:8px;">
+          <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">浪漫值（Romance）</span>
+          <input type="range" id="relRomRange" min="0" max="100" step="1" value="20" aria-label="浪漫值">
+          <strong id="relRomVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">20% · 已解锁</strong>
+        </div>
+
+        <details class="l3-adv section-fold" id="animaDiagFoldDetails">
+          <summary class="section-fold-summary">
+            <span>Anima 向量空间与本地发件箱诊断（Outbox · 死信重放）</span>
+            <span id="animaOutboxBadge" class="rel-stage-badge num">pending 0 · dead 0</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="l3-box" style="margin-top:0;">
+              <div class="l3-head" style="margin-bottom:6px;">
+                <strong>Anima 多向量空间与检索状态（Multi-Space · 降级显式提示）</strong>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <span id="animaSemanticBadge" class="rel-stage-badge num">检测中…</span>
+                  <button type="button" class="btn" id="animaResetEmbedBreakerBtn" style="padding:4px 11px;font-size:12px;display:none;">重置向量熔断</button>
+                </div>
+              </div>
+              <div class="field-foot" style="margin-top:2px;">
+                <span id="animaSemanticText">活动空间：检测中…</span>
+                <span id="animaSemanticSpacesText" class="num" style="color:var(--ink-muted);">共存空间：0</span>
+              </div>
             </div>
-            <div>
-              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WorkdirInput">宿主机工作目录（只读 · 仅限宿主机 .env）</label>
-              <input type="text" id="l3WorkdirInput" readonly placeholder="自动取项目上级目录（宿主机 .env XIAOZHI_L3_WORKDIR）">
-            </div>
-            <div>
-              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3DshCmdInput">DSH 命令路径（只读 · 仅限宿主机 .env）</label>
-              <input type="text" id="l3DshCmdInput" readonly placeholder="自动探测或由宿主机 .env DSH_CMD 指定">
-            </div>
-            <div>
-              <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="l3WbCmdInput">WorkBuddy / CodeBuddy 命令（只读 · 仅限宿主机 .env）</label>
-              <input type="text" id="l3WbCmdInput" readonly placeholder="自动探测或由宿主机 .env WORKBUDDY_CMD 指定">
-            </div>
-            <div style="display:flex;align-items:flex-end;">
-              <label style="display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink-muted);">
-                <input type="checkbox" id="l3WbAutoApprove" disabled style="width:auto;accent-color:var(--accent);">
-                <span>WorkBuddy 自动确认 -y（默认关闭 · 仅限宿主机 .env WORKBUDDY_AUTO_APPROVE）</span>
-              </label>
+
+            <div class="l3-box" style="margin-top:8px;">
+              <div class="l3-head" style="margin-bottom:6px;">
+                <strong>Anima 本地发件箱（Outbox 持久化与死信重放 · B-5）</strong>
+                <button type="button" class="btn" id="animaReplayDeadBtn" style="padding:4px 11px;font-size:12px;" disabled>重放 dead</button>
+              </div>
+              <div class="field-foot" style="margin-top:2px;">
+                <span>队列统计：待发 <strong id="animaOutboxPendingText" class="num">0</strong> · 死信 <strong id="animaOutboxDeadText" class="num">0</strong> · 已送达 <strong id="animaOutboxSentText" class="num">0</strong><span id="animaOutboxCorruptWrap" style="display:none;"> · 损坏 <strong id="animaOutboxCorruptText" class="num">0</strong></span></span>
+                <span id="animaOutboxErrText" style="color:var(--ink-muted);">无积压异常</span>
+              </div>
             </div>
           </div>
-          <div class="l3-adv-foot">
-            <span style="font-size:12px;color:var(--ink-muted);" id="l3EffectiveWorkdirText">当前生效目录：--</span>
-            <button type="button" class="btn" id="l3SaveAdvBtn" style="padding:5px 12px;font-size:12.5px;">保存超时设置</button>
+        </details>
+
+        <div class="field-foot">
+          <span>Anima Brain 同步状态（18787）：<strong id="relStatusText">检测中…</strong> · 最近备份：<strong id="animaBackupText" class="num">检测中…</strong></span>
+          <span>下一句话即刻生效</span>
+        </div>
+      </div>
+
+      <!-- 2. Reply & Storytelling Length -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">回复字数与讲故事篇幅（拖动即刻生效，免重启）</h2>
+        </div>
+        <p class="section-desc">分别微调平时闲聊和讲故事/深度讲解的篇幅，拖动滑块或点选预设后下一句话立刻生效。</p>
+
+        <div class="preset-bar" id="replyLenPresetBar" style="margin-bottom:10px;">
+          <button type="button" class="preset-pill" data-len-preset="concise">简短利落（60 / 200 字）</button>
+          <button type="button" class="preset-pill active" data-len-preset="balanced">舒展日常（150 / 450 字 · 推荐）</button>
+          <button type="button" class="preset-pill" data-len-preset="chatty">话痨详聊（260 / 750 字）</button>
+          <button type="button" class="preset-pill" data-len-preset="storyteller">长篇故事（200 / 1000 字）</button>
+        </div>
+
+        <div class="audio-vol-bar" style="margin-top:0;">
+          <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">日常聊天目标字数</span>
+          <input type="range" id="chatCharsRange" min="40" max="600" step="10" value="150" aria-label="日常聊天目标字数">
+          <strong id="chatCharsVal" class="num" style="font-size:12.5px;min-width:118px;text-align:right;">150 字（约 33 秒）</strong>
+        </div>
+
+        <div class="audio-vol-bar" style="margin-top:8px;">
+          <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">讲故事 / 详述字数</span>
+          <input type="range" id="storyCharsRange" min="150" max="1500" step="50" value="450" aria-label="讲故事与详述目标字数">
+          <strong id="storyCharsVal" class="num" style="font-size:12.5px;min-width:118px;text-align:right;">450 字（约 1分40秒）</strong>
+        </div>
+
+        <div class="field-foot">
+          <span>当前动态生成上限：<strong id="replyMaxTokText" class="num">1246 tokens</strong></span>
+          <span>下一句话即刻生效，无需重启或重连 ESP32</span>
+        </div>
+      </div>
+
+      <!-- 3. Proactive Companion, Desktop Rhythm & Vocal Cue (Default OFF) -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">主动陪伴与感知（默认关闭 · 零常驻资源）</h2>
+          <span id="proactiveBadge" class="rel-stage-badge num">已关闭</span>
+        </div>
+        <p class="section-desc">按需开启桌面节律关怀、SenseVoice 语气声学感知与 Anima 微日常；全屏/游戏/会议/打字心流及免打扰时段自动静默。</p>
+
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>启用主动陪伴心跳引擎（默认关闭）</strong>
+            <span id="proactiveEnabledHint">关闭时不启动后台心跳线程、不轮询 18900；开启后默认仅记录静默试运行台词，绝不打扰</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用主动陪伴心跳引擎开关">
+            <input type="checkbox" id="proactiveEnabledToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>启用 SenseVoice 语气与声学事件感知（默认关闭）</strong>
+            <span id="vocalCueEnabledHint">关闭时零标签解析与缓存；开启后从 Sherpa SenseVoice 零额外内存提取笑声/叹气/低落等语气参考</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用语气与声学事件感知开关">
+            <input type="checkbox" id="vocalCueEnabledToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用 Anima 角色微日常背景（默认关闭）</strong>
+            <span id="innerLifeEnabledHint">关闭时被动聊天不额外查询或注入微日常；开启后为角色按早/午/晚生成 1 条自然生活背景</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用角色微日常开关">
+            <input type="checkbox" id="innerLifeEnabledToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <details class="l3-adv section-fold" id="proactiveFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开主动陪伴门控、播报方式、桌面节律与试运行记录</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="mode-grid-2" id="proactiveModeGrid" style="margin-bottom:10px;">
+              <button type="button" class="mode-btn active" data-proactive-mode="dry_run">
+                <strong>静默试运行（默认 · 仅记录到控制台）</strong>
+                <span>完整演练桌面门控与台词生成，仅写入下方观测记录，不发声、不消耗未完小事跟进配额</span>
+              </button>
+              <button type="button" class="mode-btn" data-proactive-mode="pc_speaker">
+                <strong>电脑音响轻声播报（18900 直出）</strong>
+                <span>通过当前音色在电脑音响轻声打招呼，自动遵守免打扰、心流静默与忽略冷却退避</span>
+              </button>
+              <button type="button" class="mode-btn" data-proactive-mode="mobile_push">
+                <strong>仅推手机通知栏（零声音 · 需开手机推送）</strong>
+                <span>不合成音频、不占电脑音响，直接将关怀台词经国内免代理通道推送到手机通知栏</span>
+              </button>
+              <button type="button" class="mode-btn" data-proactive-mode="pc_and_mobile">
+                <strong>电脑轻声播报 + 同步推手机留痕</strong>
+                <span>电脑音响轻声打招呼的同时顺手推送一条手机通知，离开座位也能看到</span>
+              </button>
+            </div>
+
+            <div class="proactive-grid">
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveQuietStart">免打扰开始（HH:MM）</label>
+                <input type="text" id="proactiveQuietStart" value="23:00" spellcheck="false" placeholder="23:00">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveQuietEnd">免打扰结束（HH:MM）</label>
+                <input type="text" id="proactiveQuietEnd" value="08:00" spellcheck="false" placeholder="08:00">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveIntervalInput">门禁巡检间隔（分）</label>
+                <input type="number" id="proactiveIntervalInput" min="5" max="120" step="5" value="15">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveCooldownInput">基础冷却（分）</label>
+                <input type="number" id="proactiveCooldownInput" min="15" max="720" step="15" value="90">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveMaxDailyInput">每日实发上限（次）</label>
+                <input type="number" id="proactiveMaxDailyInput" min="1" max="12" step="1" value="4">
+              </div>
+            </div>
+
+            <div class="audio-vol-bar" style="margin-top:8px;">
+              <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">主动播报轻声音量</span>
+              <input type="range" id="proactiveVolumeRange" min="20" max="120" step="5" value="75" aria-label="主动播报轻声音量">
+              <strong id="proactiveVolumeVal" class="num" style="font-size:12.5px;min-width:44px;text-align:right;">75%</strong>
+              <button type="button" class="btn" id="proactiveSaveBtn" style="padding:5px 12px;font-size:12.5px;white-space:nowrap;">保存门控设置</button>
+            </div>
+
+            <div class="l3-box" style="margin-top:10px;">
+              <div class="proactive-meta-row">
+                <span>桌面节律（18900）：<strong id="proactiveRhythmText">等待探测…</strong></span>
+              </div>
+              <div class="proactive-meta-row">
+                <span>最近语气声学感知：<strong id="proactiveVocalCueText">等待对话（SenseVoice 实时提取）</strong></span>
+              </div>
+              <div class="proactive-meta-row">
+                <span>今日角色微日常：<strong id="proactiveInnerLifeText">等待同步…</strong></span>
+              </div>
+              <div class="field-foot" style="margin-top:6px;align-items:center;">
+                <span id="proactiveStatsText" class="num">今日实发 0/4 · 忽略退避 0 次</span>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                  <button type="button" class="btn" id="proactiveRunBtn" style="padding:4px 11px;font-size:12px;">立即试跑一次</button>
+                  <button type="button" class="btn" id="proactiveInnerLifeRefreshBtn" style="padding:4px 11px;font-size:12px;">刷新角色日常</button>
+                  <button type="button" class="btn" id="proactiveRefreshBtn" style="padding:4px 11px;font-size:12px;">刷新状态</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="proactiveHistoryList" class="proactive-history-list">
+              <div class="dream-empty">暂无主动陪伴试运行记录；点击「立即试跑一次」可在不发声的前提下验证决策与台词效果。</div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 4. Voiceprint Speaker Guard & Privacy-Guarded Screen Peek (Default OFF) -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">单设备声纹认人与隐私浅看屏（默认关闭 · 零模型占用）</h2>
+          <span id="voiceprintBadge" class="rel-stage-badge num">已关闭</span>
+        </div>
+        <p class="section-desc">复用容器 Sherpa-ONNX，关闭时绝不加载声纹模型；未录主人前默认全放行防自锁。桌面立绘浮窗可双击根目录 <code>桌角陪伴小窗.bat</code>。</p>
+
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>启用单设备声纹自动认人（默认关闭）</strong>
+            <span id="voiceprintEnabledHint">关闭状态零模型加载、零额外内存；开启并录好主人声纹后自动生效记忆隔离与非主人操控拦截</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用单设备声纹自动认人开关">
+            <input type="checkbox" id="voiceprintEnabledToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用按需隐私护栏浅看屏（默认关闭）</strong>
+            <span id="screenPeekEnabledHint">仅截取当前活动窗口并自动屏蔽终端/密码管理器/网银/无痕/私密聊天，纯按需触发零后台开销</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用按需浅看屏开关">
+            <input type="checkbox" id="screenPeekEnabledToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <details class="l3-adv section-fold" id="voiceprintFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开声纹策略、声纹录入管理与隐私浅看屏测试</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="preset-bar" id="voiceprintPolicyBar" style="margin-bottom:10px;">
+              <button type="button" class="preset-pill active" data-vp-policy="full_guard">全防护（记忆隔离 + 非主人拦截操控 · 默认）</button>
+              <button type="button" class="preset-pill" data-vp-policy="isolate_memory">仅记忆隔离（不拦截电脑工具）</button>
+              <button type="button" class="preset-pill" data-vp-policy="observe">仅识别观察（只记录说话人）</button>
+            </div>
+
+            <div class="audio-vol-bar" style="margin-top:0;margin-bottom:10px;">
+              <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">声纹匹配相似度阈值</span>
+              <input type="range" id="voiceprintThresholdRange" min="30" max="90" step="2" value="58" aria-label="声纹匹配相似度阈值">
+              <strong id="voiceprintThresholdVal" class="num" style="font-size:12.5px;min-width:44px;text-align:right;">0.58</strong>
+              <button type="button" class="btn" id="voiceprintDownloadBtn" style="padding:5px 11px;font-size:12px;white-space:nowrap;">下载声纹模型 (~28MB)</button>
+              <button type="button" class="btn" id="voiceprintRefreshBtn" style="padding:5px 11px;font-size:12px;white-space:nowrap;">刷新声纹状态</button>
+            </div>
+
+            <div class="l3-box" style="margin-top:0;margin-bottom:10px;">
+              <div class="proactive-meta-row">
+                <span>模型状态：<strong id="voiceprintModelText">未检测</strong></span>
+              </div>
+              <div class="proactive-meta-row">
+                <span>最近可录入语音：<strong id="voiceprintRecentPcmText">开启开关后对着设备说 1～3 秒话即可一键录入</strong></span>
+              </div>
+              <div class="proactive-meta-row">
+                <span>最近识别结果：<strong id="voiceprintLatestText">暂无识别记录</strong></span>
+              </div>
+              <div class="vp-enroll-row">
+                <input type="text" id="voiceprintNameInput" placeholder="说话人名称（如 主人 / 家人名）" value="主人" maxlength="32">
+                <select id="voiceprintRoleSelect" aria-label="说话人角色">
+                  <option value="owner" selected>主人（owner · 完整权限）</option>
+                  <option value="family">家人（family · 独立记忆）</option>
+                </select>
+                <button type="button" class="btn" id="voiceprintEnrollLastBtn" style="padding:5px 11px;font-size:12px;white-space:nowrap;">把刚才那句录为声纹</button>
+                <label class="btn" style="padding:5px 11px;font-size:12px;white-space:nowrap;cursor:pointer;margin:0;">
+                  上传 WAV 录入
+                  <input type="file" id="voiceprintWavInput" accept=".wav,audio/wav" style="display:none;">
+                </label>
+              </div>
+            </div>
+
+            <div id="voiceprintSpeakerList" class="vp-speaker-list">
+              <div class="dream-empty">尚未录入任何声纹（未录入主人声纹前默认完全放行，不会自锁）。</div>
+            </div>
+
+            <div class="l3-box" style="margin-top:10px;">
+              <div class="proactive-meta-row">
+                <span>最新浅看屏结果：<strong id="screenPeekResultText">未触发（需先开启上方开关；桌面浮窗请双击根目录「桌角陪伴小窗.bat」，立绘放 voices/&lt;角色&gt;/portraits/ 即自动加载）</strong></span>
+              </div>
+              <div class="vp-enroll-row" style="margin-top:6px;">
+                <input type="text" id="screenPeekQuestionInput" placeholder="可选：想问芽衣屏幕上的什么内容（留空则简述当前窗口）" maxlength="160">
+                <button type="button" class="btn" id="screenPeekBtn" style="padding:5px 12px;font-size:12px;white-space:nowrap;">看一眼当前屏幕</button>
+              </div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 5. Custom Idle Timeout Farewell -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">空闲超时告别语（免重启热更新）</h2>
+          <span id="idleFarewellBadge" class="rel-stage-badge num">120 秒</span>
+        </div>
+        <p class="section-desc">无人说话超过设定时长后播报告别并挂断，全程不污染 Anima 长期记忆与 Obsidian。</p>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用超时告别语音</strong>
+            <span id="idleFarewellToggleHint">开启后按所选模式播报告别语；关闭则静默断开连接</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用空闲超时告别语音开关">
+            <input type="checkbox" id="idleFarewellToggle" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <details class="l3-adv section-fold" id="idleFarewellFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开告别模式、超时滑块与自定义台词编辑</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="mode-grid-2" id="idleFarewellModeGrid" style="margin-bottom:10px;">
+              <button type="button" class="mode-btn active" data-farewell-mode="fixed">
+                <strong>固定随机台词（零 LLM）</strong>
+                <span>直接随机念下方自定义短句，零 token 消耗、秒级响应</span>
+              </button>
+              <button type="button" class="mode-btn" data-farewell-mode="llm_summary">
+                <strong>总结本轮对话 + 依恋不舍（AI 现场生成）</strong>
+                <span>简短呼应刚聊的话题并温柔道别，不入记忆；无对话或超时自动回退下方兜底句</span>
+              </button>
+            </div>
+
+            <div class="preset-bar" id="idleTimeoutPresetBar" style="margin-bottom:10px;">
+              <button type="button" class="preset-pill" data-idle-timeout="60">60 秒（1 分钟）</button>
+              <button type="button" class="preset-pill active" data-idle-timeout="120">120 秒（2 分钟 · 默认）</button>
+              <button type="button" class="preset-pill" data-idle-timeout="300">300 秒（5 分钟）</button>
+              <button type="button" class="preset-pill" data-idle-timeout="600">600 秒（10 分钟）</button>
+            </div>
+
+            <div class="audio-vol-bar" style="margin-top:0;">
+              <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">无声超时时长</span>
+              <input type="range" id="idleTimeoutRange" min="30" max="600" step="10" value="120" aria-label="无声超时秒数">
+              <strong id="idleTimeoutVal" class="num" style="font-size:12.5px;min-width:118px;text-align:right;">120 秒（2分）</strong>
+            </div>
+
+            <div id="idleFarewellSummaryWrap" style="display:none;margin-top:10px;">
+              <label class="field-label" for="idleFarewellPromptInput">AI 总结告别提示词（决定总结方式、依恋语气与字数上限）</label>
+              <textarea id="idleFarewellPromptInput" spellcheck="false" style="min-height:76px;" placeholder="描述你希望她如何总结本轮对话并表达不舍…"></textarea>
+            </div>
+
+            <label class="field-label" id="idleFarewellInputLabel" for="idleFarewellInput" style="margin-top:10px;">自定义告别台词（每行一句，超时随机播报；多情绪音色支持 [tender] / [shy] 等情绪标签）</label>
+            <textarea id="idleFarewellInput" spellcheck="false" style="min-height:84px;" placeholder="每行写一句告别台词，例如：&#10;先去忙吧，有事随时叫我。&#10;[tender] 那我先安静待在一旁啦，需要的时候再叫我哦。"></textarea>
+
+            <div class="field-foot" style="margin-top:8px;align-items:center;">
+              <span id="idleFarewellMeta" class="num">已配置 2 句 · 修改后点右侧按钮立即生效</span>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <button type="button" class="btn" id="idleFarewellPreviewBtn" style="padding:5px 11px;font-size:12.5px;">试听首句</button>
+                <button type="button" class="btn primary" id="idleFarewellSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存告别语</button>
+              </div>
+            </div>
           </div>
         </details>
       </div>
     </div>
 
-    <!-- Section 1b: Audio Output Target (ESP32 Speaker <-> Windows PC Speakers, Instant Switch) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">语音播报输出端（点击即刻生效，免重启）</h2>
-      </div>
-      <p class="section-desc">ESP32 始终负责麦克风收音与 OLED 表情字幕显示；选择「Windows 电脑音响」将直出高保真 48kHz 原声（兼容云端 TTS、EdgeTTS 与本机 GPU），自动与桌面声音混音。</p>
-
-      <div class="mode-grid-2" id="audioOutGrid">
-        <button type="button" class="mode-btn" data-target="esp32">
-          <strong>ESP32 本机喇叭</strong>
-          <span>声音从开发板自带的 MAX98357A 小喇叭播出，适合脱离桌面独立使用</span>
-        </button>
-        <button type="button" class="mode-btn active" data-target="pc">
-          <strong>Windows 电脑音响（推荐 · 48kHz 原声）</strong>
-          <span>零硬件直连电脑默认音箱/耳机，高保真满血音质，ESP32 屏幕表情照常同步</span>
-        </button>
-      </div>
-
-      <div class="audio-vol-bar" id="pcAudioVolBar">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;">电脑播报增益</span>
-        <input type="range" id="pcAudioVolRange" min="20" max="150" step="5" value="100" aria-label="电脑播报音量增益">
-        <strong id="pcAudioVolVal" class="num" style="font-size:12.5px;min-width:38px;text-align:right;">100%</strong>
-        <button type="button" class="btn" id="pcAudioTestBtn" style="padding:5px 11px;font-size:12.5px;">电脑音响试播</button>
-      </div>
-
-      <div class="field-foot">
-        <span>电脑音响桥接状态（18900）：<strong id="pcAudioStatusText">检测中…</strong></span>
-        <span>无 ESP32 硬件也可双击运行 <code>电脑对话客户端.bat</code> 打字触发 48kHz 电脑音响回复</span>
-      </div>
-    </div>
-
-    <!-- Section 1c: Reply & Storytelling Length Control (Instant Hot-Update, No Restart Required) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">回复字数与讲故事篇幅（拖动即刻生效，免重启）</h2>
-      </div>
-      <p class="section-desc">分别微调平时闲聊和讲故事/深度讲解的篇幅；拖动滑块或点选预设后，下一句话立刻生效并自动放宽生成上限。</p>
-
-      <div class="preset-bar" id="replyLenPresetBar" style="margin-bottom:10px;">
-        <button type="button" class="preset-pill" data-len-preset="concise">简短利落（60 / 200 字）</button>
-        <button type="button" class="preset-pill active" data-len-preset="balanced">舒展日常（150 / 450 字 · 推荐）</button>
-        <button type="button" class="preset-pill" data-len-preset="chatty">话痨详聊（260 / 750 字）</button>
-        <button type="button" class="preset-pill" data-len-preset="storyteller">长篇故事（200 / 1000 字）</button>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:0;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">日常聊天目标字数</span>
-        <input type="range" id="chatCharsRange" min="40" max="600" step="10" value="150" aria-label="日常聊天目标字数">
-        <strong id="chatCharsVal" class="num" style="font-size:12.5px;min-width:118px;text-align:right;">150 字（约 33 秒）</strong>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:8px;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">讲故事 / 详述字数</span>
-        <input type="range" id="storyCharsRange" min="150" max="1500" step="50" value="450" aria-label="讲故事与详述目标字数">
-        <strong id="storyCharsVal" class="num" style="font-size:12.5px;min-width:118px;text-align:right;">450 字（约 1分40秒）</strong>
-      </div>
-
-      <div class="field-foot">
-        <span>当前动态生成上限：<strong id="replyMaxTokText" class="num">1246 tokens</strong></span>
-        <span>下一句话即刻生效，无需重启或重连 ESP32</span>
-      </div>
-    </div>
-
-    <!-- Section 1c-2: Custom Idle Timeout Farewell (Fixed or Zero-Pollution LLM Summary, Hot-Update) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">空闲超时告别语（免重启热更新）</h2>
-        <span id="idleFarewellBadge" class="rel-stage-badge num">120 秒</span>
-      </div>
-      <p class="section-desc">无人说话超过设定时长后触发告别并挂断；支持「固定随机台词」或「AI 总结本轮对话并表达依恋不舍」，全程不显示假用户字幕，也不会污染 Anima 长期记忆与 Obsidian。</p>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用超时告别语音</strong>
-          <span id="idleFarewellToggleHint">开启后按所选模式播报告别语；关闭则静默断开连接</span>
+    <!-- ======================== TAB 3: 记忆与外联 ======================== -->
+    <div class="config-tab-pane" data-config-pane="memory" role="tabpanel">
+      <!-- 1. Dialogue Memory Archive -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">对话记忆存档</h2>
         </div>
-        <label class="toggle-switch" aria-label="启用空闲超时告别语音开关">
-          <input type="checkbox" id="idleFarewellToggle" checked>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="mode-grid-2" id="idleFarewellModeGrid" style="margin-bottom:10px;">
-        <button type="button" class="mode-btn active" data-farewell-mode="fixed">
-          <strong>固定随机台词（零 LLM）</strong>
-          <span>直接随机念下方自定义短句，零 token 消耗、秒级响应</span>
-        </button>
-        <button type="button" class="mode-btn" data-farewell-mode="llm_summary">
-          <strong>总结本轮对话 + 依恋不舍（AI 现场生成）</strong>
-          <span>简短呼应刚聊的话题并温柔道别，不入记忆；无对话或超时自动回退下方兜底句</span>
-        </button>
-      </div>
-
-      <div class="preset-bar" id="idleTimeoutPresetBar" style="margin-bottom:10px;">
-        <button type="button" class="preset-pill" data-idle-timeout="60">60 秒（1 分钟）</button>
-        <button type="button" class="preset-pill active" data-idle-timeout="120">120 秒（2 分钟 · 默认）</button>
-        <button type="button" class="preset-pill" data-idle-timeout="300">300 秒（5 分钟）</button>
-        <button type="button" class="preset-pill" data-idle-timeout="600">600 秒（10 分钟）</button>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:0;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">无声超时时长</span>
-        <input type="range" id="idleTimeoutRange" min="30" max="600" step="10" value="120" aria-label="无声超时秒数">
-        <strong id="idleTimeoutVal" class="num" style="font-size:12.5px;min-width:118px;text-align:right;">120 秒（2分）</strong>
-      </div>
-
-      <div id="idleFarewellSummaryWrap" style="display:none;margin-top:10px;">
-        <label class="field-label" for="idleFarewellPromptInput">AI 总结告别提示词（决定总结方式、依恋语气与字数上限）</label>
-        <textarea id="idleFarewellPromptInput" spellcheck="false" style="min-height:76px;" placeholder="描述你希望她如何总结本轮对话并表达不舍…"></textarea>
-      </div>
-
-      <label class="field-label" id="idleFarewellInputLabel" for="idleFarewellInput" style="margin-top:10px;">自定义告别台词（每行一句，超时随机播报；多情绪音色支持 [tender] / [shy] 等情绪标签）</label>
-      <textarea id="idleFarewellInput" spellcheck="false" style="min-height:84px;" placeholder="每行写一句告别台词，例如：&#10;先去忙吧，有事随时叫我。&#10;[tender] 那我先安静待在一旁啦，需要的时候再叫我哦。"></textarea>
-
-      <div class="field-foot" style="margin-top:8px;align-items:center;">
-        <span id="idleFarewellMeta" class="num">已配置 2 句 · 修改后点右侧按钮立即生效</span>
-        <div style="display:flex;gap:8px;align-items:center;">
-          <button type="button" class="btn" id="idleFarewellPreviewBtn" style="padding:5px 11px;font-size:12.5px;">试听首句</button>
-          <button type="button" class="btn primary" id="idleFarewellSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存告别语</button>
+        <p class="section-desc">给设备选择下次语音连接使用的存档；正在对话时，请先结束会话再重新唤醒小智。</p>
+        <label class="field-label" for="archiveDevice">设备</label>
+        <select id="archiveDevice" disabled><option value="">等待设备接入</option></select>
+        <div class="preset-bar" id="archiveChoices" role="group" aria-label="选择记忆存档" style="margin-top:10px;">
+          <button type="button" class="preset-pill" data-archive="daily" aria-pressed="false" disabled>日常陪伴</button>
+          <button type="button" class="preset-pill" data-archive="tavern" aria-pressed="false" disabled>酒馆剧情</button>
         </div>
-      </div>
-    </div>
-
-    <!-- Section 1c-3: Proactive Companion, Desktop Rhythm & Vocal Cue Awareness (Phase 1, Default OFF) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">主动陪伴与感知（默认关闭 · 零常驻资源）</h2>
-        <span id="proactiveBadge" class="rel-stage-badge num">已关闭</span>
-      </div>
-      <p class="section-desc">所有新增陪伴感知开关均默认关闭以保持最低内存与零后台巡检开销；按需开启后结合宿主机 18900 桌面节律、SenseVoice 语气声学感知与 Anima 角色微日常工作，全屏/游戏/会议/打字心流及免打扰时段自动保持安静。</p>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用主动陪伴心跳引擎（默认关闭）</strong>
-          <span id="proactiveEnabledHint">关闭时不启动后台心跳线程、不轮询 18900；开启后默认仅记录静默试运行台词，绝不打扰</span>
-        </div>
-        <label class="toggle-switch" aria-label="启用主动陪伴心跳引擎开关">
-          <input type="checkbox" id="proactiveEnabledToggle">
-          <span class="toggle-slider"></span>
-        </label>
+        <div class="field-foot"><span id="archiveStatus" role="status">设备接入后可以选择存档。</span></div>
+        <details class="l3-adv">
+          <summary>从酒馆接续聊天</summary>
+          <p class="section-desc" style="margin-top:6px;">在 SillyTavern 扩展中导出当前聊天，再选择导出的 JSON 文件。先核对设备和对白，再导入最近最多三轮。</p>
+          <label class="field-label" for="handoffFile">酒馆接续文件</label>
+          <input id="handoffFile" type="file" accept=".json,application/json">
+          <div id="handoffPreview" style="white-space:pre-wrap;overflow-wrap:anywhere;"></div>
+          <p class="section-desc" id="handoffStatus" role="status"></p>
+          <button type="button" class="btn btn-primary" id="handoffSubmit" disabled>导入并切换到酒馆</button>
+        </details>
       </div>
 
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用 SenseVoice 语气与声学事件感知（默认关闭）</strong>
-          <span id="vocalCueEnabledHint">关闭时零标签解析与缓存；开启后从 Sherpa SenseVoice 零额外内存提取笑声/叹气/低落等语气参考</span>
+      <!-- 2. Obsidian Sync & Two-Way Inbox -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">Obsidian 同步与双向备忘收件箱（免重启）</h2>
+          <span id="obsStatusBadge" class="rel-stage-badge num">检测中…</span>
         </div>
-        <label class="toggle-switch" aria-label="启用语气与声学事件感知开关">
-          <input type="checkbox" id="vocalCueEnabledToggle">
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
+        <p class="section-desc">单向将对话与长期记忆脱敏导出为 Markdown；双向备忘收件箱默认关闭，开启后只读监听 Vault「收件箱/」且绝不改写原笔记。</p>
 
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用 Anima 角色微日常背景（默认关闭）</strong>
-          <span id="innerLifeEnabledHint">关闭时被动聊天不额外查询或注入微日常；开启后为角色按早/午/晚生成 1 条自然生活背景</span>
-        </div>
-        <label class="toggle-switch" aria-label="启用角色微日常开关">
-          <input type="checkbox" id="innerLifeEnabledToggle">
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="mode-grid-2" id="proactiveModeGrid" style="margin-bottom:10px;">
-        <button type="button" class="mode-btn active" data-proactive-mode="dry_run">
-          <strong>静默试运行（默认 · 仅记录到控制台）</strong>
-          <span>完整演练桌面门控与台词生成，仅写入下方观测记录，不发声、不消耗未完小事跟进配额</span>
-        </button>
-        <button type="button" class="mode-btn" data-proactive-mode="pc_speaker">
-          <strong>电脑音响轻声播报（18900 直出）</strong>
-          <span>通过当前音色在电脑音响轻声打招呼，自动遵守免打扰、心流静默与忽略冷却退避</span>
-        </button>
-        <button type="button" class="mode-btn" data-proactive-mode="mobile_push">
-          <strong>仅推手机通知栏（零声音 · 需开手机推送）</strong>
-          <span>不合成音频、不占电脑音响，直接将关怀台词经国内免代理通道推送到手机通知栏</span>
-        </button>
-        <button type="button" class="mode-btn" data-proactive-mode="pc_and_mobile">
-          <strong>电脑轻声播报 + 同步推手机留痕</strong>
-          <span>电脑音响轻声打招呼的同时顺手推送一条手机通知，离开座位也能看到</span>
-        </button>
-      </div>
-
-      <div class="proactive-grid">
-        <div>
-          <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveQuietStart">免打扰开始（HH:MM）</label>
-          <input type="text" id="proactiveQuietStart" value="23:00" spellcheck="false" placeholder="23:00">
-        </div>
-        <div>
-          <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveQuietEnd">免打扰结束（HH:MM）</label>
-          <input type="text" id="proactiveQuietEnd" value="08:00" spellcheck="false" placeholder="08:00">
-        </div>
-        <div>
-          <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveIntervalInput">门禁巡检间隔（分）</label>
-          <input type="number" id="proactiveIntervalInput" min="5" max="120" step="5" value="15">
-        </div>
-        <div>
-          <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveCooldownInput">基础冷却（分）</label>
-          <input type="number" id="proactiveCooldownInput" min="15" max="720" step="15" value="90">
-        </div>
-        <div>
-          <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="proactiveMaxDailyInput">每日实发上限（次）</label>
-          <input type="number" id="proactiveMaxDailyInput" min="1" max="12" step="1" value="4">
-        </div>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:8px;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">主动播报轻声音量</span>
-        <input type="range" id="proactiveVolumeRange" min="20" max="120" step="5" value="75" aria-label="主动播报轻声音量">
-        <strong id="proactiveVolumeVal" class="num" style="font-size:12.5px;min-width:44px;text-align:right;">75%</strong>
-        <button type="button" class="btn" id="proactiveSaveBtn" style="padding:5px 12px;font-size:12.5px;white-space:nowrap;">保存门控设置</button>
-      </div>
-
-      <div class="l3-box" style="margin-top:10px;">
-        <div class="proactive-meta-row">
-          <span>桌面节律（18900）：<strong id="proactiveRhythmText">等待探测…</strong></span>
-        </div>
-        <div class="proactive-meta-row">
-          <span>最近语气声学感知：<strong id="proactiveVocalCueText">等待对话（SenseVoice 实时提取）</strong></span>
-        </div>
-        <div class="proactive-meta-row">
-          <span>今日角色微日常：<strong id="proactiveInnerLifeText">等待同步…</strong></span>
-        </div>
-        <div class="field-foot" style="margin-top:6px;align-items:center;">
-          <span id="proactiveStatsText" class="num">今日实发 0/4 · 忽略退避 0 次</span>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;">
-            <button type="button" class="btn" id="proactiveRunBtn" style="padding:4px 11px;font-size:12px;">立即试跑一次</button>
-            <button type="button" class="btn" id="proactiveInnerLifeRefreshBtn" style="padding:4px 11px;font-size:12px;">刷新角色日常</button>
-            <button type="button" class="btn" id="proactiveRefreshBtn" style="padding:4px 11px;font-size:12px;">刷新状态</button>
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>启用自动单向导出</strong>
+            <span id="obsToggleHint">开启后每轮对话结束防抖 5 秒自动更新当天日志与记忆快照</span>
           </div>
-        </div>
-      </div>
-
-      <div id="proactiveHistoryList" class="proactive-history-list">
-        <div class="dream-empty">暂无主动陪伴试运行记录；点击「立即试跑一次」可在不发声的前提下验证决策与台词效果。</div>
-      </div>
-    </div>
-
-    <!-- Section 1c-4: Voiceprint Speaker Guard & Privacy-Guarded On-Demand Screen Peek (Phase 2, Default OFF) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">单设备声纹认人与隐私浅看屏（默认关闭 · 零模型占用）</h2>
-        <span id="voiceprintBadge" class="rel-stage-badge num">已关闭</span>
-      </div>
-      <p class="section-desc">复用容器自带 Sherpa-ONNX（零 PyTorch），关闭时绝不加载声纹模型也不缓存音频，从开切关即刻卸载释放内存。未录入主人声纹前默认 100% 放行防自锁；录好主人声纹后默认自动隔离家人/访客记忆并拦截非主人调用电脑操控工具。</p>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用单设备声纹自动认人（默认关闭）</strong>
-          <span id="voiceprintEnabledHint">关闭状态零模型加载、零额外内存；开启并录好主人声纹后自动生效记忆隔离与非主人操控拦截</span>
-        </div>
-        <label class="toggle-switch" aria-label="启用单设备声纹自动认人开关">
-          <input type="checkbox" id="voiceprintEnabledToggle">
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="preset-bar" id="voiceprintPolicyBar" style="margin-bottom:10px;">
-        <button type="button" class="preset-pill active" data-vp-policy="full_guard">全防护（记忆隔离 + 非主人拦截操控 · 默认）</button>
-        <button type="button" class="preset-pill" data-vp-policy="isolate_memory">仅记忆隔离（不拦截电脑工具）</button>
-        <button type="button" class="preset-pill" data-vp-policy="observe">仅识别观察（只记录说话人）</button>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-bottom:10px;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:118px;">声纹匹配相似度阈值</span>
-        <input type="range" id="voiceprintThresholdRange" min="30" max="90" step="2" value="58" aria-label="声纹匹配相似度阈值">
-        <strong id="voiceprintThresholdVal" class="num" style="font-size:12.5px;min-width:44px;text-align:right;">0.58</strong>
-        <button type="button" class="btn" id="voiceprintDownloadBtn" style="padding:5px 11px;font-size:12px;white-space:nowrap;">下载声纹模型 (~28MB)</button>
-        <button type="button" class="btn" id="voiceprintRefreshBtn" style="padding:5px 11px;font-size:12px;white-space:nowrap;">刷新声纹状态</button>
-      </div>
-
-      <div class="l3-box" style="margin-bottom:10px;">
-        <div class="proactive-meta-row">
-          <span>模型状态：<strong id="voiceprintModelText">未检测</strong></span>
-        </div>
-        <div class="proactive-meta-row">
-          <span>最近可录入语音：<strong id="voiceprintRecentPcmText">开启开关后对着设备说 1～3 秒话即可一键录入</strong></span>
-        </div>
-        <div class="proactive-meta-row">
-          <span>最近识别结果：<strong id="voiceprintLatestText">暂无识别记录</strong></span>
-        </div>
-        <div class="vp-enroll-row">
-          <input type="text" id="voiceprintNameInput" placeholder="说话人名称（如 主人 / 家人名）" value="主人" maxlength="32">
-          <select id="voiceprintRoleSelect" aria-label="说话人角色">
-            <option value="owner" selected>主人（owner · 完整权限）</option>
-            <option value="family">家人（family · 独立记忆）</option>
-          </select>
-          <button type="button" class="btn" id="voiceprintEnrollLastBtn" style="padding:5px 11px;font-size:12px;white-space:nowrap;">把刚才那句录为声纹</button>
-          <label class="btn" style="padding:5px 11px;font-size:12px;white-space:nowrap;cursor:pointer;margin:0;">
-            上传 WAV 录入
-            <input type="file" id="voiceprintWavInput" accept=".wav,audio/wav" style="display:none;">
+          <label class="toggle-switch" aria-label="启用 Obsidian 单向同步开关">
+            <input type="checkbox" id="obsSyncToggle" disabled>
+            <span class="toggle-slider"></span>
           </label>
         </div>
-      </div>
 
-      <div id="voiceprintSpeakerList" class="vp-speaker-list">
-        <div class="dream-empty">尚未录入任何声纹（未录入主人声纹前默认完全放行，不会自锁）。</div>
-      </div>
-
-      <div class="switch-row" style="margin-top:12px;">
-        <div class="switch-row-label">
-          <strong>启用按需隐私护栏浅看屏（默认关闭）</strong>
-          <span id="screenPeekEnabledHint">仅截取当前活动窗口并自动屏蔽终端/密码管理器/网银/无痕/私密聊天，纯按需触发零后台开销</span>
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>启用每日/每周离线待跟进简报（低成本 · 零语音打扰）</strong>
+            <span id="obsBriefingHint">按日/周离线梳理待跟进事项与近期摘要写入 Obsidian「简报/」目录，不触发主动语音推送</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用每日每周离线简报开关">
+            <input type="checkbox" id="obsBriefingToggle" disabled>
+            <span class="toggle-slider"></span>
+          </label>
         </div>
-        <label class="toggle-switch" aria-label="启用按需浅看屏开关">
-          <input type="checkbox" id="screenPeekEnabledToggle">
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
 
-      <div class="l3-box" style="margin-top:6px;">
-        <div class="proactive-meta-row">
-          <span>最新浅看屏结果：<strong id="screenPeekResultText">未触发（需先开启上方开关；桌面浮窗请双击根目录「桌角陪伴小窗.bat」，立绘放 voices/&lt;角色&gt;/portraits/ 即自动加载）</strong></span>
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>启用双向备忘收件箱（默认关闭 · 零空载扫描）</strong>
+            <span id="obsInboxHint">关闭时不扫描磁盘；开启后只读监听 Vault「收件箱/」目录写入长期记忆与待办，勾选 [x] 自动消标，绝不改写原笔记</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用 Obsidian 双向备忘收件箱开关">
+            <input type="checkbox" id="obsInboxToggle" disabled>
+            <span class="toggle-slider"></span>
+          </label>
         </div>
-        <div class="vp-enroll-row" style="margin-top:6px;">
-          <input type="text" id="screenPeekQuestionInput" placeholder="可选：想问芽衣屏幕上的什么内容（留空则简述当前窗口）" maxlength="160">
-          <button type="button" class="btn" id="screenPeekBtn" style="padding:5px 12px;font-size:12px;white-space:nowrap;">看一眼当前屏幕</button>
-        </div>
-      </div>
-    </div>
 
-    <!-- Section 1d: Relationship & Intimacy Hot-Control (Instant Hot-Update, No Restart Required) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">亲密度与关系热度（拖动即刻生效，免重启）</h2>
-        <span id="relStageBadge" class="rel-stage-badge num">检测中…</span>
-      </div>
-      <p class="section-desc">实时调节 Anima Brain 中 AI 伙伴对你的熟悉、温暖、信任与浪漫尺度；点选预设、开关浪漫模式或拖动滑块后，下一句话立刻按新关系注入。</p>
-
-      <div class="preset-bar" id="relPresetBar" style="margin-bottom:10px;">
-        <button type="button" class="preset-pill" data-rel-preset="restrained">克制助手（礼貌分寸 · 无浪漫）</button>
-        <button type="button" class="preset-pill" data-rel-preset="confidant">温柔知己（熟识贴心 · 轻浪漫）</button>
-        <button type="button" class="preset-pill" data-rel-preset="intimate">亲密依恋（深度默契 · 偏爱哄慰）</button>
-      </div>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>允许浪漫亲昵互动（Romance 开关）</strong>
-          <span id="relRomanceHint">开启后允许顺应你的亲昵与撒娇表达，并激活下方浪漫值刻度</span>
-        </div>
-        <label class="toggle-switch" aria-label="允许浪漫亲昵互动开关">
-          <input type="checkbox" id="relRomanceToggle" checked>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:0;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">熟悉度（Familiarity）</span>
-        <input type="range" id="relFamRange" min="0" max="100" step="1" value="62" aria-label="熟悉度">
-        <strong id="relFamVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">62% · Lv.2</strong>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:8px;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">温暖度（Warmth）</span>
-        <input type="range" id="relWarmRange" min="0" max="100" step="1" value="66" aria-label="温暖度">
-        <strong id="relWarmVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">66% · Lv.2</strong>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:8px;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">信任度（Trust）</span>
-        <input type="range" id="relTrustRange" min="0" max="100" step="1" value="62" aria-label="信任度">
-        <strong id="relTrustVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">62% · Lv.2</strong>
-      </div>
-
-      <div class="audio-vol-bar" id="relRomRow" style="margin-top:8px;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">浪漫值（Romance）</span>
-        <input type="range" id="relRomRange" min="0" max="100" step="1" value="20" aria-label="浪漫值">
-        <strong id="relRomVal" class="num" style="font-size:12.5px;min-width:108px;text-align:right;">20% · 已解锁</strong>
-      </div>
-
-      <div class="l3-box" style="margin-top:11px;">
-        <div class="l3-head" style="margin-bottom:6px;">
-          <strong>Anima 多向量空间与检索状态（Multi-Space · 降级显式提示）</strong>
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-            <span id="animaSemanticBadge" class="rel-stage-badge num">检测中…</span>
-            <button type="button" class="btn" id="animaResetEmbedBreakerBtn" style="padding:4px 11px;font-size:12px;display:none;">重置向量熔断</button>
+        <div class="audio-vol-bar" style="margin-top:0;justify-content:space-between;gap:8px;">
+          <div style="display:flex;flex-direction:column;gap:2px;min-width:0;flex:1;">
+            <span style="font-size:12px;color:var(--ink-secondary);">导出目录：<strong id="obsExportDirText" style="font-family:var(--font-mono);color:var(--ink);">--</strong></span>
+            <span style="font-size:12px;color:var(--ink-secondary);">上次导出：<strong id="obsLastExportText" class="num" style="color:var(--ink);">尚未导出</strong></span>
+            <span style="font-size:12px;color:var(--ink-secondary);">最近简报：<strong id="obsBriefingStatusText" class="num" style="color:var(--ink-muted);">等待离线梳理</strong></span>
+            <span style="font-size:12px;color:var(--ink-secondary);">备忘收件箱：<strong id="obsInboxStatusText" class="num" style="color:var(--ink-muted);">已关闭（零扫描）</strong></span>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button type="button" class="btn" id="obsInboxScanBtn" style="padding:6px 11px;font-size:12.5px;white-space:nowrap;" disabled>立即扫描收件箱</button>
+            <button type="button" class="btn" id="obsBriefingBtn" style="padding:6px 11px;font-size:12.5px;white-space:nowrap;" disabled>立即生成简报</button>
+            <button type="button" class="btn" id="obsBriefingPushBtn" style="padding:6px 11px;font-size:12.5px;white-space:nowrap;" disabled>简报推手机</button>
+            <button type="button" class="btn" id="obsRebuildBtn" style="padding:6px 13px;font-size:12.5px;white-space:nowrap;" disabled>立即全量重建</button>
           </div>
         </div>
-        <div class="field-foot" style="margin-top:2px;">
-          <span id="animaSemanticText">活动空间：检测中…</span>
-          <span id="animaSemanticSpacesText" class="num" style="color:var(--ink-muted);">共存空间：0</span>
+
+        <div class="field-foot">
+          <span>同步概览：<strong id="obsStatsText" class="num">检测中…</strong></span>
+          <span id="obsErrText" style="color:var(--ink-muted);">哈希未变自动跳过写入</span>
         </div>
       </div>
 
-      <div class="l3-box" style="margin-top:11px;">
-        <div class="l3-head" style="margin-bottom:6px;">
-          <strong>Anima 本地发件箱（Outbox 持久化与死信重放 · B-5）</strong>
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-            <span id="animaOutboxBadge" class="rel-stage-badge num">pending 0 · dead 0</span>
-            <button type="button" class="btn" id="animaReplayDeadBtn" style="padding:4px 11px;font-size:12px;" disabled>重放 dead</button>
+      <!-- 3. Domestic Zero-Proxy Lightweight Mobile Push Bridge (Default OFF) -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">手机端轻量通知推送（默认关闭 · 国内免代理）</h2>
+          <span id="mobilePushBadge" class="rel-stage-badge num">已关闭</span>
+        </div>
+        <p class="section-desc">支持 Bark / 飞书 / 企微 / PushPlus / Server酱纯出站 HTTPS 推送；凭据仅存隔离文件，外发正文强制脱敏。</p>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用手机端轻量通知推送（默认关闭 · 零外发）</strong>
+            <span>关闭时绝不发起任何外网推送请求；开启后可将主动关怀与每日简报送达手机通知栏</span>
           </div>
+          <label class="toggle-switch" aria-label="启用手机端轻量通知推送开关">
+            <input type="checkbox" id="mobilePushEnabledToggle">
+            <span class="toggle-slider"></span>
+          </label>
         </div>
-        <div class="field-foot" style="margin-top:2px;">
-          <span>队列统计：待发 <strong id="animaOutboxPendingText" class="num">0</strong> · 死信 <strong id="animaOutboxDeadText" class="num">0</strong> · 已送达 <strong id="animaOutboxSentText" class="num">0</strong><span id="animaOutboxCorruptWrap" style="display:none;"> · 损坏 <strong id="animaOutboxCorruptText" class="num">0</strong></span></span>
-          <span id="animaOutboxErrText" style="color:var(--ink-muted);">无积压异常</span>
+
+        <details class="l3-adv section-fold" id="mobilePushFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开推送通道凭据、转发选项与发送记录</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="proactive-grid" style="margin-bottom:8px;">
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="mobilePushProviderSelect">推送通道</label>
+                <select id="mobilePushProviderSelect">
+                  <option value="bark">Bark (iOS 通知栏)</option>
+                  <option value="feishu">飞书群机器人 Webhook</option>
+                  <option value="wecom">企业微信群机器人 Webhook</option>
+                  <option value="pushplus">PushPlus 微信推送</option>
+                  <option value="serverchan">Server酱 (微信推送)</option>
+                </select>
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="mobilePushMaxDailyInput">每日推送上限（条）</label>
+                <input type="number" id="mobilePushMaxDailyInput" min="1" max="50" step="1" value="12">
+              </div>
+              <div style="grid-column:1 / -1;">
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="mobilePushSecretInput" id="mobilePushSecretLabel">Bark 推送 URL（例如 https://api.day.app/你的设备Key）</label>
+                <input type="password" id="mobilePushSecretInput" autocomplete="new-password" spellcheck="false" placeholder="留空表示保留已有凭据；输入新值点击保存将写入 0600 隔离文件">
+              </div>
+              <div id="mobilePushFeishuSecretWrap" style="grid-column:1 / -1;display:none;">
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="mobilePushFeishuSecretInput">飞书机器人加签密钥（可选 · MOBILE_PUSH_FEISHU_SECRET）</label>
+                <input type="password" id="mobilePushFeishuSecretInput" autocomplete="new-password" spellcheck="false" placeholder="若机器人开启签名校验可填写，否则留空">
+              </div>
+            </div>
+
+            <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:8px;font-size:12.5px;color:var(--ink-secondary);">
+              <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" id="mobilePushForwardProactiveToggle" checked>
+                <span>主动关怀同步推送到手机</span>
+              </label>
+              <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" id="mobilePushForwardBriefingToggle">
+                <span>允许一键推送每日简报</span>
+              </label>
+              <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" id="mobilePushQuietToggle" checked>
+                <span>遵守免打扰时段</span>
+              </label>
+            </div>
+
+            <div class="proactive-meta-row" style="margin-bottom:8px;">
+              <span>当前凭据状态：<strong id="mobilePushSecretStatusText" class="num">未配置</strong></span>
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+              <button type="button" class="btn" id="mobilePushSaveBtn" style="padding:5px 12px;font-size:12.5px;">保存推送设置</button>
+              <button type="button" class="btn" id="mobilePushTestBtn" style="padding:5px 12px;font-size:12.5px;">发送测试通知</button>
+              <button type="button" class="btn" id="mobilePushBriefingBtn" style="padding:5px 12px;font-size:12.5px;">推送今日简报</button>
+              <button type="button" class="btn" id="mobilePushClearSecretBtn" style="padding:5px 11px;font-size:12px;">清除当前通道本地凭据</button>
+              <span id="mobilePushStatsText" class="num" style="margin-left:auto;font-size:12px;color:var(--ink-muted);">今日已推 0/12</span>
+            </div>
+
+            <div id="mobilePushHistoryList" class="proactive-history-list">
+              <div class="dream-empty">暂无手机推送记录；填好通道凭据并点击「发送测试通知」即可验证连通性。</div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 4. AutoDream Read-Only Reflection Proposals -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">AutoDream 离线反思提案（只读分析 · 人工审批）</h2>
+          <span id="dreamPendingBadge" class="rel-stage-badge num">待审 0</span>
+        </div>
+        <p class="section-desc">仅基于一手用户原话梳理 ASR 纠错词条、冲突记忆合并与相处习惯建议，经你批准后才写入生效。</p>
+
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>启用定期离线只读梳理（AutoDream）</strong>
+            <span id="dreamMetaText">上次梳理：尚未运行 · 仅产出待审批提案</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用 AutoDream 离线反思开关">
+            <input type="checkbox" id="dreamEnabledToggle" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+          <button type="button" class="btn" id="dreamRunBtn" style="padding:5px 13px;font-size:12.5px;">立即离线梳理提案</button>
+          <button type="button" class="btn" id="dreamRefreshBtn" style="padding:5px 13px;font-size:12.5px;">刷新待审批列表</button>
+        </div>
+
+        <div id="dreamProposalList" class="dream-list">
+          <div class="dream-empty">点击「刷新待审批列表」或「立即离线梳理提案」查看当前待人工审核的离线建议。</div>
         </div>
       </div>
 
-      <div class="field-foot">
-        <span>Anima Brain 同步状态（18787）：<strong id="relStatusText">检测中…</strong> · 最近一次备份：<strong id="animaBackupText" class="num">检测中…</strong></span>
-        <span>下一句话即刻生效，无需重启或重连 ESP32</span>
+      <!-- 5. Recall Sensitive Filter & Spoken Style Rules -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">召回隐私拦截与口语短规则（免重启热开关）</h2>
+          <span id="recallStyleBadge" class="rel-stage-badge num">检测中…</span>
+        </div>
+        <p class="section-desc">记忆召回链路默认拦截敏感凭据/证件号防语音外放泄密，并用短规则保持自然口语感且不破坏前缀缓存。</p>
+
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>召回层敏感实体自动拦截（默认开启）</strong>
+            <span>自动屏蔽记忆上下文中的 API Key/密码、手机号、银行卡号、身份证/护照号与验证码</span>
+          </div>
+          <label class="toggle-switch" aria-label="召回层敏感实体自动拦截开关">
+            <input type="checkbox" id="rsSensitiveToggle" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row">
+          <div class="switch-row-label">
+            <strong>记忆无声参与短规则</strong>
+            <span>自然融入已知信息，禁止机械说出“我记得你上次说过…”“根据记忆…”等播报式句式</span>
+          </div>
+          <label class="toggle-switch" aria-label="记忆无声参与短规则开关">
+            <input type="checkbox" id="rsSilentMemToggle" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>去书面 AI 味口语短规则</strong>
+            <span>禁止“总而言之”“综上所述”“首先…其次…最后…”等公文或客服套话，保持真人聊天节奏</span>
+          </div>
+          <label class="toggle-switch" aria-label="去书面 AI 味口语短规则开关">
+            <input type="checkbox" id="rsAntiAiToggle" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="field-foot">
+          <span id="recallGuardStatsText" class="num">本轮进程已扫描 0 次召回 · 拦截敏感实体 0 次</span>
+          <span>切换后下一句话立即生效</span>
+        </div>
       </div>
     </div>
 
-    <!-- Section 1f: Speculative VAD Early-Commit (F-1) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">投机 VAD 抢答加速（句末早判 · 免重启热开关）</h2>
-        <span id="vadSpecBadge" class="rel-stage-badge num">检测中…</span>
-      </div>
-      <p class="section-desc">保留 1100ms 静音上限防止句中换气被截断；在设定早判窗口触发异步识别，若判断语义完整则提前提交省去约 0.4～0.55 秒尾延迟，遇犹豫停顿词或讲故事模式自动继续等待。</p>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用投机 VAD 句末早判（F-1）</strong>
-          <span id="vadSpecToggleHint">开启后在完整句结尾提前提交；关闭即刻回退纯 1100ms 稳健判停</span>
+    <!-- ======================== TAB 4: 系统与调优 ======================== -->
+    <div class="config-tab-pane" data-config-pane="system" role="tabpanel">
+      <!-- 1. ESP32 Device Allowlist -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">设备与电脑客户端接入白名单（免重启热放行）</h2>
+          <span id="esp32AuthBadge" class="rel-stage-badge num">检测中…</span>
         </div>
-        <label class="toggle-switch" aria-label="启用投机 VAD 句末早判开关">
-          <input type="checkbox" id="vadSpecToggle" checked>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
+        <p class="section-desc">仅白名单内的 ESP32 开发板或电脑客户端（<code>电脑对话客户端.bat</code> 默认 ID：<code>pc-talk-local</code>）可访问 18000/18003；新设备首次连入被拦会自动出现在下方。</p>
 
-      <div class="audio-vol-bar" style="margin-top:0;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">早判静默阈值</span>
-        <input type="range" id="vadSpecMsRange" min="300" max="950" step="25" value="550" aria-label="投机早判静默毫秒数">
-        <strong id="vadSpecMsVal" class="num" style="font-size:12.5px;min-width:84px;text-align:right;">550 ms</strong>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:8px;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">唤醒首句静默阈值</span>
-        <input type="range" id="vadPostWakeupMsRange" min="450" max="1050" step="25" value="800" aria-label="唤醒首句静默毫秒数">
-        <strong id="vadPostWakeupMsVal" class="num" style="font-size:12.5px;min-width:84px;text-align:right;">800 ms</strong>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:8px;">
-        <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">早判最小字数</span>
-        <input type="range" id="vadMinCharsRange" min="2" max="20" step="1" value="4" aria-label="早判最小字数">
-        <strong id="vadMinCharsVal" class="num" style="font-size:12.5px;min-width:84px;text-align:right;">4 字</strong>
-      </div>
-
-      <div class="l3-adv-grid" style="margin-top:10px;">
-        <div>
-          <label class="field-label" style="font-size:12.5px;margin-bottom:4px;" for="vadCompleteSuffixesInput">完整句尾词表（逗号或换行分隔）</label>
-          <textarea id="vadCompleteSuffixesInput" spellcheck="false" style="min-height:68px;font-size:12.5px;" placeholder="吗, 呢, 吧, 了, 啊, 呀, 哦, 谢谢, 好的"></textarea>
+        <div id="esp32PendingWrap" class="esp32-pending-wrap" style="display:none;">
+          <div class="l3-head" style="margin-bottom:6px;">
+            <strong style="color:var(--warn);">发现待放行的新设备 / 客户端</strong>
+            <span class="num" style="font-size:12px;color:var(--ink-muted);">放行后如 ESP32 未自动重连，按一下开发板 RST 键即可上线</span>
+          </div>
+          <div id="esp32PendingList" class="esp32-device-list"></div>
         </div>
-        <div>
-          <label class="field-label" style="font-size:12.5px;margin-bottom:4px;" for="vadHesitationSuffixesInput">犹豫/未完词表（命中则继续等到 1100ms）</label>
-          <textarea id="vadHesitationSuffixesInput" spellcheck="false" style="min-height:68px;font-size:12.5px;" placeholder="然后, 就是, 那个, 因为, 嗯, 但是, 而且, 所以"></textarea>
+
+        <div id="esp32AllowedList" class="esp32-chip-list">
+          <div class="dream-empty">暂未放行任何设备；请让 ESP32 请求一次 OTA，或在下方手动添加 MAC 地址 / 客户端 ID（如 pc-talk-local）。</div>
+        </div>
+
+        <div class="esp32-add-row">
+          <input type="text" id="esp32MacInput" spellcheck="false" placeholder="输入 ESP32 MAC（如 aa:bb:cc:dd:ee:ff）或客户端 ID（如 pc-talk-local）" aria-label="ESP32 MAC 地址或客户端 ID">
+          <button type="button" class="btn btn-primary" id="esp32AddMacBtn" style="white-space:nowrap;">加入白名单</button>
+        </div>
+
+        <div class="field-foot">
+          <span id="esp32AuthHint">鉴权采用 fail-closed 默认拒绝策略；控制台放行的设备将自动持久化并实时同步</span>
+          <span>OTA 端口 18003 · WS 端口 18000</span>
         </div>
       </div>
 
-      <div class="field-foot" style="margin-top:8px;align-items:center;">
-        <span id="vadSpecStatsText" class="num">遥测：等待对话触发 · 1100ms 上限始终生效</span>
-        <button type="button" class="btn" id="vadSpecSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存投机 VAD 配置</button>
-      </div>
-    </div>
-
-    <!-- Section 1g: Post-ASR Homophone Corrections Hot Editor (G-4) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">语音识别同音词热纠错（ASR 后处理 · 免重启生效）</h2>
-        <span id="asrCorrBadge" class="rel-stage-badge num">检测中…</span>
-      </div>
-      <p class="section-desc">在 SherpaASR 识别输出后自动替换高频同音错词（按词长优先匹配，避免子串错替），保存后下一句话立即生效。</p>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用同音词自动纠错（G-4）</strong>
-          <span id="asrCorrToggleHint">开启后自动按下方映射表修正所有语音识别结果</span>
+      <!-- 2. ASR Engine Selection -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">语音识别引擎（ASR · 云端低配 API / 本地离线）</h2>
+          <span id="asrEngineBadge" class="rel-stage-badge num">检测中…</span>
         </div>
-        <label class="toggle-switch" aria-label="启用语音识别同音词热纠错开关">
-          <input type="checkbox" id="asrCorrToggle" checked>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
+        <p class="section-desc">低配电脑可一键切云端 ASR 压降内存，也可随时切回本地离线 SherpaASR；API Key 仅由环境变量注入。</p>
 
-      <label class="field-label" for="asrCorrInput" style="margin-top:8px;">纠错映射表（每行一条，格式：错词-&gt;正词，例如 小志-&gt;小智）</label>
-      <textarea id="asrCorrInput" spellcheck="false" style="min-height:84px;font-family:var(--font-mono);font-size:12.5px;" placeholder="你好小志->你好小智&#10;小志->小智"></textarea>
+        <div id="lowspecPresetBar" class="lowspec-bar" aria-label="低配云端一键预设"></div>
 
-      <div class="field-foot" style="margin-top:8px;align-items:center;">
-        <span id="asrCorrMeta" class="num">已配置 0 条规则 · 最多 500 条</span>
-        <button type="button" class="btn" id="asrCorrSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存纠错词表</button>
-      </div>
-    </div>
-
-    <!-- Section 1h: Recall Sensitive Filter & Lightweight Spoken Style Rules -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">召回隐私拦截与口语短规则（与人设解耦 · 免重启热开关）</h2>
-        <span id="recallStyleBadge" class="rel-stage-badge num">检测中…</span>
-      </div>
-      <p class="section-desc">在记忆自动召回链路默认拦截密钥、手机号、银行卡、证件号与验证码防语音外放泄密；同时用独立短规则控制「记忆无声参与」与去书面 AI 味，不修改人设正文、不破坏前缀缓存。</p>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>召回层敏感实体自动拦截（默认开启）</strong>
-          <span>自动屏蔽记忆上下文中的 API Key/密码、手机号、银行卡号、身份证/护照号与验证码</span>
-        </div>
-        <label class="toggle-switch" aria-label="召回层敏感实体自动拦截开关">
-          <input type="checkbox" id="rsSensitiveToggle" checked>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>记忆无声参与短规则</strong>
-          <span>自然融入已知信息，禁止机械说出“我记得你上次说过…”“根据记忆…”等播报式句式</span>
-        </div>
-        <label class="toggle-switch" aria-label="记忆无声参与短规则开关">
-          <input type="checkbox" id="rsSilentMemToggle" checked>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="switch-row" style="margin-bottom:0;">
-        <div class="switch-row-label">
-          <strong>去书面 AI 味口语短规则</strong>
-          <span>禁止“总而言之”“综上所述”“首先…其次…最后…”等公文或客服套话，保持真人聊天节奏</span>
-        </div>
-        <label class="toggle-switch" aria-label="去书面 AI 味口语短规则开关">
-          <input type="checkbox" id="rsAntiAiToggle" checked>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="field-foot">
-        <span id="recallGuardStatsText" class="num">本轮进程已扫描 0 次召回 · 拦截敏感实体 0 次</span>
-        <span>切换后下一句话立即生效</span>
-      </div>
-    </div>
-
-    <!-- Section 1i: AutoDream Read-Only Reflection Proposals (Human Approval Required) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">AutoDream 离线反思提案（只读分析 · 零自动发布 · 人工审批）</h2>
-        <span id="dreamPendingBadge" class="rel-stage-badge num">待审 0</span>
-      </div>
-      <p class="section-desc">严格在只读边界下仅基于一手用户原话（排除摘要与自我输出防递归污染）定期/手动梳理 ASR 纠错词条、冲突旧记忆合并与相处习惯建议；展示 Diff、证据出处与基线校验，经你批准后才写入生效。</p>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用定期离线只读梳理（AutoDream）</strong>
-          <span id="dreamMetaText">上次梳理：尚未运行 · 仅产出待审批提案</span>
-        </div>
-        <label class="toggle-switch" aria-label="启用 AutoDream 离线反思开关">
-          <input type="checkbox" id="dreamEnabledToggle" checked>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
-        <button type="button" class="btn" id="dreamRunBtn" style="padding:5px 13px;font-size:12.5px;">立即离线梳理提案</button>
-        <button type="button" class="btn" id="dreamRefreshBtn" style="padding:5px 13px;font-size:12.5px;">刷新待审批列表</button>
-      </div>
-
-      <div id="dreamProposalList" class="dream-list">
-        <div class="dream-empty">点击「刷新待审批列表」或「立即离线梳理提案」查看当前待人工审核的离线建议。</div>
-      </div>
-    </div>
-
-    <!-- Section 1e: Obsidian One-Way Memory & Dialogue Export -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">Obsidian 同步（单向记忆与对话导出 · 免重启）</h2>
-        <span id="obsStatusBadge" class="rel-stage-badge num">检测中…</span>
-      </div>
-      <p class="section-desc">由 Anima Brain 自动将对话流水、长期记忆、未完待续与关系状态单向导出为 Markdown（已自动脱敏 API Key 与密码）；平时冻结历史日，点「立即全量重建」可按最新模板重刷全部日期。</p>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用自动单向导出</strong>
-          <span id="obsToggleHint">开启后每轮对话结束防抖 5 秒自动更新当天日志与记忆快照</span>
-        </div>
-        <label class="toggle-switch" aria-label="启用 Obsidian 单向同步开关">
-          <input type="checkbox" id="obsSyncToggle" disabled>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用每日/每周离线待跟进简报（低成本 · 零语音打扰）</strong>
-          <span id="obsBriefingHint">按日/周离线梳理待跟进事项与近期摘要写入 Obsidian「简报/」目录，不触发主动语音推送</span>
-        </div>
-        <label class="toggle-switch" aria-label="启用每日每周离线简报开关">
-          <input type="checkbox" id="obsBriefingToggle" disabled>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用双向备忘收件箱（默认关闭 · 零空载扫描）</strong>
-          <span id="obsInboxHint">关闭时不扫描磁盘；开启后只读监听 Vault「收件箱/」目录写入长期记忆与待办，勾选 [x] 自动消标，绝不改写原笔记</span>
-        </div>
-        <label class="toggle-switch" aria-label="启用 Obsidian 双向备忘收件箱开关">
-          <input type="checkbox" id="obsInboxToggle" disabled>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="audio-vol-bar" style="margin-top:0;justify-content:space-between;gap:8px;">
-        <div style="display:flex;flex-direction:column;gap:2px;min-width:0;flex:1;">
-          <span style="font-size:12px;color:var(--ink-secondary);">导出目录：<strong id="obsExportDirText" style="font-family:var(--font-mono);color:var(--ink);">--</strong></span>
-          <span style="font-size:12px;color:var(--ink-secondary);">上次导出：<strong id="obsLastExportText" class="num" style="color:var(--ink);">尚未导出</strong></span>
-          <span style="font-size:12px;color:var(--ink-secondary);">最近简报：<strong id="obsBriefingStatusText" class="num" style="color:var(--ink-muted);">等待离线梳理</strong></span>
-          <span style="font-size:12px;color:var(--ink-secondary);">备忘收件箱：<strong id="obsInboxStatusText" class="num" style="color:var(--ink-muted);">已关闭（零扫描）</strong></span>
-        </div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button type="button" class="btn" id="obsInboxScanBtn" style="padding:6px 11px;font-size:12.5px;white-space:nowrap;" disabled>立即扫描收件箱</button>
-          <button type="button" class="btn" id="obsBriefingBtn" style="padding:6px 11px;font-size:12.5px;white-space:nowrap;" disabled>立即生成简报</button>
-          <button type="button" class="btn" id="obsBriefingPushBtn" style="padding:6px 11px;font-size:12.5px;white-space:nowrap;" disabled>简报推手机</button>
-          <button type="button" class="btn" id="obsRebuildBtn" style="padding:6px 13px;font-size:12.5px;white-space:nowrap;" disabled>立即全量重建</button>
-        </div>
-      </div>
-
-      <div class="field-foot">
-        <span>同步概览：<strong id="obsStatsText" class="num">检测中…</strong></span>
-        <span id="obsErrText" style="color:var(--ink-muted);">哈希未变自动跳过写入</span>
-      </div>
-    </div>
-
-    <!-- Section 1f: Domestic Zero-Proxy Lightweight Mobile Push Bridge -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">手机端轻量通知推送（默认关闭 · 国内免代理）</h2>
-        <span id="mobilePushBadge" class="rel-stage-badge num">已关闭</span>
-      </div>
-      <p class="section-desc">纯出站 HTTPS 轻量桥接（支持 Bark / 飞书 / 企微 / PushPlus / Server酱，零入站端口、零代理依赖）；凭据仅存 `.env` 或 `0600` 本地隔离文件，绝不写入公开配置，外发正文强制脱敏。</p>
-
-      <div class="switch-row">
-        <div class="switch-row-label">
-          <strong>启用手机端轻量通知推送（默认关闭 · 零外发）</strong>
-          <span>关闭时绝不发起任何外网推送请求；开启后可将主动关怀与每日简报送达手机通知栏</span>
-        </div>
-        <label class="toggle-switch" aria-label="启用手机端轻量通知推送开关">
-          <input type="checkbox" id="mobilePushEnabledToggle">
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-
-      <div class="proactive-grid" style="margin-bottom:8px;">
-        <div>
-          <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="mobilePushProviderSelect">推送通道</label>
-          <select id="mobilePushProviderSelect">
-            <option value="bark">Bark (iOS 通知栏)</option>
-            <option value="feishu">飞书群机器人 Webhook</option>
-            <option value="wecom">企业微信群机器人 Webhook</option>
-            <option value="pushplus">PushPlus 微信推送</option>
-            <option value="serverchan">Server酱 (微信推送)</option>
-          </select>
-        </div>
-        <div>
-          <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="mobilePushMaxDailyInput">每日推送上限（条）</label>
-          <input type="number" id="mobilePushMaxDailyInput" min="1" max="50" step="1" value="12">
-        </div>
-        <div style="grid-column:1 / -1;">
-          <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="mobilePushSecretInput" id="mobilePushSecretLabel">Bark 推送 URL（例如 https://api.day.app/你的设备Key）</label>
-          <input type="password" id="mobilePushSecretInput" autocomplete="new-password" spellcheck="false" placeholder="留空表示保留已有凭据；输入新值点击保存将写入 0600 隔离文件">
-        </div>
-        <div id="mobilePushFeishuSecretWrap" style="grid-column:1 / -1;display:none;">
-          <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="mobilePushFeishuSecretInput">飞书机器人加签密钥（可选 · MOBILE_PUSH_FEISHU_SECRET）</label>
-          <input type="password" id="mobilePushFeishuSecretInput" autocomplete="new-password" spellcheck="false" placeholder="若机器人开启签名校验可填写，否则留空">
-        </div>
-      </div>
-
-      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:8px;font-size:12.5px;color:var(--ink-secondary);">
-        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="mobilePushForwardProactiveToggle" checked>
-          <span>主动关怀同步推送到手机</span>
-        </label>
-        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="mobilePushForwardBriefingToggle">
-          <span>允许一键推送每日简报</span>
-        </label>
-        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="mobilePushQuietToggle" checked>
-          <span>遵守免打扰时段</span>
-        </label>
-      </div>
-
-      <div class="proactive-meta-row" style="margin-bottom:8px;">
-        <span>当前凭据状态：<strong id="mobilePushSecretStatusText" class="num">未配置</strong></span>
-      </div>
-
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
-        <button type="button" class="btn" id="mobilePushSaveBtn" style="padding:5px 12px;font-size:12.5px;">保存推送设置</button>
-        <button type="button" class="btn" id="mobilePushTestBtn" style="padding:5px 12px;font-size:12.5px;">发送测试通知</button>
-        <button type="button" class="btn" id="mobilePushBriefingBtn" style="padding:5px 12px;font-size:12.5px;">推送今日简报</button>
-        <button type="button" class="btn" id="mobilePushClearSecretBtn" style="padding:5px 11px;font-size:12px;">清除当前通道本地凭据</button>
-        <span id="mobilePushStatsText" class="num" style="margin-left:auto;font-size:12px;color:var(--ink-muted);">今日已推 0/12</span>
-      </div>
-
-      <div id="mobilePushHistoryList" class="proactive-history-list">
-        <div class="dream-empty">暂无手机推送记录；填好通道凭据并点击「发送测试通知」即可验证连通性。</div>
-      </div>
-    </div>
-
-    <!-- Section 2: LLM provider -->
-    <div class="config-section">
-      <h2 class="section-title" style="margin-bottom:6px;">对话模型</h2>
-      <p class="section-desc">本地陪伴使用电脑上 LM Studio 加载的 Huihui Qwen3 14B。保存后，下一轮对话会使用所选模型，沿用当前角色和记忆。语音、看屏和长期记忆服务各自配置。</p>
-
-      <div class="form-grid-3">
-        <div>
-          <label class="field-label" for="providerSelect">对话模式</label>
-          <select id="providerSelect">
-            <option value="GLMLLM">智谱 GLM（GLM_API_KEY）</option>
-            <option value="DeepSeekLLM">DeepSeek 国内直连（DEEPSEEK_API_KEY）</option>
-            <option value="HuihuiLocal">本地陪伴 · Huihui Qwen3 14B（LM Studio）</option>
-            <option value="GeminiOpenAI">Google Gemini（GEMINI_API_KEY）</option>
-          </select>
-        </div>
-        <div>
-          <label class="field-label" for="modelSelect">推荐模型</label>
-          <select id="modelSelect"></select>
-        </div>
-        <div>
-          <label class="field-label" for="modelCustomInput">当前生效模型名</label>
-          <input type="text" id="modelCustomInput" spellcheck="false">
-        </div>
-      </div>
-
-      <div class="field-foot">
-        <span>环境变量状态：DeepSeek <strong id="dsKeyBadge">--</strong> · 智谱 GLM <strong id="glmKeyBadge">--</strong> · Gemini <strong id="gemKeyBadge">--</strong> · 前缀缓存 <strong id="llmCacheRateBadge" class="num">--</strong></span>
-        <span>修改后点击右上角「保存并立即生效」（支持免重启热更新）</span>
-      </div>
-    </div>
-
-    <!-- Section 2b: ASR Engine Selection (Cloud Low-Spec API / Local Offline) -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">语音识别引擎（ASR · 云端低配 API / 本地离线）</h2>
-        <span id="asrEngineBadge" class="rel-stage-badge num">检测中…</span>
-      </div>
-      <p class="section-desc">低配/无独显电脑可一键切换云端 ASR（零本地模型、内存压降至 ~120–160 MiB，且自动休眠投机早判避免双倍计费）；也可随时切回本地离线 SherpaASR。API Key 仅通过系统环境变量注入，绝不落盘明文。</p>
-
-      <div id="lowspecPresetBar" class="lowspec-bar" aria-label="低配云端一键预设"></div>
-
-      <label class="field-label" for="asrProviderSelect">识别引擎</label>
-      <div class="voice-row">
-        <select id="asrProviderSelect">
-          <optgroup label="云端低配 API（0 显存 · 无需本地模型）">
-            <option value="SiliconFlowASR">硅基流动 SenseVoiceSmall（云端低配推荐 · 国内直连）</option>
-            <option value="OpenaiASR">通用 OpenAI 兼容 ASR（OpenAI / Groq / One-API / 自建）</option>
-            <option value="Qwen3ASRFlash">阿里云百炼 Qwen3-ASR-Flash（国内直连 HTTP）</option>
-            <option value="AliyunBLStreamASR">阿里云百炼 Paraformer 实时流式（国内直连 WS）</option>
-            <option value="DoubaoASR">火山引擎豆包语音识别（中文高精度）</option>
-            <option value="DoubaoStreamASR">火山引擎豆包大模型流式识别（低延迟 WS）</option>
-          </optgroup>
-          <optgroup label="本地离线识别模型">
-            <option value="SherpaASR">本地 Sherpa-ONNX SenseVoice（int8 轻量离线 · ~350MB）</option>
-            <option value="FunASR">本地 FunASR PyTorch（旧版重型 · ~3.5GB）</option>
-          </optgroup>
-        </select>
-        <button type="button" class="btn" id="asrTestBtn" style="white-space:nowrap;">测试识别接口</button>
-      </div>
-
-      <div id="asrFieldsGrid" class="audio-fields-grid" style="display:none;"></div>
-
-      <div class="field-foot">
-        <span>环境变量：<strong id="asrEnvBadge">--</strong></span>
-        <span id="asrHintText">切换本地与云端 ASR 时将平滑重启以释放或加载模型内存</span>
-      </div>
-    </div>
-
-    <!-- Section 3: Voice & TTS Engine Selection -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">语音合成引擎与音色（TTS · 云端 API / EdgeTTS / 本机 GPU）</h2>
-        <span id="ttsEngineBadge" class="rel-stage-badge num">检测中…</span>
-      </div>
-      <p class="section-desc" id="ttsSectionDesc">全部 7 家云端 TTS、EdgeTTS 与本机 GPU GPT-SoVITS 均支持在线试听与电脑高保真（48kHz / 44.1kHz）音响直通；若配置了本地自定义多情绪模型，同步支持 7 情绪动态路由。</p>
-
-      <label class="field-label" for="ttsProviderSelect">合成引擎</label>
-      <div class="voice-row" style="margin-bottom:10px;">
-        <select id="ttsProviderSelect">
-          <optgroup label="免显存免费">
-            <option value="EdgeTTS">微软 EdgeTTS（免费免显存 · 开箱即用）</option>
-          </optgroup>
-          <optgroup label="云端高拟真音频 API（零显存 · 全兼容电脑高保真音响直通）">
-            <option value="CosyVoiceSiliconflow">硅基流动 CosyVoice2（国内直连推荐 · 48kHz）</option>
-            <option value="OpenAITTS">通用 OpenAI 兼容 TTS（OpenAI / One-API / 自建 · 48kHz）</option>
-            <option value="AliBLTTS">阿里云百炼 CosyVoice 双向流式（国内直连 · 48kHz）</option>
-            <option value="DoubaoTTS">火山引擎豆包 HTTP TTS（中文自然 · 48kHz）</option>
-            <option value="HuoshanDoubleStreamTTS">火山引擎豆包大模型双流式 V3（高拟人 · 48kHz）</option>
-            <option value="FishSpeech">Fish Audio / FishSpeech（高拟真克隆 · 48kHz）</option>
-            <option value="MinimaxTTSHTTPStream">MiniMax 海螺语音 T2A V2（多情绪流式 · 44.1kHz）</option>
-          </optgroup>
-          <optgroup label="本机独显专精引擎">
-            <option value="GPT_SOVITS_V2">本机 RTX GPU GPT-SoVITS V4（需独显 19880）</option>
-          </optgroup>
-        </select>
-        <button type="button" class="btn" id="previewBtn" style="white-space:nowrap;">
-          <svg class="icon" viewBox="0 0 24 24">
-            <polygon points="6 4 20 12 6 20 6 4"/>
-          </svg>
-          <span id="previewBtnText">试听音色</span>
-        </button>
-      </div>
-
-      <div id="legacyVoiceWrap">
-        <label class="field-label" for="voiceSelect">播报音色</label>
+        <label class="field-label" for="asrProviderSelect">识别引擎</label>
         <div class="voice-row">
-          <select id="voiceSelect">
-            <option value="__gsv_raiden_mei__">崩坏三 · 雷电芽衣（本机 GPU 满血 V4 · 7 情绪动态声线）</option>
-            <option value="__gsv_luoxiaohei__">罗小黑战记 · 罗小黑（本机 GPU 满血 V5-Turbo · 7 情绪动态声线）</option>
-            <option value="__gsv_xiaozhi_tw__">小智原版台湾腔 · 湾湾小何（本机 GPU 复刻）</option>
-            <option value="zh-TW-HsiaoChenNeural">晓辰 · 微软台湾腔甜美女声（免显存）</option>
-            <option value="zh-TW-YunJheNeural">云哲 · 微软台湾腔温和男声（免显存）</option>
-            <option value="zh-CN-XiaoxiaoNeural" selected>晓晓 · 自然温柔女声</option>
-            <option value="zh-CN-XiaoyiNeural">晓伊 · 活泼甜美少女音</option>
-            <option value="zh-CN-YunxiNeural">云希 · 清朗阳光少年音</option>
-            <option value="zh-CN-YunjianNeural">云健 · 沉稳磁性男声</option>
-            <option value="zh-CN-YunxiaNeural">云夏 · 元气可爱童声</option>
-            <option value="zh-HK-HiuGaaiNeural">晓佳 · 粤语自然女声</option>
-            <option value="zh-CN-liaoning-XiaobeiNeural">晓北 · 幽默东北话女声</option>
-            <option value="zh-CN-shaanxi-XiaoniNeural">晓妮 · 亲切陕西话女声</option>
+          <select id="asrProviderSelect">
+            <optgroup label="云端低配 API（0 显存 · 无需本地模型）">
+              <option value="SiliconFlowASR">硅基流动 SenseVoiceSmall（云端低配推荐 · 国内直连）</option>
+              <option value="OpenaiASR">通用 OpenAI 兼容 ASR（OpenAI / Groq / One-API / 自建）</option>
+              <option value="Qwen3ASRFlash">阿里云百炼 Qwen3-ASR-Flash（国内直连 HTTP）</option>
+              <option value="AliyunBLStreamASR">阿里云百炼 Paraformer 实时流式（国内直连 WS）</option>
+              <option value="DoubaoASR">火山引擎豆包语音识别（中文高精度）</option>
+              <option value="DoubaoStreamASR">火山引擎豆包大模型流式识别（低延迟 WS）</option>
+            </optgroup>
+            <optgroup label="本地离线识别模型">
+              <option value="SherpaASR">本地 Sherpa-ONNX SenseVoice（int8 轻量离线 · ~350MB）</option>
+              <option value="FunASR">本地 FunASR PyTorch（旧版重型 · ~3.5GB）</option>
+            </optgroup>
           </select>
+          <button type="button" class="btn" id="asrTestBtn" style="white-space:nowrap;">测试识别接口</button>
         </div>
 
-        <div id="meiEmotionBar" class="preset-bar" style="display:none;margin-top:10px;margin-bottom:0;">
-          <button type="button" class="preset-pill active" data-emotion="auto">自动情绪识别</button>
-          <button type="button" class="preset-pill" data-emotion="gentle">温柔关怀</button>
-          <button type="button" class="preset-pill" data-emotion="happy">欣喜明朗</button>
-          <button type="button" class="preset-pill" data-emotion="playful">俏皮打趣</button>
-          <button type="button" class="preset-pill" data-emotion="shy">羞赧微嗔</button>
-          <button type="button" class="preset-pill" data-emotion="serious">沉稳认真</button>
-          <button type="button" class="preset-pill" data-emotion="tender">轻柔抚慰</button>
-          <button type="button" class="preset-pill" data-emotion="calm">平静默认</button>
+        <div id="asrFieldsGrid" class="audio-fields-grid" style="display:none;"></div>
+
+        <div class="field-foot">
+          <span>环境变量：<strong id="asrEnvBadge">--</strong></span>
+          <span id="asrHintText">切换本地与云端 ASR 时将平滑重启以释放或加载模型内存</span>
         </div>
       </div>
 
-      <div id="cloudTtsFieldsWrap" class="audio-fields-grid" style="display:none;"></div>
-
-      <div class="preview-text-row">
-        <input type="text" id="previewTextInput" value="你好呀，我是小智，今天过得怎么样？有什么需要我帮忙的随时告诉我。" aria-label="试听台词">
-      </div>
-
-      <div class="field-foot">
-        <span>环境变量：<strong id="ttsEnvBadge">--</strong></span>
-        <span id="ttsCompatNote">已支持 ESP32 喇叭与电脑 48kHz 音响直通</span>
-      </div>
-    </div>
-
-    <!-- Section 4: System Prompt -->
-    <div class="config-section">
-      <div class="section-head">
-        <h2 class="section-title">角色人设提示词（Prompt）</h2>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <span id="personaRevBadge" class="rel-stage-badge num">rev.0</span>
-          <span class="num" style="font-size:12px;color:var(--ink-muted);" id="charCount">0 字</span>
+      <!-- 3. Speculative VAD Early-Commit -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">投机 VAD 抢答加速（句末早判 · 免重启热开关）</h2>
+          <span id="vadSpecBadge" class="rel-stage-badge num">检测中…</span>
         </div>
-      </div>
-      <p class="section-desc">决定小智的性格口吻与交流风格；保存时强制 CAS 版本与摘要校验并留存快照，<strong>人设绝不授予工具权限、不替代宿主机电脑操控挡位策略</strong>。</p>
+        <p class="section-desc">保留 1100ms 静音防截断，同时在完整句结尾提前提交省去约 0.4～0.55 秒尾延迟。</p>
 
-      <div class="preset-bar" id="presetBar">
-        <button type="button" class="preset-pill" data-preset="mei">崩坏三 · 雷电芽衣</button>
-        <button type="button" class="preset-pill" data-preset="luoxiaohei">罗小黑战记 · 罗小黑</button>
-        <button type="button" class="preset-pill" data-preset="taiwan">台湾机车女孩</button>
-        <button type="button" class="preset-pill" data-preset="default">默认机智助手</button>
-        <button type="button" class="preset-pill" data-preset="geek">硬核电子极客</button>
-        <button type="button" class="preset-pill" data-preset="warm">温柔陪伴知己</button>
-      </div>
-
-      <textarea id="promptInput" spellcheck="false"></textarea>
-
-      <details class="l3-adv" id="personaHistoryDetails" style="margin-top:10px;">
-        <summary>人设版本快照（CAS 摘要校验 · Diff 对比 · 一键回滚）<span id="personaSyncTag" class="num" style="margin-left:6px;color:var(--ink-muted);"></span></summary>
-        <div id="personaHistoryList" class="persona-snap-list" style="margin-top:8px;">
-          <div class="dream-empty">暂无历史快照。</div>
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用投机 VAD 句末早判（F-1）</strong>
+            <span id="vadSpecToggleHint">开启后在完整句结尾提前提交；关闭即刻回退纯 1100ms 稳健判停</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用投机 VAD 句末早判开关">
+            <input type="checkbox" id="vadSpecToggle" checked>
+            <span class="toggle-slider"></span>
+          </label>
         </div>
-        <pre id="personaDiffViewer" class="diff-pre" style="display:none;"></pre>
-      </details>
+
+        <details class="l3-adv section-fold" id="vadSpecFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开早判阈值滑块与完整/犹豫词表调优</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="audio-vol-bar" style="margin-top:0;">
+              <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">早判静默阈值</span>
+              <input type="range" id="vadSpecMsRange" min="300" max="950" step="25" value="550" aria-label="投机早判静默毫秒数">
+              <strong id="vadSpecMsVal" class="num" style="font-size:12.5px;min-width:84px;text-align:right;">550 ms</strong>
+            </div>
+
+            <div class="audio-vol-bar" style="margin-top:8px;">
+              <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">唤醒首句静默阈值</span>
+              <input type="range" id="vadPostWakeupMsRange" min="450" max="1050" step="25" value="800" aria-label="唤醒首句静默毫秒数">
+              <strong id="vadPostWakeupMsVal" class="num" style="font-size:12.5px;min-width:84px;text-align:right;">800 ms</strong>
+            </div>
+
+            <div class="audio-vol-bar" style="margin-top:8px;">
+              <span style="font-size:12.5px;color:var(--ink-secondary);white-space:nowrap;min-width:132px;">早判最小字数</span>
+              <input type="range" id="vadMinCharsRange" min="2" max="20" step="1" value="4" aria-label="早判最小字数">
+              <strong id="vadMinCharsVal" class="num" style="font-size:12.5px;min-width:84px;text-align:right;">4 字</strong>
+            </div>
+
+            <div class="l3-adv-grid" style="margin-top:10px;">
+              <div>
+                <label class="field-label" style="font-size:12.5px;margin-bottom:4px;" for="vadCompleteSuffixesInput">完整句尾词表（逗号或换行分隔）</label>
+                <textarea id="vadCompleteSuffixesInput" spellcheck="false" style="min-height:68px;font-size:12.5px;" placeholder="吗, 呢, 吧, 了, 啊, 呀, 哦, 谢谢, 好的"></textarea>
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12.5px;margin-bottom:4px;" for="vadHesitationSuffixesInput">犹豫/未完词表（命中则继续等到 1100ms）</label>
+                <textarea id="vadHesitationSuffixesInput" spellcheck="false" style="min-height:68px;font-size:12.5px;" placeholder="然后, 就是, 那个, 因为, 嗯, 但是, 而且, 所以"></textarea>
+              </div>
+            </div>
+
+            <div class="field-foot" style="margin-top:8px;align-items:center;">
+              <span id="vadSpecStatsText" class="num">遥测：等待对话触发 · 1100ms 上限始终生效</span>
+              <button type="button" class="btn" id="vadSpecSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存投机 VAD 配置</button>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 4. Post-ASR Homophone Corrections -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">语音识别同音词热纠错（ASR 后处理 · 免重启）</h2>
+          <span id="asrCorrBadge" class="rel-stage-badge num">检测中…</span>
+        </div>
+        <p class="section-desc">在识别输出后自动替换高频同音错词（按词长优先匹配），保存后下一句话立即生效。</p>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用同音词自动纠错（G-4）</strong>
+            <span id="asrCorrToggleHint">开启后自动按下方映射表修正所有语音识别结果</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用语音识别同音词热纠错开关">
+            <input type="checkbox" id="asrCorrToggle" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <details class="l3-adv section-fold" id="asrCorrFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开同音词纠错映射表编辑</span>
+          </summary>
+          <div class="section-fold-body">
+            <label class="field-label" for="asrCorrInput" style="margin-top:0;">纠错映射表（每行一条，格式：错词-&gt;正词，例如 小志-&gt;小智）</label>
+            <textarea id="asrCorrInput" spellcheck="false" style="min-height:84px;font-family:var(--font-mono);font-size:12.5px;" placeholder="你好小志->你好小智&#10;小志->小智"></textarea>
+
+            <div class="field-foot" style="margin-top:8px;align-items:center;">
+              <span id="asrCorrMeta" class="num">已配置 0 条规则 · 最多 500 条</span>
+              <button type="button" class="btn" id="asrCorrSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存纠错词表</button>
+            </div>
+          </div>
+        </details>
+      </div>
     </div>
   </section>
 
@@ -1087,6 +1166,31 @@
     </div>
 
     <div class="log-stream" id="logStream"></div>
+
+    <div class="pc-mic-bar" aria-label="电脑麦克风语音对话">
+      <div class="pc-mic-controls">
+        <button type="button" class="btn pc-mic-btn" id="pcMicToggleBtn" title="使用电脑麦克风直接与小智连续对话">
+          <svg class="icon" viewBox="0 0 24 24">
+            <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="22"/>
+          </svg>
+          <span id="pcMicToggleLabel">开麦自由聊</span>
+        </button>
+        <button type="button" class="btn pc-mic-btn" id="pcMicPttBtn" title="按住说话，松手立即识别发送">按住说话</button>
+        <button type="button" class="btn pc-mic-btn" id="pcMicInterruptBtn" disabled title="立即打断小智当前播报">打断</button>
+        <label class="pc-mic-duplex-opt" title="默认外放防回声（小智说话时自动闭麦）；戴耳机时勾选可随时语音插话">
+          <input type="checkbox" id="pcMicFullDuplexToggle">
+          <span>耳机插话</span>
+        </label>
+      </div>
+      <div class="pc-mic-meta">
+        <span id="pcMicStatusText" class="pc-mic-status">电脑麦克风未开启（免 ESP32 语音对话）</span>
+        <div class="pc-mic-meter" aria-hidden="true">
+          <div id="pcMicLevelFill" class="pc-mic-meter-fill"></div>
+        </div>
+      </div>
+    </div>
 
     <div class="monitor-footer num">
       <span id="deviceIdText">设备 MAC: --</span>

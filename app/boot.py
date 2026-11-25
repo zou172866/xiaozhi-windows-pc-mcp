@@ -107,6 +107,12 @@ def _install_voiceprint_mcp_guard() -> None:
     voiceprint.install_voiceprint_mcp_guard_patch()
 
 
+def _install_pc_pcm_input() -> None:
+    from patches import pc_pcm_input
+
+    pc_pcm_input.install_pc_pcm_input_patch()
+
+
 def install_all(
     *,
     chdir: bool = True,
@@ -175,6 +181,12 @@ def install_all(
                 _install_voiceprint_mcp_guard,
                 "ServerMCPManager.execute_tool",
                 "[VoiceprintGuard]",
+            ),
+            (
+                "pc_pcm_audio_input",
+                _install_pc_pcm_input,
+                "ConnectionHandler._decode_opus_packet",
+                "[PCPcmInput]",
             ),
         ):
             patch_registry.run_patch_installer(

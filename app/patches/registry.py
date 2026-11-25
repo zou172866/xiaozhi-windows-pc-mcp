@@ -247,6 +247,15 @@ PATCH_CATALOG: List[Dict[str, Any]] = [
         "failure_behavior": "fail-soft (falls back to upstream MCP tool dispatch, marks /api/health degraded)",
         "tests": ["tests/container/test_phase2_voiceprint_widget.py", "tests/container/test_upstream_contracts.py"],
     },
+    {
+        "name": "pc_pcm_audio_input",
+        "module": "app/patches/pc_pcm_input.py",
+        "target": "core.connection.ConnectionHandler._decode_opus_packet",
+        "category": "experience",
+        "contract": "sync method _decode_opus_packet(self, opus_packet); passes validated 16-bit PCM frames straight to VAD/ASR when conn.audio_format == 'pcm', keeping ESP32 opus path unchanged",
+        "failure_behavior": "fail-soft (skips mount on contract mismatch -> Opus-only WS input, marks /api/health degraded)",
+        "tests": ["tests/container/test_pc_mic_input.py", "tests/container/test_upstream_contracts.py"],
+    },
 ]
 
 

@@ -232,6 +232,7 @@ def _build_plan(
                         "test_phase1_companion.py",
                         "test_phase2_voiceprint_widget.py",
                         "test_phase3_obsidian_mobile.py",
+                        "test_pc_mic_input.py",
                     ],
                     image=upstream_image,
                 ),
@@ -265,7 +266,7 @@ def _build_plan(
         plan.append(
             (
                 "contract",
-                "Upstream image contracts (ephemeral docker run --rm: SERVER_VERSION, 22 patches + PATCH_CATALOG sync, zero side-effects)",
+                "Upstream image contracts (ephemeral docker run --rm: SERVER_VERSION, 23 patches + PATCH_CATALOG sync, zero side-effects)",
                 _ephemeral_container_cmd("test_upstream_contracts.py", image=upstream_image),
                 None,
             )

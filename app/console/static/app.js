@@ -32,6 +32,20 @@
   };
 
   const els = {
+    configTabBar: document.getElementById("configTabBar"),
+    tabMemoryBadge: document.getElementById("tabMemoryBadge"),
+    tabSystemBadge: document.getElementById("tabSystemBadge"),
+    l3BoxFoldDetails: document.getElementById("l3BoxFoldDetails"),
+    proactiveFoldDetails: document.getElementById("proactiveFoldDetails"),
+    voiceprintFoldDetails: document.getElementById("voiceprintFoldDetails"),
+    mobilePushFoldDetails: document.getElementById("mobilePushFoldDetails"),
+    pcMicToggleBtn: document.getElementById("pcMicToggleBtn"),
+    pcMicToggleLabel: document.getElementById("pcMicToggleLabel"),
+    pcMicPttBtn: document.getElementById("pcMicPttBtn"),
+    pcMicInterruptBtn: document.getElementById("pcMicInterruptBtn"),
+    pcMicFullDuplexToggle: document.getElementById("pcMicFullDuplexToggle"),
+    pcMicStatusText: document.getElementById("pcMicStatusText"),
+    pcMicLevelFill: document.getElementById("pcMicLevelFill"),
     statusPill: document.getElementById("statusPill"),
     statusText: document.getElementById("statusText"),
     otaDisplay: document.getElementById("otaDisplay"),
@@ -558,6 +572,7 @@
         els.esp32AuthBadge.classList.add("badge-ok");
       }
     }
+    setTabBadge(els.tabSystemBadge, pending.length);
 
     if (els.esp32PendingWrap && els.esp32PendingList) {
       els.esp32PendingList.innerHTML = "";
@@ -758,6 +773,9 @@
     if (!btn) return;
     const mode = btn.dataset.mode;
     renderModeButtons(mode);
+    if (mode === "full" && els.l3BoxFoldDetails) {
+      els.l3BoxFoldDetails.open = true;
+    }
     try {
       const resp = await consolePost("/api/pc-mode", { mode });
       const res = await resp.json();
@@ -1442,6 +1460,9 @@
   if (els.proactiveEnabledToggle) {
     els.proactiveEnabledToggle.addEventListener("change", () => {
       const nextEn = Boolean(els.proactiveEnabledToggle.checked);
+      if (nextEn && els.proactiveFoldDetails) {
+        els.proactiveFoldDetails.open = true;
+      }
       saveProactiveConfig({ enabled: nextEn }, nextEn ? "已开启主动陪伴心跳引擎" : "已关闭主动陪伴心跳引擎（后台线程已停止）");
     });
   }
@@ -1705,6 +1726,9 @@
   if (els.voiceprintEnabledToggle) {
     els.voiceprintEnabledToggle.addEventListener("change", () => {
       const nextEn = Boolean(els.voiceprintEnabledToggle.checked);
+      if (nextEn && els.voiceprintFoldDetails) {
+        els.voiceprintFoldDetails.open = true;
+      }
       saveVoiceprintConfig(
         { enabled: nextEn },
         nextEn ? "已开启单设备声纹认人（未录主人前默认放行）" : "已关闭声纹认人并释放模型与缓存内存"
@@ -1715,6 +1739,9 @@
   if (els.screenPeekEnabledToggle) {
     els.screenPeekEnabledToggle.addEventListener("change", () => {
       const nextEn = Boolean(els.screenPeekEnabledToggle.checked);
+      if (nextEn && els.voiceprintFoldDetails) {
+        els.voiceprintFoldDetails.open = true;
+      }
       saveVoiceprintConfig(
         { screen_peek_enabled: nextEn },
         nextEn ? "已开启按需隐私护栏浅看屏" : "已关闭按需浅看屏"
@@ -2847,7 +2874,12 @@
   }
 
   if (els.mobilePushEnabledToggle) {
-    els.mobilePushEnabledToggle.addEventListener("change", () => saveMobilePushConfig());
+    els.mobilePushEnabledToggle.addEventListener("change", () => {
+      if (els.mobilePushEnabledToggle.checked && els.mobilePushFoldDetails) {
+        els.mobilePushFoldDetails.open = true;
+      }
+      saveMobilePushConfig();
+    });
   }
   if (els.mobilePushSaveBtn) {
     els.mobilePushSaveBtn.addEventListener("click", () => saveMobilePushConfig());
@@ -3060,10 +3092,11 @@
     if (!dream) return;
     const isOffline = dream.online === false;
     dreamOnline = !isOffline;
+    const dreamPendingCount = isOffline ? 0 : Number(dream.pending_count || 0);
     if (els.dreamPendingBadge) {
-      const pcnt = Number(dream.pending_count || 0);
-      els.dreamPendingBadge.textContent = isOffline ? "Anima 离线" : `待审 ${pcnt}`;
+      els.dreamPendingBadge.textContent = isOffline ? "Anima 离线" : `待审 ${dreamPendingCount}`;
     }
+    setTabBadge(els.tabMemoryBadge, dreamPendingCount);
     const dcfg = dream.config || {};
     if (els.dreamEnabledToggle) {
       els.dreamEnabledToggle.disabled = !dreamOnline;
@@ -4793,6 +4826,484 @@
     }
   });
 
+  const CONFIG_TAB_STORAGE_KEY = "xiaozhi_console_active_tab";
+  const VALID_CONFIG_TABS = new Set(["daily", "companion", "memory", "system"]);
+
+  function setTabBadge(el, count) {
+    if (!el) return;
+    const n = Number(count || 0);
+    if (n > 0) {
+      el.textContent = n > 99 ? "99+" : String(n);
+      el.style.display = "inline-flex";
+    } else {
+      el.textContent = "";
+      el.style.display = "none";
+    }
+  }
+
+  function readSavedConfigTab() {
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        const saved = window.localStorage.getItem(CONFIG_TAB_STORAGE_KEY);
+        if (saved && VALID_CONFIG_TABS.has(saved)) return saved;
+      }
+    } catch (_) {}
+    return "daily";
+  }
+
+  function setActiveConfigTab(tabKey, persist = true) {
+    const nextKey = VALID_CONFIG_TABS.has(tabKey) ? tabKey : "daily";
+    if (els.configTabBar && typeof els.configTabBar.querySelectorAll === "function") {
+      els.configTabBar.querySelectorAll(".config-tab-btn").forEach((btn) => {
+        const active = Boolean(btn.dataset && btn.dataset.configTab === nextKey);
+        btn.classList.toggle("active", active);
+        if (typeof btn.setAttribute === "function") {
+          btn.setAttribute("aria-selected", active ? "true" : "false");
+        }
+      });
+    }
+    if (typeof document.querySelectorAll === "function") {
+      document.querySelectorAll(".config-tab-pane").forEach((pane) => {
+        const active = Boolean(pane.dataset && pane.dataset.configPane === nextKey);
+        pane.classList.toggle("active", active);
+      });
+    }
+    if (persist) {
+      try {
+        if (typeof window !== "undefined" && window.localStorage) {
+          window.localStorage.setItem(CONFIG_TAB_STORAGE_KEY, nextKey);
+        }
+      } catch (_) {}
+    }
+  }
+
+  if (els.configTabBar) {
+    els.configTabBar.addEventListener("click", (e) => {
+      const btn = e.target && typeof e.target.closest === "function"
+        ? e.target.closest(".config-tab-btn")
+        : null;
+      if (!btn || !btn.dataset || !btn.dataset.configTab) return;
+      setActiveConfigTab(btn.dataset.configTab, true);
+    });
+  }
+
+  // ===================== PC Browser Microphone (Same-Origin /ws/pc-mic) =====================
+  const pcMic = {
+    ws: null,
+    stream: null,
+    audioCtx: null,
+    sourceNode: null,
+    processorNode: null,
+    sinkGain: null,
+    mode: "idle", // "idle" | "auto" | "manual"
+    connected: false,
+    helloDone: false,
+    sending: false,
+    assistantSpeaking: false,
+    pttPressed: false,
+    unmuteTimer: null,
+    busy: false,
+  };
+
+  function setPcMicStatus(text) {
+    if (els.pcMicStatusText) els.pcMicStatusText.textContent = text;
+  }
+
+  function setPcMicLevel(rms) {
+    if (!els.pcMicLevelFill) return;
+    const pct = Math.max(0, Math.min(100, Math.round(Number(rms || 0) * 320)));
+    els.pcMicLevelFill.style.width = `${pct}%`;
+  }
+
+  function updatePcMicButtons() {
+    const active = Boolean(pcMic.ws && pcMic.connected);
+    if (els.pcMicToggleBtn) {
+      els.pcMicToggleBtn.classList.toggle("is-live", active && pcMic.mode === "auto");
+      els.pcMicToggleBtn.disabled = pcMic.busy;
+    }
+    if (els.pcMicToggleLabel) {
+      els.pcMicToggleLabel.textContent = active ? "关闭麦克风" : "开麦自由聊";
+    }
+    if (els.pcMicPttBtn) {
+      els.pcMicPttBtn.classList.toggle("is-ptt", pcMic.pttPressed);
+      els.pcMicPttBtn.disabled = pcMic.busy;
+    }
+    if (els.pcMicInterruptBtn) {
+      els.pcMicInterruptBtn.disabled = !active;
+    }
+  }
+
+  function isPcMicFullDuplex() {
+    return Boolean(els.pcMicFullDuplexToggle && els.pcMicFullDuplexToggle.checked);
+  }
+
+  function sendPcMicJson(obj) {
+    if (pcMic.ws && pcMic.ws.readyState === 1) {
+      try {
+        pcMic.ws.send(JSON.stringify(obj));
+        return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  function clearPcMicUnmuteTimer() {
+    if (pcMic.unmuteTimer !== null) {
+      clearTimeout(pcMic.unmuteTimer);
+      pcMic.unmuteTimer = null;
+    }
+  }
+
+  function handlePcMicPcmFrame(pcmBuffer, rms) {
+    const canUpload = pcMic.connected && pcMic.helloDone && pcMic.sending && (!pcMic.assistantSpeaking || isPcMicFullDuplex());
+    setPcMicLevel(canUpload ? rms : 0);
+    if (!canUpload) return;
+    if (pcMic.ws && pcMic.ws.readyState === 1 && pcmBuffer && pcmBuffer.byteLength >= 2) {
+      try {
+        pcMic.ws.send(pcmBuffer);
+      } catch (_) {}
+    }
+  }
+
+  function stopPcMic(silent = false, reasonText = "") {
+    clearPcMicUnmuteTimer();
+    pcMic.pttPressed = false;
+    pcMic.sending = false;
+    pcMic.connected = false;
+    pcMic.helloDone = false;
+    pcMic.assistantSpeaking = false;
+    pcMic.mode = "idle";
+    pcMic.busy = false;
+    if (pcMic.processorNode) {
+      try { pcMic.processorNode.disconnect(); } catch (_) {}
+      pcMic.processorNode = null;
+    }
+    if (pcMic.sourceNode) {
+      try { pcMic.sourceNode.disconnect(); } catch (_) {}
+      pcMic.sourceNode = null;
+    }
+    if (pcMic.sinkGain) {
+      try { pcMic.sinkGain.disconnect(); } catch (_) {}
+      pcMic.sinkGain = null;
+    }
+    if (pcMic.audioCtx) {
+      try { pcMic.audioCtx.close(); } catch (_) {}
+      pcMic.audioCtx = null;
+    }
+    if (pcMic.stream) {
+      try { pcMic.stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      pcMic.stream = null;
+    }
+    if (pcMic.ws) {
+      const oldWs = pcMic.ws;
+      pcMic.ws = null;
+      try {
+        if (oldWs.readyState === 1) oldWs.close(1000, "client_stop");
+      } catch (_) {}
+    }
+    setPcMicLevel(0);
+    updatePcMicButtons();
+    if (!silent) {
+      setPcMicStatus(reasonText || "电脑麦克风已关闭");
+    }
+  }
+
+  async function setupBrowserAudioCapture(stream) {
+    const AudioCtxCtor = (typeof window !== "undefined") && (window.AudioContext || window.webkitAudioContext);
+    if (!AudioCtxCtor) {
+      throw new Error("当前浏览器不支持 Web Audio API");
+    }
+    const ctx = new AudioCtxCtor();
+    if (ctx.state === "suspended" && typeof ctx.resume === "function") {
+      await ctx.resume();
+    }
+    const source = ctx.createMediaStreamSource(stream);
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    sink.connect(ctx.destination);
+
+    let processor = null;
+    if (ctx.audioWorklet && typeof ctx.audioWorklet.addModule === "function") {
+      try {
+        await ctx.audioWorklet.addModule("/static/pcm_worklet.js");
+        const worklet = new AudioWorkletNode(ctx, "xiaozhi-pcm-capture");
+        worklet.port.onmessage = (ev) => {
+          const d = ev && ev.data;
+          if (d && d.pcm) handlePcMicPcmFrame(d.pcm, d.rms || 0);
+        };
+        source.connect(worklet);
+        worklet.connect(sink);
+        processor = worklet;
+      } catch (_) {
+        processor = null;
+      }
+    }
+
+    if (!processor) {
+      const scriptNode = ctx.createScriptProcessor(2048, 1, 1);
+      const srcRate = ctx.sampleRate || 48000;
+      const ratio = srcRate / 16000;
+      const frameSamples = 960;
+      let out = new Int16Array(frameSamples);
+      let outIdx = 0;
+      let phase = 0;
+      let lastSample = 0;
+      let energySum = 0;
+      scriptNode.onaudioprocess = (ev) => {
+        const input = ev.inputBuffer.getChannelData(0);
+        const len = input.length;
+        let pos = phase;
+        while (pos < len) {
+          const i0 = Math.floor(pos);
+          const frac = pos - i0;
+          const s0 = i0 < 0 ? lastSample : input[i0];
+          const s1 = i0 + 1 < len ? input[i0 + 1] : input[len - 1];
+          const clamped = Math.max(-1, Math.min(1, s0 + (s1 - s0) * frac));
+          out[outIdx++] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
+          energySum += clamped * clamped;
+          if (outIdx >= frameSamples) {
+            const rms = Math.sqrt(energySum / frameSamples);
+            const buf = out.buffer;
+            out = new Int16Array(frameSamples);
+            outIdx = 0;
+            energySum = 0;
+            handlePcMicPcmFrame(buf, rms);
+          }
+          pos += ratio;
+        }
+        lastSample = input[len - 1] || 0;
+        phase = pos - len;
+      };
+      source.connect(scriptNode);
+      scriptNode.connect(sink);
+      processor = scriptNode;
+    }
+
+    pcMic.audioCtx = ctx;
+    pcMic.sourceNode = source;
+    pcMic.processorNode = processor;
+    pcMic.sinkGain = sink;
+  }
+
+  async function startPcMicSession(mode) {
+    if (pcMic.busy) return false;
+    if (typeof navigator === "undefined" || !navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+      setPcMicStatus("当前浏览器不支持麦克风权限（请用 http://127.0.0.1:18080 打开）");
+      showBanner("err", "当前浏览器不支持麦克风接口，请确认使用 http://127.0.0.1:18080 打开控制台。");
+      return false;
+    }
+    if (typeof WebSocket === "undefined") {
+      setPcMicStatus("当前浏览器不支持 WebSocket");
+      return false;
+    }
+
+    pcMic.busy = true;
+    pcMic.mode = mode;
+    updatePcMicButtons();
+    setPcMicStatus("正在请求麦克风权限并连接语音通道…");
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+      pcMic.stream = stream;
+
+      const resp = await consolePost("/api/pc-mic/session", {
+        device_id: "pc-talk-local",
+        ensure_pc_audio: true,
+      });
+      const res = await resp.json();
+      if (!resp.ok || !res || !res.ok || !res.ws_path) {
+        throw new Error((res && res.error) || `会话创建失败 (HTTP ${resp.status})`);
+      }
+
+      await setupBrowserAudioCapture(stream);
+
+      const proto = (typeof window !== "undefined" && window.location && window.location.protocol === "https:") ? "wss://" : "ws://";
+      const host = (typeof window !== "undefined" && window.location && window.location.host) ? window.location.host : "127.0.0.1:18080";
+      const ws = new WebSocket(`${proto}${host}${res.ws_path}`);
+      ws.binaryType = "arraybuffer";
+      pcMic.ws = ws;
+
+      ws.onopen = () => {
+        if (pcMic.ws !== ws) return;
+        pcMic.connected = true;
+        pcMic.busy = false;
+        updatePcMicButtons();
+        sendPcMicJson({
+          type: "hello",
+          version: 1,
+          transport: "websocket",
+          features: { mcp: false },
+          audio_params: {
+            format: "pcm",
+            sample_rate: 16000,
+            channels: 1,
+            frame_duration: 60,
+          },
+        });
+      };
+
+      ws.onmessage = (ev) => {
+        if (pcMic.ws !== ws || typeof ev.data !== "string") return;
+        let msg = null;
+        try {
+          msg = JSON.parse(ev.data);
+        } catch (_) {
+          return;
+        }
+        if (!msg || typeof msg !== "object") return;
+        const mtype = msg.type;
+        if (mtype === "hello") {
+          pcMic.helloDone = true;
+          if (pcMic.mode === "auto") {
+            pcMic.sending = true;
+            sendPcMicJson({ type: "listen", state: "start", mode: "auto" });
+            setPcMicStatus(res.pc_audio_online === false
+              ? "已开麦聆听（提示：18900 电脑音响未在线，仅显示字幕）"
+              : "已开麦聆听中 · 直接对着电脑说话即可");
+          } else if (pcMic.mode === "manual") {
+            if (pcMic.pttPressed) {
+              pcMic.sending = true;
+              sendPcMicJson({ type: "listen", state: "start", mode: "manual" });
+              setPcMicStatus("按住说话中… 松手即刻识别");
+            } else {
+              pcMic.sending = false;
+              setPcMicStatus("语音通道已就绪 · 按住「按住说话」即可讲话");
+            }
+          }
+          updatePcMicButtons();
+          return;
+        }
+        if (mtype === "stt") {
+          const sttTxt = String(msg.text || "").trim();
+          if (sttTxt) {
+            setPcMicStatus(`识别到：${sttTxt.slice(0, 28)}`);
+            pollState(true);
+          }
+          return;
+        }
+        if (mtype === "tts") {
+          const st = msg.state;
+          if (st === "start" || st === "sentence_start") {
+            clearPcMicUnmuteTimer();
+            pcMic.assistantSpeaking = true;
+            if (!isPcMicFullDuplex()) {
+              setPcMicStatus("小智说话中（已自动闭麦防回声 · 点「打断」可插话）");
+            } else {
+              setPcMicStatus("小智说话中（耳机全双工 · 可随时插话）");
+            }
+            if (st === "sentence_start") pollState(true);
+          } else if (st === "stop") {
+            clearPcMicUnmuteTimer();
+            pcMic.unmuteTimer = setTimeout(() => {
+              pcMic.unmuteTimer = null;
+              pcMic.assistantSpeaking = false;
+              if (pcMic.connected && pcMic.mode === "auto") {
+                setPcMicStatus("已开麦聆听中 · 直接对着电脑说话即可");
+              } else if (pcMic.connected && pcMic.mode === "manual") {
+                setPcMicStatus("按住「按住说话」继续对话");
+              }
+            }, isPcMicFullDuplex() ? 60 : 350);
+            pollState(true);
+          }
+        }
+      };
+
+      ws.onerror = () => {
+        if (pcMic.ws !== ws) return;
+        stopPcMic(false, "语音连接异常断开，请重新开麦");
+      };
+
+      ws.onclose = () => {
+        if (pcMic.ws !== ws) return;
+        stopPcMic(false, "语音会话已结束（点击重新开麦）");
+      };
+      return true;
+    } catch (err) {
+      stopPcMic(false, `开麦失败：${err && err.message ? err.message : err}`);
+      showBanner("err", `电脑麦克风启动失败：${err && err.message ? err.message : err}`);
+      return false;
+    }
+  }
+
+  function interruptPcMicPlayback() {
+    if (!pcMic.connected) return;
+    clearPcMicUnmuteTimer();
+    pcMic.assistantSpeaking = false;
+    sendPcMicJson({ type: "abort", reason: "wake_word_detected" });
+    if (pcMic.mode === "auto") {
+      pcMic.sending = true;
+      sendPcMicJson({ type: "listen", state: "start", mode: "auto" });
+      setPcMicStatus("已打断 · 请继续说话");
+    } else {
+      setPcMicStatus("已打断播报");
+    }
+  }
+
+  if (els.pcMicToggleBtn) {
+    els.pcMicToggleBtn.addEventListener("click", () => {
+      if (pcMic.connected || pcMic.ws) {
+        stopPcMic(false, "电脑麦克风已关闭");
+      } else {
+        startPcMicSession("auto");
+      }
+    });
+  }
+
+  if (els.pcMicPttBtn) {
+    const startPtt = async (ev) => {
+      if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
+      if (pcMic.busy) return;
+      pcMic.pttPressed = true;
+      updatePcMicButtons();
+      if (!pcMic.connected) {
+        await startPcMicSession("manual");
+        return;
+      }
+      pcMic.mode = "manual";
+      if (pcMic.assistantSpeaking) {
+        clearPcMicUnmuteTimer();
+        pcMic.assistantSpeaking = false;
+        sendPcMicJson({ type: "abort", reason: "wake_word_detected" });
+      }
+      pcMic.sending = true;
+      sendPcMicJson({ type: "listen", state: "start", mode: "manual" });
+      setPcMicStatus("按住说话中… 松手即刻识别");
+    };
+    const endPtt = () => {
+      if (!pcMic.pttPressed) return;
+      pcMic.pttPressed = false;
+      updatePcMicButtons();
+      if (pcMic.connected && pcMic.helloDone && pcMic.sending) {
+        pcMic.sending = false;
+        sendPcMicJson({ type: "listen", state: "stop" });
+        setPcMicStatus("正在识别刚才那句话…");
+      }
+    };
+    els.pcMicPttBtn.addEventListener("pointerdown", startPtt);
+    els.pcMicPttBtn.addEventListener("pointerup", endPtt);
+    els.pcMicPttBtn.addEventListener("pointercancel", endPtt);
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      window.addEventListener("pointerup", endPtt);
+    }
+  }
+
+  if (els.pcMicInterruptBtn) {
+    els.pcMicInterruptBtn.addEventListener("click", () => interruptPcMicPlayback());
+  }
+
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("beforeunload", () => stopPcMic(true));
+  }
+
+  setActiveConfigTab(readSavedConfigTab(), false);
   loadAudioCatalog();
   fetchDreamStatus(true);
   fetchProactiveStatus(true);
