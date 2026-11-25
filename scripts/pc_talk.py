@@ -597,6 +597,10 @@ class PcMicBridge:
             self._unmute_after = 0.0
         if rec is not None:
             rec.stop()
+            try:
+                self._ws.send_json({"type": "listen", "state": "stop", "pc_mic_state": "off"})
+            except Exception:
+                pass
 
 
 def run_interactive_loop(

@@ -243,7 +243,7 @@ def _build_plan(
             plan.append(
                 (
                     "unit",
-                    "Host Node.js vm console frontend audit (CAS rollback, Dream offline, semantic UI, DOM IDs)",
+                    "Host Node.js vm console frontend audit (CAS rollback, Dream offline, semantic UI, PC wake switch, DOM IDs)",
                     [
                         sys.executable,
                         "-c",
@@ -252,8 +252,12 @@ def _build_plan(
                             "os.environ['XIAOZHI_REQUIRE_NODE_VM'] = '1'; "
                             f"os.environ['XIAOZHI_APP_DIR'] = {str(APP_DIR)!r}; "
                             f"sys.path.insert(0, {str(TESTS_CONTAINER_DIR)!r}); "
-                            "import test_diva_borrowed_mechanisms as m; "
-                            "suite = unittest.TestSuite([m.TestDivaBorrowedMechanisms('test_r2_frontend_dom_audit_and_vm_cas_offline_semantic_checks')]); "
+                            "import test_diva_borrowed_mechanisms as m1; "
+                            "import test_pc_mic_input as m2; "
+                            "suite = unittest.TestSuite(["
+                            "m1.TestDivaBorrowedMechanisms('test_r2_frontend_dom_audit_and_vm_cas_offline_semantic_checks'), "
+                            "m2.TestPcMicInputAndBridge('test_09_console_pc_wake_toggle_switch_ui_wiring')"
+                            "]); "
                             "res = unittest.TextTestRunner(verbosity=2).run(suite); "
                             "raise SystemExit(0 if res.wasSuccessful() else 1)"
                         ),

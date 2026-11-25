@@ -17,6 +17,7 @@ import patch_registry
 import runtime_events
 import runtime_settings
 import xz_common
+from patches import pc_pcm_input
 from patches.emotion import splitter, tags, tts_route
 
 _WAKEUP_YAML_LOCK = threading.Lock()
@@ -300,6 +301,13 @@ def apply_mei_wakeup_responses_patch() -> None:
 
     @functools.wraps(_orig_check_wakeup)
     async def _mei_aware_check_wakeup_words(conn, text, *args, **kwargs):
+        if pc_pcm_input.should_suppress_hardware_conn(conn):
+            pc_pcm_input.schedule_close_suppressed_hardware_conn(
+                conn,
+                reason="wakeup_while_pc_mic_active",
+                delay_sec=0.0,
+            )
+            return True
         sync_wakeup_words_from_yaml(conn)
         tts = getattr(conn, "tts", None)
         # Wait briefly if TTS is still initializing (same behavior as upstream)
@@ -317,7 +325,22 @@ def apply_mei_wakeup_responses_patch() -> None:
             else None
         )
         if tts is None or char_key is None:
-            matched = await _orig_check_wakeup(conn, text, *args, **kwargs)
+            delegate_text = text
+            cfg_dict = getattr(conn, "config", None)
+            if isinstance(cfg_dict, dict) and isinstance(cfg_dict.get("wakeup_words"), list):
+                norm_list = []
+                for w in cfg_dict.get("wakeup_words") or []:
+                    nw = _normalize_wakeup_word(w)
+                    if nw and nw not in norm_list:
+                        norm_list.append(nw)
+                cfg_dict["wakeup_words"] = norm_list
+                _, filtered_chk = hello_mod.remove_punctuation_and_length(str(text or ""))
+                low_chk = filtered_chk.lower()
+                for nw in norm_list:
+                    if nw.lower() == low_chk:
+                        delegate_text = nw
+                        break
+            matched = await _orig_check_wakeup(conn, delegate_text, *args, **kwargs)
             if matched and tts is not None:
                 tts_route.prime_gsv_async(tts, reason="wakeup")
             return matched
@@ -434,6 +457,30 @@ def apply_mei_wakeup_responses_patch() -> None:
         if _orig_handle_hello is not None:
             @functools.wraps(_orig_handle_hello)
             async def _prime_aware_handle_hello(conn, msg_json, *args, **kwargs):
+                audio_params = msg_json.get("audio_params") if isinstance(msg_json, dict) else None
+                req_fmt = str(
+                    (audio_params or {}).get("format") or getattr(conn, "audio_format", "opus") or "opus"
+                ).strip().lower()
+                if req_fmt != "pcm" and pc_pcm_input.has_active_pc_mic_connection(exclude=conn):
+                    try:
+                        conn.audio_format = req_fmt or "opus"
+                        conn._yielded_to_pc_mic = True
+                        welcome = getattr(conn, "welcome_msg", None)
+                        if isinstance(welcome, dict):
+                            payload = dict(welcome)
+                            if audio_params:
+                                payload["audio_params"] = audio_params
+                            ws = getattr(conn, "websocket", None)
+                            if ws is not None and callable(getattr(ws, "send", None)):
+                                await ws.send(json.dumps(payload))
+                    except Exception:
+                        pass
+                    pc_pcm_input.schedule_close_suppressed_hardware_conn(
+                        conn,
+                        reason="hello_while_pc_mic_active",
+                        delay_sec=0.3,
+                    )
+                    return
                 tts_route.prime_gsv_async(getattr(conn, "tts", None), reason="hello")
                 return await _orig_handle_hello(conn, msg_json, *args, **kwargs)
 
@@ -474,7 +521,94 @@ def apply_mei_wakeup_responses_patch() -> None:
 
             @functools.wraps(_orig_listen_handle)
             async def _interrupt_aware_listen_handle(self, conn, msg_json, *args, **kwargs):
-                if isinstance(msg_json, dict) and msg_json.get("state") == "start":
+                if isinstance(msg_json, dict):
+                    listen_state = str(msg_json.get("state") or "").strip().lower()
+                    if pc_pcm_input.is_pcm_audio_connection(conn):
+                        wake_action = str(msg_json.get("pc_wake_action") or "").strip().lower()
+                        has_wake_flag = "pc_wake_mode" in msg_json
+                        wake_flag = bool(msg_json.get("pc_wake_mode"))
+                        if wake_action == "sleep":
+                            if "mode" in msg_json:
+                                conn.client_listen_mode = msg_json["mode"]
+                            pc_pcm_input.mark_pc_mic_active(conn, True)
+                            pc_pcm_input.preempt_other_pc_mic_connections(conn)
+                            pc_pcm_input.preempt_hardware_connections_for_pc_mic(conn)
+                            await pc_pcm_input.enter_pc_wake_standby(
+                                conn,
+                                reason="manual_sleep",
+                                flush_session=True,
+                                abort_speaking=True,
+                            )
+                            return
+                        if listen_state == "start":
+                            pc_pcm_input.mark_pc_mic_active(conn, True)
+                            pc_pcm_input.preempt_other_pc_mic_connections(conn)
+                            pc_pcm_input.preempt_hardware_connections_for_pc_mic(conn)
+                            if has_wake_flag and wake_flag:
+                                conn.client_listen_mode = str(msg_json.get("mode") or "auto")
+                                if wake_action == "keep_awake" and pc_pcm_input.is_pc_wake_awake(conn):
+                                    try:
+                                        conn.just_woken_up = False
+                                        conn._vad_post_wakeup_pending = False
+                                        conn.close_after_chat = False
+                                        conn._idle_farewell_cancelled = True
+                                        conn.last_activity_time = time.time() * 1000.0
+                                    except Exception:
+                                        pass
+                                    vad_task = getattr(conn, "vad_resume_task", None)
+                                    if vad_task is not None and callable(getattr(vad_task, "done", None)) and not vad_task.done():
+                                        try:
+                                            vad_task.cancel()
+                                        except Exception:
+                                            pass
+                                    if callable(getattr(conn, "reset_audio_states", None)):
+                                        conn.reset_audio_states()
+                                    try:
+                                        runtime_events.publish_event(
+                                            "listen_start",
+                                            device_id=str(getattr(conn, "device_id", "") or ""),
+                                        )
+                                    except Exception:
+                                        pass
+                                    return
+                                await pc_pcm_input.enter_pc_wake_standby(
+                                    conn,
+                                    reason="client_start",
+                                    flush_session=False,
+                                )
+                                return
+                            if has_wake_flag and not wake_flag and pc_pcm_input.is_pc_wake_mode(conn):
+                                await pc_pcm_input.exit_pc_wake_mode(
+                                    conn,
+                                    reason="switch_mode",
+                                    send_state=True,
+                                )
+                        elif (
+                            listen_state == "stop"
+                            and str(msg_json.get("pc_mic_state") or "").strip().lower() == "off"
+                        ):
+                            if pc_pcm_input.is_pc_wake_mode(conn):
+                                await pc_pcm_input.exit_pc_wake_mode(
+                                    conn,
+                                    reason="client_off",
+                                    send_state=False,
+                                )
+                            pc_pcm_input.mark_pc_mic_active(conn, False)
+                            if callable(getattr(conn, "reset_audio_states", None)):
+                                conn.reset_audio_states()
+                            return
+                    elif pc_pcm_input.should_suppress_hardware_conn(conn):
+                        await pc_pcm_input.close_suppressed_hardware_conn(
+                            conn,
+                            reason=f"listen_{listen_state or 'event'}_while_pc_mic_active",
+                            delay_sec=0.0,
+                        )
+                        return
+                if (
+                    isinstance(msg_json, dict)
+                    and msg_json.get("state") == "start"
+                    and not pc_pcm_input.is_pc_wake_standby(conn)
+                ):
                     try:
                         runtime_events.publish_event(
                             "listen_start",

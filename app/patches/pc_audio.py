@@ -1260,12 +1260,43 @@ def apply_pc_audio_playback_patches() -> None:
     send_audio_mod._wait_for_audio_completion = _pc_aware_wait_completion
     rebound_all = patch_registry.rebind(_orig_wait_completion, _pc_aware_wait_completion)
 
+    async def _finalize_pc_wake_after_tts_stop(conn, cur_sid) -> None:
+        if conn is None or getattr(conn, "client_abort", False):
+            return
+        if cur_sid is not None and getattr(conn, "sentence_id", None) != cur_sid:
+            return
+        try:
+            from patches import pc_pcm_input as _pc_mic_mod
+        except Exception:
+            return
+        if _pc_mic_mod.is_pcm_audio_connection(conn) and getattr(conn, "just_woken_up", False):
+            try:
+                conn.just_woken_up = False
+            except Exception:
+                pass
+            vad_task = getattr(conn, "vad_resume_task", None)
+            if vad_task is not None and callable(getattr(vad_task, "done", None)) and not vad_task.done():
+                try:
+                    vad_task.cancel()
+                except Exception:
+                    pass
+        if _pc_mic_mod.is_pc_wake_mode(conn) and getattr(conn, "close_after_chat", False):
+            try:
+                conn.close_after_chat = False
+            except Exception:
+                pass
+            await _pc_mic_mod.enter_pc_wake_standby(
+                conn,
+                reason="chat_exit",
+                flush_session=True,
+            )
+
     # 2. Patch send_tts_message and rebind across ALL sys.modules (including listenMessageHandler & helloHandle!)
     @functools.wraps(_orig_send_tts_message)
     async def _pc_aware_send_tts_message(conn, state, text=None, *args, **kwargs):
+        cur_sid = getattr(conn, "sentence_id", None) if conn is not None else None
         if conn is not None:
             _ensure_conn_pc_state(conn)
-            cur_sid = getattr(conn, "sentence_id", None)
 
             if state == "sentence_start":
                 clip = _pop_pc_clip_for_sentence(conn, cur_sid, text)
@@ -1338,12 +1369,17 @@ def apply_pc_audio_playback_patches() -> None:
                             conn._pc_audio_enqueued_sid = None
                     conn._pc_audio_skip_wait_once = cur_sid
                     try:
-                        return await _orig_send_tts_message(conn, state, text, *args, **kwargs)
+                        res = await _orig_send_tts_message(conn, state, text, *args, **kwargs)
                     finally:
                         if getattr(conn, "_pc_audio_skip_wait_once", None) == cur_sid:
                             conn._pc_audio_skip_wait_once = None
+                    await _finalize_pc_wake_after_tts_stop(conn, cur_sid)
+                    return res
 
-        return await _orig_send_tts_message(conn, state, text, *args, **kwargs)
+        res = await _orig_send_tts_message(conn, state, text, *args, **kwargs)
+        if state == "stop" and conn is not None:
+            await _finalize_pc_wake_after_tts_stop(conn, cur_sid)
+        return res
 
     send_audio_mod.send_tts_message = _pc_aware_send_tts_message
     send_audio_mod._pc_audio_playback_patched = True
@@ -1385,13 +1421,47 @@ def apply_pc_audio_playback_patches() -> None:
     @functools.wraps(_orig_abort)
     async def _pc_aware_abort(conn, *args, **kwargs):
         if conn is not None:
+            try:
+                from patches import pc_pcm_input as _pc_mic_mod
+
+                if _pc_mic_mod.should_suppress_hardware_conn(conn):
+                    _pc_mic_mod.schedule_close_suppressed_hardware_conn(
+                        conn,
+                        reason="abort_while_pc_mic_active",
+                        delay_sec=0.0,
+                    )
+                    return
+                if _pc_mic_mod.is_pcm_audio_connection(conn) and getattr(conn, "just_woken_up", False):
+                    try:
+                        conn.just_woken_up = False
+                        conn._vad_post_wakeup_pending = False
+                    except Exception:
+                        pass
+                    vad_task = getattr(conn, "vad_resume_task", None)
+                    if vad_task is not None and callable(getattr(vad_task, "done", None)) and not vad_task.done():
+                        try:
+                            vad_task.cancel()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             _ensure_conn_pc_state(conn)
             _clear_pc_clips(conn)
             _clear_pc_stream_chunks(conn)
-            was_pc = (
+            owns_pc_audio = (
                 conn._pc_audio_active_sid is not None
                 or conn._pc_audio_enqueued_sid is not None
-                or read_audio_output_config()["target"] == "pc"
+            )
+            other_speaking_pc = any(
+                other is not conn
+                and (
+                    getattr(other, "_pc_audio_active_sid", None) is not None
+                    or getattr(other, "_pc_audio_enqueued_sid", None) is not None
+                )
+                for other in runtime_events.get_active_connections()
+            )
+            was_pc = owns_pc_audio or (
+                read_audio_output_config()["target"] == "pc" and not other_speaking_pc
             )
             with conn._pc_audio_queue_lock:
                 conn._pc_audio_active_sid = None

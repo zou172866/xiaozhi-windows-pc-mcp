@@ -17,6 +17,7 @@ import runtime_events
 import runtime_settings
 import turn_context_router
 import xz_common
+from patches import pc_pcm_input
 from patches.emotion import tags
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -210,22 +211,31 @@ def apply_idle_farewell_patch() -> None:
         return
     _last_farewell = {"text": ""}
 
+    async def _close_or_standby(conn: Any, *, reason: str = "idle_timeout") -> None:
+        if pc_pcm_input.is_pc_wake_mode(conn):
+            conn.close_after_chat = False
+            await pc_pcm_input.enter_pc_wake_standby(conn, reason=reason, flush_session=True)
+            return
+        await conn.close()
+
     async def _speak_or_close(conn: Any, chosen: str, *, timeout_sec: int, default_emotion: str, reason: str) -> None:
         conn.close_after_chat = True
         conn.client_abort = False
 
         if not chosen:
             conn.logger.bind(tag=recv_mod.TAG).info(
-                f"无声超时 {timeout_sec}s（{reason}），无有效告别台词，静默断开连接"
+                f"无声超时 {timeout_sec}s（{reason}），无有效告别台词，{'电脑麦退回唤醒待命' if pc_pcm_input.is_pc_wake_mode(conn) else '静默断开连接'}"
             )
-            await conn.close()
+            await _close_or_standby(conn, reason="idle_timeout")
             return
 
         tts = getattr(conn, "tts", None)
         tts_q = getattr(tts, "tts_text_queue", None)
         if tts is None or tts_q is None:
-            conn.logger.bind(tag=recv_mod.TAG).info("无声超时但 TTS 通道未就绪，直接断开连接")
-            await conn.close()
+            conn.logger.bind(tag=recv_mod.TAG).info(
+                f"无声超时但 TTS 通道未就绪，{'电脑麦退回唤醒待命' if pc_pcm_input.is_pc_wake_mode(conn) else '直接断开连接'}"
+            )
+            await _close_or_standby(conn, reason="idle_timeout")
             return
 
         mei_active = tags.is_emotion_routed_gsv_voice(getattr(tts, "ref_audio_path", ""), tts=tts)
@@ -237,9 +247,9 @@ def apply_idle_farewell_patch() -> None:
         _, stripped_spoken = tags.extract_and_strip_emotion(tts_payload_text, flush_incomplete=True)
         if not tags.clean_segment_for_tts(stripped_spoken):
             conn.logger.bind(tag=recv_mod.TAG).info(
-                f"无声超时 {timeout_sec}s，告别语无有效朗读内容，静默断开连接"
+                f"无声超时 {timeout_sec}s，告别语无有效朗读内容，{'电脑麦退回唤醒待命' if pc_pcm_input.is_pc_wake_mode(conn) else '静默断开连接'}"
             )
-            await conn.close()
+            await _close_or_standby(conn, reason="idle_timeout")
             return
 
         sid = uuid.uuid4().hex
@@ -275,6 +285,12 @@ def apply_idle_farewell_patch() -> None:
     @functools.wraps(_orig_no_voice_close)
     async def _custom_no_voice_close_connect(conn, have_voice, *args, **kwargs):
         now_ms = time.time() * 1000.0
+        if pc_pcm_input.is_pc_wake_standby(conn):
+            conn.last_activity_time = now_ms
+            if int(getattr(conn, "timeout_seconds", 0) or 0) < pc_pcm_input.PC_WAKE_STANDBY_HARD_TIMEOUT_SEC:
+                conn.timeout_seconds = pc_pcm_input.PC_WAKE_STANDBY_HARD_TIMEOUT_SEC
+            return
+
         if have_voice:
             conn.last_activity_time = now_ms
             if getattr(conn, "_idle_farewell_inflight", False):
@@ -308,9 +324,9 @@ def apply_idle_farewell_patch() -> None:
             conn.close_after_chat = True
             conn.client_abort = False
             conn.logger.bind(tag=recv_mod.TAG).info(
-                f"无声超时 {timeout_sec}s，已关闭超时告别语，静默断开连接"
+                f"无声超时 {timeout_sec}s，已关闭超时告别语，{'电脑麦退回唤醒待命' if pc_pcm_input.is_pc_wake_mode(conn) else '静默断开连接'}"
             )
-            await conn.close()
+            await _close_or_standby(conn, reason="idle_timeout")
             return
 
         mode = str(farewell_cfg.get("mode") or "fixed").strip().lower()
@@ -340,6 +356,7 @@ def apply_idle_farewell_patch() -> None:
                             or getattr(conn, "client_abort", False)
                             or getattr(conn, "close_after_chat", False)
                             or getattr(conn, "client_is_speaking", False)
+                            or pc_pcm_input.is_pc_wake_standby(conn)
                             or (stop_ev is not None and stop_ev.is_set())
                             or float(getattr(conn, "last_activity_time", 0.0)) > trigger_activity_ts
                         ):
@@ -371,8 +388,10 @@ def apply_idle_farewell_patch() -> None:
                         conn.logger.bind(tag=recv_mod.TAG).warning(
                             f"AI 总结告别任务异常，尝试安全收尾: {exc}"
                         )
-                        if not getattr(conn, "_idle_farewell_cancelled", False) and not getattr(
-                            conn, "close_after_chat", False
+                        if (
+                            not getattr(conn, "_idle_farewell_cancelled", False)
+                            and not getattr(conn, "close_after_chat", False)
+                            and not pc_pcm_input.is_pc_wake_standby(conn)
                         ):
                             fb = select_idle_farewell_text(fallback_messages, last_text=_last_farewell["text"])
                             await _speak_or_close(

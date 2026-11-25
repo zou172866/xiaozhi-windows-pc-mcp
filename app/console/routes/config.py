@@ -92,7 +92,17 @@ def _update_idle_farewell_config(payload: dict) -> tuple[bool, dict | str]:
                 srv.config["close_connection_no_voice_time"] = eff_timeout
         for conn in runtime_events.get_active_connections():
             if hasattr(conn, "timeout_seconds"):
-                conn.timeout_seconds = eff_hard
+                keep_standby = False
+                try:
+                    from patches import pc_pcm_input as _pc_mic_mod
+
+                    if _pc_mic_mod.is_pc_wake_standby(conn):
+                        keep_standby = True
+                        conn._pc_wake_prev_timeout_seconds = eff_hard
+                except Exception:
+                    keep_standby = False
+                if not keep_standby:
+                    conn.timeout_seconds = eff_hard
             if isinstance(getattr(conn, "config", None), dict):
                 conn.config["close_connection_no_voice_time"] = eff_timeout
     except Exception as exc:

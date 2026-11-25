@@ -262,6 +262,14 @@ class TestPcMicWinMMAndDesktopClients(unittest.TestCase):
 
         bridge.stop()
         self.assertFalse(bridge.is_running)
+        self.assertEqual(
+            ws.json_msgs[-1],
+            {"type": "listen", "state": "stop", "pc_mic_state": "off"},
+        )
+        # Idempotent stop does not emit duplicate release signals
+        msg_count = len(ws.json_msgs)
+        bridge.stop()
+        self.assertEqual(len(ws.json_msgs), msg_count)
 
     def test_03_widget_mic_controller_default_off_and_bat_encoding_contract(self):
         widget = _load_script("desktop_companion_mic_test", SCRIPTS_DIR / "desktop_companion.py")

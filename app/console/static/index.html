@@ -1168,6 +1168,19 @@
     <div class="log-stream" id="logStream"></div>
 
     <div class="pc-mic-bar" aria-label="电脑麦克风语音对话">
+      <div class="pc-mic-wake-row" id="pcMicWakeRow">
+        <div class="pc-mic-wake-info">
+          <div class="pc-mic-wake-head">
+            <label for="pcMicWakeToggle" class="pc-mic-wake-title">电脑麦替代 ESP32（唤醒待命）</label>
+            <span id="pcMicWakeBadge" class="pc-mic-wake-badge">已关闭</span>
+          </div>
+          <span id="pcMicWakeHint" class="pc-mic-wake-hint">开启后喊唤醒词自动唤醒，说「退出」回待命，关闭即恢复 ESP32</span>
+        </div>
+        <label class="toggle-switch pc-mic-wake-switch" title="开启后用电脑麦克风替代 ESP32 收音：喊唤醒词自动唤醒，说「退出」回待命；关闭即恢复 ESP32">
+          <input type="checkbox" id="pcMicWakeToggle" role="switch" aria-label="电脑麦唤醒待命开关">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
       <div class="pc-mic-controls">
         <button type="button" class="btn pc-mic-btn" id="pcMicToggleBtn" title="使用电脑麦克风直接与小智连续对话">
           <svg class="icon" viewBox="0 0 24 24">

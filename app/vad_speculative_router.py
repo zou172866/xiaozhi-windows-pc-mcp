@@ -32,6 +32,7 @@ import patch_registry
 import runtime_settings
 import vocal_cue_router
 import voiceprint_router
+from patches import pc_pcm_input
 
 TAG = "vad_speculative_router"
 
@@ -527,11 +528,27 @@ async def _run_speculative_decode_task(
         # Speech may have resumed or state reset while Sherpa was decoding!
         if state.generation != gen:
             return
-        should_commit, reason = judge_utterance_completeness(
-            text,
-            cfg=cfg,
-            is_story_or_dictation=story_or_dictation,
-        )
+        if pc_pcm_input.is_pc_wake_standby(conn):
+            matched_wake, remainder = pc_pcm_input.match_pc_wakeup_word(conn, text)
+            if matched_wake:
+                if not remainder:
+                    should_commit, reason = True, f"pc_wake_word:{matched_wake}"
+                else:
+                    rem_story = is_story_or_dictation_mode(conn, audio_bytes_len=len(pcm_snapshot))
+                    should_commit, rem_reason = judge_utterance_completeness(
+                        remainder,
+                        cfg=cfg,
+                        is_story_or_dictation=rem_story,
+                    )
+                    reason = f"pc_wake_cmd:{rem_reason}" if should_commit else f"pc_wake_cmd_hold:{rem_reason}"
+            else:
+                should_commit, reason = False, "pc_wake_standby_non_wake"
+        else:
+            should_commit, reason = judge_utterance_completeness(
+                text,
+                cfg=cfg,
+                is_story_or_dictation=story_or_dictation,
+            )
         if state.generation != gen:
             return
         state.result_gen = gen
@@ -540,7 +557,7 @@ async def _run_speculative_decode_task(
         state.result_pcm_len = len(pcm_snapshot)
         state.should_commit = should_commit
         state.reason = reason
-        if not should_commit:
+        if not should_commit and reason != "pc_wake_standby_non_wake":
             if reason.startswith(("hesitation_suffix", "unpaired_clause", "trailing_continuation_punct", "incomplete_transitive")):
                 _bump_stat("held_hesitation", 1)
             else:
@@ -579,37 +596,50 @@ def _stash_asr_speculative_hit(
     pcm_len: int,
     text: str,
     vocal_cue: Optional[Dict[str, Any]] = None,
+    *,
+    from_speculative: bool = True,
 ) -> None:
     cache = getattr(asr, "_vad_spec_text_cache", None)
     if not isinstance(cache, dict):
         cache = {}
         asr._vad_spec_text_cache = cache
-    cache[str(session_id or "")] = (int(pcm_len), str(text), time.monotonic(), vocal_cue)
+    cache[str(session_id or "")] = (int(pcm_len), str(text), time.monotonic(), vocal_cue, bool(from_speculative))
     if len(cache) > 64:
         oldest = next(iter(cache))
         cache.pop(oldest, None)
 
 
-def _pop_asr_speculative_hit_with_cue(
+def _pop_asr_speculative_hit_with_meta(
     asr: Any, session_id: str, pcm_len: int
-) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], bool]:
     cache = getattr(asr, "_vad_spec_text_cache", None)
     if not isinstance(cache, dict):
-        return None, None
+        return None, None, False
     entry = cache.pop(str(session_id or ""), None)
     if entry is None:
-        return None, None
-    if len(entry) >= 4:
+        return None, None, False
+    if len(entry) >= 5:
+        cached_len, cached_text, ts, cached_cue, from_spec = entry[0], entry[1], entry[2], entry[3], bool(entry[4])
+    elif len(entry) >= 4:
         cached_len, cached_text, ts, cached_cue = entry[0], entry[1], entry[2], entry[3]
+        from_spec = True
     else:
         cached_len, cached_text, ts = entry[0], entry[1], entry[2]
         cached_cue = None
+        from_spec = True
     # Allow up to ~900ms (15 frames = 28800 bytes) of trailing silence appended between speculative trigger and commit/1100ms cutoff
     if (time.monotonic() - ts) > 3.0:
-        return None, None
+        return None, None, False
     if pcm_len < cached_len or (pcm_len - cached_len) > 1920 * 15:
-        return None, None
-    return cached_text, cached_cue
+        return None, None, False
+    return cached_text, cached_cue, from_spec
+
+
+def _pop_asr_speculative_hit_with_cue(
+    asr: Any, session_id: str, pcm_len: int
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    hit_text, hit_cue, _ = _pop_asr_speculative_hit_with_meta(asr, session_id, pcm_len)
+    return hit_text, hit_cue
 
 
 def _pop_asr_speculative_hit(asr: Any, session_id: str, pcm_len: int) -> Optional[str]:
@@ -743,7 +773,12 @@ def apply_vad_speculative_patch() -> None:
                         if stop_duration_ms >= threshold_ms:
                             pcm_total_len = sum(len(f) for f in (getattr(conn, "asr_audio", None) or ())) + len(pcm_frame)
                             if pcm_total_len > _MIN_AUDIO_BYTES:
-                                story_mode = is_story_or_dictation_mode(conn, audio_bytes_len=pcm_total_len)
+                                in_pc_standby = pc_pcm_input.is_pc_wake_standby(conn)
+                                story_mode = (
+                                    False
+                                    if in_pc_standby
+                                    else is_story_or_dictation_mode(conn, audio_bytes_len=pcm_total_len)
+                                )
                                 if story_mode:
                                     state.triggered_gen = state.generation
                                     _bump_stat("story_mode_skips", 1)
@@ -761,11 +796,21 @@ def apply_vad_speculative_patch() -> None:
 
         return await _orig_receive_audio(self, conn, pcm_frame, audio_have_voice, *args, **kwargs)
 
+    def _extract_asr_text_for_pc_wake(raw_val: Any) -> str:
+        if isinstance(raw_val, dict):
+            raw_val = raw_val.get("content", "")
+        cleaned = _SENSEVOICE_TAG_RE.sub("", str(raw_val or "")).strip()
+        if cleaned:
+            cleaned = asr_corrections.apply_asr_corrections(cleaned)
+        return cleaned
+
     @functools.wraps(_orig_handle_voice_stop)
     async def _spec_aware_handle_voice_stop(self, conn, asr_audio_task, *args, **kwargs):
         sid = str(getattr(conn, "session_id", "") or "")
         st = getattr(conn, "_vad_spec_state", None)
-        stashed = False
+        pre_text: Optional[str] = None
+        pre_cue: Optional[Dict[str, Any]] = None
+        pre_pcm_len: int = 0
         if isinstance(st, _SpeculativeState):
             if (
                 not st.committed_text
@@ -788,17 +833,201 @@ def apply_vad_speculative_patch() -> None:
                     st.committed_pcm_len = st.result_pcm_len
                     _bump_stat("inflight_reuses", 1)
             if st.committed_text:
-                _stash_asr_speculative_hit(
-                    self,
-                    sid,
-                    st.committed_pcm_len,
-                    st.committed_text,
-                    vocal_cue=st.committed_vocal_cue,
-                )
-                stashed = True
+                pre_text = st.committed_text
+                pre_cue = st.committed_vocal_cue
+                pre_pcm_len = st.committed_pcm_len
                 st.committed_text = None
                 st.committed_vocal_cue = None
                 st.committed_pcm_len = 0
+
+        pcm_joined = b"".join(b for b in (asr_audio_task or ()) if isinstance(b, (bytes, bytearray)))
+        pcm_len = len(pcm_joined)
+        pre_usable = bool(
+            pre_text is not None
+            and (pcm_len == 0 or (pcm_len >= pre_pcm_len and (pcm_len - pre_pcm_len) <= 1920 * 15))
+        )
+
+        # Branch 1: PC wake-standby mode — locally decode, silently drop non-wakeup speech, wake on wakeup word
+        if pc_pcm_input.is_pc_wake_standby(conn):
+            decoded_text = ""
+            decoded_cue: Optional[Dict[str, Any]] = None
+            if pre_usable and pre_text is not None:
+                decoded_text = pre_text
+                decoded_cue = pre_cue
+                _bump_stat("cache_reuses", 1)
+            elif _is_sherpa_asr(self):
+                if pcm_joined:
+                    loop = asyncio.get_running_loop()
+                    executor = _get_asr_executor_safe()
+                    decoded_text, decoded_cue = await loop.run_in_executor(
+                        executor, _decode_pcm_with_sherpa_with_cue_sync, self, pcm_joined
+                    )
+            else:
+                raw_res = await _orig_stt_wrapper(self, asr_audio_task, sid)
+                raw_val = raw_res[0] if isinstance(raw_res, tuple) and raw_res else raw_res
+                decoded_text = _extract_asr_text_for_pc_wake(raw_val)
+                if vocal_cue_router.is_vocal_cue_enabled():
+                    raw_str = raw_val.get("content", "") if isinstance(raw_val, dict) else str(raw_val or "")
+                    if "<|" in raw_str:
+                        try:
+                            decoded_cue = vocal_cue_router.extract_vocal_cue(raw_str)
+                        except Exception:
+                            decoded_cue = None
+
+            stop_ws = getattr(self, "stop_ws_connection", None)
+            if callable(stop_ws):
+                try:
+                    stop_ws()
+                except Exception:
+                    pass
+
+            matched_wake, remainder = pc_pcm_input.match_pc_wakeup_word(conn, decoded_text)
+            if not matched_wake:
+                return
+            if remainder and pc_pcm_input.match_pc_exit_command(conn, remainder):
+                return
+
+            await pc_pcm_input.enter_pc_wake_awake(
+                conn,
+                wake_word=matched_wake,
+                text=remainder or matched_wake,
+            )
+            if remainder:
+                try:
+                    from patches.emotion import tts_route as _tts_route
+
+                    _tts_route.prime_gsv_async(getattr(conn, "tts", None), reason="wakeup")
+                except Exception:
+                    pass
+                if vocal_cue_router.is_vocal_cue_enabled():
+                    try:
+                        vocal_cue_router.record_vocal_cue(sid, decoded_cue, source="pc_wake_standby")
+                    except Exception:
+                        pass
+                if voiceprint_router.is_voiceprint_enabled() and pcm_joined:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        ex = _get_asr_executor_safe()
+                        await loop.run_in_executor(
+                            ex,
+                            lambda: voiceprint_router.identify_turn_pcm(
+                                sid,
+                                pcm_joined,
+                                transcript=str(remainder),
+                            ),
+                        )
+                    except Exception:
+                        pass
+                try:
+                    from core.handle.reportHandle import enqueue_asr_report
+
+                    enqueue_asr_report(conn, remainder, list(asr_audio_task or ()))
+                except Exception:
+                    pass
+                await recv_mod.startToChat(conn, remainder)
+                return
+
+            conn._vad_post_wakeup_pending = True
+            enable_greeting = (getattr(conn, "config", None) or {}).get("enable_greeting", True)
+            if not enable_greeting:
+                conn.just_woken_up = False
+                import core.handle.sendAudioHandle as send_audio_mod
+
+                await send_audio_mod.send_stt_message(conn, matched_wake)
+                await send_audio_mod.send_tts_message(conn, "stop", None)
+                conn.client_is_speaking = False
+                return
+
+            import core.handle.helloHandle as hello_mod
+
+            handled = await hello_mod.checkWakeupWords(conn, matched_wake)
+            if not handled:
+                if getattr(conn, "tts", None) is not None:
+                    await recv_mod.startToChat(conn, matched_wake)
+                else:
+                    conn.just_woken_up = False
+                    conn.client_is_speaking = False
+            return
+
+        # Branch 2: PC wake-awake mode — intercept exact exit commands back to standby (never drop WS)
+        stashed = False
+        override_set = False
+        if pc_pcm_input.is_pc_wake_awake(conn):
+            if _is_sherpa_asr(self) and getattr(self, "delete_audio_file", True):
+                used_spec_pre = False
+                if pre_usable and pre_text is not None:
+                    decoded_text = pre_text
+                    decoded_cue = pre_cue
+                    used_spec_pre = True
+                elif pcm_joined:
+                    loop = asyncio.get_running_loop()
+                    executor = _get_asr_executor_safe()
+                    decoded_text, decoded_cue = await loop.run_in_executor(
+                        executor, _decode_pcm_with_sherpa_with_cue_sync, self, pcm_joined
+                    )
+                else:
+                    decoded_text, decoded_cue = "", None
+
+                if pc_pcm_input.match_pc_exit_command(conn, decoded_text):
+                    stop_ws = getattr(self, "stop_ws_connection", None)
+                    if callable(stop_ws):
+                        try:
+                            stop_ws()
+                        except Exception:
+                            pass
+                    await pc_pcm_input.enter_pc_wake_standby(
+                        conn,
+                        reason="voice_exit",
+                        trigger_text=decoded_text,
+                        flush_session=True,
+                        abort_speaking=True,
+                    )
+                    return
+
+                _stash_asr_speculative_hit(
+                    self,
+                    sid,
+                    pcm_len,
+                    decoded_text,
+                    vocal_cue=decoded_cue,
+                    from_speculative=used_spec_pre,
+                )
+                stashed = True
+            else:
+                raw_res = await _orig_stt_wrapper(self, asr_audio_task, sid)
+                raw_val = raw_res[0] if isinstance(raw_res, tuple) and raw_res else raw_res
+                decoded_text = _extract_asr_text_for_pc_wake(raw_val)
+                if pc_pcm_input.match_pc_exit_command(conn, decoded_text):
+                    stop_ws = getattr(self, "stop_ws_connection", None)
+                    if callable(stop_ws):
+                        try:
+                            stop_ws()
+                        except Exception:
+                            pass
+                    await pc_pcm_input.enter_pc_wake_standby(
+                        conn,
+                        reason="voice_exit",
+                        trigger_text=decoded_text,
+                        flush_session=True,
+                        abort_speaking=True,
+                    )
+                    return
+                ov = getattr(self, "_pc_wake_stt_override", None)
+                if not isinstance(ov, dict):
+                    ov = {}
+                    self._pc_wake_stt_override = ov
+                ov[sid] = raw_res
+                override_set = True
+        elif pre_text:
+            _stash_asr_speculative_hit(
+                self,
+                sid,
+                pre_pcm_len,
+                pre_text,
+                vocal_cue=pre_cue,
+            )
+            stashed = True
+
         try:
             return await _orig_handle_voice_stop(self, conn, asr_audio_task, *args, **kwargs)
         finally:
@@ -808,14 +1037,24 @@ def apply_vad_speculative_patch() -> None:
                 cache = getattr(self, "_vad_spec_text_cache", None)
                 if isinstance(cache, dict):
                     cache.pop(sid, None)
+            if override_set:
+                ov = getattr(self, "_pc_wake_stt_override", None)
+                if isinstance(ov, dict):
+                    ov.pop(sid, None)
 
     @functools.wraps(_orig_stt_wrapper)
     async def _spec_aware_stt_wrapper(self, pcm_data, session_id, *args, **kwargs):
+        ov = getattr(self, "_pc_wake_stt_override", None)
+        if isinstance(ov, dict):
+            ov_res = ov.pop(str(session_id or ""), None)
+            if ov_res is not None:
+                return ov_res
         if getattr(self, "delete_audio_file", True):
             pcm_len = sum(len(b) for b in (pcm_data or ()))
-            hit, hit_cue = _pop_asr_speculative_hit_with_cue(self, str(session_id or ""), pcm_len)
+            hit, hit_cue, from_spec = _pop_asr_speculative_hit_with_meta(self, str(session_id or ""), pcm_len)
             if hit is not None:
-                _bump_stat("cache_reuses", 1)
+                if from_spec:
+                    _bump_stat("cache_reuses", 1)
                 if vocal_cue_router.is_vocal_cue_enabled():
                     try:
                         vocal_cue_router.record_vocal_cue(

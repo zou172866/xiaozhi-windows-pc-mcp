@@ -878,7 +878,78 @@
     background: var(--surface-subtle);
     display: flex;
     flex-direction: column;
+    gap: 7px;
+  }
+  .pc-mic-wake-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    transition: background-color 0.16s ease, border-color 0.16s ease;
+  }
+  .pc-mic-wake-row.is-standby {
+    background: var(--warn-tint);
+    border-color: #FCD34D;
+  }
+  .pc-mic-wake-row.is-awake {
+    background: var(--accent-tint);
+    border-color: var(--accent-border);
+  }
+  .pc-mic-wake-info {
+    min-width: 0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .pc-mic-wake-head {
+    display: flex;
+    align-items: center;
     gap: 6px;
+    flex-wrap: wrap;
+  }
+  .pc-mic-wake-title {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink);
+    cursor: pointer;
+    user-select: none;
+  }
+  .pc-mic-wake-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 7px;
+    border-radius: 99px;
+    font-size: 11px;
+    font-weight: 550;
+    border: 1px solid var(--border);
+    background: var(--surface-subtle);
+    color: var(--ink-muted);
+    white-space: nowrap;
+  }
+  .pc-mic-wake-badge.is-standby {
+    border-color: #F59E0B;
+    background: #FEF3C7;
+    color: var(--warn);
+  }
+  .pc-mic-wake-badge.is-awake {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #FFFFFF;
+  }
+  .pc-mic-wake-hint {
+    font-size: 11.5px;
+    line-height: 1.4;
+    color: var(--ink-secondary);
+    white-space: normal;
+  }
+  .pc-mic-wake-row.is-standby .pc-mic-wake-switch input:checked + .toggle-slider {
+    background: #D97706;
   }
   .pc-mic-controls {
     display: flex;
