@@ -49,6 +49,18 @@ foreach ($proc in (Get-CimInstance Win32_Process | Where-Object { Test-ProjectPy
     Stop-ProjectPythonProcess $proc $mcpScript
 }
 
+$widgetScript = Join-Path $serverDir "scripts\desktop_companion.py"
+foreach ($wproc in (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { Test-ProjectPythonProcess $_ $widgetScript })) {
+    try {
+        Stop-ProjectPythonProcess $wproc $widgetScript
+        Write-Host "  已关闭桌角陪伴小窗进程 PID=$($wproc.ProcessId)" -ForegroundColor DarkGray
+    } catch {}
+}
+$widgetPidFile = Join-Path $serverDir "state\desktop_companion.pid"
+if (Test-Path $widgetPidFile) {
+    Remove-Item -Path $widgetPidFile -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "[3/5] 正在关闭本地 19880 语音合成进程..." -ForegroundColor Cyan
 $gsvConfig = Join-Path $serverDir "config\runtime\tts_infer_xiaozhi.yaml"
 foreach ($listener in (Get-NetTCPConnection -LocalPort 19880 -State Listen -ErrorAction SilentlyContinue)) {

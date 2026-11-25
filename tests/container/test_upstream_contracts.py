@@ -44,12 +44,12 @@ class TestUpstreamImageContracts(unittest.TestCase):
             f"Upstream SERVER_VERSION mismatch: got {info.get('actual')!r}, expected {info.get('expected')!r}",
         )
 
-    def test_all_21_patches_registered_ok_and_match_catalog(self):
+    def test_all_22_patches_registered_ok_and_match_catalog(self):
         catalog = self.patch_registry.get_patch_catalog()
         catalog_names = [p["name"] for p in catalog]
         self.assertEqual(len(catalog_names), len(set(catalog_names)), "Duplicate names in PATCH_CATALOG")
         expected_patches = set(catalog_names)
-        self.assertEqual(len(expected_patches), 21, f"Expected 21 cataloged patches, got {len(expected_patches)}")
+        self.assertEqual(len(expected_patches), 22, f"Expected 22 cataloged patches, got {len(expected_patches)}")
 
         # Verify security category metadata matches SECURITY_PATCH_NAMES 1-to-1
         for entry in catalog:
@@ -144,6 +144,12 @@ class TestUpstreamImageContracts(unittest.TestCase):
         self.assertTrue(getattr(AliyunBLStreamASR, "_cloud_audio_patched", False))
         self.assertTrue(getattr(DoubaoASR, "_cloud_audio_patched", False))
         self.assertTrue(getattr(DoubaoStreamASR, "_cloud_audio_patched", False))
+
+        # Voiceprint & screen-peek MCP guard (22nd patch: voiceprint_mcp_guard)
+        from core.providers.tools.server_mcp.mcp_manager import ServerMCPManager
+
+        self.assertTrue(getattr(ServerMCPManager, "_voiceprint_mcp_guard_patched", False))
+        self.assertTrue(inspect.iscoroutinefunction(ServerMCPManager.execute_tool))
 
         for coro_fn in (
             OpenaiASR.speech_to_text,

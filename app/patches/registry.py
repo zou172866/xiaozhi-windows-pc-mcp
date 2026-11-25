@@ -238,6 +238,15 @@ PATCH_CATALOG: List[Dict[str, Any]] = [
         "failure_behavior": "fail-soft (skips mismatched cloud provider targets, marks /api/health degraded)",
         "tests": ["tests/container/test_cloud_audio_api.py", "tests/container/test_upstream_contracts.py"],
     },
+    {
+        "name": "voiceprint_mcp_guard",
+        "module": "app/patches/voiceprint.py",
+        "target": "core.providers.tools.server_mcp.mcp_manager.ServerMCPManager.execute_tool",
+        "category": "experience",
+        "contract": "async method execute_tool(self, tool_name, arguments); default-off zero-overhead guard blocking non-owner privileged host MCP tools under voiceprint full_guard and honoring screen_peek toggle",
+        "failure_behavior": "fail-soft (falls back to upstream MCP tool dispatch, marks /api/health degraded)",
+        "tests": ["tests/container/test_phase2_voiceprint_widget.py", "tests/container/test_upstream_contracts.py"],
+    },
 ]
 
 

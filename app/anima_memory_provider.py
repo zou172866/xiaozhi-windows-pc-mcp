@@ -29,6 +29,9 @@ from core.providers.memory.base import MemoryProviderBase, logger
 _CURRENT_DEVICE_ID_VAR: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "anima_current_device_id", default=None
 )
+_CURRENT_SPEAKER_CHAR_ID_VAR: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "anima_current_speaker_char_id", default=None
+)
 _RETRYABLE_HTTP_4XX = frozenset({401, 408, 429})
 
 
@@ -44,6 +47,24 @@ def set_current_device_id(device_id: str | None) -> contextvars.Token:
 def reset_current_device_id(token: contextvars.Token) -> None:
     try:
         _CURRENT_DEVICE_ID_VAR.reset(token)
+    except Exception:
+        pass
+
+
+def get_current_speaker_character_id() -> str | None:
+    return _CURRENT_SPEAKER_CHAR_ID_VAR.get()
+
+
+def set_current_speaker_character_id(character_id: str | None) -> contextvars.Token:
+    cleaned = str(character_id or "").strip().lower()
+    if cleaned and not _SAFE_CHAR_ID_RE.match(cleaned):
+        cleaned = ""
+    return _CURRENT_SPEAKER_CHAR_ID_VAR.set(cleaned or None)
+
+
+def reset_current_speaker_character_id(token: contextvars.Token) -> None:
+    try:
+        _CURRENT_SPEAKER_CHAR_ID_VAR.reset(token)
     except Exception:
         pass
 
@@ -1227,6 +1248,9 @@ class MemoryProvider(MemoryProviderBase):
         }
 
     def _resolve_character_id(self, dev_key: str) -> str:
+        spk_cid = _CURRENT_SPEAKER_CHAR_ID_VAR.get()
+        if spk_cid and _SAFE_CHAR_ID_RE.match(spk_cid):
+            return spk_cid
         return resolve_character_id_for_device(
             None if dev_key == "__default__" else dev_key,
             base_character_id=self._base_character_id,
@@ -1236,6 +1260,9 @@ class MemoryProvider(MemoryProviderBase):
 
     def memory_target(self, device_id: str | None = None) -> MemoryTarget:
         device_key = self._resolve_device_key(device_id)
+        spk_cid = _CURRENT_SPEAKER_CHAR_ID_VAR.get()
+        if spk_cid and _SAFE_CHAR_ID_RE.match(spk_cid):
+            return MemoryTarget(device_key, "daily", spk_cid)
         return connection_memory_target(device_key, self._resolve_character_id(device_key))
 
     async def _fetch_recall_once(
@@ -1249,12 +1276,20 @@ class MemoryProvider(MemoryProviderBase):
         url = _GLOBAL_CONFIG["service_url"] + "/xiaozhi/recall"
         client = self._get_async_client()
         t0 = time.monotonic()
+        include_inner_life = False
+        try:
+            import runtime_settings
+
+            include_inner_life = bool(runtime_settings.get_proactive().get("inner_life_enabled", False))
+        except Exception:
+            include_inner_life = False
         resp = await client.post(
             url,
             headers={"Authorization": f"Bearer {token}"},
             json={
                 "character_id": target.character_id,
                 "query": query or "",
+                "include_inner_life": include_inner_life,
             },
         )
         elapsed_ms = (time.monotonic() - t0) * 1000.0
@@ -1461,6 +1496,33 @@ class _DeviceBoundMemoryProxy:
         self._base = base
         self._device_id = str(device_id or "").strip()
         self.target = target
+        self._override_lock = threading.Lock()
+        self._speaker_char_id_override: Optional[str] = None
+
+    def set_speaker_character_override(self, char_id: Optional[str]) -> Optional[str]:
+        """Set per-connection speaker character override (propagates cleanly across event-loop threads)."""
+        cleaned = str(char_id or "").strip().lower()
+        if cleaned and not _SAFE_CHAR_ID_RE.match(cleaned):
+            cleaned = ""
+        with self._override_lock:
+            prev = self._speaker_char_id_override
+            self._speaker_char_id_override = cleaned or None
+            return prev
+
+    def effective_target(self) -> MemoryTarget:
+        """Return speaker-isolated MemoryTarget when a non-owner voiceprint override is active."""
+        with self._override_lock:
+            spk_cid = self._speaker_char_id_override
+        if not spk_cid:
+            spk_cid = _CURRENT_SPEAKER_CHAR_ID_VAR.get()
+        if spk_cid and _SAFE_CHAR_ID_RE.match(spk_cid) and spk_cid != self.target.character_id:
+            # Always isolate non-owner speakers to a clean daily target without owner's tavern/handoff state
+            return MemoryTarget(
+                device_key=self.target.device_key,
+                archive="daily",
+                character_id=spk_cid,
+            )
+        return self.target
 
     @property
     def role_id(self) -> str:
@@ -1472,12 +1534,12 @@ class _DeviceBoundMemoryProxy:
 
     @property
     def _cached_context(self) -> str | None:
-        entry = self._base._recall_cache.get(self.target)
+        entry = self._base._recall_cache.get(self.effective_target())
         return entry[0] if entry is not None else None
 
     @property
     def _bg_refresh_task(self) -> asyncio.Task | None:
-        return self._base._bg_refresh_tasks.get(self.target)
+        return self._base._bg_refresh_tasks.get(self.effective_target())
 
     def init_memory(self, role_id=None, *args, **kwargs):
         if role_id:
@@ -1491,15 +1553,15 @@ class _DeviceBoundMemoryProxy:
 
     async def query_memory(self, query: str, *, device_id: str | None = None) -> str:
         eff_dev = device_id if device_id is not None else (self._device_id or None)
-        return await self._base.query_memory(query, device_id=eff_dev, target=self.target)
+        return await self._base.query_memory(query, device_id=eff_dev, target=self.effective_target())
 
     async def save_memory(self, msgs, session_id=None, *, device_id: str | None = None):
         eff_dev = device_id if device_id is not None else (self._device_id or None)
-        return await self._base.save_memory(msgs, session_id=session_id, device_id=eff_dev, target=self.target)
+        return await self._base.save_memory(msgs, session_id=session_id, device_id=eff_dev, target=self.effective_target())
 
     def get_recall_stats(self, device_id: str | None = None) -> dict[str, Any]:
         eff_dev = device_id if device_id is not None else (self._device_id or None)
-        return self._base.get_recall_stats(device_id=eff_dev, target=self.target)
+        return self._base.get_recall_stats(device_id=eff_dev, target=self.effective_target())
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)

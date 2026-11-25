@@ -483,6 +483,8 @@ class ObsidianExporter:
         snapshot_interval_seconds: int = 600,
         default_briefing_enabled: bool = True,
         briefing_interval_seconds: int = 3600,
+        default_inbox_enabled: bool = False,
+        inbox_interval_seconds: int = 120,
     ):
         self.brain = brain
         self.character_id = character_id
@@ -493,9 +495,11 @@ class ObsidianExporter:
         self.snapshot_interval_seconds = max(15, int(snapshot_interval_seconds))
         self.default_briefing_enabled = bool(default_briefing_enabled)
         self.briefing_interval_seconds = max(300, int(briefing_interval_seconds))
+        self.default_inbox_enabled = bool(default_inbox_enabled)
+        self.inbox_interval_seconds = max(15, int(inbox_interval_seconds))
 
         self._op_lock = threading.RLock()
-        self._enabled, self._briefing_enabled = self._load_settings()
+        self._enabled, self._briefing_enabled, self._inbox_enabled = self._load_settings()
         self._writable: bool | None = None
         self._last_error: str = ""
         self._last_export_ts: float = 0.0
@@ -506,6 +510,7 @@ class ObsidianExporter:
         self._last_briefing_reason: str = ""
         self._last_briefing_daily_date: str = ""
         self._last_briefing_week_key: str = ""
+        self._last_briefing_summary: str = ""
         self._last_briefing_stats: dict[str, Any] = {
             "written": 0,
             "skipped": 0,
@@ -514,6 +519,24 @@ class ObsidianExporter:
             "open_loops": 0,
             "urgent_loops": 0,
         }
+        self._last_inbox_ts: float = 0.0
+        self._last_inbox_at: str = ""
+        self._last_inbox_error: str = ""
+        self._last_inbox_fingerprint: str = ""
+        self._last_inbox_stats: dict[str, Any] = {
+            "scanned_files": 0,
+            "parsed_items": 0,
+            "added_facts": 0,
+            "added_loops": 0,
+            "resolved_loops": 0,
+            "skipped_existing": 0,
+            "redacted_skipped": 0,
+            "total_facts": 0,
+            "total_open_todos": 0,
+            "total_resolved_todos": 0,
+        }
+        self._last_inbox_recent: list[dict[str, Any]] = []
+        self._last_inbox_warnings: list[str] = []
         self._last_fingerprint: str = ""
         self._last_export_seq: int | None = None
         self._seq_triggers_ready: bool = False
@@ -530,9 +553,10 @@ class ObsidianExporter:
             "files_skipped": 0,
         }
 
-    def _load_settings(self) -> tuple[bool, bool]:
+    def _load_settings(self) -> tuple[bool, bool, bool]:
         en = self.default_enabled
         br = self.default_briefing_enabled
+        ib = self.default_inbox_enabled
         if self.config_path and self.config_path.is_file():
             try:
                 data = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -541,9 +565,11 @@ class ObsidianExporter:
                         en = bool(data["enabled"])
                     if isinstance(data.get("briefing_enabled"), bool):
                         br = bool(data["briefing_enabled"])
+                    if isinstance(data.get("inbox_enabled"), bool):
+                        ib = bool(data["inbox_enabled"])
             except Exception:
                 pass
-        return en, br
+        return en, br, ib
 
     def _persist_settings_locked(self) -> None:
         if self.config_path is None:
@@ -555,6 +581,7 @@ class ObsidianExporter:
                     {
                         "enabled": self._enabled,
                         "briefing_enabled": self._briefing_enabled,
+                        "inbox_enabled": self._inbox_enabled,
                         "updated_at": round(time.time(), 3),
                     },
                     ensure_ascii=False,
@@ -571,6 +598,9 @@ class ObsidianExporter:
     def is_briefing_enabled(self) -> bool:
         return bool(self._briefing_enabled)
 
+    def is_inbox_enabled(self) -> bool:
+        return bool(self._inbox_enabled)
+
     def set_enabled(self, enabled: bool) -> dict[str, Any]:
         with self._op_lock:
             self._enabled = bool(enabled)
@@ -580,6 +610,14 @@ class ObsidianExporter:
     def set_briefing_enabled(self, briefing_enabled: bool) -> dict[str, Any]:
         with self._op_lock:
             self._briefing_enabled = bool(briefing_enabled)
+            self._persist_settings_locked()
+        return self.status()
+
+    def set_inbox_enabled(self, inbox_enabled: bool) -> dict[str, Any]:
+        with self._op_lock:
+            self._inbox_enabled = bool(inbox_enabled)
+            if not self._inbox_enabled:
+                self._last_inbox_fingerprint = ""
             self._persist_settings_locked()
         return self.status()
 
@@ -2012,11 +2050,28 @@ class ObsidianExporter:
                 lines.append(f"- **互动片段**：{self._briefing_safe_text(ep.get('text') or '', 200)}")
         lines.append("")
 
+        summary_lines = [
+            f"{day_str} · 今日对话 {len(day_turns)} 轮 · 待跟进 {len(urgent) + len(regular)} 项"
+        ]
+        top_loops = (urgent + regular)[:3]
+        if top_loops:
+            summary_lines.append("待跟进：")
+            for item in top_loops:
+                m = item["memory"]
+                due_part = f"（{m.details.event_date.isoformat()}）" if m.details.event_date else ""
+                summary_lines.append(f"- {self._briefing_safe_text(m.text, 64)}{due_part}")
+        if new_facts_today:
+            summary_lines.append("今日新增记忆：")
+            for m in new_facts_today[:2]:
+                summary_lines.append(f"- {self._briefing_safe_text(m.text, 64)}")
+        summary_text = "\n".join(summary_lines)[:420]
+
         return "\n".join(lines), {
             "daily_date": day_str,
             "daily_turns": len(day_turns),
             "open_loops": len(urgent) + len(regular),
             "urgent_loops": len(urgent),
+            "summary_text": summary_text,
         }
 
     def _render_weekly_briefing(
@@ -2266,6 +2321,7 @@ class ObsidianExporter:
             self._last_briefing_reason = reason
             self._last_briefing_daily_date = daily_meta["daily_date"]
             self._last_briefing_week_key = weekly_meta["week_key"]
+            self._last_briefing_summary = str(daily_meta.get("summary_text") or "")
             self._last_briefing_stats = {
                 "written": written,
                 "skipped": skipped,
@@ -2294,8 +2350,45 @@ class ObsidianExporter:
                 "daily_date": daily_meta["daily_date"],
                 "week_key": weekly_meta["week_key"],
                 "last_briefing_at": self._last_briefing_at,
+                "briefing_summary": self._last_briefing_summary,
                 "stats": dict(self._last_briefing_stats),
             }
+
+    def scan_inbox(self, *, force: bool = False) -> dict[str, Any]:
+        """Scan `<export_dir>/收件箱/*.md` into Anima Brain facts & open loops (no-op when disabled)."""
+        with self._op_lock:
+            if not self._inbox_enabled:
+                return {
+                    "ok": False if force else True,
+                    "enabled": False,
+                    "changed": False,
+                    "skipped_disabled": True,
+                    "error": "Obsidian 双向备忘收件箱当前未开启，请先打开开关后再扫描" if force else "",
+                }
+            import obsidian_inbox
+
+            res = obsidian_inbox.scan_obsidian_inbox(
+                self.brain,
+                character_id=self.character_id,
+                export_dir=self.export_dir,
+                redact_fn=redact_credentials,
+                write_atomic_fn=_atomic_write_if_changed,
+                force=force,
+                last_fingerprint=self._last_inbox_fingerprint,
+            )
+            if not res.get("ok"):
+                self._last_inbox_error = str(res.get("error") or "inbox_scan_failed")
+                return res
+            self._last_inbox_error = ""
+            if res.get("fingerprint") is not None:
+                self._last_inbox_fingerprint = str(res.get("fingerprint") or "")
+            if not res.get("skipped_unchanged"):
+                self._last_inbox_ts = float(res.get("scanned_ts") or time.time())
+                self._last_inbox_at = str(res.get("scanned_at") or "")
+                self._last_inbox_stats = dict(res.get("stats") or self._last_inbox_stats)
+                self._last_inbox_recent = list(res.get("recent_items") or [])
+                self._last_inbox_warnings = list(res.get("warnings") or [])
+            return res
 
     def status(self) -> dict[str, Any]:
         with self._op_lock:
@@ -2307,11 +2400,13 @@ class ObsidianExporter:
             return {
                 "enabled": bool(self._enabled),
                 "briefing_enabled": bool(self._briefing_enabled),
+                "inbox_enabled": bool(self._inbox_enabled),
                 "writable": bool(self._writable),
                 "export_dir": str(self.export_dir),
                 "host_export_dir": self.host_export_dir,
                 "snapshot_interval_seconds": self.snapshot_interval_seconds,
                 "briefing_interval_seconds": self.briefing_interval_seconds,
+                "inbox_interval_seconds": self.inbox_interval_seconds,
                 "last_export_at": self._last_export_at,
                 "last_export_ts": self._last_export_ts,
                 "last_export_reason": self._last_export_reason,
@@ -2325,8 +2420,20 @@ class ObsidianExporter:
                     "last_briefing_reason": self._last_briefing_reason,
                     "daily_date": self._last_briefing_daily_date,
                     "week_key": self._last_briefing_week_key,
+                    "summary": self._last_briefing_summary,
                     "stats": dict(self._last_briefing_stats),
                     "voice_push": False,
+                },
+                "inbox": {
+                    "enabled": bool(self._inbox_enabled),
+                    "dirname": "收件箱",
+                    "interval_seconds": self.inbox_interval_seconds,
+                    "last_scan_at": self._last_inbox_at,
+                    "last_scan_ts": self._last_inbox_ts,
+                    "last_error": self._last_inbox_error,
+                    "stats": dict(self._last_inbox_stats),
+                    "warnings": list(self._last_inbox_warnings),
+                    "recent_items": list(self._last_inbox_recent),
                 },
             }
 
@@ -2394,6 +2501,21 @@ class ObsidianSyncRunner:
             await asyncio.to_thread(self.exporter.export_briefings, reason="briefing_toggle_enabled")
             status = self.exporter.status()
         return status
+
+    async def set_inbox_enabled_async(self, inbox_enabled: bool) -> dict[str, Any]:
+        status = await asyncio.to_thread(self.exporter.set_inbox_enabled, inbox_enabled)
+        if inbox_enabled:
+            res = await asyncio.to_thread(self.exporter.scan_inbox, force=True)
+            if isinstance(res, dict) and res.get("changed") and self.exporter.is_enabled():
+                self.notify_db_change()
+            status = self.exporter.status()
+        return status
+
+    async def scan_inbox_now(self, *, force: bool = True) -> dict[str, Any]:
+        res = await asyncio.to_thread(self.exporter.scan_inbox, force=force)
+        if isinstance(res, dict) and res.get("changed") and self.exporter.is_enabled():
+            self.notify_db_change()
+        return res
 
     async def run_briefings_now(self, *, reason: str = "manual_briefing", target_date: str | None = None) -> dict[str, Any]:
         return await asyncio.to_thread(
@@ -2466,15 +2588,27 @@ class ObsidianSyncRunner:
                     await asyncio.to_thread(self.exporter.export_briefings, reason="startup_briefing")
                 except Exception as exc:
                     log.warning("Obsidian startup briefing error: %s", exc)
+        if self.exporter.is_inbox_enabled():
+            try:
+                ib_res = await asyncio.to_thread(self.exporter.scan_inbox, force=False)
+                if isinstance(ib_res, dict) and ib_res.get("changed") and self.exporter.is_enabled():
+                    self.notify_db_change()
+            except Exception as exc:
+                log.warning("Obsidian startup inbox scan error: %s", exc)
 
         interval = float(self.exporter.snapshot_interval_seconds)
         brief_interval = float(self.exporter.briefing_interval_seconds)
+        inbox_interval = float(self.exporter.inbox_interval_seconds)
         next_poll = time.monotonic() + interval
         next_briefing = time.monotonic() + brief_interval
+        next_inbox = time.monotonic() + inbox_interval
 
         while not self._stop_event.is_set():
             now_mono = time.monotonic()
-            wait_sec = max(0.2, min(next_poll, next_briefing) - now_mono)
+            deadlines = [next_poll, next_briefing]
+            if self.exporter.is_inbox_enabled():
+                deadlines.append(next_inbox)
+            wait_sec = max(0.2, min(deadlines) - now_mono)
             try:
                 await asyncio.wait_for(self._wake_event.wait(), timeout=wait_sec)
             except asyncio.TimeoutError:
@@ -2546,3 +2680,12 @@ class ObsidianSyncRunner:
                         )
                     except Exception as exc:
                         log.warning("Obsidian scheduled briefing error: %s", exc)
+            if time.monotonic() >= next_inbox:
+                next_inbox = time.monotonic() + inbox_interval
+                if self.exporter.is_inbox_enabled():
+                    try:
+                        ib_res = await asyncio.to_thread(self.exporter.scan_inbox, force=False)
+                        if isinstance(ib_res, dict) and ib_res.get("changed") and self.exporter.is_enabled():
+                            self.notify_db_change()
+                    except Exception as exc:
+                        log.warning("Obsidian scheduled inbox scan error: %s", exc)

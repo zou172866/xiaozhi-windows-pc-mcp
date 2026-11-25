@@ -344,11 +344,22 @@ def _patch_openai_asr() -> Tuple[bool, str]:
             elapsed = time.monotonic() - t0
             if response.status_code == 200:
                 payload = response.json()
-                text = str(payload.get("text", "") or "").strip() if isinstance(payload, dict) else ""
+                raw_text = str(payload.get("text", "") or "").strip() if isinstance(payload, dict) else ""
+                text = raw_text
                 if text:
                     text = _SENSEVOICE_TAG_RE.sub("", text).strip()
                 if text:
                     text = asr_corrections.apply_asr_corrections(text)
+                try:
+                    import vocal_cue_router
+
+                    if text:
+                        cue = vocal_cue_router.extract_vocal_cue(raw_text) if "<|" in raw_text else None
+                        vocal_cue_router.record_vocal_cue(str(session_id or ""), cue, source="cloud_asr")
+                    else:
+                        vocal_cue_router.clear_vocal_cue(str(session_id or ""))
+                except Exception:
+                    pass
                 openai_asr_mod.logger.bind(tag=openai_asr_mod.TAG).debug(
                     f"[CloudAudio] OpenaiASR 耗时: {elapsed:.3f}s | 长度: {len(text)}"
                 )

@@ -15,6 +15,7 @@ import concurrent.futures
 import datetime
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -47,6 +48,7 @@ from companion_engine.models import (
 )
 from companion_engine.temporal import local_today
 import dream_executor
+import proactive_state
 import recall_sanitizer
 
 logging.basicConfig(
@@ -122,6 +124,8 @@ OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS = _env_int("OBSIDIAN_SNAPSHOT_INTERVAL_SECOND
 OBSIDIAN_DEBOUNCE_SECONDS = _env_float("OBSIDIAN_DEBOUNCE_SECONDS", 5.0, 0.1, 60.0)
 OBSIDIAN_BRIEFING_ENABLED = _env_bool("OBSIDIAN_BRIEFING_ENABLED", True)
 OBSIDIAN_BRIEFING_INTERVAL_SECONDS = _env_int("OBSIDIAN_BRIEFING_INTERVAL_SECONDS", 3600, 300, 86400)
+OBSIDIAN_INBOX_ENABLED = _env_bool("OBSIDIAN_INBOX_ENABLED", False)
+OBSIDIAN_INBOX_INTERVAL_SECONDS = _env_int("OBSIDIAN_INBOX_INTERVAL_SECONDS", 120, 15, 86400)
 
 # AutoDream offline read-only reflection & recall privacy sanitizer settings
 DREAM_ENABLED = _env_bool("ANIMA_DREAM_ENABLED", True)
@@ -1667,6 +1671,7 @@ def build_fast_recall_context(
     *,
     query_vector: list[float] | None = None,
     embed_model: str | None = None,
+    include_inner_life: bool = False,
 ) -> dict[str, Any]:
     """Read-only fast recall from SQLite/FTS5/PAD (+ optional bounded query vector) without reserving a pending turn."""
     engine = brain.engine
@@ -1802,8 +1807,27 @@ def build_fast_recall_context(
         if not episode_docs:
             episode_docs = [d for d in all_docs if d["kind"] == "episode"][:1]
 
-        # 4. Open loops (unresolved user events to follow up naturally)
-        open_loops = [m for m in engine.memory.loops(character_id)[:4] if eligible(m, today=today)]
+        # 4. Open loops (unresolved user events to follow up naturally, filtering expired/dismissed)
+        raw_open_loops = [m for m in engine.memory.loops(character_id)[:12] if eligible(m, today=today)]
+        open_loops = proactive_state.filter_active_open_loops_readonly(
+            engine,
+            character_id,
+            raw_open_loops,
+            today=today,
+            now=now,
+        )[:4]
+
+        # 4b. Optional read-only character Inner Life micro-state (only queried when explicitly enabled)
+        inner_life_hint = (
+            proactive_state.get_active_inner_life_hint(
+                brain,
+                character_id,
+                now=now,
+                locked=True,
+            )
+            if include_inner_life
+            else None
+        )
 
         # 5. Recent committed cross-session turns (bridges Web UI chat <-> ESP32 hardware!)
         recent_rows = engine.db.execute(
@@ -1847,6 +1871,12 @@ def build_fast_recall_context(
         sections.append(
             "【未完待续事项（仅作背景知情，切勿每次打招呼都机械重复追问同一件旧事，除非对方主动聊起）】\n"
             + "\n".join(loop_lines)
+        )
+
+    if inner_life_hint and inner_life_hint.get("text"):
+        sections.append(
+            "【角色当下生活气息背景（仅作自然日常背景，切勿生硬主动汇报，顺着聊天自然带到即可）】\n"
+            f"- {inner_life_hint['text']}"
         )
 
     if episode_docs:
@@ -2919,6 +2949,7 @@ def create_combined_asgi_app(
 
     ensure_xiaozhi_turn_meta_table(brain.engine)
     ensure_xiaozhi_inbox_table(brain.engine)
+    proactive_state.ensure_proactive_tables(brain.engine)
     configure_sqlite_wal(brain.engine)
     backup_dir = _resolve_backup_dir(brain)
 
@@ -2943,6 +2974,8 @@ def create_combined_asgi_app(
             snapshot_interval_seconds=OBSIDIAN_SNAPSHOT_INTERVAL_SECONDS,
             default_briefing_enabled=OBSIDIAN_BRIEFING_ENABLED,
             briefing_interval_seconds=OBSIDIAN_BRIEFING_INTERVAL_SECONDS,
+            default_inbox_enabled=OBSIDIAN_INBOX_ENABLED,
+            inbox_interval_seconds=OBSIDIAN_INBOX_INTERVAL_SECONDS,
         )
     obsidian_runner = ObsidianSyncRunner(
         obsidian_exporter,
@@ -3532,11 +3565,15 @@ def create_combined_asgi_app(
                     if path == "/xiaozhi/obsidian/config" and req.method == "POST":
                         has_en = "enabled" in body
                         has_br = "briefing_enabled" in body
-                        if (not has_en and not has_br) or (has_en and not isinstance(body.get("enabled"), bool)) or (
-                            has_br and not isinstance(body.get("briefing_enabled"), bool)
+                        has_ib = "inbox_enabled" in body
+                        if (
+                            (not has_en and not has_br and not has_ib)
+                            or (has_en and not isinstance(body.get("enabled"), bool))
+                            or (has_br and not isinstance(body.get("briefing_enabled"), bool))
+                            or (has_ib and not isinstance(body.get("inbox_enabled"), bool))
                         ):
                             resp = JSONResponse(
-                                {"error": "Field 'enabled' and/or 'briefing_enabled' (boolean) is required"},
+                                {"error": "Field 'enabled', 'briefing_enabled', and/or 'inbox_enabled' (boolean) is required"},
                                 status_code=400,
                             )
                             await resp(scope, receive, send)
@@ -3548,7 +3585,27 @@ def create_combined_asgi_app(
                             status_data = await obsidian_runner.set_briefing_enabled_async(
                                 bool(body["briefing_enabled"])
                             )
+                        if has_ib:
+                            status_data = await obsidian_runner.set_inbox_enabled_async(
+                                bool(body["inbox_enabled"])
+                            )
                         resp = JSONResponse({"ok": True, "obsidian": status_data, **status_data})
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/obsidian/inbox/scan" and req.method == "POST":
+                        result = await obsidian_runner.scan_inbox_now(force=True)
+                        status_data = obsidian_exporter.status()
+                        if result.get("ok"):
+                            code = 200
+                        elif result.get("skipped_disabled"):
+                            code = 400
+                        else:
+                            code = 500
+                        resp = JSONResponse(
+                            {"result": result, "obsidian": status_data, **result},
+                            status_code=code,
+                        )
                         await resp(scope, receive, send)
                         return
 
@@ -3788,8 +3845,124 @@ def create_combined_asgi_app(
                         await resp(scope, receive, send)
                         return
 
+                    if path == "/xiaozhi/proactive/context" and req.method == "POST":
+                        weather_hint = str(body.get("weather_hint") or "").strip()[:120]
+                        ensure_il = body.get("ensure_inner_life", True)
+                        if not isinstance(ensure_il, bool):
+                            resp = JSONResponse(
+                                {"ok": False, "error": "Field 'ensure_inner_life' must be boolean"},
+                                status_code=400,
+                            )
+                            await resp(scope, receive, send)
+                            return
+
+                        def _fetch_proactive_ctx():
+                            cid_eff = ensure_character_exists(brain, char_id)
+                            return proactive_state.get_proactive_context(
+                                brain,
+                                cid_eff,
+                                weather_hint=weather_hint,
+                                ensure_inner_life=ensure_il,
+                            )
+
+                        data = await asyncio.to_thread(_fetch_proactive_ctx)
+                        resp = JSONResponse(data)
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/proactive/ack" and req.method == "POST":
+                        open_loop_id = str(body.get("open_loop_id") or "").strip()[:120]
+                        action = str(body.get("action") or "nudged").strip().lower()
+                        raw_snooze = body.get("snooze_hours", 24.0)
+                        if isinstance(raw_snooze, bool):
+                            resp = JSONResponse(
+                                {"ok": False, "error": "Field 'snooze_hours' must be a number"},
+                                status_code=400,
+                            )
+                            await resp(scope, receive, send)
+                            return
+                        try:
+                            snooze_h = float(raw_snooze)
+                            if not math.isfinite(snooze_h) or snooze_h <= 0.0:
+                                raise ValueError("non-finite or non-positive")
+                        except (TypeError, ValueError):
+                            resp = JSONResponse(
+                                {
+                                    "ok": False,
+                                    "error": "Field 'snooze_hours' must be a positive finite number",
+                                },
+                                status_code=400,
+                            )
+                            await resp(scope, receive, send)
+                            return
+                        reason_s = str(body.get("reason") or "").strip()[:80]
+                        event_id_s = str(body.get("event_id") or "").strip()[:80]
+
+                        def _run_ack():
+                            cid_eff = ensure_character_exists(brain, char_id)
+                            return proactive_state.ack_proactive_event(
+                                brain,
+                                cid_eff,
+                                open_loop_id=open_loop_id,
+                                action=action,
+                                snooze_hours=snooze_h,
+                                reason=reason_s,
+                                event_id=event_id_s,
+                            )
+
+                        try:
+                            data = await asyncio.to_thread(_run_ack)
+                            resp = JSONResponse(data, status_code=200)
+                        except ValueError as exc:
+                            resp = JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+                        await resp(scope, receive, send)
+                        return
+
+                    if path == "/xiaozhi/inner-life/refresh" and req.method == "POST":
+                        weather_hint = str(body.get("weather_hint") or "").strip()[:120]
+                        slot_arg = body.get("slot")
+                        if slot_arg is not None:
+                            if not isinstance(slot_arg, str) or (
+                                slot_arg.strip()
+                                and slot_arg.strip().lower() not in proactive_state.VALID_SLOTS
+                            ):
+                                resp = JSONResponse(
+                                    {
+                                        "ok": False,
+                                        "error": "Field 'slot' must be morning, afternoon, or evening",
+                                    },
+                                    status_code=400,
+                                )
+                                await resp(scope, receive, send)
+                                return
+                            slot_arg = slot_arg.strip().lower() or None
+                        use_llm = body.get("use_llm", False)
+                        if not isinstance(use_llm, bool):
+                            resp = JSONResponse(
+                                {"ok": False, "error": "Field 'use_llm' must be boolean"},
+                                status_code=400,
+                            )
+                            await resp(scope, receive, send)
+                            return
+
+                        def _run_refresh_il():
+                            cid_eff = ensure_character_exists(brain, char_id)
+                            return proactive_state.refresh_inner_life(
+                                brain,
+                                cid_eff,
+                                weather_hint=weather_hint,
+                                slot=slot_arg,
+                                use_llm=use_llm,
+                            )
+
+                        data = await asyncio.to_thread(_run_refresh_il)
+                        resp = JSONResponse({"ok": True, "inner_life": data, **data})
+                        await resp(scope, receive, send)
+                        return
+
                     if path == "/xiaozhi/recall" and req.method == "POST":
                         query = str(body.get("query") or "")
+                        include_il = bool(body.get("include_inner_life", False))
                         q_vec, q_model = await resolve_recall_query_embedding(brain, query)
                         data = await asyncio.to_thread(
                             build_fast_recall_context,
@@ -3798,6 +3971,7 @@ def create_combined_asgi_app(
                             query,
                             query_vector=q_vec,
                             embed_model=q_model,
+                            include_inner_life=include_il,
                         )
                         resp = JSONResponse(data)
                         await resp(scope, receive, send)

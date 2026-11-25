@@ -30,6 +30,8 @@ from typing import Any, Dict, Optional, Tuple
 import asr_corrections
 import patch_registry
 import runtime_settings
+import vocal_cue_router
+import voiceprint_router
 
 TAG = "vad_speculative_router"
 
@@ -382,11 +384,13 @@ class _SpeculativeState:
         "triggered_gen",
         "result_gen",
         "result_text",
+        "result_vocal_cue",
         "result_pcm_len",
         "should_commit",
         "reason",
         "triggered_silence_ms",
         "committed_text",
+        "committed_vocal_cue",
         "committed_pcm_len",
     )
 
@@ -396,11 +400,13 @@ class _SpeculativeState:
         self.triggered_gen: int = -1
         self.result_gen: int = -1
         self.result_text: Optional[str] = None
+        self.result_vocal_cue: Optional[Dict[str, Any]] = None
         self.result_pcm_len: int = 0
         self.should_commit: bool = False
         self.reason: str = ""
         self.triggered_silence_ms: float = 0.0
         self.committed_text: Optional[str] = None
+        self.committed_vocal_cue: Optional[Dict[str, Any]] = None
         self.committed_pcm_len: int = 0
 
     def invalidate(self, *, count_discard: bool = False) -> None:
@@ -419,11 +425,13 @@ class _SpeculativeState:
         self.triggered_gen = -1
         self.result_gen = -1
         self.result_text = None
+        self.result_vocal_cue = None
         self.result_pcm_len = 0
         self.should_commit = False
         self.reason = ""
         self.triggered_silence_ms = 0.0
         self.committed_text = None
+        self.committed_vocal_cue = None
         self.committed_pcm_len = 0
         if count_discard and had_pending:
             _bump_stat("resumed_discards", 1)
@@ -446,26 +454,46 @@ def _is_sherpa_asr(asr: Any) -> bool:
     return ("sherpa" in mod_name) and (getattr(asr, "model", None) is not None)
 
 
-def _decode_pcm_with_sherpa_sync(asr: Any, pcm_bytes: bytes) -> str:
-    """In-memory 16kHz PCM decode on Sherpa-ONNX (zero temp WAV disk I/O)."""
+def _decode_pcm_with_sherpa_with_cue_sync(
+    asr: Any, pcm_bytes: bytes
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """In-memory 16kHz PCM decode on Sherpa-ONNX returning `(clean_text, vocal_cue)`."""
     custom_fn = getattr(asr, "_speculative_decode_pcm", None)
+    cue: Optional[Dict[str, Any]] = None
+    want_cue = vocal_cue_router.is_vocal_cue_enabled()
     if callable(custom_fn):
-        raw = str(custom_fn(pcm_bytes) or "")
+        raw_res = custom_fn(pcm_bytes)
+        if isinstance(raw_res, tuple) and len(raw_res) >= 2:
+            raw = str(raw_res[0] or "")
+            if want_cue:
+                cue = raw_res[1] if isinstance(raw_res[1], dict) else vocal_cue_router.extract_vocal_cue(raw)
+        else:
+            raw = str(raw_res or "")
+            if want_cue:
+                cue = vocal_cue_router.extract_vocal_cue(raw)
     else:
         import numpy as np
 
         if len(pcm_bytes) % 2 != 0:
             pcm_bytes = pcm_bytes[:-1]
         if not pcm_bytes:
-            return ""
+            return "", None
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         stream = asr.model.create_stream()
         stream.accept_waveform(16000, samples)
         asr.model.decode_stream(stream)
         raw = str(getattr(stream.result, "text", "") or "")
+        if want_cue:
+            cue = vocal_cue_router.extract_vocal_cue(raw, result=stream.result)
     cleaned = _SENSEVOICE_TAG_RE.sub("", raw).strip()
     if cleaned:
         cleaned = asr_corrections.apply_asr_corrections(cleaned)
+    return cleaned, cue
+
+
+def _decode_pcm_with_sherpa_sync(asr: Any, pcm_bytes: bytes) -> str:
+    """In-memory 16kHz PCM decode on Sherpa-ONNX (zero temp WAV disk I/O)."""
+    cleaned, _ = _decode_pcm_with_sherpa_with_cue_sync(asr, pcm_bytes)
     return cleaned
 
 
@@ -493,7 +521,9 @@ async def _run_speculative_decode_task(
     try:
         loop = asyncio.get_running_loop()
         executor = _get_asr_executor_safe()
-        text = await loop.run_in_executor(executor, _decode_pcm_with_sherpa_sync, asr, pcm_snapshot)
+        text, cue = await loop.run_in_executor(
+            executor, _decode_pcm_with_sherpa_with_cue_sync, asr, pcm_snapshot
+        )
         # Speech may have resumed or state reset while Sherpa was decoding!
         if state.generation != gen:
             return
@@ -506,6 +536,7 @@ async def _run_speculative_decode_task(
             return
         state.result_gen = gen
         state.result_text = text
+        state.result_vocal_cue = cue
         state.result_pcm_len = len(pcm_snapshot)
         state.should_commit = should_commit
         state.reason = reason
@@ -542,31 +573,48 @@ def _effective_speculative_threshold_ms(conn: Any, cfg: Dict[str, Any]) -> float
     return min(target, max(300.0, upper - 50.0))
 
 
-def _stash_asr_speculative_hit(asr: Any, session_id: str, pcm_len: int, text: str) -> None:
+def _stash_asr_speculative_hit(
+    asr: Any,
+    session_id: str,
+    pcm_len: int,
+    text: str,
+    vocal_cue: Optional[Dict[str, Any]] = None,
+) -> None:
     cache = getattr(asr, "_vad_spec_text_cache", None)
     if not isinstance(cache, dict):
         cache = {}
         asr._vad_spec_text_cache = cache
-    cache[str(session_id or "")] = (int(pcm_len), str(text), time.monotonic())
+    cache[str(session_id or "")] = (int(pcm_len), str(text), time.monotonic(), vocal_cue)
     if len(cache) > 64:
         oldest = next(iter(cache))
         cache.pop(oldest, None)
 
 
-def _pop_asr_speculative_hit(asr: Any, session_id: str, pcm_len: int) -> Optional[str]:
+def _pop_asr_speculative_hit_with_cue(
+    asr: Any, session_id: str, pcm_len: int
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     cache = getattr(asr, "_vad_spec_text_cache", None)
     if not isinstance(cache, dict):
-        return None
+        return None, None
     entry = cache.pop(str(session_id or ""), None)
     if entry is None:
-        return None
-    cached_len, cached_text, ts = entry
+        return None, None
+    if len(entry) >= 4:
+        cached_len, cached_text, ts, cached_cue = entry[0], entry[1], entry[2], entry[3]
+    else:
+        cached_len, cached_text, ts = entry[0], entry[1], entry[2]
+        cached_cue = None
     # Allow up to ~900ms (15 frames = 28800 bytes) of trailing silence appended between speculative trigger and commit/1100ms cutoff
     if (time.monotonic() - ts) > 3.0:
-        return None
+        return None, None
     if pcm_len < cached_len or (pcm_len - cached_len) > 1920 * 15:
-        return None
-    return cached_text
+        return None, None
+    return cached_text, cached_cue
+
+
+def _pop_asr_speculative_hit(asr: Any, session_id: str, pcm_len: int) -> Optional[str]:
+    hit_text, _ = _pop_asr_speculative_hit_with_cue(asr, session_id, pcm_len)
+    return hit_text
 
 
 def apply_vad_speculative_patch() -> None:
@@ -652,6 +700,7 @@ def apply_vad_speculative_patch() -> None:
                     and not getattr(conn, "last_is_voice", False)
                 ):
                     state.committed_text = state.result_text
+                    state.committed_vocal_cue = state.result_vocal_cue
                     state.committed_pcm_len = state.result_pcm_len
                 elif state.task is not None and not state.task.done():
                     if state.triggered_gen != state.generation or getattr(conn, "last_is_voice", False):
@@ -676,6 +725,7 @@ def apply_vad_speculative_patch() -> None:
                         _bump_stat("early_commits", 1)
                         _bump_stat("total_saved_ms", saved_ms)
                         state.committed_text = state.result_text
+                        state.committed_vocal_cue = state.result_vocal_cue
                         state.committed_pcm_len = state.result_pcm_len
                         conn.client_voice_stop = True
                         try:
@@ -734,12 +784,20 @@ def apply_vad_speculative_patch() -> None:
                     and not getattr(conn, "last_is_voice", False)
                 ):
                     st.committed_text = st.result_text
+                    st.committed_vocal_cue = st.result_vocal_cue
                     st.committed_pcm_len = st.result_pcm_len
                     _bump_stat("inflight_reuses", 1)
             if st.committed_text:
-                _stash_asr_speculative_hit(self, sid, st.committed_pcm_len, st.committed_text)
+                _stash_asr_speculative_hit(
+                    self,
+                    sid,
+                    st.committed_pcm_len,
+                    st.committed_text,
+                    vocal_cue=st.committed_vocal_cue,
+                )
                 stashed = True
                 st.committed_text = None
+                st.committed_vocal_cue = None
                 st.committed_pcm_len = 0
         try:
             return await _orig_handle_voice_stop(self, conn, asr_audio_task, *args, **kwargs)
@@ -755,9 +813,34 @@ def apply_vad_speculative_patch() -> None:
     async def _spec_aware_stt_wrapper(self, pcm_data, session_id, *args, **kwargs):
         if getattr(self, "delete_audio_file", True):
             pcm_len = sum(len(b) for b in (pcm_data or ()))
-            hit = _pop_asr_speculative_hit(self, str(session_id or ""), pcm_len)
+            hit, hit_cue = _pop_asr_speculative_hit_with_cue(self, str(session_id or ""), pcm_len)
             if hit is not None:
                 _bump_stat("cache_reuses", 1)
+                if vocal_cue_router.is_vocal_cue_enabled():
+                    try:
+                        vocal_cue_router.record_vocal_cue(
+                            str(session_id or ""),
+                            hit_cue,
+                            source="sherpa_speculative",
+                        )
+                    except Exception:
+                        pass
+                if voiceprint_router.is_voiceprint_enabled():
+                    try:
+                        pcm_joined = b"".join(pcm_data or ())
+                        if pcm_joined:
+                            loop = asyncio.get_running_loop()
+                            ex = _get_asr_executor_safe()
+                            await loop.run_in_executor(
+                                ex,
+                                lambda: voiceprint_router.identify_turn_pcm(
+                                    str(session_id or ""),
+                                    pcm_joined,
+                                    transcript=str(hit or ""),
+                                ),
+                            )
+                    except Exception:
+                        pass
                 return hit, None
         return await _orig_stt_wrapper(self, pcm_data, session_id, *args, **kwargs)
 

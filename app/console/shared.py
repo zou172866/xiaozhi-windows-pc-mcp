@@ -115,7 +115,7 @@ def get_console_boot_id() -> str:
 _SECRET_PATTERNS = (
     (re.compile(r"(Bearer[\s;]+)[A-Za-z0-9._\-~+/=]{6,}", re.IGNORECASE), r"\1***"),
     (re.compile(r"(Basic\s+)[A-Za-z0-9+/=]{8,}", re.IGNORECASE), r"\1***"),
-    (re.compile(r"(\bToken\s+)[A-Za-z0-9._\-~+/=]{6,}", re.IGNORECASE), r"\1***"),
+    (re.compile(r"((?<![A-Za-z0-9_])Token\s+)[A-Za-z0-9._\-~+/=]{6,}", re.IGNORECASE), r"\1***"),
     (
         re.compile(
             r"((?:https?|wss?|ftp)://)[^/\s:@\"']+:[^/\s@\"']+@",
@@ -125,14 +125,21 @@ _SECRET_PATTERNS = (
     ),
     (
         re.compile(
-            r"([?#&](?:access_token|refresh_token|auth_token|token|api_key|apikey|auth_key|key|groupid)=)[^\s&#\"',;)}\]]+",
+            r"((?:https?|wss?|ftp)://)[^/\s:@\"']+@",
+            re.IGNORECASE,
+        ),
+        r"\1***@",
+    ),
+    (
+        re.compile(
+            r"([?#&](?:access_token|refresh_token|auth_token|token|api_key|api-key|apikey|auth_key|key|secret|secret_key|client_secret|password|passwd|pwd|groupid)=)[^\s&#\"',;)}\]]+",
             re.IGNORECASE,
         ),
         r"\1***",
     ),
     (
         re.compile(
-            r"(\b(?:x-goog-api-key|x-api-key|x-api-access-key|x-api-app-key|x-console-token|api_key|apikey|access_token|refresh_token|auth_token|auth_key|token|appid|group_id|pc_mcp_token|anima_studio_token|esp32_auth_key|deepseek_api_key|glm_api_key|gemini_api_key|siliconflow_api_key|openai_audio_api_key|dashscope_api_key|doubao_appid|doubao_asr_appid|doubao_tts_appid|doubao_access_token|doubao_asr_access_token|doubao_tts_access_token|fishspeech_api_key|minimax_api_key|minimax_group_id)\b\s*[\"']?\s*[:=]\s*[\"']?)(?!None\b|null\b|true\b|false\b)[^\s&\"',;)}\]]+",
+            r"((?<![A-Za-z0-9_])(?:x-goog-api-key|x-api-key|x-api-access-key|x-api-app-key|x-console-token|api_key|api-key|apikey|access_token|refresh_token|auth_token|auth_key|token|secret|secret_key|client_secret|password|passwd|pwd|appid|group_id|pc_mcp_token|anima_studio_token|esp32_auth_key|deepseek_api_key|glm_api_key|gemini_api_key|siliconflow_api_key|openai_audio_api_key|dashscope_api_key|doubao_appid|doubao_asr_appid|doubao_tts_appid|doubao_access_token|doubao_asr_access_token|doubao_tts_access_token|fishspeech_api_key|minimax_api_key|minimax_group_id)(?![A-Za-z0-9_])\s*[\"']?\s*[:=]\s*[\"']?)(?!None\b|null\b|true\b|false\b)[^\s&\"',;)}\]]+",
             re.IGNORECASE,
         ),
         r"\1***",
@@ -144,8 +151,10 @@ _SECRET_PATTERNS = (
         ),
         r"\1***",
     ),
-    (re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"), "sk-***"),
-    (re.compile(r"\bAIza[0-9A-Za-z_\-]{16,}\b"), "AIza***"),
+    (re.compile(r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_\-]{12,}(?![A-Za-z0-9_\-])"), "sk-***"),
+    (re.compile(r"(?<![A-Za-z0-9_])AIza[0-9A-Za-z_\-]{16,}(?![A-Za-z0-9_\-])"), "AIza***"),
+    (re.compile(r"(?<![A-Za-z0-9_])ghp_[A-Za-z0-9]{16,}(?![A-Za-z0-9_])"), "ghp_***"),
+    (re.compile(r"(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9\-]{10,}(?![A-Za-z0-9\-])"), "xox-***"),
 )
 
 _ERROR_PAYLOAD_KEYS = frozenset(

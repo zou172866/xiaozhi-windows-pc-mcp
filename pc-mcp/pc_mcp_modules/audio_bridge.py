@@ -7,6 +7,7 @@ import asyncio
 import ctypes
 import ctypes.wintypes as wt
 import io
+import json
 import logging
 import math
 import queue
@@ -22,11 +23,13 @@ from starlette.responses import JSONResponse as _StarletteJSONResponse
 from . import facade_attr
 from .security import (
     EmergencyStopLockedError,
+    _check_permission,
     _get_mode,
     is_emergency_stop_active,
     set_host_mode,
 )
-from .winapi import _kernel32
+from .vision import peek_active_window
+from .winapi import _kernel32, get_desktop_rhythm_snapshot
 
 
 class _WAVEFORMATEX(ctypes.Structure):
@@ -465,8 +468,120 @@ def _validate_l3_config_payload(body: dict) -> dict:
     return cleaned
 
 
+def _parse_l3_finished_ts(obj: dict, fp) -> float:
+    """Resolve L3 task finish epoch from numeric finished_ts/updated_ts, formatted finished_at, or mtime."""
+    for num_key in ("finished_ts", "updated_ts"):
+        raw = obj.get(num_key)
+        if raw is not None and not isinstance(raw, bool):
+            try:
+                val = float(raw)
+                if math.isfinite(val) and val > 0.0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+    raw_at = str(obj.get("finished_at") or "").strip()
+    if raw_at:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return float(time.mktime(time.strptime(raw_at[:19], fmt)))
+            except (ValueError, OverflowError):
+                continue
+    try:
+        return float(fp.stat().st_mtime or 0.0)
+    except OSError:
+        return 0.0
+
+
+def _summarize_l3_rhythm_status(l3_mod) -> dict:
+    """Fast read-only scan of L3 active task records without spawning external detection subprocesses."""
+    now = time.time()
+    running_count = 0
+    queued_count = 0
+    recently_finished: Optional[dict] = None
+    best_finished_ts = 0.0
+    agy_busy_fn = None
+    try:
+        agy_mod = getattr(l3_mod, "antigravity", None)
+        if agy_mod is not None and callable(getattr(agy_mod, "_is_dispatched_conversation_busy", None)):
+            agy_busy_fn = agy_mod._is_dispatched_conversation_busy
+    except Exception:
+        agy_busy_fn = None
+    try:
+        active_dir = getattr(l3_mod, "ACTIVE_DIR", None)
+        if active_dir is not None and active_dir.exists():
+            files = sorted(active_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+            for fp in files:
+                try:
+                    if fp.is_symlink():
+                        continue
+                    obj = json.loads(fp.read_text(encoding="utf-8"))
+                    if not isinstance(obj, dict):
+                        continue
+                    st = str(obj.get("status") or "").strip().lower()
+                    backend = str(obj.get("backend") or "").strip().lower()
+                    if st == "running":
+                        running_count += 1
+                    elif st == "dispatched":
+                        # Antigravity task files stay status='dispatched' permanently; check active transcript!
+                        if backend == "antigravity" and callable(agy_busy_fn):
+                            conv_id = str(obj.get("conversation_id") or "").strip()
+                            if agy_busy_fn(conv_id, fp):
+                                running_count += 1
+                        elif (now - float(fp.stat().st_mtime or 0.0)) <= 600.0:
+                            running_count += 1
+                    elif st == "queued":
+                        queued_count += 1
+                    elif st in ("done", "completed", "failed", "error"):
+                        if obj.get("reaped_zombie"):
+                            continue
+                        fin_ts = _parse_l3_finished_ts(obj, fp)
+                        age_sec = max(0.0, now - fin_ts)
+                        if fin_ts > 0.0 and age_sec <= 900.0 and fin_ts > best_finished_ts:
+                            best_finished_ts = fin_ts
+                            recently_finished = {
+                                "id": str(obj.get("id") or fp.stem)[:64],
+                                "status": st,
+                                "backend": backend[:32],
+                                "finished_ts": round(fin_ts, 2),
+                                "age_seconds": round(age_sec, 1),
+                            }
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return {
+        "running_count": running_count,
+        "queued_count": queued_count,
+        "recently_finished": recently_finished,
+    }
+
+
 def register_http_routes(mcp, player: _WinMMPlayer) -> None:
-    """Mount /audio/* and /l3/* Starlette routes onto the MCPServer HTTP app."""
+    """Mount /audio/*, /l3/*, /mode, and /desktop/rhythm Starlette routes onto the MCPServer HTTP app."""
+
+    @mcp.custom_route("/desktop/rhythm", methods=["GET"])
+    async def _desktop_rhythm_route(request: _StarletteRequest):
+        rhythm_fn = facade_attr("get_desktop_rhythm_snapshot", get_desktop_rhythm_snapshot)
+        l3_mod = facade_attr("l3_backends", l3_backends)
+        snap = await asyncio.to_thread(rhythm_fn)
+        if not isinstance(snap, dict):
+            snap = {"ok": False}
+        audio_st = player.status()
+        l3_summary = await asyncio.to_thread(_summarize_l3_rhythm_status, l3_mod)
+        payload = {
+            "ok": bool(snap.get("ok", True)),
+            "idle_seconds": float(snap.get("idle_seconds", 0.0)),
+            "is_fullscreen": bool(snap.get("is_fullscreen", False)),
+            "activity_category": str(snap.get("activity_category") or "other"),
+            "process_name": str(snap.get("process_name") or ""),
+            "safe_title": str(snap.get("safe_title") or ""),
+            "active_streak_seconds": float(snap.get("active_streak_seconds", 0.0)),
+            "just_paused": bool(snap.get("just_paused", False)),
+            "returned_from_away": bool(snap.get("returned_from_away", False)),
+            "pc_audio_busy": bool(audio_st.get("playing") or int(audio_st.get("queued") or 0) > 0),
+            "l3_status": l3_summary,
+        }
+        return _StarletteJSONResponse(payload)
 
     @mcp.custom_route("/audio/status", methods=["GET"])
     async def _audio_status_route(request: _StarletteRequest):
@@ -579,3 +694,48 @@ def register_http_routes(mcp, player: _WinMMPlayer) -> None:
             return _StarletteJSONResponse(overview)
         except Exception as exc:
             return _StarletteJSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    @mcp.custom_route("/desktop/screen-peek", methods=["POST"])
+    async def _desktop_screen_peek_route(request: _StarletteRequest):
+        check_perm_fn = facade_attr("_check_permission", _check_permission)
+        perm_err = check_perm_fn("L1")
+        if perm_err:
+            return _StarletteJSONResponse(
+                {"ok": False, "blocked": True, "blocked_reason": "pc_mode_blocked", "summary": perm_err},
+                status_code=403,
+            )
+        try:
+            raw_body = await request.body()
+            body = json.loads(raw_body.decode("utf-8")) if raw_body and raw_body.strip() else {}
+            if not isinstance(body, dict):
+                return _StarletteJSONResponse({"ok": False, "error": "请求体必须为 JSON 对象"}, status_code=400)
+            extra = [k for k in body.keys() if k not in ("question",)]
+            if extra:
+                return _StarletteJSONResponse(
+                    {"ok": False, "error": f"禁止提交未知字段: {', '.join(sorted(str(k) for k in extra))}"},
+                    status_code=400,
+                )
+            q = body.get("question", "")
+            if q is not None and not isinstance(q, str):
+                return _StarletteJSONResponse({"ok": False, "error": "字段 question 必须为字符串"}, status_code=400)
+        except Exception as exc:
+            return _StarletteJSONResponse({"ok": False, "error": f"请求体解析失败: {exc}"}, status_code=400)
+
+        peek_fn = facade_attr("peek_active_window", peek_active_window)
+        try:
+            res = await asyncio.to_thread(peek_fn, (q or "").strip()[:200])
+        except Exception as exc:
+            return _StarletteJSONResponse(
+                {
+                    "ok": False,
+                    "blocked": False,
+                    "blocked_reason": "screen_peek_error",
+                    "summary": f"浅看屏执行异常: {type(exc).__name__}",
+                },
+                status_code=502,
+            )
+        if res.get("blocked"):
+            return _StarletteJSONResponse(res, status_code=403)
+        if not res.get("ok"):
+            return _StarletteJSONResponse(res, status_code=502)
+        return _StarletteJSONResponse(res, status_code=200)

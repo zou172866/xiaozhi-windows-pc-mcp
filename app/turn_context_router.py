@@ -59,6 +59,7 @@ _MEMORY_BLOCK_RE = _make_block_re("memory")
 _REPLY_LEN_BLOCK_RE = _make_block_re("reply_length_control")
 _SPEECH_STYLE_BLOCK_RE = _make_block_re("speech_style_rules")
 _SPEAKERS_BLOCK_RE = _make_block_re("speakers_info")
+_VOCAL_CUE_BLOCK_RE = _make_block_re("user_vocal_cue")
 _TURN_CONTEXT_BLOCK_RE = re.compile(
     r"(?im)(?:^|\r?\n)[ \t]*<turn_context>(?:[ \t]*\r?\n(?:(?!<turn_context>).)*?|[^\r\n<>]*)</turn_context>[ \t]*(?=\r?\n|$)",
     re.DOTALL,
@@ -152,6 +153,7 @@ def build_turn_context_block(
     reply_length_block: str = "",
     speech_style_block: str = "",
     speakers_block: str = "",
+    vocal_cue_block: str = "",
 ) -> str:
     """Assemble a single <turn_context> envelope combining all per-turn volatile signals."""
     parts: List[str] = []
@@ -163,6 +165,12 @@ def build_turn_context_block(
             parts.append(mem_s)
         else:
             parts.append(f"<memory>\n{mem_s}\n</memory>")
+    if vocal_cue_block and vocal_cue_block.strip():
+        vc_s = vocal_cue_block.strip()
+        if vc_s.lower().startswith("<user_vocal_cue>") and vc_s.lower().endswith("</user_vocal_cue>"):
+            parts.append(vc_s)
+        else:
+            parts.append(f"<user_vocal_cue>\n{vc_s}\n</user_vocal_cue>")
     if reply_length_block and reply_length_block.strip():
         parts.append(reply_length_block.strip())
     if speech_style_block and speech_style_block.strip():
@@ -182,6 +190,8 @@ def apply_turn_context_to_messages(
     current_time_str: Optional[str] = None,
     mode: Optional[str] = None,
     pinned_turn_context: Optional[str] = None,
+    vocal_cue_block: Optional[str] = None,
+    speakers_block: Optional[str] = None,
     out_meta: Optional[Dict[str, str]] = None,
 ) -> list:
     """Stabilize system prompt prefix by relocating volatile per-turn blocks into <turn_context>.
@@ -207,6 +217,7 @@ def apply_turn_context_to_messages(
         except Exception:
             pass
     eff_time = current_time_str or datetime.now().strftime("%H:%M")
+    vc_clean = str(vocal_cue_block or "").strip()
 
     if active_mode == "legacy":
         out_leg = [dict(m) if isinstance(m, dict) else m for m in msgs]
@@ -243,6 +254,23 @@ def apply_turn_context_to_messages(
                     sys_c = f"{sys_c.rstrip()}\n\n{style_blk_leg}"
             except Exception:
                 pass
+            sys_c, _ = _extract_and_strip(_VOCAL_CUE_BLOCK_RE, sys_c)
+            if vc_clean:
+                vc_wrapped = (
+                    vc_clean
+                    if vc_clean.lower().startswith("<user_vocal_cue>") and vc_clean.lower().endswith("</user_vocal_cue>")
+                    else f"<user_vocal_cue>\n{vc_clean}\n</user_vocal_cue>"
+                )
+                sys_c = f"{sys_c.rstrip()}\n\n{vc_wrapped}"
+            spk_clean_leg = str(speakers_block or "").strip()
+            if spk_clean_leg:
+                sys_c, _ = _extract_and_strip(_SPEAKERS_BLOCK_RE, sys_c)
+                spk_wrapped = (
+                    spk_clean_leg
+                    if spk_clean_leg.lower().startswith("<speakers_info>") and spk_clean_leg.lower().endswith("</speakers_info>")
+                    else f"<speakers_info>\n{spk_clean_leg}\n</speakers_info>"
+                )
+                sys_c = f"{sys_c.rstrip()}\n\n{spk_wrapped}"
             out_leg[0]["content"] = sys_c
         try:
             reply_length_router.inject_reply_length_into_messages(out_leg)
@@ -287,6 +315,7 @@ def apply_turn_context_to_messages(
         sys_txt, memory_blocks = _extract_and_strip(_MEMORY_BLOCK_RE, sys_txt)
         sys_txt, _ = _extract_and_strip(_REPLY_LEN_BLOCK_RE, sys_txt)
         sys_txt, _ = _extract_and_strip(_SPEECH_STYLE_BLOCK_RE, sys_txt)
+        sys_txt, _ = _extract_and_strip(_VOCAL_CUE_BLOCK_RE, sys_txt)
         sys_txt, speakers_blocks = _extract_and_strip(_SPEAKERS_BLOCK_RE, sys_txt)
         sys_txt = re.sub(r"\n{3,}", "\n\n", sys_txt).strip()
         out_msgs[0]["content"] = sys_txt
@@ -329,6 +358,10 @@ def apply_turn_context_to_messages(
         except Exception:
             speech_style_blk = ""
 
+        if speakers_block and str(speakers_block).strip():
+            spk_extra = str(speakers_block).strip()
+            if spk_extra not in speakers_blocks:
+                speakers_blocks.append(spk_extra)
         speakers_joined = "\n\n".join(b for b in speakers_blocks if b.strip())
 
         turn_ctx = build_turn_context_block(
@@ -337,6 +370,7 @@ def apply_turn_context_to_messages(
             reply_length_block=reply_len_blk,
             speech_style_block=speech_style_blk,
             speakers_block=speakers_joined,
+            vocal_cue_block=vc_clean,
         )
 
     if isinstance(out_meta, dict):

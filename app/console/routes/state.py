@@ -29,6 +29,7 @@ import mei_emotion_router
 import patch_registry
 import pc_audio_router
 import persona_versions
+import proactive_companion
 import recall_guard
 import reply_length_router
 import runtime_events
@@ -621,6 +622,7 @@ def handle_get_state(handler, parsed) -> None:
                 "recall_style": recall_style_cfg,
                 "esp32_auth": esp32_auth_cfg,
                 "recall_guard_stats": recall_guard_stats,
+                "proactive": proactive_companion.get_proactive_snapshot(refresh_live=False, history_limit=10),
                 "obsidian": obs_cfg,
                 "l3_backend": l3_cfg,
                 "agy_bridge_online": l3._check_agy_bridge_online(l3_cfg),

@@ -749,3 +749,109 @@ def look_at_screen(question: str = "请简明描述当前电脑屏幕上正在�
     if not ans:
         return "屏幕视觉识别接口暂不可用，请检查 DEEPSEEK_API_KEY 或 GEMINI_API_KEY。"
     return f"屏幕画面分析结果：{ans}"
+
+
+def peek_active_window(
+    question: str = "请用自然简洁的中文概括当前活动窗口正在看或处理的主要内容。",
+) -> dict[str, Any]:
+    """Privacy-guarded active-window-only shallow screen peek (<=1024px JPEG, <=120-char summary)."""
+    from .winapi import (
+        _get_active_window_clipped_rect,
+        _get_foreground_window_info,
+        check_screen_peek_privacy,
+        classify_desktop_activity,
+        sanitize_window_title,
+    )
+
+    from .security import redact_secrets
+
+    get_fg = facade_attr("_get_foreground_window_info", _get_foreground_window_info)
+    privacy_fn = facade_attr("check_screen_peek_privacy", check_screen_peek_privacy)
+    clip_rect_fn = facade_attr("_get_active_window_clipped_rect", _get_active_window_clipped_rect)
+    ig = facade_attr("ImageGrab", ImageGrab)
+    call_vlm = facade_attr("_call_vision_llm", _call_vision_llm)
+
+    # Run foreground inspection, privacy guard, active-window rect & pixel grab atomically under _gui_lock (no TOCTOU)
+    with _gui_lock:
+        fg = get_fg() or {}
+        proc = str(fg.get("process") or "")
+        win_cls = str(fg.get("class") or "")
+        raw_title = str(fg.get("title") or "")
+        hwnd = int(fg.get("hwnd") or 0)
+        category = classify_desktop_activity(proc, win_cls, raw_title)
+        safe_title = sanitize_window_title(proc, raw_title, category)
+
+        allowed, deny_reason = privacy_fn(fg)
+        if not allowed:
+            return {
+                "ok": False,
+                "blocked": True,
+                "blocked_reason": deny_reason,
+                "summary": deny_reason,
+                "process_name": proc,
+                "activity_category": category,
+                "safe_title": safe_title,
+            }
+
+        win_rect = clip_rect_fn(hwnd) if hwnd else None
+        if win_rect is None:
+            # Fail closed: NEVER fall back to full-monitor capture (prevents leaking adjacent sensitive windows)
+            return {
+                "ok": False,
+                "blocked": True,
+                "blocked_reason": "active_window_rect_unavailable",
+                "summary": "未能精确定位当前活动窗口边界，为防止截到相邻窗口已取消本次浅看屏。",
+                "process_name": proc,
+                "activity_category": category,
+                "safe_title": safe_title,
+            }
+        try:
+            try:
+                img = ig.grab(bbox=win_rect, all_screens=True).convert("RGB")
+            except TypeError:
+                img = ig.grab(bbox=win_rect).convert("RGB")
+        except Exception:
+            return {
+                "ok": False,
+                "blocked": True,
+                "blocked_reason": "capture_unavailable",
+                "summary": "当前桌面无法截取活动窗口画面（可能处于锁屏、远程会话断开或受保护桌面）。",
+                "process_name": proc,
+                "activity_category": category,
+                "safe_title": safe_title,
+            }
+
+    w, h = img.size
+    max_side = max(w, h)
+    if max_side > 1024 and max_side > 0:
+        scale = 1024.0 / float(max_side)
+        img = img.resize((max(1, int(round(w * scale))), max(1, int(round(h * scale)))))
+
+    q_clean = str(question or "").strip()[:200] or "请用自然简洁的中文概括当前活动窗口正在看或处理的主要内容。"
+    prompt_q = (
+        f"你正在陪用户看他当前的活动窗口（类别：{category}，标题：{safe_title}）。\n"
+        f"用户的问题或关注点：{q_clean}\n"
+        "请只围绕核心可见内容给出准确、口语化、简洁的中文观察摘要（严格 120 字以内，不要逐字念界面菜单，"
+        "若意外看到手机号/密钥/密码/验证码/隐私账号请直接忽略绝不复述）。"
+    )
+    ans = call_vlm(prompt_q, img, json_mode=False)
+    if not ans:
+        return {
+            "ok": False,
+            "blocked": False,
+            "blocked_reason": "vlm_unavailable",
+            "summary": "视觉识别当前暂时不可用，请检查视觉 API Key 或网络连接。",
+            "process_name": proc,
+            "activity_category": category,
+            "safe_title": safe_title,
+        }
+    safe_summary = redact_secrets(str(ans).strip())[:160]
+    return {
+        "ok": True,
+        "blocked": False,
+        "blocked_reason": "",
+        "summary": safe_summary,
+        "process_name": proc,
+        "activity_category": category,
+        "safe_title": safe_title,
+    }

@@ -16,9 +16,24 @@ import time
 from urllib.parse import urlparse
 
 import persona_versions
+import proactive_companion
 import runtime_events
+import voiceprint_router
 from console import shared
-from console.routes import anima, archives, audio_api, config, gsv, l3, logs, state, tavern
+from console.routes import (
+    anima,
+    archives,
+    audio_api,
+    config,
+    gsv,
+    l3,
+    logs,
+    mobile_push as mobile_push_routes,
+    proactive,
+    state,
+    tavern,
+    voiceprint,
+)
 
 _console_atexit_registered = False
 
@@ -81,13 +96,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_body_json(self) -> dict:
+    def _read_body_json(self, *, max_bytes: int = 2 * 1024 * 1024) -> dict:
         raw_len = self.headers.get("Content-Length", "0")
         try:
             length = int(raw_len)
         except (TypeError, ValueError) as exc:
             raise shared._BadRequestError("无效的 Content-Length 请求头") from exc
-        if length < 0 or length > 2 * 1024 * 1024:
+        cap = max(1024, int(max_bytes))
+        if length < 0 or length > cap:
             raise shared._BadRequestError("请求体过大或长度非法")
         raw = self.rfile.read(length) if length > 0 else b"{}"
         if not raw or not raw.strip():
@@ -234,6 +250,10 @@ _GET_ROUTES = {
     "/api/recall-style": config.handle_get_recall_style,
     "/api/esp32-devices": config.handle_get_esp32_devices,
     "/api/audio-providers": audio_api.handle_get_audio_providers,
+    "/api/proactive": proactive.handle_get_proactive,
+    "/api/voiceprint": voiceprint.handle_get_voiceprint,
+    "/api/companion-widget": voiceprint.handle_get_companion_widget,
+    "/api/mobile-push": mobile_push_routes.handle_get_mobile_push,
 }
 
 _POST_ROUTES = {
@@ -259,15 +279,36 @@ _POST_ROUTES = {
     "/api/obsidian/config": anima.handle_post_obsidian_config,
     "/api/obsidian/rebuild": anima.handle_post_obsidian_rebuild,
     "/api/obsidian/briefing": anima.handle_post_obsidian_briefing,
+    "/api/obsidian/inbox/scan": anima.handle_post_obsidian_inbox_scan,
     "/api/l3-backend": l3.handle_post_l3_backend,
     "/api/audio-test": gsv.handle_post_audio_test,
     "/api/clear-history": state.handle_post_clear_history,
     "/api/tts-preview": gsv.handle_post_tts_preview,
+    "/api/proactive": proactive.handle_post_proactive,
+    "/api/proactive/run": proactive.handle_post_proactive_run,
+    "/api/proactive/inner-life": proactive.handle_post_proactive_inner_life,
+    "/api/voiceprint/config": voiceprint.handle_post_voiceprint_config,
+    "/api/voiceprint/enroll-last": voiceprint.handle_post_voiceprint_enroll_last,
+    "/api/voiceprint/enroll-wav": voiceprint.handle_post_voiceprint_enroll_wav,
+    "/api/voiceprint/delete": voiceprint.handle_post_voiceprint_delete,
+    "/api/voiceprint/download-model": voiceprint.handle_post_voiceprint_download_model,
+    "/api/screen-peek": voiceprint.handle_post_screen_peek,
+    "/api/mobile-push/config": mobile_push_routes.handle_post_mobile_push_config,
+    "/api/mobile-push/test": mobile_push_routes.handle_post_mobile_push_test,
+    "/api/mobile-push/briefing": mobile_push_routes.handle_post_mobile_push_briefing,
 }
 
 
 def _flush_console_state_on_shutdown() -> None:
     """Flush coalesced dirty history and throttled log cursor on clean process shutdown (D-1 / D-4)."""
+    try:
+        proactive_companion.stop_proactive_companion(timeout=1.5)
+    except Exception as exc:
+        shared._log_rate_limited("shutdown_stop_proactive", exc)
+    try:
+        voiceprint_router.unload_voiceprint_model(run_gc=False)
+    except Exception as exc:
+        shared._log_rate_limited("shutdown_unload_voiceprint", exc)
     try:
         shared.flush_history_if_dirty()
     except Exception as exc:
@@ -323,6 +364,10 @@ def start_console_background() -> None:
     watcher.start()
     prober = threading.Thread(target=state._service_probe_loop, name="console-service-prober", daemon=True)
     prober.start()
+    try:
+        proactive_companion.start_proactive_companion()
+    except Exception as exc:
+        shared._log_rate_limited("start_proactive_companion", exc)
 
     def _boot_sync():
         need_persona = True

@@ -96,6 +96,51 @@
     idleFarewellMeta: document.getElementById("idleFarewellMeta"),
     idleFarewellPreviewBtn: document.getElementById("idleFarewellPreviewBtn"),
     idleFarewellSaveBtn: document.getElementById("idleFarewellSaveBtn"),
+    proactiveBadge: document.getElementById("proactiveBadge"),
+    proactiveEnabledToggle: document.getElementById("proactiveEnabledToggle"),
+    proactiveEnabledHint: document.getElementById("proactiveEnabledHint"),
+    vocalCueEnabledToggle: document.getElementById("vocalCueEnabledToggle"),
+    vocalCueEnabledHint: document.getElementById("vocalCueEnabledHint"),
+    innerLifeEnabledToggle: document.getElementById("innerLifeEnabledToggle"),
+    innerLifeEnabledHint: document.getElementById("innerLifeEnabledHint"),
+    proactiveModeGrid: document.getElementById("proactiveModeGrid"),
+    proactiveQuietStart: document.getElementById("proactiveQuietStart"),
+    proactiveQuietEnd: document.getElementById("proactiveQuietEnd"),
+    proactiveIntervalInput: document.getElementById("proactiveIntervalInput"),
+    proactiveCooldownInput: document.getElementById("proactiveCooldownInput"),
+    proactiveMaxDailyInput: document.getElementById("proactiveMaxDailyInput"),
+    proactiveVolumeRange: document.getElementById("proactiveVolumeRange"),
+    proactiveVolumeVal: document.getElementById("proactiveVolumeVal"),
+    proactiveSaveBtn: document.getElementById("proactiveSaveBtn"),
+    proactiveRunBtn: document.getElementById("proactiveRunBtn"),
+    proactiveInnerLifeRefreshBtn: document.getElementById("proactiveInnerLifeRefreshBtn"),
+    proactiveRefreshBtn: document.getElementById("proactiveRefreshBtn"),
+    proactiveRhythmText: document.getElementById("proactiveRhythmText"),
+    proactiveVocalCueText: document.getElementById("proactiveVocalCueText"),
+    proactiveInnerLifeText: document.getElementById("proactiveInnerLifeText"),
+    proactiveStatsText: document.getElementById("proactiveStatsText"),
+    proactiveHistoryList: document.getElementById("proactiveHistoryList"),
+    voiceprintBadge: document.getElementById("voiceprintBadge"),
+    voiceprintEnabledToggle: document.getElementById("voiceprintEnabledToggle"),
+    voiceprintEnabledHint: document.getElementById("voiceprintEnabledHint"),
+    voiceprintPolicyBar: document.getElementById("voiceprintPolicyBar"),
+    voiceprintThresholdRange: document.getElementById("voiceprintThresholdRange"),
+    voiceprintThresholdVal: document.getElementById("voiceprintThresholdVal"),
+    voiceprintDownloadBtn: document.getElementById("voiceprintDownloadBtn"),
+    voiceprintRefreshBtn: document.getElementById("voiceprintRefreshBtn"),
+    voiceprintModelText: document.getElementById("voiceprintModelText"),
+    voiceprintRecentPcmText: document.getElementById("voiceprintRecentPcmText"),
+    voiceprintLatestText: document.getElementById("voiceprintLatestText"),
+    voiceprintNameInput: document.getElementById("voiceprintNameInput"),
+    voiceprintRoleSelect: document.getElementById("voiceprintRoleSelect"),
+    voiceprintEnrollLastBtn: document.getElementById("voiceprintEnrollLastBtn"),
+    voiceprintWavInput: document.getElementById("voiceprintWavInput"),
+    voiceprintSpeakerList: document.getElementById("voiceprintSpeakerList"),
+    screenPeekEnabledToggle: document.getElementById("screenPeekEnabledToggle"),
+    screenPeekEnabledHint: document.getElementById("screenPeekEnabledHint"),
+    screenPeekResultText: document.getElementById("screenPeekResultText"),
+    screenPeekQuestionInput: document.getElementById("screenPeekQuestionInput"),
+    screenPeekBtn: document.getElementById("screenPeekBtn"),
     relStageBadge: document.getElementById("relStageBadge"),
     relPresetBar: document.getElementById("relPresetBar"),
     relRomanceToggle: document.getElementById("relRomanceToggle"),
@@ -160,11 +205,34 @@
     obsBriefingHint: document.getElementById("obsBriefingHint"),
     obsBriefingStatusText: document.getElementById("obsBriefingStatusText"),
     obsBriefingBtn: document.getElementById("obsBriefingBtn"),
+    obsBriefingPushBtn: document.getElementById("obsBriefingPushBtn"),
+    obsInboxToggle: document.getElementById("obsInboxToggle"),
+    obsInboxHint: document.getElementById("obsInboxHint"),
+    obsInboxStatusText: document.getElementById("obsInboxStatusText"),
+    obsInboxScanBtn: document.getElementById("obsInboxScanBtn"),
     obsExportDirText: document.getElementById("obsExportDirText"),
     obsLastExportText: document.getElementById("obsLastExportText"),
     obsRebuildBtn: document.getElementById("obsRebuildBtn"),
     obsStatsText: document.getElementById("obsStatsText"),
     obsErrText: document.getElementById("obsErrText"),
+    mobilePushBadge: document.getElementById("mobilePushBadge"),
+    mobilePushEnabledToggle: document.getElementById("mobilePushEnabledToggle"),
+    mobilePushProviderSelect: document.getElementById("mobilePushProviderSelect"),
+    mobilePushSecretLabel: document.getElementById("mobilePushSecretLabel"),
+    mobilePushSecretInput: document.getElementById("mobilePushSecretInput"),
+    mobilePushFeishuSecretWrap: document.getElementById("mobilePushFeishuSecretWrap"),
+    mobilePushFeishuSecretInput: document.getElementById("mobilePushFeishuSecretInput"),
+    mobilePushSecretStatusText: document.getElementById("mobilePushSecretStatusText"),
+    mobilePushForwardProactiveToggle: document.getElementById("mobilePushForwardProactiveToggle"),
+    mobilePushForwardBriefingToggle: document.getElementById("mobilePushForwardBriefingToggle"),
+    mobilePushQuietToggle: document.getElementById("mobilePushQuietToggle"),
+    mobilePushMaxDailyInput: document.getElementById("mobilePushMaxDailyInput"),
+    mobilePushSaveBtn: document.getElementById("mobilePushSaveBtn"),
+    mobilePushClearSecretBtn: document.getElementById("mobilePushClearSecretBtn"),
+    mobilePushTestBtn: document.getElementById("mobilePushTestBtn"),
+    mobilePushBriefingBtn: document.getElementById("mobilePushBriefingBtn"),
+    mobilePushStatsText: document.getElementById("mobilePushStatsText"),
+    mobilePushHistoryList: document.getElementById("mobilePushHistoryList"),
     providerSelect: document.getElementById("providerSelect"),
     modelSelect: document.getElementById("modelSelect"),
     modelCustomInput: document.getElementById("modelCustomInput"),
@@ -1133,6 +1201,688 @@
     });
   }
 
+  // --- Proactive Companion, Desktop Rhythm & Vocal Cue Awareness (Phase 1) ---
+  let proactiveDirty = false;
+  let proactiveVolDragging = false;
+  let proactiveSaving = false;
+  let proactiveBusy = false;
+  let proactiveMode = "dry_run";
+  let proactiveLastHistorySig = "";
+
+  const PROACTIVE_CATEGORY_ZH = {
+    coding: "编程开发",
+    browser: "浏览网页",
+    media: "影音娱乐",
+    game: "游戏专注",
+    meeting: "会议/录制",
+    chat: "聊天沟通",
+    desktop: "桌面空闲",
+    other: "日常窗口",
+  };
+
+  const PROACTIVE_SLOT_ZH = {
+    morning: "上午",
+    afternoon: "下午",
+    evening: "傍晚/夜间",
+  };
+
+  const PROACTIVE_MODE_ZH = {
+    dry_run: "静默试运行",
+    pc_speaker: "电脑音响轻声播报",
+    mobile_push: "仅推手机通知栏",
+    pc_and_mobile: "音响轻声+推手机",
+  };
+  const VALID_PROACTIVE_MODES = new Set(["dry_run", "pc_speaker", "mobile_push", "pc_and_mobile"]);
+
+  function renderProactiveModeButtons(mode) {
+    proactiveMode = VALID_PROACTIVE_MODES.has(mode) ? mode : "dry_run";
+    if (!els.proactiveModeGrid) return;
+    els.proactiveModeGrid.querySelectorAll(".mode-btn").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.proactiveMode === proactiveMode);
+    });
+  }
+
+  function renderProactiveHistory(history) {
+    if (!els.proactiveHistoryList) return;
+    const list = Array.isArray(history) ? history : [];
+    const sig = JSON.stringify(list.map((x) => [x && x.id, x && x.action, x && x.mode, x && x.text]));
+    if (sig === proactiveLastHistorySig) return;
+    proactiveLastHistorySig = sig;
+    els.proactiveHistoryList.innerHTML = "";
+    if (!list.length) {
+      const empty = document.createElement("div");
+      empty.className = "dream-empty";
+      empty.textContent = "暂无主动陪伴试运行记录；点击「立即试跑一次」可在不发声的前提下验证决策与台词效果。";
+      els.proactiveHistoryList.appendChild(empty);
+      return;
+    }
+    for (const item of list.slice(0, 12)) {
+      if (!item || typeof item !== "object") continue;
+      const card = document.createElement("div");
+      card.className = "proactive-item";
+      const head = document.createElement("div");
+      head.className = "proactive-item-head";
+      const left = document.createElement("span");
+      const modeTag = PROACTIVE_MODE_ZH[item.mode] || "静默试跑";
+      const actTag = item.action === "SPEAK" ? (item.emotion ? `SPEAK [${item.emotion}]` : "SPEAK") : "HEARTBEAT_OK";
+      left.textContent = `${item.time || "--"} · ${modeTag} · ${actTag}${item.manual ? " · 手动" : ""}`;
+      const right = document.createElement("span");
+      right.className = "num";
+      right.textContent = item.would_block_reason
+        ? `正常门禁会拦截: ${item.would_block_reason}`
+        : (item.reason || "");
+      head.appendChild(left);
+      head.appendChild(right);
+      card.appendChild(head);
+
+      const body = document.createElement("div");
+      body.className = "proactive-item-text";
+      body.textContent = item.text || `（保持安静 · ${item.reason || "无需打扰"}）`;
+      card.appendChild(body);
+      els.proactiveHistoryList.appendChild(card);
+    }
+  }
+
+  function renderProactiveUI(snap, forceConfig = false) {
+    if (!snap || typeof snap !== "object") return;
+    const cfg = snap.config && typeof snap.config === "object" ? snap.config : null;
+    const rt = snap.runtime && typeof snap.runtime === "object" ? snap.runtime : null;
+    const rhy = snap.rhythm && typeof snap.rhythm === "object" ? snap.rhythm : null;
+    const il = snap.inner_life && typeof snap.inner_life === "object" ? snap.inner_life : null;
+    const vc = snap.latest_vocal_cue && typeof snap.latest_vocal_cue === "object" ? snap.latest_vocal_cue : null;
+
+    if (cfg) {
+      const enabled = Boolean(cfg.enabled);
+      const innerLifeEnabled = Boolean(cfg.inner_life_enabled);
+      const vocalCueEnabled = Boolean(snap.vocal_cue_enabled);
+      const mode = VALID_PROACTIVE_MODES.has(cfg.delivery_mode) ? cfg.delivery_mode : "dry_run";
+      if (!proactiveSaving) {
+        if (els.proactiveEnabledToggle) els.proactiveEnabledToggle.checked = enabled;
+        if (els.innerLifeEnabledToggle) els.innerLifeEnabledToggle.checked = innerLifeEnabled;
+        if (els.vocalCueEnabledToggle) els.vocalCueEnabledToggle.checked = vocalCueEnabled;
+        renderProactiveModeButtons(mode);
+        if (!proactiveVolDragging && els.proactiveVolumeRange && typeof cfg.pc_speaker_volume === "number") {
+          const pct = Math.round(cfg.pc_speaker_volume * 100);
+          els.proactiveVolumeRange.value = String(pct);
+          if (els.proactiveVolumeVal) els.proactiveVolumeVal.textContent = `${pct}%`;
+        }
+      }
+      if (forceConfig || !proactiveDirty) {
+        if (els.proactiveQuietStart && cfg.quiet_start) els.proactiveQuietStart.value = String(cfg.quiet_start);
+        if (els.proactiveQuietEnd && cfg.quiet_end) els.proactiveQuietEnd.value = String(cfg.quiet_end);
+        if (els.proactiveIntervalInput && cfg.check_interval_minutes != null) {
+          els.proactiveIntervalInput.value = String(cfg.check_interval_minutes);
+        }
+        if (els.proactiveCooldownInput && cfg.min_cooldown_minutes != null) {
+          els.proactiveCooldownInput.value = String(cfg.min_cooldown_minutes);
+        }
+        if (els.proactiveMaxDailyInput && cfg.max_daily_nudges != null) {
+          els.proactiveMaxDailyInput.value = String(cfg.max_daily_nudges);
+        }
+      }
+      if (els.proactiveBadge) {
+        const modeLabel = PROACTIVE_MODE_ZH[mode] || "静默试运行";
+        if (!enabled) {
+          els.proactiveBadge.textContent = "已关闭";
+        } else if (rt && rt.in_quiet_hours) {
+          els.proactiveBadge.textContent = `免打扰中 · ${modeLabel}`;
+        } else {
+          els.proactiveBadge.textContent = modeLabel;
+        }
+      }
+      if (els.proactiveEnabledHint) {
+        els.proactiveEnabledHint.textContent = enabled
+          ? (mode === "dry_run"
+            ? "当前为静默试运行：仅在下方记录门控决策与台词，绝不打扰也不消耗未完小事配额"
+            : `已启用「${PROACTIVE_MODE_ZH[mode] || mode}」；自动遵守免打扰、心流静默与无人回应退避`)
+          : "关闭时不启动后台心跳线程、不轮询 18900；仅响应你的主动唤醒与语音对话";
+      }
+    }
+
+    if (els.proactiveRhythmText && rhy) {
+      if (rhy.online) {
+        const catZh = PROACTIVE_CATEGORY_ZH[rhy.activity_category] || rhy.activity_category || "日常窗口";
+        const flags = [];
+        if (rhy.is_fullscreen) flags.push("全屏静默");
+        if (rhy.just_paused) flags.push("专注刚停顿");
+        if (rhy.returned_from_away) flags.push("离开后刚回桌");
+        if (rhy.pc_audio_busy) flags.push("播音中");
+        const streakMin = Math.floor(Number(rhy.active_streak_seconds || 0) / 60);
+        const flagStr = flags.length ? ` · ${flags.join("/")}` : "";
+        els.proactiveRhythmText.textContent = `${catZh}「${rhy.safe_title || "常规窗口"}」· 静默 ${Math.round(Number(rhy.idle_seconds || 0))}s · 连续活跃 ${streakMin}分${flagStr}`;
+        els.proactiveRhythmText.style.color = "var(--ink)";
+      } else {
+        els.proactiveRhythmText.textContent = "宿主机 18900 节律探针离线（点击「刷新状态」重试）";
+        els.proactiveRhythmText.style.color = "var(--ink-muted)";
+      }
+    }
+
+    if (els.proactiveVocalCueText) {
+      if (vc && vc.summary_zh) {
+        els.proactiveVocalCueText.textContent = `${vc.time || ""} · ${vc.summary_zh}`;
+        els.proactiveVocalCueText.style.color = "var(--accent)";
+      } else {
+        els.proactiveVocalCueText.textContent = "暂无非中性语气事件（中性对话自动保持安静）";
+        els.proactiveVocalCueText.style.color = "var(--ink-muted)";
+      }
+    }
+
+    if (els.proactiveInnerLifeText) {
+      if (il && il.text) {
+        const slotZh = PROACTIVE_SLOT_ZH[il.slot] || il.slot || "";
+        els.proactiveInnerLifeText.textContent = `${il.local_date || ""} ${slotZh}：${il.text}`;
+        els.proactiveInnerLifeText.style.color = "var(--ink)";
+      } else {
+        els.proactiveInnerLifeText.textContent = "尚未拉取今日角色微日常（点击「刷新角色日常」生成）";
+        els.proactiveInnerLifeText.style.color = "var(--ink-muted)";
+      }
+    }
+
+    if (els.proactiveStatsText && rt) {
+      const skipPart = rt.last_skip_reason ? ` · 最近门控: ${rt.last_skip_reason}` : "";
+      els.proactiveStatsText.textContent = `今日实发 ${rt.daily_spoke_count || 0}/${rt.max_daily_nudges || 4} · 退避冷却 ${rt.effective_cooldown_minutes || 90}分（忽略 ${rt.consecutive_ignored || 0} 次）${skipPart}`;
+    }
+
+    if (Array.isArray(snap.history)) {
+      renderProactiveHistory(snap.history);
+    }
+  }
+
+  async function fetchProactiveStatus(silent = false) {
+    try {
+      const resp = await fetch("/api/proactive", { cache: "no-store" });
+      const res = await resp.json();
+      if (resp.ok && res && res.ok) {
+        renderProactiveUI(res, false);
+      } else if (!silent) {
+        showBanner("err", (res && res.error) || "获取主动陪伴状态失败");
+      }
+    } catch (err) {
+      if (!silent) showBanner("err", `获取主动陪伴状态失败：${err.message}`);
+    }
+  }
+
+  async function saveProactiveConfig(overridePayload = null, toastText = "") {
+    if (proactiveSaving) return;
+    proactiveSaving = true;
+    const isFullFormSave = overridePayload === null;
+    if (els.proactiveSaveBtn) els.proactiveSaveBtn.disabled = true;
+    try {
+      const payload = overridePayload || {
+        enabled: els.proactiveEnabledToggle ? Boolean(els.proactiveEnabledToggle.checked) : true,
+        delivery_mode: proactiveMode,
+        quiet_start: els.proactiveQuietStart ? els.proactiveQuietStart.value.trim() : "23:00",
+        quiet_end: els.proactiveQuietEnd ? els.proactiveQuietEnd.value.trim() : "08:00",
+        check_interval_minutes: Number(els.proactiveIntervalInput ? els.proactiveIntervalInput.value : 15),
+        min_cooldown_minutes: Number(els.proactiveCooldownInput ? els.proactiveCooldownInput.value : 90),
+        max_daily_nudges: Number(els.proactiveMaxDailyInput ? els.proactiveMaxDailyInput.value : 4),
+        pc_speaker_volume: Number(els.proactiveVolumeRange ? els.proactiveVolumeRange.value : 75) / 100.0,
+      };
+      const resp = await consolePost("/api/proactive", payload);
+      const res = await resp.json();
+      if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "保存主动陪伴配置失败");
+      if (isFullFormSave) proactiveDirty = false;
+      proactiveSaving = false;
+      renderProactiveUI(res, isFullFormSave);
+      showBanner("info", toastText || "主动陪伴门控设置已热更新生效");
+      scheduleHideBanner(3000);
+    } catch (err) {
+      proactiveSaving = false;
+      if (!isFullFormSave) {
+        // Revert optimistic quick-toggle UI back to authoritative server state
+        await fetchProactiveStatus(true);
+      }
+      showBanner("err", `保存主动陪伴设置失败：${err.message}`);
+    } finally {
+      proactiveSaving = false;
+      if (els.proactiveSaveBtn) els.proactiveSaveBtn.disabled = false;
+    }
+  }
+
+  if (els.proactiveEnabledToggle) {
+    els.proactiveEnabledToggle.addEventListener("change", () => {
+      const nextEn = Boolean(els.proactiveEnabledToggle.checked);
+      saveProactiveConfig({ enabled: nextEn }, nextEn ? "已开启主动陪伴心跳引擎" : "已关闭主动陪伴心跳引擎（后台线程已停止）");
+    });
+  }
+
+  if (els.vocalCueEnabledToggle) {
+    els.vocalCueEnabledToggle.addEventListener("change", () => {
+      const nextEn = Boolean(els.vocalCueEnabledToggle.checked);
+      saveProactiveConfig({ vocal_cue_enabled: nextEn }, nextEn ? "已开启 SenseVoice 语气/声学感知" : "已关闭语气感知（零额外缓存）");
+    });
+  }
+
+  if (els.innerLifeEnabledToggle) {
+    els.innerLifeEnabledToggle.addEventListener("change", () => {
+      const nextEn = Boolean(els.innerLifeEnabledToggle.checked);
+      saveProactiveConfig({ inner_life_enabled: nextEn }, nextEn ? "已开启 Anima 角色微日常" : "已关闭角色微日常背景");
+    });
+  }
+
+  if (els.proactiveModeGrid) {
+    els.proactiveModeGrid.addEventListener("click", (e) => {
+      const btn = e.target.closest(".mode-btn");
+      if (!btn) return;
+      const nextMode = btn.dataset.proactiveMode;
+      if (!nextMode || nextMode === proactiveMode) return;
+      renderProactiveModeButtons(nextMode);
+      const label = nextMode === "pc_speaker"
+        ? "已切换为「电脑音响轻声播报」（自动遵守免打扰与心流门控）"
+        : "已切换为「静默试运行」（仅记录到控制台，不发声）";
+      saveProactiveConfig({ delivery_mode: nextMode }, label);
+    });
+  }
+
+  for (const inp of [
+    els.proactiveQuietStart,
+    els.proactiveQuietEnd,
+    els.proactiveIntervalInput,
+    els.proactiveCooldownInput,
+    els.proactiveMaxDailyInput,
+  ]) {
+    if (inp) {
+      inp.addEventListener("input", () => { proactiveDirty = true; });
+    }
+  }
+
+  if (els.proactiveVolumeRange) {
+    els.proactiveVolumeRange.addEventListener("input", () => {
+      proactiveVolDragging = true;
+      if (els.proactiveVolumeVal) els.proactiveVolumeVal.textContent = `${els.proactiveVolumeRange.value}%`;
+    });
+    els.proactiveVolumeRange.addEventListener("change", () => {
+      proactiveVolDragging = false;
+      const vol = Number(els.proactiveVolumeRange.value) / 100.0;
+      saveProactiveConfig({ pc_speaker_volume: vol }, `主动播报音量已调至 ${els.proactiveVolumeRange.value}%`);
+    });
+  }
+
+  if (els.proactiveSaveBtn) {
+    els.proactiveSaveBtn.addEventListener("click", () => saveProactiveConfig());
+  }
+
+  if (els.proactiveRefreshBtn) {
+    els.proactiveRefreshBtn.addEventListener("click", () => fetchProactiveStatus(false));
+  }
+
+  if (els.proactiveRunBtn) {
+    els.proactiveRunBtn.addEventListener("click", async () => {
+      if (proactiveBusy) return;
+      proactiveBusy = true;
+      els.proactiveRunBtn.disabled = true;
+      try {
+        const resp = await consolePost("/api/proactive/run", { force_dry_run: true, bypass_timing_gates: true });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "试跑失败");
+        if (res.proactive) renderProactiveUI(res.proactive, false);
+        const entry = res.entry || {};
+        const note = entry.action === "SPEAK"
+          ? `静默试跑产出台词：[${entry.emotion || "gentle"}] ${entry.text}`
+          : `静默试跑结果：保持安静（${entry.reason || res.reason || "无需打扰"}）`;
+        showBanner("info", note);
+        scheduleHideBanner(4500);
+      } catch (err) {
+        showBanner("err", `主动陪伴试跑失败：${err.message}`);
+      } finally {
+        proactiveBusy = false;
+        els.proactiveRunBtn.disabled = false;
+      }
+    });
+  }
+
+  if (els.proactiveInnerLifeRefreshBtn) {
+    els.proactiveInnerLifeRefreshBtn.addEventListener("click", async () => {
+      if (proactiveBusy) return;
+      proactiveBusy = true;
+      els.proactiveInnerLifeRefreshBtn.disabled = true;
+      try {
+        const resp = await consolePost("/api/proactive/inner-life", { use_llm: false });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "刷新角色微日常失败");
+        await fetchProactiveStatus(true);
+        showBanner("info", `今日角色微日常已刷新：${(res.inner_life && res.inner_life.text) || "已更新"}`);
+        scheduleHideBanner(3800);
+      } catch (err) {
+        showBanner("err", `刷新角色微日常失败：${err.message}`);
+      } finally {
+        proactiveBusy = false;
+        els.proactiveInnerLifeRefreshBtn.disabled = false;
+      }
+    });
+  }
+
+  // ===== Phase 2: Voiceprint Speaker Guard & Privacy-Guarded On-Demand Screen Peek =====
+  let vpPolicy = "full_guard";
+  let vpSaving = false;
+  let vpBusy = false;
+  let vpThrDragging = false;
+
+  function renderVoiceprintPolicyButtons(policy) {
+    vpPolicy = policy || "full_guard";
+    if (!els.voiceprintPolicyBar) return;
+    els.voiceprintPolicyBar.querySelectorAll(".preset-pill").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.vpPolicy === vpPolicy);
+    });
+  }
+
+  function renderVoiceprintSpeakers(speakers) {
+    if (!els.voiceprintSpeakerList) return;
+    els.voiceprintSpeakerList.textContent = "";
+    if (!Array.isArray(speakers) || !speakers.length) {
+      const empty = document.createElement("div");
+      empty.className = "dream-empty";
+      empty.textContent = "尚未录入任何声纹（未录入主人声纹前默认完全放行，不会自锁）。";
+      els.voiceprintSpeakerList.appendChild(empty);
+      return;
+    }
+    for (const spk of speakers) {
+      const row = document.createElement("div");
+      row.className = "vp-speaker-item";
+
+      const info = document.createElement("div");
+      info.className = "vp-speaker-info";
+      const roleTag = spk.role === "owner" ? "主人" : "家人";
+      const cidPart = spk.character_id ? ` · 角色 ${spk.character_id}` : " · 主角色";
+      info.textContent = `[${roleTag}] ${spk.display_name || spk.speaker_id}（样本 ${spk.sample_count || 1} 条${cidPart}）`;
+      row.appendChild(info);
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "btn vp-del-btn";
+      delBtn.dataset.vpDeleteId = spk.speaker_id || "";
+      delBtn.textContent = "删除";
+      row.appendChild(delBtn);
+      els.voiceprintSpeakerList.appendChild(row);
+    }
+  }
+
+  function renderVoiceprintUI(data) {
+    if (!data || typeof data !== "object") return;
+    const cfg = data.config && typeof data.config === "object" ? data.config : {};
+    const enabled = Boolean(cfg.enabled);
+    const screenPeekEnabled = Boolean(data.screen_peek_enabled);
+
+    if (!vpSaving) {
+      if (els.voiceprintEnabledToggle) els.voiceprintEnabledToggle.checked = enabled;
+      if (els.screenPeekEnabledToggle) els.screenPeekEnabledToggle.checked = screenPeekEnabled;
+      renderVoiceprintPolicyButtons(cfg.policy || "full_guard");
+      if (!vpThrDragging && els.voiceprintThresholdRange && typeof cfg.threshold === "number") {
+        const pct = Math.round(cfg.threshold * 100);
+        els.voiceprintThresholdRange.value = String(pct);
+        if (els.voiceprintThresholdVal) els.voiceprintThresholdVal.textContent = cfg.threshold.toFixed(2);
+      }
+    }
+
+    if (els.voiceprintBadge) {
+      if (!enabled) {
+        els.voiceprintBadge.textContent = "已关闭（零内存）";
+      } else if (data.guard_active) {
+        els.voiceprintBadge.textContent = cfg.policy === "full_guard" ? "全防护生效中" : (cfg.policy === "isolate_memory" ? "记忆隔离中" : "观察识别中");
+      } else if (!data.model_present) {
+        els.voiceprintBadge.textContent = "待下载模型";
+      } else {
+        els.voiceprintBadge.textContent = "待录主人（放行）";
+      }
+    }
+
+    if (els.voiceprintModelText) {
+      const dl = data.download || {};
+      if (dl.downloading) {
+        els.voiceprintModelText.textContent = "正在后台下载 3D-Speaker CAM++ 模型（约 28MB）…";
+        els.voiceprintModelText.style.color = "var(--accent)";
+      } else if (data.model_present) {
+        els.voiceprintModelText.textContent = `${data.model_filename || "speaker.onnx"}（${data.model_loaded ? "已加载至内存" : "已就绪 · 懒加载未占内存"}）`;
+        els.voiceprintModelText.style.color = "var(--ink)";
+      } else {
+        const errPart = dl.last_error ? ` · 上次下载失败: ${dl.last_error}` : "";
+        els.voiceprintModelText.textContent = `未找到 ONNX 声纹模型，点击右侧按钮一键下载${errPart}`;
+        els.voiceprintModelText.style.color = "var(--ink-muted)";
+      }
+    }
+
+    if (els.voiceprintRecentPcmText) {
+      const pcm = data.recent_pcm;
+      if (pcm && pcm.available) {
+        const txt = pcm.transcript ? `「${pcm.transcript}」` : "";
+        els.voiceprintRecentPcmText.textContent = `已捕获 ${pcm.duration_sec}s 语音 ${txt}，可直接点「把刚才那句录为声纹」`;
+        els.voiceprintRecentPcmText.style.color = "var(--ink)";
+      } else {
+        els.voiceprintRecentPcmText.textContent = enabled
+          ? "等待对着设备说一句 1～3 秒的话以捕获可录入语音"
+          : "声纹开关已关闭（不缓存音频，零额外内存）";
+        els.voiceprintRecentPcmText.style.color = "var(--ink-muted)";
+      }
+    }
+
+    if (els.voiceprintLatestText) {
+      const latest = data.latest_identification;
+      if (latest && latest.display_name) {
+        const simPart = typeof latest.similarity === "number" && latest.similarity > 0 ? `（相似度 ${latest.similarity.toFixed(2)}）` : "";
+        els.voiceprintLatestText.textContent = `${latest.display_name}${simPart}`;
+      } else {
+        els.voiceprintLatestText.textContent = "暂无识别记录";
+      }
+    }
+
+    renderVoiceprintSpeakers(data.speakers || []);
+  }
+
+  async function fetchVoiceprintStatus(silent = false) {
+    try {
+      const resp = await fetch("/api/voiceprint", { cache: "no-store" });
+      const res = await resp.json();
+      if (resp.ok && res && res.ok) {
+        renderVoiceprintUI(res);
+      } else if (!silent) {
+        showBanner("err", (res && res.error) || "获取声纹状态失败");
+      }
+    } catch (err) {
+      if (!silent) showBanner("err", `获取声纹状态失败：${err.message}`);
+    }
+  }
+
+  async function saveVoiceprintConfig(payload, toastText) {
+    if (vpSaving) return;
+    vpSaving = true;
+    try {
+      const resp = await consolePost("/api/voiceprint/config", payload);
+      const res = await resp.json();
+      if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "保存声纹设置失败");
+      vpSaving = false;
+      renderVoiceprintUI(res);
+      showBanner("info", toastText || "声纹与浅看屏设置已生效");
+      scheduleHideBanner(3000);
+    } catch (err) {
+      vpSaving = false;
+      await fetchVoiceprintStatus(true);
+      showBanner("err", `保存设置失败：${err.message}`);
+    } finally {
+      vpSaving = false;
+    }
+  }
+
+  if (els.voiceprintEnabledToggle) {
+    els.voiceprintEnabledToggle.addEventListener("change", () => {
+      const nextEn = Boolean(els.voiceprintEnabledToggle.checked);
+      saveVoiceprintConfig(
+        { enabled: nextEn },
+        nextEn ? "已开启单设备声纹认人（未录主人前默认放行）" : "已关闭声纹认人并释放模型与缓存内存"
+      );
+    });
+  }
+
+  if (els.screenPeekEnabledToggle) {
+    els.screenPeekEnabledToggle.addEventListener("change", () => {
+      const nextEn = Boolean(els.screenPeekEnabledToggle.checked);
+      saveVoiceprintConfig(
+        { screen_peek_enabled: nextEn },
+        nextEn ? "已开启按需隐私护栏浅看屏" : "已关闭按需浅看屏"
+      );
+    });
+  }
+
+  if (els.voiceprintPolicyBar) {
+    els.voiceprintPolicyBar.addEventListener("click", (e) => {
+      const btn = e.target.closest(".preset-pill");
+      if (!btn) return;
+      const nextPol = btn.dataset.vpPolicy;
+      if (!nextPol || nextPol === vpPolicy) return;
+      renderVoiceprintPolicyButtons(nextPol);
+      saveVoiceprintConfig({ policy: nextPol }, `声纹策略已切换为 ${nextPol}`);
+    });
+  }
+
+  if (els.voiceprintThresholdRange) {
+    els.voiceprintThresholdRange.addEventListener("input", () => {
+      vpThrDragging = true;
+      if (els.voiceprintThresholdVal) {
+        els.voiceprintThresholdVal.textContent = (Number(els.voiceprintThresholdRange.value) / 100.0).toFixed(2);
+      }
+    });
+    els.voiceprintThresholdRange.addEventListener("change", () => {
+      vpThrDragging = false;
+      const thr = Number(els.voiceprintThresholdRange.value) / 100.0;
+      saveVoiceprintConfig({ threshold: thr }, `声纹相似度阈值已调至 ${thr.toFixed(2)}`);
+    });
+  }
+
+  if (els.voiceprintRefreshBtn) {
+    els.voiceprintRefreshBtn.addEventListener("click", () => fetchVoiceprintStatus(false));
+  }
+
+  if (els.voiceprintDownloadBtn) {
+    els.voiceprintDownloadBtn.addEventListener("click", async () => {
+      if (vpBusy) return;
+      vpBusy = true;
+      els.voiceprintDownloadBtn.disabled = true;
+      try {
+        const resp = await consolePost("/api/voiceprint/download-model", {});
+        const res = await resp.json();
+        if (!resp.ok && resp.status !== 202) throw new Error((res && res.error) || "下载触发失败");
+        renderVoiceprintUI(res);
+        showBanner("info", res.message || "已开始下载声纹模型，完成后请点刷新状态");
+        scheduleHideBanner(4500);
+      } catch (err) {
+        showBanner("err", `下载声纹模型失败：${err.message}`);
+      } finally {
+        vpBusy = false;
+        els.voiceprintDownloadBtn.disabled = false;
+      }
+    });
+  }
+
+  if (els.voiceprintEnrollLastBtn) {
+    els.voiceprintEnrollLastBtn.addEventListener("click", async () => {
+      if (vpBusy) return;
+      const displayName = (els.voiceprintNameInput ? els.voiceprintNameInput.value : "").trim() || "主人";
+      const role = els.voiceprintRoleSelect ? els.voiceprintRoleSelect.value : "owner";
+      vpBusy = true;
+      els.voiceprintEnrollLastBtn.disabled = true;
+      try {
+        const resp = await consolePost("/api/voiceprint/enroll-last", { display_name: displayName, role });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "声纹录入失败");
+        renderVoiceprintUI(res);
+        showBanner("info", `已将刚才那句话录入为「${displayName}」（${role === "owner" ? "主人" : "家人"}）`);
+        scheduleHideBanner(4000);
+      } catch (err) {
+        showBanner("err", `录入声纹失败：${err.message}`);
+      } finally {
+        vpBusy = false;
+        els.voiceprintEnrollLastBtn.disabled = false;
+      }
+    });
+  }
+
+  if (els.voiceprintWavInput) {
+    els.voiceprintWavInput.addEventListener("change", async () => {
+      const file = els.voiceprintWavInput.files && els.voiceprintWavInput.files[0];
+      els.voiceprintWavInput.value = "";
+      if (!file || vpBusy) return;
+      if (file.size > 2 * 1024 * 1024) {
+        showBanner("err", "WAV 文件不能超过 2 MB，请录制 2～8 秒清晰人声");
+        return;
+      }
+      const displayName = (els.voiceprintNameInput ? els.voiceprintNameInput.value : "").trim() || "主人";
+      const role = els.voiceprintRoleSelect ? els.voiceprintRoleSelect.value : "owner";
+      vpBusy = true;
+      try {
+        const buf = await file.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = "";
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        const wavB64 = btoa(bin);
+        const resp = await consolePost("/api/voiceprint/enroll-wav", {
+          display_name: displayName,
+          role,
+          wav_base64: wavB64,
+        });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "上传录入失败");
+        renderVoiceprintUI(res);
+        showBanner("info", `WAV 声纹录入成功：「${displayName}」`);
+        scheduleHideBanner(4000);
+      } catch (err) {
+        showBanner("err", `WAV 录入失败：${err.message}`);
+      } finally {
+        vpBusy = false;
+      }
+    });
+  }
+
+  if (els.voiceprintSpeakerList) {
+    els.voiceprintSpeakerList.addEventListener("click", async (e) => {
+      const btn = e.target.closest(".vp-del-btn");
+      if (!btn || vpBusy) return;
+      const sid = btn.dataset.vpDeleteId;
+      if (!sid) return;
+      vpBusy = true;
+      btn.disabled = true;
+      try {
+        const resp = await consolePost("/api/voiceprint/delete", { speaker_id: sid });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "删除失败");
+        renderVoiceprintUI(res);
+        showBanner("info", "已删除该说话人声纹");
+        scheduleHideBanner(3000);
+      } catch (err) {
+        showBanner("err", `删除声纹失败：${err.message}`);
+      } finally {
+        vpBusy = false;
+      }
+    });
+  }
+
+  if (els.screenPeekBtn) {
+    els.screenPeekBtn.addEventListener("click", async () => {
+      if (vpBusy) return;
+      vpBusy = true;
+      els.screenPeekBtn.disabled = true;
+      try {
+        const q = (els.screenPeekQuestionInput ? els.screenPeekQuestionInput.value : "").trim();
+        const resp = await consolePost("/api/screen-peek", { question: q, speak: false });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) {
+          if (els.screenPeekResultText) {
+            els.screenPeekResultText.textContent = (res && res.error) || "浅看屏未执行";
+          }
+          throw new Error((res && res.error) || "浅看屏失败");
+        }
+        if (els.screenPeekResultText) {
+          els.screenPeekResultText.textContent = `[${res.emotion || "gentle"}] ${res.text || res.summary || ""}`;
+        }
+        showBanner("info", `浅看屏完成：${res.text || res.summary || ""}`);
+        scheduleHideBanner(4500);
+      } catch (err) {
+        showBanner("err", `浅看屏未执行：${err.message}`);
+      } finally {
+        vpBusy = false;
+        els.screenPeekBtn.disabled = false;
+      }
+    });
+  }
+
   if (els.idleFarewellSaveBtn) {
     els.idleFarewellSaveBtn.addEventListener("click", () => saveIdleFarewell());
   }
@@ -1687,6 +2437,25 @@
         els.obsBriefingStatusText.style.color = "var(--ink-muted)";
       }
     }
+    const inbox = obs.inbox || {};
+    const inboxEnabled = typeof obs.inbox_enabled === "boolean" ? obs.inbox_enabled : Boolean(inbox.enabled);
+    if (els.obsInboxToggle) els.obsInboxToggle.checked = inboxEnabled;
+    if (els.obsInboxStatusText) {
+      if (!inboxEnabled) {
+        els.obsInboxStatusText.textContent = "已关闭（零扫描）";
+        els.obsInboxStatusText.style.color = "var(--ink-muted)";
+      } else if (inbox.last_error) {
+        els.obsInboxStatusText.textContent = `扫描异常：${inbox.last_error}`;
+        els.obsInboxStatusText.style.color = "var(--danger)";
+      } else if (inbox.last_scan_at) {
+        const ist = inbox.stats || {};
+        els.obsInboxStatusText.textContent = `${inbox.last_scan_at}（记忆 ${ist.total_facts || 0} · 待办 ${ist.total_open_todos || 0} · 已完结 ${ist.total_resolved_todos || 0}）`;
+        els.obsInboxStatusText.style.color = "var(--accent)";
+      } else {
+        els.obsInboxStatusText.textContent = "已开启（监听 Vault「收件箱/」，绝不改写原笔记）";
+        els.obsInboxStatusText.style.color = "var(--accent)";
+      }
+    }
     if (els.obsExportDirText) {
       els.obsExportDirText.textContent = obs.host_export_dir || obs.export_dir || "--";
     }
@@ -1708,8 +2477,12 @@
         els.obsStatusBadge.textContent = "Anima 离线";
       } else if (!writable) {
         els.obsStatusBadge.textContent = "目录不可写";
+      } else if (enabled && inboxEnabled) {
+        els.obsStatusBadge.textContent = "双向同步 · 就绪";
       } else if (enabled) {
         els.obsStatusBadge.textContent = "自动同步 · 就绪";
+      } else if (inboxEnabled) {
+        els.obsStatusBadge.textContent = "仅收件箱 · 就绪";
       } else {
         els.obsStatusBadge.textContent = "已暂停";
       }
@@ -1741,9 +2514,89 @@
     if (!obsBusy) {
       if (els.obsSyncToggle) els.obsSyncToggle.disabled = !online;
       if (els.obsBriefingToggle) els.obsBriefingToggle.disabled = !online;
+      if (els.obsInboxToggle) els.obsInboxToggle.disabled = !online;
+      if (els.obsInboxScanBtn) els.obsInboxScanBtn.disabled = !online || !inboxEnabled;
       if (els.obsBriefingBtn) els.obsBriefingBtn.disabled = !online;
+      if (els.obsBriefingPushBtn) els.obsBriefingPushBtn.disabled = !online;
       if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = !online;
     }
+  }
+
+  function setObsControlsDisabled(disabled) {
+    if (els.obsSyncToggle) els.obsSyncToggle.disabled = disabled;
+    if (els.obsBriefingToggle) els.obsBriefingToggle.disabled = disabled;
+    if (els.obsInboxToggle) els.obsInboxToggle.disabled = disabled;
+    if (els.obsInboxScanBtn) els.obsInboxScanBtn.disabled = disabled || !(els.obsInboxToggle && els.obsInboxToggle.checked);
+    if (els.obsBriefingBtn) els.obsBriefingBtn.disabled = disabled;
+    if (els.obsBriefingPushBtn) els.obsBriefingPushBtn.disabled = disabled;
+    if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = disabled;
+  }
+
+  if (els.obsInboxToggle) {
+    els.obsInboxToggle.addEventListener("change", async () => {
+      const inboxEnabled = Boolean(els.obsInboxToggle.checked);
+      if (obsBusy) {
+        els.obsInboxToggle.checked = !inboxEnabled;
+        return;
+      }
+      obsBusy = true;
+      obsPendingState = null;
+      let appliedFreshState = false;
+      setObsControlsDisabled(true);
+      try {
+        const resp = await consolePost("/api/obsidian/config", { inbox_enabled: inboxEnabled });
+        const res = await resp.json();
+        if (res && res.obsidian) {
+          renderObsidianUI(res.obsidian);
+          appliedFreshState = true;
+        }
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "切换收件箱开关失败");
+        showBanner("info", inboxEnabled ? "已开启 Obsidian 双向备忘收件箱（监听「收件箱/」，绝不改写原笔记）" : "已关闭 Obsidian 双向备忘收件箱（零磁盘扫描）");
+        scheduleHideBanner(3400);
+      } catch (err) {
+        if (!appliedFreshState) els.obsInboxToggle.checked = !inboxEnabled;
+        showBanner("err", `切换备忘收件箱失败：${err.message}`);
+      } finally {
+        obsBusy = false;
+        const pending = obsPendingState;
+        obsPendingState = null;
+        if (!appliedFreshState && pending) renderObsidianUI(pending);
+        setObsControlsDisabled(!obsOnline);
+      }
+    });
+  }
+
+  if (els.obsInboxScanBtn) {
+    els.obsInboxScanBtn.addEventListener("click", async () => {
+      if (obsBusy) return;
+      obsBusy = true;
+      obsPendingState = null;
+      let appliedFreshState = false;
+      const oldText = els.obsInboxScanBtn.textContent;
+      setObsControlsDisabled(true);
+      els.obsInboxScanBtn.textContent = "正在扫描…";
+      try {
+        const resp = await consolePost("/api/obsidian/inbox/scan", {});
+        const res = await resp.json();
+        if (res && res.obsidian) {
+          renderObsidianUI(res.obsidian);
+          appliedFreshState = true;
+        }
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "扫描收件箱失败");
+        const st = (res.result && res.result.stats) || {};
+        showBanner("info", `收件箱扫描完成：扫描 ${st.scanned_files || 0} 篇 · 新增记忆 ${st.added_facts || 0} 条 · 待办 ${st.added_loops || 0} 项 · 消标 ${st.resolved_loops || 0} 项`);
+        scheduleHideBanner(4200);
+      } catch (err) {
+        showBanner("err", `扫描收件箱失败：${err.message}`);
+      } finally {
+        obsBusy = false;
+        const pending = obsPendingState;
+        obsPendingState = null;
+        if (!appliedFreshState && pending) renderObsidianUI(pending);
+        els.obsInboxScanBtn.textContent = oldText;
+        setObsControlsDisabled(!obsOnline);
+      }
+    });
   }
 
   if (els.obsBriefingToggle) {
@@ -1756,10 +2609,7 @@
       obsBusy = true;
       obsPendingState = null;
       let appliedFreshState = false;
-      els.obsBriefingToggle.disabled = true;
-      if (els.obsSyncToggle) els.obsSyncToggle.disabled = true;
-      if (els.obsBriefingBtn) els.obsBriefingBtn.disabled = true;
-      if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = true;
+      setObsControlsDisabled(true);
       try {
         const resp = await consolePost("/api/obsidian/config", { briefing_enabled: briefingEnabled });
         const res = await resp.json();
@@ -1778,10 +2628,7 @@
         const pending = obsPendingState;
         obsPendingState = null;
         if (!appliedFreshState && pending) renderObsidianUI(pending);
-        if (els.obsSyncToggle) els.obsSyncToggle.disabled = !obsOnline;
-        if (els.obsBriefingToggle) els.obsBriefingToggle.disabled = !obsOnline;
-        if (els.obsBriefingBtn) els.obsBriefingBtn.disabled = !obsOnline;
-        if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = !obsOnline;
+        setObsControlsDisabled(!obsOnline);
       }
     });
   }
@@ -1793,10 +2640,7 @@
       obsPendingState = null;
       let appliedFreshState = false;
       const oldText = els.obsBriefingBtn.textContent;
-      els.obsBriefingBtn.disabled = true;
-      if (els.obsSyncToggle) els.obsSyncToggle.disabled = true;
-      if (els.obsBriefingToggle) els.obsBriefingToggle.disabled = true;
-      if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = true;
+      setObsControlsDisabled(true);
       els.obsBriefingBtn.textContent = "正在梳理…";
       try {
         const resp = await consolePost("/api/obsidian/briefing", {});
@@ -1817,12 +2661,263 @@
         obsPendingState = null;
         if (!appliedFreshState && pending) renderObsidianUI(pending);
         els.obsBriefingBtn.textContent = oldText;
-        if (els.obsSyncToggle) els.obsSyncToggle.disabled = !obsOnline;
-        if (els.obsBriefingToggle) els.obsBriefingToggle.disabled = !obsOnline;
-        if (els.obsBriefingBtn) els.obsBriefingBtn.disabled = !obsOnline;
-        if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = !obsOnline;
+        setObsControlsDisabled(!obsOnline);
       }
     });
+  }
+
+  // --- Domestic Zero-Proxy Lightweight Mobile Push Bridge (Phase 3 ⑥) ---
+  let mobilePushBusy = false;
+  let mobilePushStateCache = null;
+
+  const MP_PROVIDER_FIELD_META = {
+    bark: {
+      field: "bark_url",
+      label: "Bark 推送 URL（例如 https://api.day.app/你的设备Key）",
+      placeholder: "https://api.day.app/你的设备Key（留空保留现有凭据）",
+    },
+    feishu: {
+      field: "feishu_webhook",
+      label: "飞书机器人 Webhook（https://open.feishu.cn/open-apis/bot/v2/hook/...）",
+      placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/...（留空保留现有）",
+    },
+    wecom: {
+      field: "wecom_webhook",
+      label: "企业微信机器人 Webhook（https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...）",
+      placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...（留空保留现有）",
+    },
+    pushplus: {
+      field: "pushplus_token",
+      label: "PushPlus 微信推送 Token（MOBILE_PUSH_PUSHPLUS_TOKEN）",
+      placeholder: "填写 PushPlus Token（留空保留现有凭据）",
+    },
+    serverchan: {
+      field: "serverchan_key",
+      label: "Server酱 SendKey（Turbo SCT... 或 SC3 sctp...）",
+      placeholder: "填写 Server酱 SendKey（留空保留现有凭据）",
+    },
+  };
+
+  function updateMobilePushProviderHints(provider, secrets) {
+    const meta = MP_PROVIDER_FIELD_META[provider] || MP_PROVIDER_FIELD_META.bark;
+    if (els.mobilePushSecretLabel) els.mobilePushSecretLabel.textContent = meta.label;
+    if (els.mobilePushSecretInput) els.mobilePushSecretInput.placeholder = meta.placeholder;
+    if (els.mobilePushFeishuSecretWrap) {
+      els.mobilePushFeishuSecretWrap.style.display = provider === "feishu" ? "" : "none";
+    }
+    if (els.mobilePushSecretStatusText) {
+      const info = (secrets && secrets[meta.field]) || {};
+      if (info.configured) {
+        const srcZh = info.source === "env" ? `环境变量 ${info.env_var || ""}` : "本地 0600 隔离文件";
+        let txt = `已配置（${srcZh}）：${info.masked || "***"}`;
+        if (provider === "feishu" && secrets && secrets.feishu_secret && secrets.feishu_secret.configured) {
+          txt += " · 已配置加签密钥";
+        }
+        els.mobilePushSecretStatusText.textContent = txt;
+        els.mobilePushSecretStatusText.style.color = "var(--accent)";
+      } else {
+        els.mobilePushSecretStatusText.textContent = `未配置（可在上方填写保存，或在 .env 设置 ${info.env_var || ""}）`;
+        els.mobilePushSecretStatusText.style.color = "var(--ink-muted)";
+      }
+    }
+  }
+
+  function renderMobilePushHistory(history) {
+    if (!els.mobilePushHistoryList) return;
+    const list = Array.isArray(history) ? history : [];
+    els.mobilePushHistoryList.innerHTML = "";
+    if (!list.length) {
+      const empty = document.createElement("div");
+      empty.className = "dream-empty";
+      empty.textContent = "暂无手机推送记录；填好通道凭据并点击「发送测试通知」即可验证连通性。";
+      els.mobilePushHistoryList.appendChild(empty);
+      return;
+    }
+    for (const item of list.slice(0, 10)) {
+      if (!item || typeof item !== "object") continue;
+      const card = document.createElement("div");
+      card.className = "proactive-item";
+      const head = document.createElement("div");
+      head.className = "proactive-item-head";
+      const left = document.createElement("span");
+      left.textContent = `${item.time || "--"} · ${item.provider || "--"} · ${item.category || "general"} · ${item.ok ? "成功" : "失败"}`;
+      const right = document.createElement("span");
+      right.className = "num";
+      right.textContent = item.ok ? (item.title || "") : (item.error || "失败");
+      head.appendChild(left);
+      head.appendChild(right);
+      card.appendChild(head);
+      const body = document.createElement("div");
+      body.className = "proactive-item-text";
+      body.textContent = item.preview || item.error || "";
+      card.appendChild(body);
+      els.mobilePushHistoryList.appendChild(card);
+    }
+  }
+
+  function renderMobilePushUI(data) {
+    if (!data || typeof data !== "object") return;
+    mobilePushStateCache = data;
+    const cfg = data.config || {};
+    const enabled = Boolean(cfg.enabled);
+    const prov = String(cfg.provider || "bark");
+    if (els.mobilePushEnabledToggle) els.mobilePushEnabledToggle.checked = enabled;
+    if (els.mobilePushProviderSelect) els.mobilePushProviderSelect.value = prov;
+    if (els.mobilePushForwardProactiveToggle) els.mobilePushForwardProactiveToggle.checked = cfg.forward_proactive !== false;
+    if (els.mobilePushForwardBriefingToggle) els.mobilePushForwardBriefingToggle.checked = Boolean(cfg.forward_briefing);
+    if (els.mobilePushQuietToggle) els.mobilePushQuietToggle.checked = cfg.respect_quiet_hours !== false;
+    if (els.mobilePushMaxDailyInput && cfg.max_daily_pushes != null) {
+      els.mobilePushMaxDailyInput.value = String(cfg.max_daily_pushes);
+    }
+    if (els.mobilePushBadge) {
+      if (!enabled) {
+        els.mobilePushBadge.textContent = "已关闭";
+      } else if (data.provider_ready) {
+        els.mobilePushBadge.textContent = `已开启 · ${data.provider_label || prov}`;
+      } else {
+        els.mobilePushBadge.textContent = "已开启（待填凭据）";
+      }
+    }
+    if (els.mobilePushStatsText) {
+      els.mobilePushStatsText.textContent = `今日已推 ${data.daily_count || 0}/${data.max_daily_pushes || 12}`;
+    }
+    updateMobilePushProviderHints(prov, data.secrets || {});
+    renderMobilePushHistory(data.history || []);
+  }
+
+  async function fetchMobilePushStatus() {
+    try {
+      const resp = await fetch("/api/mobile-push", { cache: "no-store" });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.ok) renderMobilePushUI(data);
+    } catch (_) {
+      // keep UI idle
+    }
+  }
+
+  if (els.mobilePushProviderSelect) {
+    els.mobilePushProviderSelect.addEventListener("change", () => {
+      const prov = els.mobilePushProviderSelect.value || "bark";
+      if (els.mobilePushSecretInput) els.mobilePushSecretInput.value = "";
+      if (els.mobilePushFeishuSecretInput) els.mobilePushFeishuSecretInput.value = "";
+      updateMobilePushProviderHints(prov, (mobilePushStateCache && mobilePushStateCache.secrets) || {});
+    });
+  }
+
+  async function saveMobilePushConfig(extraPayload) {
+    if (mobilePushBusy) return;
+    mobilePushBusy = true;
+    try {
+      const prov = els.mobilePushProviderSelect ? els.mobilePushProviderSelect.value : "bark";
+      const maxDaily = Math.max(1, Math.min(50, parseInt(els.mobilePushMaxDailyInput ? els.mobilePushMaxDailyInput.value : "12", 10) || 12));
+      const payload = Object.assign(
+        {
+          enabled: Boolean(els.mobilePushEnabledToggle && els.mobilePushEnabledToggle.checked),
+          provider: prov,
+          forward_proactive: Boolean(els.mobilePushForwardProactiveToggle && els.mobilePushForwardProactiveToggle.checked),
+          forward_briefing: Boolean(els.mobilePushForwardBriefingToggle && els.mobilePushForwardBriefingToggle.checked),
+          respect_quiet_hours: Boolean(els.mobilePushQuietToggle && els.mobilePushQuietToggle.checked),
+          max_daily_pushes: maxDaily,
+        },
+        extraPayload || {}
+      );
+      const meta = MP_PROVIDER_FIELD_META[prov] || MP_PROVIDER_FIELD_META.bark;
+      const rawSec = (els.mobilePushSecretInput ? els.mobilePushSecretInput.value : "").trim();
+      const rawFeishuSec = (els.mobilePushFeishuSecretInput ? els.mobilePushFeishuSecretInput.value : "").trim();
+      if (!payload.secrets && (rawSec || (prov === "feishu" && rawFeishuSec))) {
+        payload.secrets = {};
+        if (rawSec) payload.secrets[meta.field] = rawSec;
+        if (prov === "feishu" && rawFeishuSec) payload.secrets.feishu_secret = rawFeishuSec;
+      }
+      const resp = await consolePost("/api/mobile-push/config", payload);
+      const res = await resp.json();
+      if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "保存推送配置失败");
+      if (els.mobilePushSecretInput) els.mobilePushSecretInput.value = "";
+      if (els.mobilePushFeishuSecretInput) els.mobilePushFeishuSecretInput.value = "";
+      renderMobilePushUI(res);
+      showBanner("info", payload.enabled ? "手机端轻量推送配置已保存！" : "已关闭手机端轻量推送（零外发）。");
+      scheduleHideBanner(3200);
+    } catch (err) {
+      showBanner("err", `保存手机推送失败：${err.message}`);
+      fetchMobilePushStatus();
+    } finally {
+      mobilePushBusy = false;
+    }
+  }
+
+  if (els.mobilePushEnabledToggle) {
+    els.mobilePushEnabledToggle.addEventListener("change", () => saveMobilePushConfig());
+  }
+  if (els.mobilePushSaveBtn) {
+    els.mobilePushSaveBtn.addEventListener("click", () => saveMobilePushConfig());
+  }
+  if (els.mobilePushClearSecretBtn) {
+    els.mobilePushClearSecretBtn.addEventListener("click", () => {
+      const prov = els.mobilePushProviderSelect ? els.mobilePushProviderSelect.value : "bark";
+      const meta = MP_PROVIDER_FIELD_META[prov] || MP_PROVIDER_FIELD_META.bark;
+      const secClear = { [meta.field]: null };
+      if (prov === "feishu") secClear.feishu_secret = null;
+      saveMobilePushConfig({ secrets: secClear });
+    });
+  }
+  if (els.mobilePushTestBtn) {
+    els.mobilePushTestBtn.addEventListener("click", async () => {
+      if (mobilePushBusy) return;
+      mobilePushBusy = true;
+      const oldTxt = els.mobilePushTestBtn.textContent;
+      els.mobilePushTestBtn.disabled = true;
+      els.mobilePushTestBtn.textContent = "发送中…";
+      try {
+        const prov = els.mobilePushProviderSelect ? els.mobilePushProviderSelect.value : "bark";
+        const resp = await consolePost("/api/mobile-push/test", { provider: prov });
+        const res = await resp.json();
+        if (res && res.mobile_push) renderMobilePushUI(res.mobile_push);
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "测试推送失败");
+        showBanner("info", `测试通知已成功送达（${prov}）！`);
+        scheduleHideBanner(3600);
+      } catch (err) {
+        showBanner("err", `测试通知失败：${err.message}`);
+      } finally {
+        mobilePushBusy = false;
+        els.mobilePushTestBtn.disabled = false;
+        els.mobilePushTestBtn.textContent = oldTxt;
+      }
+    });
+  }
+
+  async function triggerBriefingMobilePush(btnEl) {
+    if (mobilePushBusy) return;
+    mobilePushBusy = true;
+    const oldTxt = btnEl ? btnEl.textContent : "";
+    if (btnEl) {
+      btnEl.disabled = true;
+      btnEl.textContent = "推送中…";
+    }
+    try {
+      const prov = els.mobilePushProviderSelect ? els.mobilePushProviderSelect.value : "bark";
+      const resp = await consolePost("/api/mobile-push/briefing", { provider: prov });
+      const res = await resp.json();
+      if (res && res.obsidian) renderObsidianUI(res.obsidian);
+      if (res && res.mobile_push) renderMobilePushUI(res.mobile_push);
+      if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "推送简报失败");
+      showBanner("info", "今日 Obsidian 简报摘要已成功推送到手机！");
+      scheduleHideBanner(3800);
+    } catch (err) {
+      showBanner("err", `简报推手机失败：${err.message}`);
+    } finally {
+      mobilePushBusy = false;
+      if (btnEl) {
+        btnEl.disabled = false;
+        btnEl.textContent = oldTxt;
+      }
+    }
+  }
+  if (els.mobilePushBriefingBtn) {
+    els.mobilePushBriefingBtn.addEventListener("click", () => triggerBriefingMobilePush(els.mobilePushBriefingBtn));
+  }
+  if (els.obsBriefingPushBtn) {
+    els.obsBriefingPushBtn.addEventListener("click", () => triggerBriefingMobilePush(els.obsBriefingPushBtn));
   }
 
   // --- Recall Privacy Filter & Lightweight Spoken Style Rules ---
@@ -3481,6 +4576,9 @@
       if (cfg.recall_style || cfg.recall_guard_stats) {
         renderRecallStyleUI(cfg.recall_style, cfg.recall_guard_stats);
       }
+      if (cfg.proactive) {
+        renderProactiveUI(cfg.proactive, false);
+      }
       if (cfg.anima_semantic) {
         renderAnimaSemanticUI(cfg.anima_semantic);
       }
@@ -3648,10 +4746,7 @@
     } catch (_) {
       obsOnline = false;
       if (!obsBusy) {
-        if (els.obsSyncToggle) els.obsSyncToggle.disabled = true;
-        if (els.obsBriefingToggle) els.obsBriefingToggle.disabled = true;
-        if (els.obsBriefingBtn) els.obsBriefingBtn.disabled = true;
-        if (els.obsRebuildBtn) els.obsRebuildBtn.disabled = true;
+        setObsControlsDisabled(true);
       }
       if (!isRestarting) {
         els.statusPill.className = "status-pill offline";
@@ -3700,6 +4795,9 @@
 
   loadAudioCatalog();
   fetchDreamStatus(true);
+  fetchProactiveStatus(true);
+  fetchVoiceprintStatus(true);
+  fetchMobilePushStatus();
   if (isTabVisible()) {
     startPolling();
   }

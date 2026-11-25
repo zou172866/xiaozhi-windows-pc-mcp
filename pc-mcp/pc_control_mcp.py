@@ -147,8 +147,10 @@ from pc_mcp_modules.vision import (  # noqa: E402
     _smart_locate_target,
     _walk_uia_controls,
     look_at_screen,
+    peek_active_window,
 )
 from pc_mcp_modules.winapi import (  # noqa: E402
+    DesktopRhythmTracker,
     SMTO_ABORTIFHUNG,
     SMTO_NORMAL,
     VK_MEDIA_NEXT_TRACK,
@@ -156,23 +158,31 @@ from pc_mcp_modules.winapi import (  # noqa: E402
     VK_MEDIA_PREV_TRACK,
     VK_VOLUME_MUTE,
     _broadcast_screen_off,
+    _desktop_rhythm_tracker,
     _dwmapi,
     _force_foreground_window,
+    _get_active_window_clipped_rect,
     _get_focused_control_info,
     _get_foreground_window_info,
     _get_process_name_by_pid,
+    _get_user_idle_seconds,
     _get_window_info_at_point,
     _get_window_info_by_hwnd,
     _get_window_title,
     _is_window_cloaked,
+    _is_window_fullscreen,
     _kernel32,
     _list_top_windows,
     _set_or_get_volume,
     _shell32,
+    check_screen_peek_privacy,
     _tap_vk,
     _user32,
     check_system_status,
+    classify_desktop_activity,
+    get_desktop_rhythm_snapshot,
     run_system_control,
+    sanitize_window_title,
 )
 
 
@@ -225,6 +235,19 @@ def pc_look_at_screen(question: str = "请简明描述当前电脑屏幕上正�
     if err:
         return err
     return look_at_screen(question)
+
+
+@mcp.tool()
+def pc_peek_active_window(question: str = "请用简洁口语描述当前活动窗口正在看或处理什么内容。") -> str:
+    """[L1 隐私护栏浅看屏] 仅截取当前活动窗口（自动屏蔽终端、密码管理器、网银、无痕与私密聊天窗口），用于陪看代码、文档或视频并快速给出简短观察。"""
+    err = _check_permission("L1")
+    if err:
+        return err
+    try:
+        res = peek_active_window(question)
+    except Exception as exc:
+        return f"当前无法获取活动窗口画面：{type(exc).__name__}"
+    return str(res.get("summary") or "未能获取当前窗口内容。")
 
 
 @mcp.tool()

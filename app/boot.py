@@ -101,6 +101,12 @@ def _install_cloud_audio() -> None:
     cloud_audio.apply_cloud_audio_patches()
 
 
+def _install_voiceprint_mcp_guard() -> None:
+    from patches import voiceprint
+
+    voiceprint.install_voiceprint_mcp_guard_patch()
+
+
 def install_all(
     *,
     chdir: bool = True,
@@ -163,6 +169,12 @@ def install_all(
                 _install_cloud_audio,
                 "Cloud ASR/TTS providers (12 modules + 3 streaming PC audio)",
                 "[CloudAudio]",
+            ),
+            (
+                "voiceprint_mcp_guard",
+                _install_voiceprint_mcp_guard,
+                "ServerMCPManager.execute_tool",
+                "[VoiceprintGuard]",
             ),
         ):
             patch_registry.run_patch_installer(

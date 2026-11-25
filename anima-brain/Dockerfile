@@ -64,6 +64,8 @@ COPY --from=web-builder /build/src/companion_engine/static/memory-panel.html /ap
 COPY --from=web-builder /build/src/companion_engine/static/provider-settings.html /app/built_static/provider-settings.html
 COPY recall_sanitizer.py /app/recall_sanitizer.py
 COPY dream_executor.py /app/dream_executor.py
+COPY proactive_state.py /app/proactive_state.py
+COPY obsidian_inbox.py /app/obsidian_inbox.py
 COPY obsidian_exporter.py /app/obsidian_exporter.py
 COPY xiaozhi_anima_service.py /app/xiaozhi_anima_service.py
 

@@ -209,6 +209,8 @@ def _build_plan(
                         "/app/tests/test_xiaozhi_service.py",
                         "/app/tests/test_obsidian_exporter.py",
                         "/app/tests/test_diva_anima_mechanisms.py",
+                        "/app/tests/test_proactive_state.py",
+                        "/app/tests/test_obsidian_inbox.py",
                         "-v",
                     ],
                     None,
@@ -227,6 +229,9 @@ def _build_plan(
                         "test_batch3_console.py",
                         "test_cloud_audio_api.py",
                         "test_diva_borrowed_mechanisms.py",
+                        "test_phase1_companion.py",
+                        "test_phase2_voiceprint_widget.py",
+                        "test_phase3_obsidian_mobile.py",
                     ],
                     image=upstream_image,
                 ),
@@ -260,7 +265,7 @@ def _build_plan(
         plan.append(
             (
                 "contract",
-                "Upstream image contracts (ephemeral docker run --rm: SERVER_VERSION, 21 patches + PATCH_CATALOG sync, zero side-effects)",
+                "Upstream image contracts (ephemeral docker run --rm: SERVER_VERSION, 22 patches + PATCH_CATALOG sync, zero side-effects)",
                 _ephemeral_container_cmd("test_upstream_contracts.py", image=upstream_image),
                 None,
             )

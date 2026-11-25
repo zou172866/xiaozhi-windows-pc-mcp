@@ -11,7 +11,7 @@
 ## 概览与启动顺序
 
 - **锁定上游镜像版本**：`xiaozhi-esp32-server` `0.9.8`（`docker-compose.yml` 锁定 `@sha256` digest）
-- **补丁总数**：`21` 项（`security` 安全类 `5` 项 + `experience` 体验类 `16` 项）
+- **补丁总数**：`22` 项（`security` 安全类 `5` 项 + `experience` 体验类 `17` 项）
 - **唯一启动入口**：`app/boot.py`（模块导入零副作用，由 `install_all()` 显式挂载全部补丁 → `patches/contracts.py` 轻量契约自检写入注册表 → `enforce_security_boot_gate()` 安全门禁 → 启动 `18080` 控制台与上游 `app.py`）
 - **实时自检接口**：`GET http://127.0.0.1:18080/api/health`（返回每个补丁的状态、契约结果、早绑重绑列表与 `contract_self_check` 结果）
 
@@ -45,6 +45,7 @@
 | 19 | `vad_speculative` | `experience` | `app/vad_speculative_router.py` | `ASRProviderBase.{receive_audio,handle_voice_stop,speech_to_text_wrapper} / ConnectionHandler.reset_audio_states / receiveAudioHandle.handleAudioMessage` | async receive_audio/handle_voice_stop/speech_to_text_wrapper/handleAudioMessage + sync reset_audio_states; hot-toggleable to pure 1100ms VAD | fail-soft (skips mount on contract mismatch -> pure 1100ms VAD, marks /api/health degraded) | `tests/container/test_batch3_pipeline_vad.py`<br>`tests/container/test_batch3_console.py`<br>`tests/container/test_upstream_contracts.py` |
 | 20 | `sherpa_async_asr` | `experience` | `app/patches/asr.py` | `core.providers.asr.sherpa_onnx_local.ASRProvider.speech_to_text / ASRProviderBase.speech_to_text_wrapper` | async coroutine speech_to_text(self, opus_data, session_id, artifacts=None); offloads decode_stream to dedicated 1-thread asr executor and applies G-4 ASR corrections across all ASR providers (incl. FunASR) | fail-soft (runs upstream sync decode, marks /api/health degraded) | `tests/container/test_batch3_pipeline_vad.py`<br>`tests/container/test_upstream_contracts.py` |
 | 21 | `cloud_audio_api` | `experience` | `app/patches/cloud_audio.py` | `core.providers.{asr.{openai,qwen3_asr_flash,aliyunbl_stream,doubao,doubao_stream},tts.{openai,siliconflow,doubao,fishspeech,alibl_stream,huoshan_double_stream,minimax_httpstream}}` | async speech_to_text / receive_audio / text_to_speak / start_session / finish_session / open_audio_channels + sync {DoubaoTTS,DoubaoASR,DoubaoStreamASR,AliyunBLStreamASR,MinimaxTTSHTTPStream}.__init__; non-blocking cloud HTTP, SSRF/secret redaction, ESP32 emotion-tag sync, and 48kHz/44.1kHz PC speaker passthrough | fail-soft (skips mismatched cloud provider targets, marks /api/health degraded) | `tests/container/test_cloud_audio_api.py`<br>`tests/container/test_upstream_contracts.py` |
+| 22 | `voiceprint_mcp_guard` | `experience` | `app/patches/voiceprint.py` | `core.providers.tools.server_mcp.mcp_manager.ServerMCPManager.execute_tool` | async method execute_tool(self, tool_name, arguments); default-off zero-overhead guard blocking non-owner privileged host MCP tools under voiceprint full_guard and honoring screen_peek toggle | fail-soft (falls back to upstream MCP tool dispatch, marks /api/health degraded) | `tests/container/test_phase2_voiceprint_widget.py`<br>`tests/container/test_upstream_contracts.py` |
 
 ## 升级上游镜像或增删补丁后的必跑命令
 

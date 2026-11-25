@@ -20,6 +20,8 @@ from urllib.parse import quote
 import asr_corrections
 import patch_registry
 import runtime_events
+import vocal_cue_router
+import voiceprint_router
 import xz_common
 
 ROOT_DIR = xz_common.ROOT_DIR
@@ -474,27 +476,61 @@ def _install_memory_optimizations(*, start_trimmer: bool = True):
 
                     def _decode():
                         s = self.model.create_stream()
+                        raw_pcm_for_vp: bytes = b""
                         if use_mem_pcm:
                             import numpy as np
 
                             raw_pcm = bytes(pcm_bytes) if not isinstance(pcm_bytes, bytes) else pcm_bytes
                             if len(raw_pcm) % 2 != 0:
                                 raw_pcm = raw_pcm[:-1]
+                            raw_pcm_for_vp = raw_pcm
                             samples = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
                             s.accept_waveform(16000, samples)
                         else:
                             samples, sample_rate = self.read_wave(file_path)
                             s.accept_waveform(sample_rate, samples)
+                            if voiceprint_router.is_voiceprint_enabled() and sample_rate == 16000:
+                                import numpy as np
+
+                                raw_pcm_for_vp = (
+                                    np.clip(np.round(np.asarray(samples, dtype=np.float32) * 32768.0), -32768, 32767)
+                                    .astype(np.int16)
+                                    .tobytes()
+                                )
                         self.model.decode_stream(s)
-                        return s.result.text
+                        raw_text = str(getattr(s.result, "text", "") or "")
+                        cue = (
+                            vocal_cue_router.extract_vocal_cue(raw_text, result=s.result)
+                            if vocal_cue_router.is_vocal_cue_enabled()
+                            else None
+                        )
+                        if raw_pcm_for_vp and voiceprint_router.is_voiceprint_enabled():
+                            try:
+                                clean_hint = _TAG_RE.sub("", raw_text).strip()
+                                voiceprint_router.identify_turn_pcm(
+                                    str(session_id or ""),
+                                    raw_pcm_for_vp,
+                                    transcript=clean_hint,
+                                )
+                            except Exception:
+                                pass
+                        return raw_text, cue
 
                     loop = asyncio.get_running_loop()
-                    text = await loop.run_in_executor(get_asr_executor(), _decode)
+                    raw_text, cue = await loop.run_in_executor(get_asr_executor(), _decode)
                     asr_sec = time.monotonic() - t_asr_start
+                    text = raw_text
                     if text:
                         text = _TAG_RE.sub("", text).strip()
                     if text:
                         text = asr_corrections.apply_asr_corrections(text)
+                    try:
+                        if text:
+                            vocal_cue_router.record_vocal_cue(str(session_id or ""), cue, source="sherpa")
+                        else:
+                            vocal_cue_router.clear_vocal_cue(str(session_id or ""))
+                    except Exception:
+                        pass
                     _sherpa_mod.logger.bind(tag=_sherpa_mod.TAG).debug(
                         f"语音识别耗时: {asr_sec:.3f}s | 结果: {text}"
                     )
@@ -556,14 +592,50 @@ def _install_memory_optimizations(*, start_trimmer: bool = True):
                     )
                 )
                 if not already_corrected:
+                    raw_for_cue = ""
                     if isinstance(text, str) and text:
+                        raw_for_cue = text
                         text = _BASE_TAG_RE.sub("", text).strip()
                         if text:
                             text = asr_corrections.apply_asr_corrections(text)
                     elif isinstance(text, dict) and isinstance(text.get("content"), str) and text["content"]:
                         text = dict(text)
-                        cleaned_c = _BASE_TAG_RE.sub("", text["content"]).strip()
+                        raw_for_cue = text["content"]
+                        cleaned_c = _BASE_TAG_RE.sub("", raw_for_cue).strip()
                         text["content"] = asr_corrections.apply_asr_corrections(cleaned_c) if cleaned_c else ""
+                    if vocal_cue_router.is_vocal_cue_enabled():
+                        try:
+                            final_txt = text if isinstance(text, str) else (text.get("content", "") if isinstance(text, dict) else "")
+                            if final_txt:
+                                cue = vocal_cue_router.extract_vocal_cue(raw_for_cue) if "<|" in raw_for_cue else None
+                                vocal_cue_router.record_vocal_cue(str(session_id or ""), cue, source="asr_inline")
+                            else:
+                                vocal_cue_router.clear_vocal_cue(str(session_id or ""))
+                        except Exception:
+                            pass
+                if (
+                    not getattr(type(self), "_sherpa_async_patched", False)
+                    and voiceprint_router.is_voiceprint_enabled()
+                ):
+                    try:
+                        pcm_joined = b"".join(b for b in (pcm_data or ()) if isinstance(b, (bytes, bytearray)))
+                        if pcm_joined:
+                            final_hint = (
+                                text
+                                if isinstance(text, str)
+                                else (text.get("content", "") if isinstance(text, dict) else "")
+                            )
+                            loop = asyncio.get_running_loop()
+                            await loop.run_in_executor(
+                                get_asr_executor(),
+                                lambda: voiceprint_router.identify_turn_pcm(
+                                    str(session_id or ""),
+                                    pcm_joined,
+                                    transcript=str(final_hint or ""),
+                                ),
+                            )
+                    except Exception:
+                        pass
                 return (text, file_path, *res[2:]) if len(res) > 2 else (text, file_path)
 
             ASRProviderBase.speech_to_text_wrapper = _asr_corrections_stt_wrapper

@@ -301,19 +301,28 @@ def _update_obsidian_config(payload: dict) -> tuple[bool, dict | str]:
         _mark_obsidian_cache_offline(msg)
         return False, msg
     body = payload or {}
+    if not isinstance(body, dict):
+        return False, "缺少布尔字段 enabled、briefing_enabled 或 inbox_enabled"
+    unknown = sorted(str(k) for k in body.keys() if k not in ("enabled", "briefing_enabled", "inbox_enabled"))
+    if unknown:
+        return False, f"字段包含未允许项 ({', '.join(unknown[:4])}); 仅支持 enabled / briefing_enabled / inbox_enabled"
     has_en = "enabled" in body
     has_br = "briefing_enabled" in body
+    has_ib = "inbox_enabled" in body
     if (
-        (not has_en and not has_br)
+        (not has_en and not has_br and not has_ib)
         or (has_en and not isinstance(body.get("enabled"), bool))
         or (has_br and not isinstance(body.get("briefing_enabled"), bool))
+        or (has_ib and not isinstance(body.get("inbox_enabled"), bool))
     ):
-        return False, "缺少布尔字段 enabled 或 briefing_enabled"
+        return False, "缺少布尔字段 enabled、briefing_enabled 或 inbox_enabled"
     req_json: dict = {}
     if has_en:
         req_json["enabled"] = bool(body["enabled"])
     if has_br:
         req_json["briefing_enabled"] = bool(body["briefing_enabled"])
+    if has_ib:
+        req_json["inbox_enabled"] = bool(body["inbox_enabled"])
     try:
         client = shared._get_console_http_client()
         resp = client.post(
@@ -335,6 +344,46 @@ def _update_obsidian_config(payload: dict) -> tuple[bool, dict | str]:
         msg = f"无法连接 Anima Brain (18787): {exc}"
         _mark_obsidian_cache_offline(msg)
         return False, msg
+
+
+def _trigger_obsidian_inbox_scan() -> tuple[bool, dict | str, int]:
+    global _obsidian_cache, _obsidian_ts
+    token = _read_anima_token()
+    if not token:
+        msg = "未找到 Anima Brain 访问令牌 (studio_token.txt)"
+        _mark_obsidian_cache_offline(msg)
+        return False, msg, int(HTTPStatus.BAD_GATEWAY)
+    try:
+        client = shared._get_console_http_client()
+        resp = client.post(
+            f"{ANIMA_HOST}/xiaozhi/obsidian/inbox/scan",
+            headers={"Authorization": f"Bearer {token}"},
+            json={},
+            timeout=25.0,
+        )
+        raw = {}
+        try:
+            raw = resp.json()
+        except Exception as exc:
+            shared._log_rate_limited("obsidian_inbox_scan_json", exc)
+            raw = {}
+        if isinstance(raw.get("obsidian"), dict):
+            status_data = dict(raw["obsidian"])
+            status_data["online"] = True
+            with _obsidian_lock:
+                _obsidian_cache = dict(status_data)
+                _obsidian_ts = time.monotonic()
+        else:
+            status_data = _get_cached_obsidian_snapshot()
+        if resp.status_code == 200 and raw.get("ok"):
+            return True, {"obsidian": status_data, "result": raw.get("result") or raw}, int(HTTPStatus.OK)
+        err = raw.get("error") or f"Anima Brain 返回 HTTP {resp.status_code}: {resp.text[:160]}"
+        code = int(HTTPStatus.BAD_REQUEST) if resp.status_code == 400 else int(HTTPStatus.BAD_GATEWAY)
+        return False, str(err), code
+    except Exception as exc:
+        msg = f"无法连接 Anima Brain (18787): {exc}"
+        _mark_obsidian_cache_offline(msg)
+        return False, msg, int(HTTPStatus.BAD_GATEWAY)
 
 
 def _trigger_obsidian_briefing(payload: dict | None = None) -> tuple[bool, dict | str]:
@@ -676,6 +725,37 @@ def handle_post_obsidian_briefing(handler) -> None:
             handler._send_json(
                 {"ok": False, "error": str(result), "obsidian": _get_cached_obsidian_snapshot()},
                 status,
+            )
+    except shared._BadRequestError:
+        raise
+    except Exception as e:
+        handler._send_json({"ok": False, "error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+def handle_post_obsidian_inbox_scan(handler) -> None:
+    try:
+        body = handler._read_body_json()
+        if body:
+            unknown = sorted(str(k) for k in body.keys())
+            handler._send_json(
+                {"ok": False, "error": f"包含未允许的字段: {', '.join(unknown[:6])}"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        ok, result, code = _trigger_obsidian_inbox_scan()
+        if ok and isinstance(result, dict):
+            handler._send_json(
+                {
+                    "ok": True,
+                    "obsidian": result.get("obsidian"),
+                    "result": result.get("result"),
+                },
+                HTTPStatus(code),
+            )
+        else:
+            handler._send_json(
+                {"ok": False, "error": str(result), "obsidian": _get_cached_obsidian_snapshot()},
+                HTTPStatus(code),
             )
     except shared._BadRequestError:
         raise

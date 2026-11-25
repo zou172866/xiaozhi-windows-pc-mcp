@@ -16,6 +16,8 @@ from typing import Any
 import patch_registry
 import runtime_events
 import turn_context_router
+import vocal_cue_router
+import voiceprint_router
 
 _patched_create_memory = None
 _orig_put = None
@@ -319,16 +321,22 @@ def _flush_dialogue_latest_pair(dialogue, *, messages_slice=None, mark_closed: b
     if getattr(dialogue, "_anima_memory_unavailable", False):
         return False
     pairs = anima_memory_provider.extract_clean_pairs(msgs, device_id=dev_id, target=getattr(dialogue, "_anima_memory_target", None))
-    if mark_closed:
-        u = _find_latest_real_user(msgs)
-        if u is not None:
-            try:
-                u._turn_closed = True
-            except Exception:
-                pass
+    u = _find_latest_real_user(msgs)
+    if mark_closed and u is not None:
+        try:
+            u._turn_closed = True
+        except Exception:
+            pass
     if not pairs:
         return False
-    return _push_pair_if_changed(dialogue, pairs[-1])
+    latest_pair = dict(pairs[-1])
+    if u is not None and hasattr(u, "_speaker_char_id"):
+        spk_cid = str(getattr(u, "_speaker_char_id", "") or "").strip()
+    else:
+        spk_cid = str(getattr(dialogue, "_active_speaker_char_id", "") or "").strip()
+    if spk_cid:
+        latest_pair["character_id"] = spk_cid
+    return _push_pair_if_changed(dialogue, latest_pair)
 
 
 def _flush_all_pending_dialogues() -> None:
@@ -411,6 +419,22 @@ def _patched_put(self, message, *args, **kwargs):
             _cancel_dialogue_timer(self)
             if len(self.dialogue) > 1:
                 _flush_dialogue_latest_pair(self, messages_slice=self.dialogue[:-1], mark_closed=True)
+            # Tag THIS new user message AFTER flushing the previous turn (prevents cross-turn contamination)
+            try:
+                if int(getattr(self, "_in_chat_depth", 0) or 0) > 0:
+                    active_spk = str(getattr(self, "_active_speaker_char_id", "") or "").strip()
+                else:
+                    sid_dlg = str(getattr(self, "_session_id", "") or "").strip()
+                    tgt = getattr(self, "_anima_memory_target", None)
+                    base_cid = str(getattr(tgt, "character_id", "") or "").strip() or None
+                    active_spk = (
+                        voiceprint_router.get_speaker_character_override(sid_dlg, base_character_id=base_cid) or ""
+                        if sid_dlg
+                        else ""
+                    )
+                message._speaker_char_id = active_spk
+            except Exception:
+                pass
             return
 
         # 2. Tool call or tool result means the current turn is mid-flight: never flush a half-reply yet.
@@ -453,6 +477,10 @@ def _patched_put(self, message, *args, **kwargs):
             return
         latest_pair = dict(pairs[-1])
         latest_user_ref = _find_latest_real_user(msgs_snapshot)
+        if latest_user_ref is not None and hasattr(latest_user_ref, "_speaker_char_id"):
+            spk_cid_fb = str(getattr(latest_user_ref, "_speaker_char_id", "") or "").strip()
+            if spk_cid_fb:
+                latest_pair["character_id"] = spk_cid_fb
         _schedule_dialogue_fallback_flush(self, latest_pair, user_msg=latest_user_ref)
     except Exception:
         pass
@@ -526,6 +554,8 @@ def _patched_get_llm_dialogue_with_memory(self, *args, **kwargs):
     has_explicit_mem = bool(memory_str is not None and str(memory_str).strip())
     in_chat_depth = int(getattr(self, "_in_chat_depth", 0) or 0)
 
+    vocal_cue_blk = ""
+    speakers_blk = ""
     if (
         not has_explicit_mem
         and latest_user is not None
@@ -538,6 +568,29 @@ def _patched_get_llm_dialogue_with_memory(self, *args, **kwargs):
             eff_memory_str = cache["memory_str"]
         if cache.get("current_time_str"):
             eff_time_str = cache["current_time_str"]
+        if pinned_turn_ctx is None and cache.get("vocal_cue_block"):
+            vocal_cue_blk = str(cache.get("vocal_cue_block") or "")
+        if pinned_turn_ctx is None and cache.get("speakers_block"):
+            speakers_blk = str(cache.get("speakers_block") or "")
+
+    if (
+        pinned_turn_ctx is None
+        and latest_user is not None
+        and in_chat_depth <= 1
+        and not _has_trailing_tool_exchange(dlg_msgs, latest_user)
+    ):
+        sid = str(getattr(self, "_session_id", "") or "").strip()
+        if sid:
+            if not vocal_cue_blk:
+                try:
+                    vocal_cue_blk = vocal_cue_router.consume_vocal_cue(sid)
+                except Exception:
+                    vocal_cue_blk = ""
+            if not speakers_blk:
+                try:
+                    speakers_blk = voiceprint_router.format_speakers_info_block(sid)
+                except Exception:
+                    speakers_blk = ""
 
     try:
         meta: dict[str, str] = {}
@@ -546,6 +599,8 @@ def _patched_get_llm_dialogue_with_memory(self, *args, **kwargs):
             memory_str=eff_memory_str,
             current_time_str=eff_time_str,
             pinned_turn_context=pinned_turn_ctx,
+            vocal_cue_block=vocal_cue_blk,
+            speakers_block=speakers_blk,
             out_meta=meta,
         )
         if latest_user is not None and pinned_turn_ctx is None:
@@ -555,6 +610,8 @@ def _patched_get_llm_dialogue_with_memory(self, *args, **kwargs):
                     "turn_context": meta.get("turn_context", ""),
                     "memory_str": meta.get("memory_str", str(eff_memory_str or "").strip()),
                     "current_time_str": meta.get("current_time_str", ""),
+                    "vocal_cue_block": vocal_cue_blk,
+                    "speakers_block": speakers_blk,
                 }
             except Exception:
                 pass
@@ -670,6 +727,12 @@ def _bind_connection_memory(conn) -> None:
         raise
     if dialogue is not None:
         dialogue._device_id = device_id
+        sid_conn = str(getattr(conn, "session_id", "") or "").strip()
+        if sid_conn:
+            try:
+                dialogue._session_id = sid_conn
+            except Exception:
+                pass
         dialogue._anima_memory_unavailable = False
         dialogue._anima_memory_target = target
     if mem is not None:
@@ -761,12 +824,34 @@ def install_chat_turn_flush_patch() -> None:
 
             _bind_connection_memory(self)
             ctx_tok = amp.set_current_device_id(dev_id) if dev_id else None
+            sid_conn = str(getattr(self, "session_id", "") or "").strip()
+            mem_obj = getattr(self, "memory", None)
+            mem_tgt = getattr(mem_obj, "target", None) or getattr(self, "_anima_memory_target", None)
+            base_cid = str(getattr(mem_tgt, "character_id", "") or "").strip() or None
+            spk_cid = (
+                voiceprint_router.get_speaker_character_override(sid_conn, base_character_id=base_cid)
+                if sid_conn
+                else None
+            )
+            spk_tok = amp.set_current_speaker_character_id(spk_cid) if spk_cid else None
+            has_proxy_override = callable(getattr(mem_obj, "set_speaker_character_override", None))
+            prev_proxy_override = mem_obj.set_speaker_character_override(spk_cid) if has_proxy_override else None
+            prev_dlg_spk = str(getattr(dlg, "_active_speaker_char_id", "") or "") if dlg is not None else ""
             if dlg is not None:
                 if dev_id:
                     try:
                         dlg._device_id = dev_id
                     except Exception:
                         pass
+                if sid_conn:
+                    try:
+                        dlg._session_id = sid_conn
+                    except Exception:
+                        pass
+                try:
+                    dlg._active_speaker_char_id = spk_cid or ""
+                except Exception:
+                    pass
                 conn_loop = getattr(self, "loop", None)
                 if conn_loop is not None:
                     try:
@@ -786,11 +871,6 @@ def install_chat_turn_flush_patch() -> None:
                 chat_raised = True
                 raise
             finally:
-                if ctx_tok is not None and amp is not None:
-                    try:
-                        amp.reset_current_device_id(ctx_tok)
-                    except Exception:
-                        pass
                 if dlg is not None:
                     new_depth = 0
                     try:
@@ -804,7 +884,27 @@ def install_chat_turn_flush_patch() -> None:
                             _flush_dialogue_latest_pair(dlg, mark_closed=True)
                         except Exception:
                             pass
-                        if (
+                    try:
+                        dlg._active_speaker_char_id = prev_dlg_spk
+                    except Exception:
+                        pass
+                if has_proxy_override:
+                    try:
+                        mem_obj.set_speaker_character_override(prev_proxy_override)
+                    except Exception:
+                        pass
+                if spk_tok is not None and amp is not None:
+                    try:
+                        amp.reset_current_speaker_character_id(spk_tok)
+                    except Exception:
+                        pass
+                if ctx_tok is not None and amp is not None:
+                    try:
+                        amp.reset_current_device_id(ctx_tok)
+                    except Exception:
+                        pass
+                if dlg is not None and new_depth == 0:
+                    if (
                             (chat_raised or chat_res is None)
                             and not getattr(self, "client_is_speaking", False)
                             and getattr(self, "_pc_audio_active_sid", None) is None

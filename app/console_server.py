@@ -14,7 +14,8 @@ from console.routes import (
     gsv as _gsv,
     l3 as _l3,
     logs as _logs,
+    proactive as _proactive,
     state as _state,
 )
 
-install_facade(__name__, [_shared, _audio_api, _gsv, _logs, _l3, _anima, _config, _state, _server])
+install_facade(__name__, [_shared, _audio_api, _gsv, _logs, _l3, _anima, _config, _proactive, _state, _server])

@@ -50,6 +50,8 @@ services:
       - OBSIDIAN_SYNC_ENABLED=${OBSIDIAN_SYNC_ENABLED:-false}
       - OBSIDIAN_BRIEFING_ENABLED=${OBSIDIAN_BRIEFING_ENABLED:-true}
       - OBSIDIAN_BRIEFING_INTERVAL_SECONDS=${OBSIDIAN_BRIEFING_INTERVAL_SECONDS:-3600}
+      - OBSIDIAN_INBOX_ENABLED=${OBSIDIAN_INBOX_ENABLED:-false}
+      - OBSIDIAN_INBOX_INTERVAL_SECONDS=${OBSIDIAN_INBOX_INTERVAL_SECONDS:-120}
       - ANIMA_DREAM_ENABLED=${ANIMA_DREAM_ENABLED:-true}
       - ANIMA_DREAM_INTERVAL_SECONDS=${ANIMA_DREAM_INTERVAL_SECONDS:-21600}
       - ANIMA_RECALL_SENSITIVE_FILTER=${ANIMA_RECALL_SENSITIVE_FILTER:-true}
@@ -144,8 +146,15 @@ services:
       - PC_AUDIO_STREAM_SAMPLE_RATE=${PC_AUDIO_STREAM_SAMPLE_RATE:-}
       - ANIMA_DEVICE_CHARACTER_MAP=${ANIMA_DEVICE_CHARACTER_MAP:-}
       - ANIMA_ISOLATE_CHARACTER_BY_DEVICE=${ANIMA_ISOLATE_CHARACTER_BY_DEVICE:-}
-      - NO_PROXY=localhost,127.0.0.1,anima-brain,xiaozhi-anima-brain,xiaozhi-esp32-server,host.docker.internal,.deepseek.com,.siliconflow.cn,.aliyuncs.com,.bytedance.com,.minimaxi.com,.nmc.cn,.modelscope.cn,open.bigmodel.cn
-      - no_proxy=localhost,127.0.0.1,anima-brain,xiaozhi-anima-brain,xiaozhi-esp32-server,host.docker.internal,.deepseek.com,.siliconflow.cn,.aliyuncs.com,.bytedance.com,.minimaxi.com,.nmc.cn,.modelscope.cn,open.bigmodel.cn
+      # 手机端轻量通知推送凭据（可选，默认关闭；仅注入主容器，绝不注入 anima-brain）
+      - MOBILE_PUSH_BARK_URL=${MOBILE_PUSH_BARK_URL:-}
+      - MOBILE_PUSH_FEISHU_WEBHOOK=${MOBILE_PUSH_FEISHU_WEBHOOK:-}
+      - MOBILE_PUSH_FEISHU_SECRET=${MOBILE_PUSH_FEISHU_SECRET:-}
+      - MOBILE_PUSH_WECOM_WEBHOOK=${MOBILE_PUSH_WECOM_WEBHOOK:-}
+      - MOBILE_PUSH_PUSHPLUS_TOKEN=${MOBILE_PUSH_PUSHPLUS_TOKEN:-}
+      - MOBILE_PUSH_SERVERCHAN_KEY=${MOBILE_PUSH_SERVERCHAN_KEY:-}
+      - NO_PROXY=localhost,127.0.0.1,anima-brain,xiaozhi-anima-brain,xiaozhi-esp32-server,host.docker.internal,.deepseek.com,.siliconflow.cn,.aliyuncs.com,.bytedance.com,.minimaxi.com,.nmc.cn,.modelscope.cn,open.bigmodel.cn,.day.app,.feishu.cn,.weixin.qq.com,.pushplus.plus,.ftqq.com,.ft07.com
+      - no_proxy=localhost,127.0.0.1,anima-brain,xiaozhi-anima-brain,xiaozhi-esp32-server,host.docker.internal,.deepseek.com,.siliconflow.cn,.aliyuncs.com,.bytedance.com,.minimaxi.com,.nmc.cn,.modelscope.cn,open.bigmodel.cn,.day.app,.feishu.cn,.weixin.qq.com,.pushplus.plus,.ftqq.com,.ft07.com
       # 如果容器内无法直连 Google API（未开启全局 TUN 模式），取消下面两行注释并改成你本地软件的代理端口：
       # - HTTP_PROXY=http://host.docker.internal:7890
       # - HTTPS_PROXY=http://host.docker.internal:7890
@@ -178,5 +187,7 @@ services:
       - ./voices:/opt/xiaozhi-esp32-server/voices:ro
       # 轻量 Sherpa-ONNX SenseVoice int8 本地离线语音识别模型（默认，内存仅 ~350MB；需可写以支持首次启动自动下载）
       - ./models/sherpa-onnx-sense-voice:/opt/xiaozhi-esp32-server/models/sherpa-onnx-sense-voice
+      # 可选 Sherpa-ONNX 声纹识别模型（默认关闭零加载，按需从 18080 下载约 28MB）
+      - ./models/sherpa-onnx-speaker:/opt/xiaozhi-esp32-server/models/sherpa-onnx-speaker
       # 可选 FunASR PyTorch 模型目录挂载（不遮蔽镜像内置 snakers4_silero-vad，新电脑无 model.pt 也可正常启动）
       - ./models/SenseVoiceSmall:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from typing import Any, Dict, Optional
 
@@ -33,6 +34,10 @@ VALID_PC_MODES = frozenset({"off", "safe", "full"})
 VALID_AUDIO_TARGETS = frozenset({"esp32", "pc"})
 VALID_IDLE_FAREWELL_MODES = frozenset({"fixed", "llm_summary"})
 VALID_TURN_CONTEXT_MODES = frozenset({"split", "legacy"})
+VALID_PROACTIVE_DELIVERY_MODES = frozenset({"dry_run", "pc_speaker", "mobile_push", "pc_and_mobile"})
+VALID_VOICEPRINT_POLICIES = frozenset({"observe", "isolate_memory", "full_guard"})
+VALID_MOBILE_PUSH_PROVIDERS = frozenset({"bark", "feishu", "wecom", "pushplus", "serverchan"})
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 REPLY_LEN_PRESETS: Dict[str, Dict[str, int]] = {
     "concise": {"chat_chars": 60, "story_chars": 200},
@@ -104,6 +109,40 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "sensitive_filter_enabled": True,
         "silent_memory_enabled": True,
         "anti_ai_flavor_enabled": True,
+    },
+    "proactive": {
+        "enabled": False,
+        "delivery_mode": "dry_run",
+        "check_interval_minutes": 15,
+        "quiet_start": "23:00",
+        "quiet_end": "08:00",
+        "min_since_last_chat_minutes": 45,
+        "min_cooldown_minutes": 90,
+        "max_daily_nudges": 4,
+        "pc_speaker_volume": 0.75,
+        "allow_idle_chitchat": True,
+        "allow_l3_finish_notify": True,
+        "allow_open_loop_followup": True,
+        "inner_life_enabled": False,
+    },
+    "vocal_cue": {
+        "enabled": False,
+    },
+    "voiceprint": {
+        "enabled": False,
+        "policy": "full_guard",
+        "threshold": 0.58,
+    },
+    "screen_peek": {
+        "enabled": False,
+    },
+    "mobile_push": {
+        "enabled": False,
+        "provider": "bark",
+        "forward_proactive": True,
+        "forward_briefing": False,
+        "respect_quiet_hours": True,
+        "max_daily_pushes": 12,
     },
 }
 
@@ -305,6 +344,90 @@ def normalize_recall_style(raw: Any) -> Dict[str, bool]:
     }
 
 
+def _normalize_hhmm(raw: Any, default: str) -> str:
+    s = str(raw or "").strip()
+    if _HHMM_RE.match(s):
+        return s
+    return default
+
+
+def normalize_proactive(raw: Any) -> Dict[str, Any]:
+    d = raw if isinstance(raw, dict) else {}
+    mode = str(d.get("delivery_mode") or "dry_run").strip().lower()
+    if mode not in VALID_PROACTIVE_DELIVERY_MODES:
+        mode = "dry_run"
+    try:
+        vol = float(d.get("pc_speaker_volume", 0.75))
+    except Exception:
+        vol = 0.75
+    if vol != vol:  # NaN guard
+        vol = 0.75
+    vol = round(max(0.2, min(1.2, vol)), 2)
+    return {
+        "enabled": _coerce_bool(d.get("enabled"), False),
+        "delivery_mode": mode,
+        "check_interval_minutes": _clamp_int(d.get("check_interval_minutes", 15), 5, 120, 15),
+        "quiet_start": _normalize_hhmm(d.get("quiet_start"), "23:00"),
+        "quiet_end": _normalize_hhmm(d.get("quiet_end"), "08:00"),
+        "min_since_last_chat_minutes": _clamp_int(d.get("min_since_last_chat_minutes", 45), 5, 720, 45),
+        "min_cooldown_minutes": _clamp_int(d.get("min_cooldown_minutes", 90), 15, 720, 90),
+        "max_daily_nudges": _clamp_int(d.get("max_daily_nudges", 4), 1, 12, 4),
+        "pc_speaker_volume": vol,
+        "allow_idle_chitchat": _coerce_bool(d.get("allow_idle_chitchat"), True),
+        "allow_l3_finish_notify": _coerce_bool(d.get("allow_l3_finish_notify"), True),
+        "allow_open_loop_followup": _coerce_bool(d.get("allow_open_loop_followup"), True),
+        "inner_life_enabled": _coerce_bool(d.get("inner_life_enabled"), False),
+    }
+
+
+def normalize_vocal_cue(raw: Any) -> Dict[str, bool]:
+    d = raw if isinstance(raw, dict) else {}
+    return {
+        "enabled": _coerce_bool(d.get("enabled"), False),
+    }
+
+
+def normalize_voiceprint(raw: Any) -> Dict[str, Any]:
+    d = raw if isinstance(raw, dict) else {}
+    policy = str(d.get("policy") or "full_guard").strip().lower()
+    if policy not in VALID_VOICEPRINT_POLICIES:
+        policy = "full_guard"
+    try:
+        thr = float(d.get("threshold", 0.58))
+    except Exception:
+        thr = 0.58
+    if thr != thr:  # NaN guard
+        thr = 0.58
+    thr = round(max(0.30, min(0.90, thr)), 2)
+    return {
+        "enabled": _coerce_bool(d.get("enabled"), False),
+        "policy": policy,
+        "threshold": thr,
+    }
+
+
+def normalize_screen_peek(raw: Any) -> Dict[str, bool]:
+    d = raw if isinstance(raw, dict) else {}
+    return {
+        "enabled": _coerce_bool(d.get("enabled"), False),
+    }
+
+
+def normalize_mobile_push(raw: Any) -> Dict[str, Any]:
+    d = raw if isinstance(raw, dict) else {}
+    prov = str(d.get("provider") or "bark").strip().lower()
+    if prov not in VALID_MOBILE_PUSH_PROVIDERS:
+        prov = "bark"
+    return {
+        "enabled": _coerce_bool(d.get("enabled"), False),
+        "provider": prov,
+        "forward_proactive": _coerce_bool(d.get("forward_proactive"), True),
+        "forward_briefing": _coerce_bool(d.get("forward_briefing"), False),
+        "respect_quiet_hours": _coerce_bool(d.get("respect_quiet_hours"), True),
+        "max_daily_pushes": _clamp_int(d.get("max_daily_pushes", 12), 1, 50, 12),
+    }
+
+
 def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
     d = raw if isinstance(raw, dict) else {}
     return {
@@ -316,6 +439,11 @@ def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
         "turn_context": normalize_turn_context(d.get("turn_context")),
         "vad_speculative": normalize_vad_speculative(d.get("vad_speculative")),
         "recall_style": normalize_recall_style(d.get("recall_style")),
+        "proactive": normalize_proactive(d.get("proactive")),
+        "vocal_cue": normalize_vocal_cue(d.get("vocal_cue")),
+        "voiceprint": normalize_voiceprint(d.get("voiceprint")),
+        "screen_peek": normalize_screen_peek(d.get("screen_peek")),
+        "mobile_push": normalize_mobile_push(d.get("mobile_push")),
     }
 
 
@@ -684,3 +812,267 @@ def set_recall_style(
         "silent_memory_enabled": bool(sec["silent_memory_enabled"]),
         "anti_ai_flavor_enabled": bool(sec["anti_ai_flavor_enabled"]),
     }
+
+
+def get_proactive(settings_path: Optional[str] = None) -> Dict[str, Any]:
+    return dict(read_runtime_settings(settings_path)["proactive"])
+
+
+def set_proactive(
+    *,
+    enabled: Optional[bool] = None,
+    delivery_mode: Optional[str] = None,
+    check_interval_minutes: Optional[int] = None,
+    quiet_start: Optional[str] = None,
+    quiet_end: Optional[str] = None,
+    min_since_last_chat_minutes: Optional[int] = None,
+    min_cooldown_minutes: Optional[int] = None,
+    max_daily_nudges: Optional[int] = None,
+    pc_speaker_volume: Optional[float] = None,
+    allow_idle_chitchat: Optional[bool] = None,
+    allow_l3_finish_notify: Optional[bool] = None,
+    allow_open_loop_followup: Optional[bool] = None,
+    inner_life_enabled: Optional[bool] = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    for bname, bval in (
+        ("enabled", enabled),
+        ("allow_idle_chitchat", allow_idle_chitchat),
+        ("allow_l3_finish_notify", allow_l3_finish_notify),
+        ("allow_open_loop_followup", allow_open_loop_followup),
+        ("inner_life_enabled", inner_life_enabled),
+    ):
+        if bval is not None and not isinstance(bval, bool):
+            raise ValueError(f"{bname} must be a boolean, got {type(bval).__name__}")
+
+    mode_val: Optional[str] = None
+    if delivery_mode is not None:
+        if not isinstance(delivery_mode, str):
+            raise ValueError("delivery_mode must be a string")
+        m = delivery_mode.strip().lower()
+        if m not in VALID_PROACTIVE_DELIVERY_MODES:
+            raise ValueError(f"Unsupported proactive delivery_mode: {delivery_mode!r}")
+        mode_val = m
+
+    qs_val: Optional[str] = None
+    if quiet_start is not None:
+        if not isinstance(quiet_start, str) or not _HHMM_RE.match(quiet_start.strip()):
+            raise ValueError(f"quiet_start must be HH:MM (00:00..23:59), got {quiet_start!r}")
+        qs_val = quiet_start.strip()
+
+    qe_val: Optional[str] = None
+    if quiet_end is not None:
+        if not isinstance(quiet_end, str) or not _HHMM_RE.match(quiet_end.strip()):
+            raise ValueError(f"quiet_end must be HH:MM (00:00..23:59), got {quiet_end!r}")
+        qe_val = quiet_end.strip()
+
+    iv_val = _require_int_param("check_interval_minutes", check_interval_minutes) if check_interval_minutes is not None else None
+    min_chat_val = _require_int_param("min_since_last_chat_minutes", min_since_last_chat_minutes) if min_since_last_chat_minutes is not None else None
+    cd_val = _require_int_param("min_cooldown_minutes", min_cooldown_minutes) if min_cooldown_minutes is not None else None
+    max_n_val = _require_int_param("max_daily_nudges", max_daily_nudges) if max_daily_nudges is not None else None
+
+    vol_val: Optional[float] = None
+    if pc_speaker_volume is not None:
+        if isinstance(pc_speaker_volume, bool):
+            raise ValueError("pc_speaker_volume must be a number, not bool")
+        try:
+            fv = float(pc_speaker_volume)
+        except Exception as exc:
+            raise ValueError(f"pc_speaker_volume must be a number: {pc_speaker_volume!r}") from exc
+        if fv != fv or fv < 0.2 or fv > 1.2:
+            raise ValueError("pc_speaker_volume must be between 0.2 and 1.2")
+        vol_val = round(fv, 2)
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if enabled is not None:
+            next_cfg["enabled"] = bool(enabled)
+        if mode_val is not None:
+            next_cfg["delivery_mode"] = mode_val
+        if iv_val is not None:
+            next_cfg["check_interval_minutes"] = iv_val
+        if qs_val is not None:
+            next_cfg["quiet_start"] = qs_val
+        if qe_val is not None:
+            next_cfg["quiet_end"] = qe_val
+        if min_chat_val is not None:
+            next_cfg["min_since_last_chat_minutes"] = min_chat_val
+        if cd_val is not None:
+            next_cfg["min_cooldown_minutes"] = cd_val
+        if max_n_val is not None:
+            next_cfg["max_daily_nudges"] = max_n_val
+        if vol_val is not None:
+            next_cfg["pc_speaker_volume"] = vol_val
+        if allow_idle_chitchat is not None:
+            next_cfg["allow_idle_chitchat"] = bool(allow_idle_chitchat)
+        if allow_l3_finish_notify is not None:
+            next_cfg["allow_l3_finish_notify"] = bool(allow_l3_finish_notify)
+        if allow_open_loop_followup is not None:
+            next_cfg["allow_open_loop_followup"] = bool(allow_open_loop_followup)
+        if inner_life_enabled is not None:
+            next_cfg["inner_life_enabled"] = bool(inner_life_enabled)
+        return normalize_proactive(next_cfg)
+
+    saved = update_runtime_section("proactive", _upd, settings_path=settings_path)
+    return dict(saved["proactive"])
+
+
+def get_vocal_cue(settings_path: Optional[str] = None) -> Dict[str, bool]:
+    sec = read_runtime_settings(settings_path)["vocal_cue"]
+    return {"enabled": bool(sec["enabled"])}
+
+
+def set_vocal_cue(
+    *,
+    enabled: Optional[bool] = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, bool]:
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be a boolean, got {type(enabled).__name__}")
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if enabled is not None:
+            next_cfg["enabled"] = bool(enabled)
+        return normalize_vocal_cue(next_cfg)
+
+    saved = update_runtime_section("vocal_cue", _upd, settings_path=settings_path)
+    return {"enabled": bool(saved["vocal_cue"]["enabled"])}
+
+
+def get_voiceprint(settings_path: Optional[str] = None) -> Dict[str, Any]:
+    sec = read_runtime_settings(settings_path)["voiceprint"]
+    return {
+        "enabled": bool(sec["enabled"]),
+        "policy": str(sec["policy"]),
+        "threshold": float(sec["threshold"]),
+    }
+
+
+def set_voiceprint(
+    *,
+    enabled: Optional[bool] = None,
+    policy: Optional[str] = None,
+    threshold: Optional[float] = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be a boolean, got {type(enabled).__name__}")
+    pol_val: Optional[str] = None
+    if policy is not None:
+        if not isinstance(policy, str):
+            raise ValueError("policy must be a string")
+        p = policy.strip().lower()
+        if p not in VALID_VOICEPRINT_POLICIES:
+            raise ValueError(f"Unsupported voiceprint policy: {policy!r}")
+        pol_val = p
+    thr_val: Optional[float] = None
+    if threshold is not None:
+        if isinstance(threshold, bool):
+            raise ValueError("threshold must be a number, not bool")
+        try:
+            fv = float(threshold)
+        except Exception as exc:
+            raise ValueError(f"threshold must be a number: {threshold!r}") from exc
+        if fv != fv or fv < 0.30 or fv > 0.90:
+            raise ValueError("threshold must be between 0.30 and 0.90")
+        thr_val = round(fv, 2)
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if enabled is not None:
+            next_cfg["enabled"] = bool(enabled)
+        if pol_val is not None:
+            next_cfg["policy"] = pol_val
+        if thr_val is not None:
+            next_cfg["threshold"] = thr_val
+        return normalize_voiceprint(next_cfg)
+
+    saved = update_runtime_section("voiceprint", _upd, settings_path=settings_path)
+    sec = saved["voiceprint"]
+    return {
+        "enabled": bool(sec["enabled"]),
+        "policy": str(sec["policy"]),
+        "threshold": float(sec["threshold"]),
+    }
+
+
+def get_screen_peek(settings_path: Optional[str] = None) -> Dict[str, bool]:
+    sec = read_runtime_settings(settings_path)["screen_peek"]
+    return {"enabled": bool(sec["enabled"])}
+
+
+def set_screen_peek(
+    *,
+    enabled: Optional[bool] = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, bool]:
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be a boolean, got {type(enabled).__name__}")
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if enabled is not None:
+            next_cfg["enabled"] = bool(enabled)
+        return normalize_screen_peek(next_cfg)
+
+    saved = update_runtime_section("screen_peek", _upd, settings_path=settings_path)
+    return {"enabled": bool(saved["screen_peek"]["enabled"])}
+
+
+def get_mobile_push(settings_path: Optional[str] = None) -> Dict[str, Any]:
+    return dict(read_runtime_settings(settings_path)["mobile_push"])
+
+
+def set_mobile_push(
+    *,
+    enabled: Optional[bool] = None,
+    provider: Optional[str] = None,
+    forward_proactive: Optional[bool] = None,
+    forward_briefing: Optional[bool] = None,
+    respect_quiet_hours: Optional[bool] = None,
+    max_daily_pushes: Optional[int] = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    for name, bval in (
+        ("enabled", enabled),
+        ("forward_proactive", forward_proactive),
+        ("forward_briefing", forward_briefing),
+        ("respect_quiet_hours", respect_quiet_hours),
+    ):
+        if bval is not None and not isinstance(bval, bool):
+            raise ValueError(f"{name} must be a boolean, got {type(bval).__name__}")
+    prov_val: Optional[str] = None
+    if provider is not None:
+        if not isinstance(provider, str):
+            raise ValueError("provider must be a string")
+        p = provider.strip().lower()
+        if p not in VALID_MOBILE_PUSH_PROVIDERS:
+            raise ValueError(f"Unsupported mobile_push provider: {provider!r}")
+        prov_val = p
+    max_val: Optional[int] = None
+    if max_daily_pushes is not None:
+        if isinstance(max_daily_pushes, bool) or not isinstance(max_daily_pushes, int):
+            raise ValueError("max_daily_pushes must be an integer")
+        if max_daily_pushes < 1 or max_daily_pushes > 50:
+            raise ValueError("max_daily_pushes must be between 1 and 50")
+        max_val = max_daily_pushes
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if enabled is not None:
+            next_cfg["enabled"] = bool(enabled)
+        if prov_val is not None:
+            next_cfg["provider"] = prov_val
+        if forward_proactive is not None:
+            next_cfg["forward_proactive"] = bool(forward_proactive)
+        if forward_briefing is not None:
+            next_cfg["forward_briefing"] = bool(forward_briefing)
+        if respect_quiet_hours is not None:
+            next_cfg["respect_quiet_hours"] = bool(respect_quiet_hours)
+        if max_val is not None:
+            next_cfg["max_daily_pushes"] = max_val
+        return normalize_mobile_push(next_cfg)
+
+    saved = update_runtime_section("mobile_push", _upd, settings_path=settings_path)
+    return dict(saved["mobile_push"])
