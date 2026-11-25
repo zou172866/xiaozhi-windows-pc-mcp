@@ -1,5 +1,7 @@
 # Xiaozhi ESP32 · Windows 三层电脑操控与长期记忆本地服务端
 
+[![Clones](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zou172866/repo-traffic-archive/main/badges/xiaozhi-windows-pc-mcp.json)](https://github.com/zou172866/repo-traffic-archive)
+
 让 **ESP32-S3 小智语音助手** 直连你的本地 Windows 电脑，提供 **高精度 GUI 视觉点击操控 + 可插拔后台 Agent（DSH / WorkBuddy / Antigravity）异步派单 + Anima Brain 长期情感记忆与 Obsidian 单向同步 + 本地 GPU `GPT-SoVITS` 多情绪定制音色** 的一站式私有化方案。
 
 同时内置可独立安装的 Agent Skill `windows-pc-mcp-automation`，支持通过 `npx skills add` 复用到任意 Agent 环境。
