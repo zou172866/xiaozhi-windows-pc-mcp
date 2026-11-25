@@ -36,6 +36,7 @@ import asr_corrections
 import patch_registry
 import runtime_events
 import runtime_settings
+import zh_pinyin
 
 MAX_PCM_FRAME_BYTES = 32768
 _PC_MIC_EXCLUSIVE_ENV = "XIAOZHI_PC_MIC_EXCLUSIVE"
@@ -50,6 +51,9 @@ _PURE_TRAILING_PARTICLES = frozenset(
     {"呀", "啊", "哦", "噢", "哈", "啦", "呢", "嘛", "诶", "哎", "喂", "嗯", "呀呀", "啊啊"}
 )
 _LEADING_SEP_CHARS = " \t\r\n,，.。!！?？;；:：、~～·…—-_\"'“”‘’()（）"
+_EXIT_LEADING_FILLER_RE = re.compile(r"^(?:好了|好啦|行了|行啦|好的|那就|那我|先|请|嗯|好|行|那)")
+_EXIT_TRAILING_PARTICLE_RE = re.compile(r"(?:吧|啦|了|呀|啊|哦|噢|嘛|哈|呢|呗|一下)+$")
+_ASR_BREATH_FILLERS = frozenset({"uh", "um", "ah", "eh", "hm", "hmm", "mm", "mmm", "er"})
 DEFAULT_PC_WAKE_EXIT_COMMANDS: Tuple[str, ...] = (
     "退出对话",
     "退下",
@@ -61,6 +65,9 @@ DEFAULT_PC_WAKE_EXIT_COMMANDS: Tuple[str, ...] = (
     "回到待命",
     "退出吧",
     "结束对话",
+    "停止对话",
+    "拜拜",
+    "再见",
 )
 _LOCAL_ASR_TYPE_TOKENS = frozenset({"sherpa_onnx_local", "fun_local", "vosk_local", "vosk"})
 _LOCAL_ASR_SELECTED_NAMES = frozenset({"SherpaASR", "FunASR"})
@@ -209,6 +216,39 @@ def _clear_hardware_conn_local_state(hw_conn: Any) -> bool:
     return owns_pc_audio
 
 
+async def _fast_close_websocket(ws: Any, *, timeout_sec: float = 0.25) -> bool:
+    """Close a WebSocket promptly without blocking on websockets' default 10s close handshake timeout."""
+    if ws is None:
+        return False
+    closed_any = False
+    try:
+        cur_timeout = getattr(ws, "close_timeout", None)
+        if isinstance(cur_timeout, (int, float)) and cur_timeout > timeout_sec:
+            ws.close_timeout = float(timeout_sec)
+    except Exception:
+        pass
+    close_fn = getattr(ws, "close", None)
+    if callable(close_fn):
+        closed_any = True
+        try:
+            res = close_fn()
+            if inspect.isawaitable(res):
+                await asyncio.wait_for(res, timeout=float(timeout_sec) + 0.15)
+        except Exception:
+            pass
+    transport = getattr(ws, "transport", None)
+    if transport is not None:
+        try:
+            is_closing = getattr(transport, "is_closing", None)
+            if not (callable(is_closing) and is_closing()):
+                if callable(getattr(transport, "close", None)):
+                    transport.close()
+                    closed_any = True
+        except Exception:
+            pass
+    return closed_any
+
+
 async def close_suppressed_hardware_conn(
     hw_conn: Any,
     *,
@@ -253,20 +293,14 @@ async def close_suppressed_hardware_conn(
         print(f"[PCMicArbiter] 电脑麦已开启，已静默让硬件设备 ({dev}) 退回待机 ({reason})", flush=True)
 
     ws = getattr(hw_conn, "websocket", None)
-    if ws is not None and callable(getattr(ws, "close", None)):
-        try:
-            res = ws.close()
-            if inspect.isawaitable(res):
-                await res
-            return
-        except Exception:
-            pass
+    if await _fast_close_websocket(ws, timeout_sec=0.25):
+        return
     close_fn = getattr(hw_conn, "close", None)
     if callable(close_fn):
         try:
             res = close_fn()
             if inspect.isawaitable(res):
-                await res
+                await asyncio.wait_for(res, timeout=0.4)
         except Exception:
             pass
 
@@ -351,20 +385,14 @@ async def _close_preempted_pc_mic_conn(old_pc_conn: Any, *, reason: str = "repla
     except Exception:
         pass
     ws = getattr(old_pc_conn, "websocket", None)
-    if ws is not None and callable(getattr(ws, "close", None)):
-        try:
-            res = ws.close()
-            if inspect.isawaitable(res):
-                await res
-            return
-        except Exception:
-            pass
+    if await _fast_close_websocket(ws, timeout_sec=0.25):
+        return
     close_fn = getattr(old_pc_conn, "close", None)
     if callable(close_fn):
         try:
             res = close_fn()
             if inspect.isawaitable(res):
-                await res
+                await asyncio.wait_for(res, timeout=0.4)
         except Exception:
             pass
 
@@ -516,12 +544,17 @@ def get_conn_exit_commands(conn: Any) -> List[str]:
     return out
 
 
-def match_pc_wakeup_word(conn: Any, text: Any) -> Tuple[str, str]:
-    """Match configured wakeup words at utterance start (or after <=2-char filler) and return `(matched_wake, remainder)`.
+def match_pc_wakeup_word(conn: Any, text: Any, *, _depth: int = 0) -> Tuple[str, str]:
+    """Match configured wakeup words via 3-tier Hanzi + Mandarin Pinyin + controlled acoustic-confusion matching.
 
-    Prevents mid-sentence false triggers (e.g. "我刚才提到了你好芽衣这个词") while supporting:
-    - pure wakeups ("你好芽衣", "你好芽衣呀", "嗯，你好芽衣") -> `(matched_wake, "")`
-    - wakeups with attached commands ("你好芽衣，明天杭州天气怎么样") -> `(matched_wake, "明天杭州天气怎么样")`
+    Tiers:
+    1. Exact normalized Hanzi + `asr_corrections` (prefix, leading <=2-char filler, or sliding window on short <=12-char utterances).
+    2. Exact tone-less Mandarin Pinyin sequence match (covers all homophones like 雅依/亚伊/压抑/讶异/呀一 for any Chinese wakeup word).
+    3. Controlled acoustic-confusion Pinyin match for >=4-char Chinese wakeup words (at most 1 confusable syllable with >=3 exact
+       syllables, e.g. 你好阿姨 / 你好爱衣 / 你好芽语 / 你好小诗->你好小智), plus leading-syllable clipped exact trailing match
+       (e.g. 好芽衣 / 好牙医) on short <=5-char standalone utterances.
+
+    Long casual sentences (>12 chars) remain strictly start-anchored so mid-sentence mentions never false-trigger.
     """
     corrected = _clean_asr_text_for_match(text)
     if not corrected:
@@ -557,18 +590,30 @@ def match_pc_wakeup_word(conn: Any, text: Any) -> Tuple[str, str]:
         rem_norm = _normalize_match_token(rem)
         if not rem_norm or rem_norm in _PURE_TRAILING_PARTICLES:
             return orig_word, ""
+        # Collapse repeated wakeup attempts in one utterance (e.g. "你好压抑，你好芽衣" or "你好压抑，你好芽衣今天天气")
+        if _depth < 2:
+            sub_wake, sub_rem = match_pc_wakeup_word(conn, rem, _depth=_depth + 1)
+            if sub_wake:
+                return sub_wake, sub_rem
         return orig_word, rem
 
-    def _matches_prefix_boundary(start_idx: int, norm_word: str) -> bool:
-        if not norm_text[start_idx:].startswith(norm_word):
-            return False
-        end_idx = start_idx + len(norm_word)
-        if end_idx < len(norm_text):
-            last_ch = norm_word[-1]
-            next_ch = norm_text[end_idx]
-            directly_contiguous = orig_indices[end_idx] == orig_indices[end_idx - 1] + 1
+    def _ascii_boundaries_ok(start_idx: int, end_idx: int) -> bool:
+        if start_idx > 0:
+            prev_ch = norm_text[start_idx - 1]
+            first_ch = norm_text[start_idx]
             if (
-                directly_contiguous
+                orig_indices[start_idx] == orig_indices[start_idx - 1] + 1
+                and prev_ch.isascii()
+                and prev_ch.isalnum()
+                and first_ch.isascii()
+                and first_ch.isalnum()
+            ):
+                return False
+        if end_idx < len(norm_text):
+            last_ch = norm_text[end_idx - 1]
+            next_ch = norm_text[end_idx]
+            if (
+                orig_indices[end_idx] == orig_indices[end_idx - 1] + 1
                 and last_ch.isascii()
                 and last_ch.isalnum()
                 and next_ch.isascii()
@@ -577,34 +622,174 @@ def match_pc_wakeup_word(conn: Any, text: Any) -> Tuple[str, str]:
                 return False
         return True
 
-    # Priority 1: exact or direct prefix match at index 0
-    for orig_word, norm_word, _ in candidates:
-        if _matches_prefix_boundary(0, norm_word):
-            return _build_result(orig_word, len(norm_word))
+    def _matches_prefix_boundary(start_idx: int, norm_word: str) -> bool:
+        if not norm_text[start_idx:].startswith(norm_word):
+            return False
+        return _ascii_boundaries_ok(start_idx, start_idx + len(norm_word))
 
-    # Priority 2: short leading interjection/filler (<=2 chars) immediately followed by wakeup word
     m_filler = _WAKEUP_LEADING_FILLER_RE.match(norm_text)
-    if m_filler is not None:
-        offset = m_filler.end()
-        if offset < len(norm_text):
-            for orig_word, norm_word, _ in candidates:
-                if _matches_prefix_boundary(offset, norm_word):
-                    return _build_result(orig_word, offset + len(norm_word))
+    filler_offset = m_filler.end() if m_filler is not None else 0
+    _NEGATION_OR_META_RE = re.compile(r"[不别没莫勿禁停说叫喊提讲聊]")
+
+    # Optional secondary offset: ONLY after an explicit punctuation/pause break preceded by a brief (<=4-char)
+    # non-negated prefix (e.g. "喂那个，你好芽衣" / "嗨，你好芽衣"), never inside "不要叫你好芽衣".
+    clause_offsets: List[int] = []
+    if len(norm_text) <= 12:
+        for idx in range(1, min(len(norm_text), 5)):
+            if orig_indices[idx] > orig_indices[idx - 1] + 1:
+                prefix_seg = norm_text[:idx]
+                if prefix_seg and not _NEGATION_OR_META_RE.search(prefix_seg):
+                    clause_offsets.append(idx)
+
+    def _candidate_offsets(word_len: int, *, allow_clause: bool) -> List[int]:
+        max_start = len(norm_text) - word_len
+        if max_start < 0:
+            return []
+        offsets: List[int] = [0]
+        if 0 < filler_offset <= max_start:
+            offsets.append(filler_offset)
+        if allow_clause:
+            for pos in clause_offsets:
+                if pos <= max_start and pos not in offsets:
+                    offsets.append(pos)
+        return offsets
+
+    # Tier 1: exact normalized Hanzi/ASCII at start, after short filler, or after brief non-negated pause
+    for orig_word, norm_word, _ in candidates:
+        for pos in _candidate_offsets(len(norm_word), allow_clause=True):
+            if _matches_prefix_boundary(pos, norm_word):
+                return _build_result(orig_word, pos + len(norm_word))
+
+    # Prepare Mandarin pinyin sequences for CJK tiers (lazy-loaded stdlib table)
+    text_pinyins = [zh_pinyin.get_char_pinyins(ch) for ch in norm_text]
+    cjk_candidates: List[Tuple[str, str, List[frozenset[str]]]] = []
+    for orig_word, norm_word, _ in candidates:
+        if len(norm_word) < 2 or not all(zh_pinyin.is_cjk_char(ch) for ch in norm_word):
+            continue
+        wp = [zh_pinyin.get_char_pinyins(ch) for ch in norm_word]
+        if all(wp):
+            cjk_candidates.append((orig_word, norm_word, wp))
+
+    if not cjk_candidates:
+        return "", ""
+
+    # Tier 2: exact tone-less Mandarin pinyin sequence match (all homophones like 雅依/亚伊/压抑/呀一)
+    for orig_word, norm_word, word_pinyins in cjk_candidates:
+        wlen = len(word_pinyins)
+        for pos in _candidate_offsets(wlen, allow_clause=True):
+            if all(
+                zh_pinyin.syllable_sets_exact_match(text_pinyins[pos + i], word_pinyins[i])
+                for i in range(wlen)
+            ):
+                return _build_result(orig_word, pos + wlen)
+
+    # Tier 3a: controlled acoustic-confusion match ONLY for >=4-syllable Chinese wakeup words
+    # (requires >= L-1 exact pinyin matches + at most 1 acoustically confusable syllable, e.g. 你好阿姨 / 你好小诗)
+    for orig_word, norm_word, word_pinyins in cjk_candidates:
+        wlen = len(word_pinyins)
+        if wlen < 4:
+            continue
+        for pos in _candidate_offsets(wlen, allow_clause=True):
+            exact_cnt = 0
+            all_fuzzy_ok = True
+            for i in range(wlen):
+                tp = text_pinyins[pos + i]
+                wp = word_pinyins[i]
+                if zh_pinyin.syllable_sets_exact_match(tp, wp):
+                    exact_cnt += 1
+                elif not zh_pinyin.syllable_sets_fuzzy_match(tp, wp):
+                    all_fuzzy_ok = False
+                    break
+            if all_fuzzy_ok and exact_cnt >= (wlen - 1):
+                return _build_result(orig_word, pos + wlen)
+
+    # Tier 3b: leading-syllable clipped exact pinyin match on short standalone utterances (<=5 chars)
+    # e.g. browser AGC/SileroVAD clips opening "你" in "你好芽衣" -> "好芽衣" / "好牙医" / "好雅依"
+    if len(norm_text) <= 5:
+        for orig_word, norm_word, word_pinyins in cjk_candidates:
+            wlen = len(word_pinyins)
+            if wlen < 4:
+                continue
+            tail_pinyins = word_pinyins[1:]
+            tlen = len(tail_pinyins)
+            if len(norm_text) < tlen:
+                continue
+            if all(
+                zh_pinyin.syllable_sets_exact_match(text_pinyins[i], tail_pinyins[i])
+                for i in range(tlen)
+            ):
+                matched_w, rem = _build_result(orig_word, tlen)
+                if not rem:
+                    return matched_w, ""
 
     return "", ""
 
 
+def is_pc_mic_asr_noise_hallucination(text: Any) -> bool:
+    """Return True for 1-letter Latin or pure breath-filler ASR hallucinations (e.g. 'H.', 'A.', 'Uh.') with zero CJK."""
+    cleaned = _clean_asr_text_for_match(text)
+    if not cleaned:
+        return True
+    norm = _normalize_match_token(cleaned)
+    if not norm:
+        return True
+    if any(zh_pinyin.is_cjk_char(ch) or ch.isdigit() for ch in norm):
+        return False
+    if norm.isascii() and norm.isalpha():
+        if len(norm) == 1:
+            return True
+        if norm in _ASR_BREATH_FILLERS:
+            return True
+    return False
+
+
 def match_pc_exit_command(conn: Any, text: Any) -> str:
-    """Match an exact whole-utterance exit command (e.g. '退出', '关闭', '休眠', '退下', '回待命')."""
+    """Match a whole-utterance exit command (exact, optional brief filler/particle, or exact CJK homophone like '推出')."""
     corrected = _clean_asr_text_for_match(text)
     if not corrected:
         return ""
     norm_text = _normalize_match_token(corrected)
     if not norm_text:
         return ""
-    for cmd in get_conn_exit_commands(conn):
-        if norm_text == _normalize_match_token(cmd):
-            return cmd
+
+    forms: List[str] = [norm_text]
+    no_tail = _EXIT_TRAILING_PARTICLE_RE.sub("", norm_text)
+    if len(no_tail) >= 2 and no_tail not in forms:
+        forms.append(no_tail)
+    no_head = _EXIT_LEADING_FILLER_RE.sub("", norm_text)
+    if len(no_head) >= 2 and no_head not in forms:
+        forms.append(no_head)
+    no_both = _EXIT_TRAILING_PARTICLE_RE.sub("", no_head)
+    if len(no_both) >= 2 and no_both not in forms:
+        forms.append(no_both)
+
+    cmds = get_conn_exit_commands(conn)
+    norm_cmds: List[Tuple[str, str]] = []
+    for cmd in cmds:
+        nc = _normalize_match_token(cmd)
+        if nc:
+            norm_cmds.append((cmd, nc))
+
+    # Tier 1: exact normalized match (with optional brief leading filler / trailing particle)
+    for form in forms:
+        for orig_cmd, nc in norm_cmds:
+            if form == nc:
+                return orig_cmd
+
+    # Tier 2: exact tone-less Mandarin pinyin match on whole standalone CJK utterance (e.g. "推出" -> "退出")
+    for form in forms:
+        if len(form) < 2 or len(form) > 5 or not all(zh_pinyin.is_cjk_char(ch) for ch in form):
+            continue
+        fp = [zh_pinyin.get_char_pinyins(ch) for ch in form]
+        if not all(fp):
+            continue
+        for orig_cmd, nc in norm_cmds:
+            if len(nc) != len(form) or not all(zh_pinyin.is_cjk_char(ch) for ch in nc):
+                continue
+            cp = [zh_pinyin.get_char_pinyins(ch) for ch in nc]
+            if all(cp) and all(zh_pinyin.syllable_sets_exact_match(fp[i], cp[i]) for i in range(len(nc))):
+                return orig_cmd
+
     return ""
 
 
@@ -635,12 +820,20 @@ async def _send_pc_mic_state_ws(
     ws = getattr(conn, "websocket", None)
     if ws is None or not callable(getattr(ws, "send", None)) or not _is_conn_alive(conn):
         return False
+    kws_active = False
+    try:
+        import pc_kws_engine
+
+        kws_active = pc_kws_engine.is_kws_available_for_conn(conn)
+    except Exception:
+        kws_active = False
     payload: dict[str, Any] = {
         "type": "pc_mic_state",
         "state": str(state),
         "reason": str(reason or ""),
         "wakeup_words": get_conn_wakeup_words(conn),
         "local_asr": is_local_asr_provider(conn),
+        "kws_active": kws_active,
         "session_id": str(getattr(conn, "session_id", "") or ""),
     }
     if wake_word:
@@ -783,6 +976,12 @@ async def enter_pc_wake_standby(
         _flush_and_trim_pc_wake_dialogue(conn)
 
     _reset_pc_audio_and_vad_buffers(conn)
+    try:
+        import pc_kws_engine
+
+        pc_kws_engine.reset_conn_kws(conn, drop_stream=False)
+    except Exception:
+        pass
 
     try:
         cur_timeout = int(getattr(conn, "timeout_seconds", 0) or 0)
@@ -873,6 +1072,12 @@ async def exit_pc_wake_mode(
     try:
         conn._pc_wake_mode = False
         conn._pc_wake_state = "off"
+    except Exception:
+        pass
+    try:
+        import pc_kws_engine
+
+        pc_kws_engine.reset_conn_kws(conn, drop_stream=True)
     except Exception:
         pass
     _restore_normal_timeout_seconds(conn)

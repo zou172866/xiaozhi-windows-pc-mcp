@@ -1691,6 +1691,379 @@ vm.runInContext(src, sandbox, { filename: 'app.js' });
 
         asyncio.run(_scenario())
 
+    def test_11_pinyin_fuzzy_wakeup_matching_and_standby_350ms_fast_threshold(self):
+        """Zero-dependency pinyin + acoustic-confusion wakeup catches SenseVoice homophones while rejecting casual speech, and standby uses 350ms fast trigger + short-audio support."""
+        import vad_speculative_router as vad_spec
+        import zh_pinyin
+
+        class _DummyConn:
+            def __init__(self, wake_words):
+                self.config = {"wakeup_words": list(wake_words)}
+                self._pc_wake_mode = True
+                self._pc_wake_state = "standby"
+                self.audio_format = "pcm"
+                self.client_listen_mode = "auto"
+                self.client_voice_stop = False
+                self.asr_audio = []
+                self.reset_called = 0
+
+            def reset_audio_states(self):
+                self.reset_called += 1
+                self.asr_audio.clear()
+                self.client_voice_stop = False
+
+        # 1. Offline zh_pinyin stdlib lookup works without external pypinyin
+        self.assertIn("ya", zh_pinyin.get_char_pinyins("芽"))
+        self.assertIn("ya", zh_pinyin.get_char_pinyins("雅"))
+        self.assertIn("yi", zh_pinyin.get_char_pinyins("依"))
+        self.assertTrue(zh_pinyin.syllables_fuzzy_close("ya", "a"))
+        self.assertTrue(zh_pinyin.syllables_fuzzy_close("zhi", "shi"))
+        self.assertFalse(zh_pinyin.syllables_fuzzy_close("ya", "ma"))
+
+        conn = _DummyConn(["你好芽衣", "你好小智"])
+
+        # 2. Tier 2: ALL tone-less Mandarin homophones of 你好芽衣 match without manual enumeration
+        for homophone in (
+            "你好，雅依。",
+            "你好亚伊",
+            "你好，压抑。",
+            "你好讶异",
+            "你好呀一",
+            "你好芽依",
+            "你好鸭翼",
+            "你好，雅意。",
+            "嗯，你好雅依",
+        ):
+            wk, rem = pc_pcm_input.match_pc_wakeup_word(conn, homophone)
+            self.assertEqual((wk, rem), ("你好芽衣", ""), f"Homophone failed to match: {homophone}")
+
+        # Attached command after homophone
+        self.assertEqual(
+            pc_pcm_input.match_pc_wakeup_word(conn, "你好雅依，明天杭州天气怎么样"),
+            ("你好芽衣", "明天杭州天气怎么样"),
+        )
+
+        # Repeated wakeup attempts collapse cleanly (never leak duplicate wakeup to LLM)
+        self.assertEqual(
+            pc_pcm_input.match_pc_wakeup_word(conn, "你好压抑，你好芽衣"),
+            ("你好芽衣", ""),
+        )
+        self.assertEqual(
+            pc_pcm_input.match_pc_wakeup_word(conn, "你好压抑，你好压抑，今天天气怎么样"),
+            ("你好芽衣", "今天天气怎么样"),
+        )
+
+        # 3. Tier 3a: Controlled acoustic confusion (at most 1 confusable syllable, >=3 exact)
+        for near_hit, expected in (
+            ("你好，阿姨。", "你好芽衣"),
+            ("你好爱衣", "你好芽衣"),
+            ("你好芽语", "你好芽衣"),
+            ("你好，小诗。", "你好小智"),
+        ):
+            wk, rem = pc_pcm_input.match_pc_wakeup_word(conn, near_hit)
+            self.assertEqual((wk, rem), (expected, ""), f"Near-phonetic failed: {near_hit}")
+
+        # 4. Tier 3b: Leading-syllable clipped short standalone utterance
+        for clipped in ("好芽衣", "好牙医", "好雅依", "好芽衣呀"):
+            wk, rem = pc_pcm_input.match_pc_wakeup_word(conn, clipped)
+            self.assertEqual((wk, rem), ("你好芽衣", ""), f"Clipped wakeup failed: {clipped}")
+        # Clipped with trailing content or unrelated phrase MUST NOT trigger
+        self.assertEqual(pc_pcm_input.match_pc_wakeup_word(conn, "好牙医诊所"), ("", ""))
+        self.assertEqual(pc_pcm_input.match_pc_wakeup_word(conn, "好家伙"), ("", ""))
+        self.assertEqual(pc_pcm_input.match_pc_wakeup_word(conn, "好呀"), ("", ""))
+
+        # 5. Strict false-positive rejection on everyday speech & long mid-sentence mentions
+        for non_wake in (
+            "你好",
+            "你好吗",
+            "你好呀",
+            "你好啊朋友",
+            "你好，今天天气真好",
+            "你好，吃饭了吗",
+            "我们今天在聊你好芽衣这个唤醒词的效果如何",
+            "我们今天在聊你好雅依这个唤醒词的效果如何",
+        ):
+            wk, rem = pc_pcm_input.match_pc_wakeup_word(conn, non_wake)
+            self.assertEqual((wk, rem), ("", ""), f"False positive on: {non_wake}")
+
+        # 6. Standby uses 350ms fast threshold while awake keeps 550ms/800ms untouched
+        cfg = {"speculative_ms": 550, "post_wakeup_ms": 800}
+        self.assertEqual(vad_spec._effective_speculative_threshold_ms(conn, cfg), 350.0)
+        conn._pc_wake_state = "awake"
+        self.assertEqual(vad_spec._effective_speculative_threshold_ms(conn, cfg), 550.0)
+        conn._vad_post_wakeup_pending = True
+        self.assertEqual(vad_spec._effective_speculative_threshold_ms(conn, cfg), 800.0)
+
+        # 7. Short 11-frame standby wakeup utterance (below upstream 15-frame floor) still reaches handle_voice_stop
+        async def _verify_short_standby_frames() -> None:
+            from core.providers.asr.base import ASRProviderBase
+            from core.providers.asr.dto.dto import InterfaceType
+
+            vad_spec.apply_vad_speculative_patch()
+
+            class _FakeStandbyASR(ASRProviderBase):
+                interface_type = InterfaceType.NON_STREAM
+
+                def __init__(self):
+                    self.stopped_lens: list[int] = []
+
+                async def speech_to_text(self, opus_data, session_id, audio_format="opus"):
+                    return "", None
+
+                async def handle_voice_stop(self, c, asr_audio_task):
+                    self.stopped_lens.append(sum(len(b) for b in asr_audio_task))
+
+            asr = _FakeStandbyASR()
+            c_short = _DummyConn(["你好芽衣"])
+            c_short.asr = asr
+            c_short.asr_audio = [b"\x01\x00" * 960 for _ in range(10)]
+            c_short.client_voice_stop = True
+            await asr.receive_audio(c_short, b"\x01\x00" * 960, False)
+            self.assertEqual(asr.stopped_lens, [1920 * 11])
+            self.assertEqual(c_short.reset_called, 1)
+
+            # Awake mode ALSO rescues short 11-frame utterances (e.g. brisk "退出" right after interrupt)
+            c_awake_short = _DummyConn(["你好芽衣"])
+            c_awake_short._pc_wake_state = "awake"
+            c_awake_short.asr = asr
+            c_awake_short.asr_audio = [b"\x01\x00" * 960 for _ in range(10)]
+            c_awake_short.client_voice_stop = True
+            await asr.receive_audio(c_awake_short, b"\x01\x00" * 960, False)
+            self.assertEqual(asr.stopped_lens, [1920 * 11, 1920 * 11])
+
+        asyncio.run(_verify_short_standby_frames())
+
+    def test_12_exit_command_homophone_particles_noise_filter_and_early_commit(self):
+        """Exit matcher catches '推出'/particles/'拜拜'/'再见' without false-exiting long sentences, drops 'H.' noise, and early-commits exit."""
+        import vad_speculative_router as vad_spec
+
+        class _DummyConn:
+            def __init__(self):
+                self.cmd_exit = ["退出", "关闭"]
+                self.config = {"wakeup_words": ["你好芽衣"], "exit_commands": ["退出", "关闭"]}
+                self._pc_wake_mode = True
+                self._pc_wake_state = "awake"
+                self.audio_format = "pcm"
+
+        conn = _DummyConn()
+
+        # 1. Exit command homophones, particles, fillers, and standalone farewells
+        for phrase in (
+            "退出",
+            "退出。",
+            "推出。",
+            "退除",
+            "退出吧",
+            "退出了",
+            "好了退出",
+            "先退出一下",
+            "拜拜",
+            "再见啦",
+            "停止对话",
+        ):
+            self.assertTrue(
+                bool(pc_pcm_input.match_pc_exit_command(conn, phrase)),
+                f"Expected exit command match for: {phrase}",
+            )
+
+        # Long sentences containing exit words MUST NOT false-exit
+        for normal in (
+            "我想退出登录",
+            "今天推出了新手机",
+            "帮我关闭浏览器窗口",
+            "明天再见面的地方在哪",
+            "明天杭州天气怎么样",
+        ):
+            self.assertEqual(
+                pc_pcm_input.match_pc_exit_command(conn, normal),
+                "",
+                f"Unexpected exit match on normal sentence: {normal}",
+            )
+
+        # 2. Single-letter Latin / breath hallucinations filtered, real words preserved
+        for noise in ("H.", "A.", "e", "Uh.", "Mm...", "  "):
+            self.assertTrue(pc_pcm_input.is_pc_mic_asr_noise_hallucination(noise), f"Should drop noise: {noise}")
+        for real in ("OK", "hi", "BLG", "退出", "好", "嗯", "123"):
+            self.assertFalse(pc_pcm_input.is_pc_mic_asr_noise_hallucination(real), f"Should keep real: {real}")
+
+        # 3. Speculative VAD early-commits short 2-char exit command in awake mode (bypasses min_chars=4)
+        async def _check_spec_exit() -> None:
+            class _FakeSherpa:
+                def _speculative_decode_pcm(self, _pcm):
+                    return "推出。", None
+
+            st = vad_spec._SpeculativeState()
+            cfg = {"speculative_ms": 550, "min_chars": 4}
+            await vad_spec._run_speculative_decode_task(conn, _FakeSherpa(), st, 0, b"\x01\x00" * 960 * 11, cfg, False)
+            self.assertTrue(st.should_commit)
+            self.assertTrue(st.reason.startswith("pc_exit_command:"))
+
+        asyncio.run(_check_spec_exit())
+
+    def test_13_kws_ppinyin_streaming_routing_and_hardware_fast_close(self):
+        """KWS ppinyin compilation, standby KWS fast-path/fallback routing, and <1s hardware WS fast-close."""
+        import core.handle.helloHandle as hello_mod
+        import core.handle.receiveAudioHandle as recv_mod
+        from core.connection import ConnectionHandler
+        import pc_kws_engine
+        import vad_speculative_router as vad_spec
+        import zh_pinyin
+
+        # 1. Toned ppinyin encoding, deduplication, and token-vocabulary validation
+        self.assertEqual(
+            zh_pinyin.text_to_ppinyin_tokens("你好芽衣"),
+            ["n", "ǐ", "h", "ǎo", "y", "á", "y", "ī"],
+        )
+        self.assertEqual(zh_pinyin.text_to_ppinyin_tokens("好"), [])
+        self.assertEqual(
+            zh_pinyin.text_to_ppinyin_tokens("你好芽衣", valid_tokens={"n", "ǐ"}),
+            [],
+        )
+        kw_lines = zh_pinyin.build_kws_keywords(["你好芽衣", "你好牙医", "你好亚一", "你好小智"])
+        self.assertEqual(
+            kw_lines,
+            [
+                "n ǐ h ǎo y á y ī @你好芽衣",
+                "n ǐ h ǎo y à y ī @你好亚一",
+                "n ǐ h ǎo x iǎo zh ì @你好小智",
+            ],
+        )
+
+        vad_spec.apply_vad_speculative_patch()
+
+        class _FakeTransport:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def is_closing(self) -> bool:
+                return self.closed
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _HungWs:
+            def __init__(self) -> None:
+                self.close_timeout = 10.0
+                self.transport = _FakeTransport()
+                self.sent: list[str] = []
+
+            async def send(self, msg: str) -> None:
+                self.sent.append(msg)
+
+            async def close(self) -> None:
+                await asyncio.sleep(5.0)
+
+        class _FakeWs:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            async def send(self, msg: str) -> None:
+                self.sent.append(msg)
+
+            async def close(self) -> None:
+                return None
+
+        async def _verify_kws_and_fast_close() -> None:
+            loop = asyncio.get_running_loop()
+
+            # 2. Hung hardware WebSocket (10s close handshake) closes in <0.8s and closes TCP transport
+            hw_conn = object.__new__(ConnectionHandler)
+            hw_conn.device_id = "aa:bb:cc:dd:ee:02"
+            hw_conn.session_id = "sid-hw-hung"
+            hw_conn.audio_format = "opus"
+            hw_conn.loop = loop
+            hw_conn.websocket = _HungWs()
+            hw_conn.stop_event = threading.Event()
+            hw_conn.client_is_speaking = False
+            hw_conn.client_abort = False
+
+            t0 = time.monotonic()
+            await pc_pcm_input.close_suppressed_hardware_conn(hw_conn, reason="audio_while_pc_mic_active", delay_sec=0.0)
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 0.9, f"Hardware WS close blocked too long: {elapsed:.2f}s")
+            self.assertLessEqual(hw_conn.websocket.close_timeout, 0.25)
+            self.assertTrue(hw_conn.websocket.transport.closed)
+
+            # 3. PC wake-standby KWS fast-path bypasses SileroVAD/ASR and wakes immediately on KWS hit
+            vad_calls: list[int] = []
+            asr_calls: list[int] = []
+            wake_hits: list[str] = []
+
+            class _SpyVAD:
+                def is_vad(self, _c, frame):
+                    vad_calls.append(len(frame))
+                    return False
+
+            class _SpyASR:
+                async def receive_audio(self, _c, frame, _hv):
+                    asr_calls.append(len(frame))
+
+            pc_conn = object.__new__(ConnectionHandler)
+            pc_conn.device_id = "pc-talk-local"
+            pc_conn.session_id = "sid-kws-route"
+            pc_conn.audio_format = "pcm"
+            pc_conn.loop = loop
+            pc_conn.websocket = _FakeWs()
+            pc_conn.stop_event = threading.Event()
+            pc_conn.client_listen_mode = "auto"
+            pc_conn.client_aec = False
+            pc_conn.client_is_speaking = False
+            pc_conn.client_abort = False
+            pc_conn.close_after_chat = False
+            pc_conn.just_woken_up = False
+            pc_conn.last_activity_time = time.time() * 1000.0
+            pc_conn.timeout_seconds = 180
+            pc_conn.config = {"wakeup_words": ["你好芽衣"], "enable_greeting": True}
+            pc_conn.vad = _SpyVAD()
+            pc_conn.asr = _SpyASR()
+            pc_conn.tts = object()
+            pc_conn.reset_audio_states = lambda: None
+
+            kws_chunks: list[int] = []
+
+            def _fake_kws_feed(_c, chunk: bytes):
+                kws_chunks.append(len(chunk))
+                return "你好芽衣"
+
+            async def _fake_check_wakeup(_c, word: str):
+                wake_hits.append(word)
+                return True
+
+            frame_60ms = b"\x01\x00" * 960  # 1920 bytes
+            with (
+                patch.object(pc_kws_engine, "is_kws_available_for_conn", return_value=True),
+                patch.object(pc_kws_engine, "feed_and_detect_sync", side_effect=_fake_kws_feed),
+                patch.object(hello_mod, "checkWakeupWords", side_effect=_fake_check_wakeup),
+                patch("patches.emotion.wakeup.sync_wakeup_words_from_yaml", return_value=False),
+            ):
+                await pc_pcm_input.enter_pc_wake_standby(pc_conn, reason="client_start")
+                # Frame 1 (1920B) buffers cleanly without touching SileroVAD or ASR
+                await recv_mod.handleAudioMessage(pc_conn, frame_60ms)
+                self.assertEqual(vad_calls, [])
+                self.assertEqual(asr_calls, [])
+                self.assertEqual(kws_chunks, [])
+                # Frame 2 reaches 3840B (120ms) -> invokes KWS -> wakes immediately
+                await recv_mod.handleAudioMessage(pc_conn, frame_60ms)
+                self.assertEqual(kws_chunks, [3840])
+                self.assertEqual(vad_calls, [])
+                self.assertEqual(asr_calls, [])
+                self.assertTrue(pc_pcm_input.is_pc_wake_awake(pc_conn))
+                self.assertEqual(wake_hits, ["你好芽衣"])
+                self.assertTrue(getattr(pc_conn, "_vad_post_wakeup_pending", False))
+
+            # 4. Graceful fallback to SileroVAD+ASR when KWS model is unavailable
+            with (
+                patch.object(pc_kws_engine, "is_kws_available_for_conn", return_value=False),
+                patch.object(recv_mod, "no_voice_close_connect", return_value=None),
+                patch("patches.emotion.wakeup.sync_wakeup_words_from_yaml", return_value=False),
+            ):
+                await pc_pcm_input.enter_pc_wake_standby(pc_conn, reason="client_start")
+                await recv_mod.handleAudioMessage(pc_conn, frame_60ms)
+                self.assertEqual(vad_calls, [1920])
+                self.assertEqual(asr_calls, [1920])
+
+        asyncio.run(_verify_kws_and_fast_close())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

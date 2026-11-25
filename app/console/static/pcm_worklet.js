@@ -1,4 +1,4 @@
-/* AudioWorkletProcessor: resamples browser mic audio to 16kHz mono Int16 PCM (60ms = 960 samples/frame). */
+/* AudioWorkletProcessor: boxcar anti-aliased resampling to 16kHz mono Int16 PCM (60ms = 960 samples/frame). */
 class XiaozhiPcmCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -6,8 +6,8 @@ class XiaozhiPcmCaptureProcessor extends AudioWorkletProcessor {
     this._frameSamples = 960;
     this._out = new Int16Array(this._frameSamples);
     this._outIdx = 0;
-    this._phase = 0;
-    this._lastSample = 0;
+    this._accSum = 0;
+    this._accWeight = 0;
     this._energySum = 0;
   }
 
@@ -17,35 +17,43 @@ class XiaozhiPcmCaptureProcessor extends AudioWorkletProcessor {
 
     const srcRate = sampleRate || 48000;
     const ratio = srcRate / this._targetRate;
-    let pos = this._phase;
     const len = input.length;
 
-    while (pos < len) {
-      const idx0 = Math.floor(pos);
-      const frac = pos - idx0;
-      const s0 = idx0 < 0 ? this._lastSample : input[idx0];
-      const s1 = idx0 + 1 < len ? input[idx0 + 1] : input[len - 1];
-      let sample = s0 + (s1 - s0) * frac;
-      if (sample > 1) sample = 1;
-      else if (sample < -1) sample = -1;
+    for (let i = 0; i < len; i += 1) {
+      const x = input[i];
+      let rem = 1.0;
+      while (rem > 1e-9) {
+        const need = ratio - this._accWeight;
+        if (rem >= need - 1e-9) {
+          this._accSum += x * need;
+          let sample = this._accSum / ratio;
+          if (sample > 1) sample = 1;
+          else if (sample < -1) sample = -1;
 
-      const pcm = sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
-      this._out[this._outIdx++] = pcm;
-      this._energySum += sample * sample;
+          const pcm = sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
+          this._out[this._outIdx++] = pcm;
+          this._energySum += sample * sample;
 
-      if (this._outIdx >= this._frameSamples) {
-        const rms = Math.sqrt(this._energySum / this._frameSamples);
-        const frame = this._out;
-        this._out = new Int16Array(this._frameSamples);
-        this._outIdx = 0;
-        this._energySum = 0;
-        this.port.postMessage({ pcm: frame.buffer, rms }, [frame.buffer]);
+          if (this._outIdx >= this._frameSamples) {
+            const rms = Math.sqrt(this._energySum / this._frameSamples);
+            const frame = this._out;
+            this._out = new Int16Array(this._frameSamples);
+            this._outIdx = 0;
+            this._energySum = 0;
+            this.port.postMessage({ pcm: frame.buffer, rms }, [frame.buffer]);
+          }
+          this._accSum = 0;
+          this._accWeight = 0;
+          rem = rem - need;
+          if (rem < 1e-9) rem = 0;
+        } else {
+          this._accSum += x * rem;
+          this._accWeight += rem;
+          rem = 0;
+        }
       }
-      pos += ratio;
     }
 
-    this._lastSample = input[len - 1];
-    this._phase = pos - len;
     return true;
   }
 }

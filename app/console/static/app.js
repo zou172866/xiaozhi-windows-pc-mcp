@@ -4903,12 +4903,14 @@
     wakeState: "off", // "off" | "standby" | "awake"
     wakeupWords: [],
     localAsr: true,
+    kwsActive: false,
     cloudAsrWarned: false,
     pcAudioOnline: true,
     connected: false,
     helloDone: false,
     sending: false,
     assistantSpeaking: false,
+    ignoreTtsUntil: 0,
     pttPressed: false,
     unmuteTimer: null,
     busy: false,
@@ -4938,16 +4940,17 @@
 
   function formatPcMicWakeStatus(state, reason = "", wakeWord = "") {
     const wk = String(wakeWord || getPcMicPrimaryWakeWord());
-    const extraNote = !pcMic.localAsr
+    const extraNote = (!pcMic.localAsr && !pcMic.kwsActive)
       ? "（提示：当前为云端 ASR，待命可能产生识别费用）"
       : (pcMic.pcAudioOnline === false ? "（提示：18900 电脑音响未在线，仅显示字幕）" : "");
     if (state === "awake") {
       return `已唤醒对话中 · 直接说话，说「退出」回待命${pcMic.pcAudioOnline === false ? "（18900 未在线）" : ""}`;
     }
+    const modeLabel = pcMic.kwsActive ? "流式唤醒待命" : "待命监听";
     if (reason === "voice_exit" || reason === "chat_exit" || reason === "idle_timeout" || reason === "manual_sleep") {
-      return `已退回待命 · 喊「${wk}」再次唤醒${extraNote}`;
+      return `已退回${modeLabel} · 喊「${wk}」再次唤醒${extraNote}`;
     }
-    return `待命监听中 · 喊「${wk}」自动唤醒${extraNote}`;
+    return `${modeLabel}中 · 喊「${wk}」自动唤醒${extraNote}`;
   }
 
   function updatePcMicButtons() {
@@ -5051,7 +5054,9 @@
     pcMic.connected = false;
     pcMic.helloDone = false;
     pcMic.assistantSpeaking = false;
+    pcMic.ignoreTtsUntil = 0;
     pcMic.cloudAsrWarned = false;
+    pcMic.kwsActive = false;
     pcMic.mode = "idle";
     pcMic.wakeState = "off";
     pcMic.busy = false;
@@ -5137,33 +5142,41 @@
       const frameSamples = 960;
       let out = new Int16Array(frameSamples);
       let outIdx = 0;
-      let phase = 0;
-      let lastSample = 0;
+      let accSum = 0;
+      let accWeight = 0;
       let energySum = 0;
       scriptNode.onaudioprocess = (ev) => {
         const input = ev.inputBuffer.getChannelData(0);
         const len = input.length;
-        let pos = phase;
-        while (pos < len) {
-          const i0 = Math.floor(pos);
-          const frac = pos - i0;
-          const s0 = i0 < 0 ? lastSample : input[i0];
-          const s1 = i0 + 1 < len ? input[i0 + 1] : input[len - 1];
-          const clamped = Math.max(-1, Math.min(1, s0 + (s1 - s0) * frac));
-          out[outIdx++] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
-          energySum += clamped * clamped;
-          if (outIdx >= frameSamples) {
-            const rms = Math.sqrt(energySum / frameSamples);
-            const buf = out.buffer;
-            out = new Int16Array(frameSamples);
-            outIdx = 0;
-            energySum = 0;
-            handlePcMicPcmFrame(buf, rms);
+        for (let i = 0; i < len; i += 1) {
+          const x = input[i];
+          let rem = 1.0;
+          while (rem > 1e-9) {
+            const need = ratio - accWeight;
+            if (rem >= need - 1e-9) {
+              accSum += x * need;
+              const clamped = Math.max(-1, Math.min(1, accSum / ratio));
+              out[outIdx++] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
+              energySum += clamped * clamped;
+              if (outIdx >= frameSamples) {
+                const rms = Math.sqrt(energySum / frameSamples);
+                const buf = out.buffer;
+                out = new Int16Array(frameSamples);
+                outIdx = 0;
+                energySum = 0;
+                handlePcMicPcmFrame(buf, rms);
+              }
+              accSum = 0;
+              accWeight = 0;
+              rem = rem - need;
+              if (rem < 1e-9) rem = 0;
+            } else {
+              accSum += x * rem;
+              accWeight += rem;
+              rem = 0;
+            }
           }
-          pos += ratio;
         }
-        lastSample = input[len - 1] || 0;
-        phase = pos - len;
       };
       source.connect(scriptNode);
       scriptNode.connect(sink);
@@ -5195,6 +5208,7 @@
     pcMic.mode = mode;
     pcMic.wakeState = mode === "wake" ? "standby" : "off";
     pcMic.cloudAsrWarned = false;
+    pcMic.kwsActive = false;
     updatePcMicButtons();
     setPcMicStatus(mode === "wake" ? "正在请求麦克风权限并启动唤醒待命…" : "正在请求麦克风权限并连接语音通道…");
 
@@ -5301,6 +5315,9 @@
           if (typeof msg.local_asr === "boolean") {
             pcMic.localAsr = msg.local_asr;
           }
+          if (typeof msg.kws_active === "boolean") {
+            pcMic.kwsActive = msg.kws_active;
+          }
           const nextState = String(msg.state || "").trim().toLowerCase();
           const reason = String(msg.reason || "").trim().toLowerCase();
           if (nextState === "off") {
@@ -5324,7 +5341,7 @@
             pcMic.wakeState = "standby";
             pcMic.sending = true;
             setPcMicStatus(formatPcMicWakeStatus("standby", reason));
-            if (!pcMic.localAsr && !pcMic.cloudAsrWarned) {
+            if (!pcMic.localAsr && !pcMic.kwsActive && !pcMic.cloudAsrWarned) {
               pcMic.cloudAsrWarned = true;
               showBanner("warn", "当前使用云端语音识别（ASR），电脑麦唤醒待命期间的环境语音可能会消耗云端识别额度。");
             }
@@ -5350,6 +5367,9 @@
         if (mtype === "tts") {
           const st = msg.state;
           if (st === "start" || st === "sentence_start") {
+            if (Date.now() < pcMic.ignoreTtsUntil) {
+              return;
+            }
             clearPcMicUnmuteTimer();
             if (pcMic.mode === "wake" && pcMic.wakeState === "standby") {
               return;
@@ -5363,6 +5383,10 @@
             updatePcMicButtons();
             if (st === "sentence_start") pollState(true);
           } else if (st === "stop") {
+            if (Date.now() < pcMic.ignoreTtsUntil && pcMic.unmuteTimer !== null) {
+              pollState(true);
+              return;
+            }
             clearPcMicUnmuteTimer();
             if (pcMic.mode === "wake" && pcMic.wakeState === "standby") {
               pcMic.assistantSpeaking = false;
@@ -5381,7 +5405,7 @@
                 setPcMicStatus("按住「按住说话」继续对话");
               }
               updatePcMicButtons();
-            }, isPcMicFullDuplex() ? 60 : 350);
+            }, isPcMicFullDuplex() ? 60 : 450);
             pollState(true);
           }
         }
@@ -5407,8 +5431,8 @@
 
   function interruptPcMicPlayback() {
     if (!pcMic.connected) return;
+    const wasSpeaking = Boolean(pcMic.assistantSpeaking);
     clearPcMicUnmuteTimer();
-    pcMic.assistantSpeaking = false;
     sendPcMicJson({ type: "abort", reason: "wake_word_detected" });
     if (pcMic.mode === "wake" && pcMic.wakeState === "awake") {
       pcMic.sending = true;
@@ -5420,6 +5444,20 @@
       setPcMicStatus("已打断 · 请继续说话");
     } else {
       setPcMicStatus("已打断播报");
+    }
+    if (wasSpeaking && !isPcMicFullDuplex()) {
+      // Absorb ~220ms of dying PC speaker buffer after abort so leftover sound never echoes back as "H."
+      pcMic.assistantSpeaking = true;
+      pcMic.ignoreTtsUntil = Date.now() + 260;
+      pcMic.unmuteTimer = setTimeout(() => {
+        pcMic.unmuteTimer = null;
+        pcMic.assistantSpeaking = false;
+        pcMic.ignoreTtsUntil = 0;
+        updatePcMicButtons();
+      }, 220);
+    } else {
+      pcMic.assistantSpeaking = false;
+      pcMic.ignoreTtsUntil = 0;
     }
     updatePcMicButtons();
   }
@@ -5436,6 +5474,7 @@
           pcMic.mode = "wake";
           pcMic.wakeState = "standby";
           pcMic.cloudAsrWarned = false;
+    pcMic.kwsActive = false;
           if (pcMic.helloDone) {
             pcMic.sending = true;
             sendPcMicJson({ type: "listen", state: "start", mode: "auto", pc_wake_mode: true, pc_wake_action: "sleep" });

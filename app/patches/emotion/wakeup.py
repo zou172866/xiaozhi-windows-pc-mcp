@@ -478,7 +478,7 @@ def apply_mei_wakeup_responses_patch() -> None:
                     pc_pcm_input.schedule_close_suppressed_hardware_conn(
                         conn,
                         reason="hello_while_pc_mic_active",
-                        delay_sec=0.3,
+                        delay_sec=0.08,
                     )
                     return
                 tts_route.prime_gsv_async(getattr(conn, "tts", None), reason="hello")

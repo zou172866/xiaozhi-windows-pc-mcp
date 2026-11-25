@@ -189,5 +189,7 @@ services:
       - ./models/sherpa-onnx-sense-voice:/opt/xiaozhi-esp32-server/models/sherpa-onnx-sense-voice
       # 可选 Sherpa-ONNX 声纹识别模型（默认关闭零加载，按需从 18080 下载约 28MB）
       - ./models/sherpa-onnx-speaker:/opt/xiaozhi-esp32-server/models/sherpa-onnx-speaker
+      # 可选 Sherpa-ONNX 中文流式唤醒词模型（WenetSpeech 3.3M int8，仅约 15MB；存在时电脑麦待命自动启用，缺失则无缝回退）
+      - ./models/sherpa-onnx-kws:/opt/xiaozhi-esp32-server/models/sherpa-onnx-kws
       # 可选 FunASR PyTorch 模型目录挂载（不遮蔽镜像内置 snakers4_silero-vad，新电脑无 model.pt 也可正常启动）
       - ./models/SenseVoiceSmall:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall

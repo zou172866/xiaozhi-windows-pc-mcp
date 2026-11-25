@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import asr_corrections
 import patch_registry
+import pc_kws_engine
 import runtime_settings
 import vocal_cue_router
 import voiceprint_router
@@ -543,6 +544,8 @@ async def _run_speculative_decode_task(
                     reason = f"pc_wake_cmd:{rem_reason}" if should_commit else f"pc_wake_cmd_hold:{rem_reason}"
             else:
                 should_commit, reason = False, "pc_wake_standby_non_wake"
+        elif pc_pcm_input.is_pc_wake_awake(conn) and pc_pcm_input.match_pc_exit_command(conn, text):
+            should_commit, reason = True, f"pc_exit_command:{text}"
         else:
             should_commit, reason = judge_utterance_completeness(
                 text,
@@ -582,6 +585,10 @@ def _get_upper_bound_silence_ms(conn: Any) -> float:
 
 def _effective_speculative_threshold_ms(conn: Any, cfg: Dict[str, Any]) -> float:
     upper = _get_upper_bound_silence_ms(conn)
+    if pc_pcm_input.is_pc_wake_standby(conn):
+        # Standby wake-word listening needs snappy (~350ms) wakeup response without touching active-chat VAD timings
+        target = min(float(cfg.get("speculative_ms", 550)), 350.0)
+        return min(target, max(250.0, upper - 50.0))
     if getattr(conn, "_vad_post_wakeup_pending", False):
         target = float(cfg.get("post_wakeup_ms", 800))
     else:
@@ -697,10 +704,134 @@ def apply_vad_speculative_patch() -> None:
         print(f"[SpeculativeVAD] 跳过挂载投机性VAD补丁（签名契约不匹配）: {'; '.join(failures)}", flush=True)
         return
 
+    async def _activate_pc_standby_wakeup(
+        conn: Any,
+        *,
+        matched_wake: str,
+        remainder: str = "",
+        reason: str = "wake_word",
+        decoded_cue: Optional[Dict[str, Any]] = None,
+        pcm_joined: bytes = b"",
+        asr_audio_task: Any = None,
+    ) -> None:
+        sid = str(getattr(conn, "session_id", "") or "")
+        await pc_pcm_input.enter_pc_wake_awake(
+            conn,
+            wake_word=matched_wake,
+            text=remainder or matched_wake,
+            reason=reason,
+        )
+        if remainder:
+            try:
+                from patches.emotion import tts_route as _tts_route
+
+                _tts_route.prime_gsv_async(getattr(conn, "tts", None), reason="wakeup")
+            except Exception:
+                pass
+            if vocal_cue_router.is_vocal_cue_enabled():
+                try:
+                    vocal_cue_router.record_vocal_cue(sid, decoded_cue, source="pc_wake_standby")
+                except Exception:
+                    pass
+            if voiceprint_router.is_voiceprint_enabled() and pcm_joined:
+                try:
+                    loop = asyncio.get_running_loop()
+                    ex = _get_asr_executor_safe()
+                    await loop.run_in_executor(
+                        ex,
+                        lambda: voiceprint_router.identify_turn_pcm(
+                            sid,
+                            pcm_joined,
+                            transcript=str(remainder),
+                        ),
+                    )
+                except Exception:
+                    pass
+            try:
+                from core.handle.reportHandle import enqueue_asr_report
+
+                enqueue_asr_report(conn, remainder, list(asr_audio_task or ()))
+            except Exception:
+                pass
+            await recv_mod.startToChat(conn, remainder)
+            return
+
+        conn._vad_post_wakeup_pending = True
+        enable_greeting = (getattr(conn, "config", None) or {}).get("enable_greeting", True)
+        if not enable_greeting:
+            conn.just_woken_up = False
+            import core.handle.sendAudioHandle as send_audio_mod
+
+            await send_audio_mod.send_stt_message(conn, matched_wake)
+            await send_audio_mod.send_tts_message(conn, "stop", None)
+            conn.client_is_speaking = False
+            return
+
+        import core.handle.helloHandle as hello_mod
+
+        handled = await hello_mod.checkWakeupWords(conn, matched_wake)
+        if not handled:
+            if getattr(conn, "tts", None) is not None:
+                await recv_mod.startToChat(conn, matched_wake)
+            else:
+                conn.just_woken_up = False
+                conn.client_is_speaking = False
+
     @functools.wraps(_orig_handle_audio)
     async def _spec_aware_handle_audio(conn, pcm_frame, *args, **kwargs):
         if getattr(conn, "just_woken_up", False):
             conn._vad_post_wakeup_pending = True
+
+        # Dedicated streaming KWS fast-path for PC mic wake-standby (bypasses SileroVAD + SenseVoiceSmall)
+        if (
+            pc_pcm_input.is_pc_wake_standby(conn)
+            and getattr(conn, "client_listen_mode", "auto") != "manual"
+            and pc_kws_engine.is_kws_available_for_conn(conn)
+        ):
+            try:
+                conn.last_activity_time = time.time() * 1000.0
+            except Exception:
+                pass
+            if isinstance(pcm_frame, (bytes, bytearray)) and pcm_frame:
+                buf = getattr(conn, "_pc_kws_pcm_buf", None)
+                if not isinstance(buf, bytearray):
+                    buf = bytearray()
+                    conn._pc_kws_pcm_buf = buf
+                buf.extend(pcm_frame)
+                if len(buf) > pc_kws_engine.KWS_MAX_PENDING_BYTES:
+                    del buf[: len(buf) - pc_kws_engine.KWS_MAX_PENDING_BYTES]
+                if len(buf) >= pc_kws_engine.KWS_CHUNK_BYTES and not getattr(conn, "_pc_kws_inflight", False):
+                    chunk = bytes(buf)
+                    buf.clear()
+                    conn._pc_kws_inflight = True
+                    matched_wake = None
+                    try:
+                        loop = asyncio.get_running_loop()
+                        executor = _get_asr_executor_safe()
+                        matched_wake = await loop.run_in_executor(
+                            executor, pc_kws_engine.feed_and_detect_sync, conn, chunk
+                        )
+                    except Exception as exc:
+                        print(f"[PCWakeKWS] 流式唤醒检测异常: {exc}", flush=True)
+                    finally:
+                        conn._pc_kws_inflight = False
+
+                    if matched_wake and pc_pcm_input.is_pc_wake_standby(conn):
+                        now_m = time.monotonic()
+                        last_hit = float(getattr(conn, "_pc_kws_last_hit_ts", 0.0) or 0.0)
+                        if (now_m - last_hit) >= pc_kws_engine.KWS_HIT_DEBOUNCE_SEC:
+                            conn._pc_kws_last_hit_ts = now_m
+                            pc_kws_engine.reset_conn_kws(conn, drop_stream=False)
+                            pc_pcm_input._reset_pc_audio_and_vad_buffers(conn)
+                            print(f"[PCWakeKWS] 流式唤醒命中「{matched_wake}」", flush=True)
+                            await _activate_pc_standby_wakeup(
+                                conn,
+                                matched_wake=matched_wake,
+                                remainder="",
+                                reason="kws_wake_word",
+                            )
+            return
+
         return await _orig_handle_audio(conn, pcm_frame, *args, **kwargs)
 
     @functools.wraps(_orig_reset_audio)
@@ -767,13 +898,15 @@ def apply_vad_speculative_patch() -> None:
                                 )
                         except Exception:
                             pass
-                    # 2. Otherwise trigger speculative decode once silence crosses speculative_ms (or post_wakeup_ms)
+                    # 2. Otherwise trigger speculative decode once silence crosses speculative_ms (or post_wakeup_ms / 350ms standby)
                     elif state.triggered_gen != state.generation:
                         threshold_ms = _effective_speculative_threshold_ms(conn, cfg)
                         if stop_duration_ms >= threshold_ms:
+                            in_pc_standby = pc_pcm_input.is_pc_wake_standby(conn)
+                            in_pc_wake = in_pc_standby or pc_pcm_input.is_pc_wake_awake(conn)
+                            min_audio_bytes = (1920 * 10) if in_pc_wake else _MIN_AUDIO_BYTES
                             pcm_total_len = sum(len(f) for f in (getattr(conn, "asr_audio", None) or ())) + len(pcm_frame)
-                            if pcm_total_len > _MIN_AUDIO_BYTES:
-                                in_pc_standby = pc_pcm_input.is_pc_wake_standby(conn)
+                            if pcm_total_len > min_audio_bytes:
                                 story_mode = (
                                     False
                                     if in_pc_standby
@@ -793,6 +926,22 @@ def apply_vad_speculative_patch() -> None:
                                             conn, self, state, gen, pcm_snapshot, cfg, False
                                         )
                                     )
+
+        # In PC wake mode (standby OR awake), brisk utterances like "你好芽衣" or "退出" right after
+        # reset_audio_states()/interrupt can total 9..15 frames (540..900ms), which upstream `_orig_receive_audio`
+        # (`len > 1920*15`) would silently drop.
+        if (
+            pc_pcm_input.is_pc_wake_mode(conn)
+            and getattr(conn, "client_listen_mode", "auto") != "manual"
+            and getattr(self, "interface_type", None) != InterfaceType.STREAM
+            and getattr(conn, "client_voice_stop", False)
+        ):
+            conn.asr_audio.append(pcm_frame)
+            pcm_bytes = b"".join(conn.asr_audio)
+            if len(pcm_bytes) > 1920 * 8:
+                await self.handle_voice_stop(conn, [pcm_bytes])
+            conn.reset_audio_states()
+            return
 
         return await _orig_receive_audio(self, conn, pcm_frame, audio_have_voice, *args, **kwargs)
 
@@ -883,70 +1032,23 @@ def apply_vad_speculative_patch() -> None:
 
             matched_wake, remainder = pc_pcm_input.match_pc_wakeup_word(conn, decoded_text)
             if not matched_wake:
+                if decoded_text:
+                    preview = str(decoded_text).strip().replace("\n", " ")[:40]
+                    if preview:
+                        print(f'[PCWakeStandby] 待命忽略未命中语音: "{preview}"', flush=True)
                 return
             if remainder and pc_pcm_input.match_pc_exit_command(conn, remainder):
                 return
 
-            await pc_pcm_input.enter_pc_wake_awake(
+            await _activate_pc_standby_wakeup(
                 conn,
-                wake_word=matched_wake,
-                text=remainder or matched_wake,
+                matched_wake=matched_wake,
+                remainder=remainder,
+                reason="wake_word",
+                decoded_cue=decoded_cue,
+                pcm_joined=pcm_joined,
+                asr_audio_task=asr_audio_task,
             )
-            if remainder:
-                try:
-                    from patches.emotion import tts_route as _tts_route
-
-                    _tts_route.prime_gsv_async(getattr(conn, "tts", None), reason="wakeup")
-                except Exception:
-                    pass
-                if vocal_cue_router.is_vocal_cue_enabled():
-                    try:
-                        vocal_cue_router.record_vocal_cue(sid, decoded_cue, source="pc_wake_standby")
-                    except Exception:
-                        pass
-                if voiceprint_router.is_voiceprint_enabled() and pcm_joined:
-                    try:
-                        loop = asyncio.get_running_loop()
-                        ex = _get_asr_executor_safe()
-                        await loop.run_in_executor(
-                            ex,
-                            lambda: voiceprint_router.identify_turn_pcm(
-                                sid,
-                                pcm_joined,
-                                transcript=str(remainder),
-                            ),
-                        )
-                    except Exception:
-                        pass
-                try:
-                    from core.handle.reportHandle import enqueue_asr_report
-
-                    enqueue_asr_report(conn, remainder, list(asr_audio_task or ()))
-                except Exception:
-                    pass
-                await recv_mod.startToChat(conn, remainder)
-                return
-
-            conn._vad_post_wakeup_pending = True
-            enable_greeting = (getattr(conn, "config", None) or {}).get("enable_greeting", True)
-            if not enable_greeting:
-                conn.just_woken_up = False
-                import core.handle.sendAudioHandle as send_audio_mod
-
-                await send_audio_mod.send_stt_message(conn, matched_wake)
-                await send_audio_mod.send_tts_message(conn, "stop", None)
-                conn.client_is_speaking = False
-                return
-
-            import core.handle.helloHandle as hello_mod
-
-            handled = await hello_mod.checkWakeupWords(conn, matched_wake)
-            if not handled:
-                if getattr(conn, "tts", None) is not None:
-                    await recv_mod.startToChat(conn, matched_wake)
-                else:
-                    conn.just_woken_up = False
-                    conn.client_is_speaking = False
             return
 
         # Branch 2: PC wake-awake mode — intercept exact exit commands back to standby (never drop WS)
@@ -968,13 +1070,20 @@ def apply_vad_speculative_patch() -> None:
                 else:
                     decoded_text, decoded_cue = "", None
 
-                if pc_pcm_input.match_pc_exit_command(conn, decoded_text):
+                if pc_pcm_input.is_pc_mic_asr_noise_hallucination(decoded_text):
+                    if decoded_text:
+                        print(f'[PCWakeAwake] 忽略单字母/喘息噪声: "{decoded_text[:20]}"', flush=True)
+                    return
+
+                exit_hit = pc_pcm_input.match_pc_exit_command(conn, decoded_text)
+                if exit_hit:
                     stop_ws = getattr(self, "stop_ws_connection", None)
                     if callable(stop_ws):
                         try:
                             stop_ws()
                         except Exception:
                             pass
+                    print(f'[PCWakeStandby] 命中退出词「{exit_hit}」(原文: "{decoded_text[:24]}")，立即退回待命', flush=True)
                     await pc_pcm_input.enter_pc_wake_standby(
                         conn,
                         reason="voice_exit",
@@ -997,13 +1106,19 @@ def apply_vad_speculative_patch() -> None:
                 raw_res = await _orig_stt_wrapper(self, asr_audio_task, sid)
                 raw_val = raw_res[0] if isinstance(raw_res, tuple) and raw_res else raw_res
                 decoded_text = _extract_asr_text_for_pc_wake(raw_val)
-                if pc_pcm_input.match_pc_exit_command(conn, decoded_text):
+                if pc_pcm_input.is_pc_mic_asr_noise_hallucination(decoded_text):
+                    if decoded_text:
+                        print(f'[PCWakeAwake] 忽略单字母/喘息噪声: "{decoded_text[:20]}"', flush=True)
+                    return
+                exit_hit = pc_pcm_input.match_pc_exit_command(conn, decoded_text)
+                if exit_hit:
                     stop_ws = getattr(self, "stop_ws_connection", None)
                     if callable(stop_ws):
                         try:
                             stop_ws()
                         except Exception:
                             pass
+                    print(f'[PCWakeStandby] 命中退出词「{exit_hit}」(原文: "{decoded_text[:24]}")，立即退回待命', flush=True)
                     await pc_pcm_input.enter_pc_wake_standby(
                         conn,
                         reason="voice_exit",

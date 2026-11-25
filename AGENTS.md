@@ -39,7 +39,7 @@
 ## 3. 必跑验证命令
 
 ```powershell
-# 1. 全链路三层回归（当前 351 项：unit 335 + contract 7 + live 9；另有 Anima 镜像内 257 项 pytest 回归）
+# 1. 全链路三层回归（当前 354 项：unit 338 + contract 7 + live 9；另有 Anima 镜像内 257 项 pytest 回归）
 python scripts/run_tests.py --layer all
 
 # 2. 离线单测 / 上游镜像契约（临时 docker run --rm，无需运行中容器；升级上游镜像必跑 contract）
