@@ -214,6 +214,17 @@
           <span>环境变量状态：DeepSeek <strong id="dsKeyBadge">--</strong> · 智谱 GLM <strong id="glmKeyBadge">--</strong> · Gemini <strong id="gemKeyBadge">--</strong> · 前缀缓存 <strong id="llmCacheRateBadge" class="num">--</strong></span>
           <span>修改后点击右上角「保存并立即生效」（免重启热更新）</span>
         </div>
+        <details class="l3-adv section-fold" id="llmCacheDetails" style="margin-top:8px;">
+          <summary class="section-fold-summary">
+            <span>查看最近 8 轮前缀缓存命中明细与低命中告警</span>
+            <span id="llmCacheAlertPill" class="num" style="margin-left:auto;font-size:11.5px;color:var(--ink-muted);">正常</span>
+          </summary>
+          <div class="section-fold-body" style="padding-top:8px;">
+            <div id="llmCacheTurnList" class="cache-turn-list">
+              <div class="dream-empty">暂无对话轮次记录，开始语音或文字对话后将实时显示每轮缓存命中与首字延迟。</div>
+            </div>
+          </div>
+        </details>
       </div>
 
       <!-- 4. Voice & TTS Engine Selection -->
@@ -479,13 +490,24 @@
           </label>
         </div>
 
-        <div class="switch-row" style="margin-bottom:0;">
+        <div class="switch-row">
           <div class="switch-row-label">
             <strong>启用 Anima 角色微日常背景（默认关闭）</strong>
             <span id="innerLifeEnabledHint">关闭时被动聊天不额外查询或注入微日常；开启后为角色按早/午/晚生成 1 条自然生活背景</span>
           </div>
           <label class="toggle-switch" aria-label="启用角色微日常开关">
             <input type="checkbox" id="innerLifeEnabledToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用任务栏闪烁/通知 10 秒防抖信箱感知（默认关闭）</strong>
+            <span id="taskbarInboxHint">关闭时宿主机零钩子线程；开启后仅上报非系统程序的任务栏闪烁汇总，仍受免打扰与心流静默保护</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用任务栏信箱感知开关">
+            <input type="checkbox" id="taskbarInboxEnabledToggle">
             <span class="toggle-slider"></span>
           </label>
         </div>
@@ -554,6 +576,9 @@
               <div class="proactive-meta-row">
                 <span>今日角色微日常：<strong id="proactiveInnerLifeText">等待同步…</strong></span>
               </div>
+              <div class="proactive-meta-row">
+                <span>任务栏防抖信箱（18900）：<strong id="proactiveInboxText">已关闭</strong></span>
+              </div>
               <div class="field-foot" style="margin-top:6px;align-items:center;">
                 <span id="proactiveStatsText" class="num">今日实发 0/4 · 忽略退避 0 次</span>
                 <div style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -566,6 +591,75 @@
 
             <div id="proactiveHistoryList" class="proactive-history-list">
               <div class="dream-empty">暂无主动陪伴试运行记录；点击「立即试跑一次」可在不发声的前提下验证决策与台词效果。</div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 3b. Natural-Language Future Tasks & Cron Reminders -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">语音定时提醒与周期任务（Future Tasks / Cron）</h2>
+          <span id="futureTasksBadge" class="rel-stage-badge num">0 条活跃</span>
+        </div>
+        <p class="section-desc">支持语音直说（如“10分钟后提醒我喝水”“每天早8点报天气”）或下方创建，SQLite 持久化防重启丢失，到点复用电脑播报与手机/QQ推送。</p>
+
+        <details class="l3-adv section-fold" id="futureTasksFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开创建定时提醒、管理计划与触发记录</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="proactive-grid" style="margin-bottom:8px;">
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="ftTitleInput">任务标题</label>
+                <input type="text" id="ftTitleInput" maxlength="80" placeholder="例如：早安天气提醒 / 喝水提醒">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="ftScheduleTypeSelect">调度类型</label>
+                <select id="ftScheduleTypeSelect">
+                  <option value="once">一次性提醒（支持几分钟后或具体时间）</option>
+                  <option value="cron">周期 Cron（5段：分 时 日 月 周）</option>
+                </select>
+              </div>
+              <div id="ftOnceWrap">
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="ftRunAtInput">触发时间（HH:MM / YYYY-MM-DD HH:MM 或填延迟分钟数）</label>
+                <input type="text" id="ftRunAtInput" placeholder="例如 08:00、2026-11-28 08:30 或 15（分钟后）">
+              </div>
+              <div id="ftCronWrap" style="display:none;">
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="ftCronInput">Cron 表达式（最小间隔 ≥5 分钟）</label>
+                <input type="text" id="ftCronInput" placeholder="例如 0 8 * * *（每天早8点）">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="ftKindSelect">任务内容类型</label>
+                <select id="ftKindSelect">
+                  <option value="reminder">普通语音/文本提醒</option>
+                  <option value="weather_briefing">附带实时天气简报</option>
+                </select>
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="ftDeliverySelect">投递通道</label>
+                <select id="ftDeliverySelect">
+                  <option value="pc_and_mobile">电脑音响播报 + 抄送手机</option>
+                  <option value="pc_speaker">仅电脑音响播报</option>
+                  <option value="mobile_push">仅手机推送</option>
+                  <option value="qq_bot">QQ 官方机器人（不可用自动回退手机）</option>
+                  <option value="dry_run">仅试运行记录</option>
+                </select>
+              </div>
+              <div style="grid-column:1 / -1;">
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="ftMessageInput">提醒正文（留空则复用标题；天气简报可附加播报词）</label>
+                <input type="text" id="ftMessageInput" maxlength="200" placeholder="例如：该起来活动一下喝杯水啦">
+              </div>
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+              <button type="button" class="btn primary" id="ftCreateBtn" style="padding:5px 12px;font-size:12.5px;">新增定时任务</button>
+              <button type="button" class="btn" id="ftRefreshBtn" style="padding:5px 12px;font-size:12.5px;">刷新列表</button>
+              <span id="ftStatsText" class="num" style="margin-left:auto;font-size:12px;color:var(--ink-muted);">活跃 0/50 · 最近触发 0 条</span>
+            </div>
+
+            <div id="ftTaskList" class="proactive-history-list">
+              <div class="dream-empty">暂无定时提醒；可直接对小智说“10分钟后提醒我喝水”或在上方创建。</div>
             </div>
           </div>
         </details>
@@ -900,6 +994,86 @@
         </details>
       </div>
 
+      <!-- 3b. Official QQ Bot v2 WebSocket Bidirectional Bridge (Default OFF) -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">QQ 官方机器人双向对话（WebSocket · 默认关闭）</h2>
+          <span id="qqBotBadge" class="rel-stage-badge num">已关闭</span>
+        </div>
+        <p class="section-desc">国内直连官方 WebSocket 网关，出门在外可在 QQ 私聊/群 @ 续聊（共享主记忆）、定提醒（<code>/提醒</code>），主人授权后可查/派发宿主机 L3 任务；陌生人强白名单默认静默拦截。</p>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用 QQ 官方机器人双向长连接（默认关闭）</strong>
+            <span id="qqBotStatusHint">关闭状态零线程、零外联；开启前请先填写 AppID/AppSecret 并用配对码绑定主人 openid</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用 QQ 官方机器人开关">
+            <input type="checkbox" id="qqBotEnabledToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <details class="l3-adv section-fold" id="qqBotFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开 QQ 机器人凭据、白名单配对与远程 L3 授权</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="proactive-grid" style="margin-bottom:8px;">
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="qqBotAppIdInput">QQ 机器人 AppID（或 .env QQ_BOT_APP_ID）</label>
+                <input type="password" id="qqBotAppIdInput" autocomplete="new-password" spellcheck="false" placeholder="留空表示保留已有凭据">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="qqBotAppSecretInput">QQ 机器人 AppSecret（0600 隔离保存）</label>
+                <input type="password" id="qqBotAppSecretInput" autocomplete="new-password" spellcheck="false" placeholder="留空表示保留已有凭据">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="qqBotAllowedUsersInput">允许私聊的 openid 白名单（逗号分隔）</label>
+                <input type="text" id="qqBotAllowedUsersInput" spellcheck="false" placeholder="也可点击下方「生成配对码」私聊自动识别">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="qqBotAllowedGroupsInput">允许群 @ 的 group_openid 白名单（可选）</label>
+                <input type="text" id="qqBotAllowedGroupsInput" spellcheck="false" placeholder="逗号分隔；留空则拒绝所有群消息">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="qqBotBatchQuietInput">连发防抖攒批静默时间（毫秒，0=关闭）</label>
+                <input type="number" id="qqBotBatchQuietInput" min="0" max="15000" step="500" value="3500" placeholder="3500">
+              </div>
+            </div>
+
+            <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:8px;font-size:12.5px;color:var(--ink-secondary);">
+              <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" id="qqBotSandboxToggle">
+                <span>使用 QQ 开放平台沙箱环境</span>
+              </label>
+              <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" id="qqBotShareMemToggle" checked>
+                <span>与主设备共享 Anima 长期记忆</span>
+              </label>
+              <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" id="qqBotAllowL3Toggle">
+                <span>允许主人私聊远程派发 L3 任务（需宿主机 full 挡）</span>
+              </label>
+            </div>
+
+            <div class="proactive-meta-row" style="margin-bottom:8px;">
+              <span>凭据与连接：<strong id="qqBotCredStatusText" class="num">未配置</strong></span>
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+              <button type="button" class="btn primary" id="qqBotSaveBtn" style="padding:5px 12px;font-size:12.5px;">保存 QQ 配置</button>
+              <button type="button" class="btn" id="qqBotPairBtn" style="padding:5px 11px;font-size:12px;">生成 6 位配对码</button>
+              <button type="button" class="btn" id="qqBotReconnectBtn" style="padding:5px 11px;font-size:12px;">立即重连网关</button>
+              <span id="qqBotPairText" class="num" style="margin-left:auto;font-size:12px;color:var(--ink-muted);">配对码未激活</span>
+            </div>
+
+            <div id="qqBotPendingList" class="proactive-history-list">
+              <div class="dream-empty">暂无待审批配对请求或最近消息记录。</div>
+            </div>
+          </div>
+        </details>
+      </div>
+
       <!-- 4. AutoDream Read-Only Reflection Proposals -->
       <div class="config-section">
         <div class="section-head">
@@ -1138,6 +1312,106 @@
             <div class="field-foot" style="margin-top:8px;align-items:center;">
               <span id="asrCorrMeta" class="num">已配置 0 条规则 · 最多 500 条</span>
               <button type="button" class="btn" id="asrCorrSaveBtn" style="padding:5px 13px;font-size:12.5px;">保存纠错词表</button>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 5. Multi-Model LLM Fallback Pool (Default OFF) -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">主对话多模型自动兜底切换（Fallback Pool · 免重启）</h2>
+          <span id="llmFbBadge" class="rel-stage-badge num">已关闭</span>
+        </div>
+        <p class="section-desc">主模型遇 429 限流、5xx 或建连超时时，在首字输出前自动无缝切至备用节点并进入冷却保护；凭据仅读环境变量或 0600 隔离文件，不破前缀缓存。</p>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用多模型自动灾备切换</strong>
+            <span id="llmFbToggleHint">关闭或未配置备用节点时零开销直通主模型</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用多模型自动灾备切换开关">
+            <input type="checkbox" id="llmFbEnabledToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <details class="l3-adv section-fold" id="llmFbFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开配置备用模型节点、冷却时间与故障切换统计</span>
+          </summary>
+          <div class="section-fold-body">
+            <div class="proactive-grid" style="margin-bottom:8px;">
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="llmFbCooldownInput">故障节点冷却时间（秒，10～600）</label>
+                <input type="number" id="llmFbCooldownInput" min="10" max="600" step="10" value="60">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="llmFbNodeLabelInput">备用节点名称</label>
+                <input type="text" id="llmFbNodeLabelInput" maxlength="48" placeholder="例如：备用 DeepSeek / 硅基流动">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="llmFbNodeUrlInput">OpenAI 兼容 Base URL（https:// 或本机非管理端口）</label>
+                <input type="text" id="llmFbNodeUrlInput" spellcheck="false" placeholder="https://api.deepseek.com/v1">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="llmFbNodeModelInput">备用模型名</label>
+                <input type="text" id="llmFbNodeModelInput" spellcheck="false" placeholder="deepseek-chat">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="llmFbNodeEnvInput">优先环境变量名（推荐，零明文落盘）</label>
+                <input type="text" id="llmFbNodeEnvInput" spellcheck="false" placeholder="例如 DEEPSEEK_API_KEY / GEMINI_API_KEY">
+              </div>
+              <div>
+                <label class="field-label" style="font-size:12px;margin-bottom:4px;" for="llmFbNodeKeyInput">或写入本地 0600 隔离密钥（可选）</label>
+                <input type="password" id="llmFbNodeKeyInput" autocomplete="new-password" spellcheck="false" placeholder="留空表示仅用环境变量或保留已有凭据">
+              </div>
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+              <button type="button" class="btn primary" id="llmFbAddBtn" style="padding:5px 12px;font-size:12.5px;">添加备用节点</button>
+              <button type="button" class="btn" id="llmFbSaveCooldownBtn" style="padding:5px 11px;font-size:12px;">保存冷却时间</button>
+              <button type="button" class="btn" id="llmFbResetHealthBtn" style="padding:5px 11px;font-size:12px;">重置节点冷却</button>
+              <span id="llmFbStatsText" class="num" style="margin-left:auto;font-size:12px;color:var(--ink-muted);">累计切换 0 次 · 当前 primary</span>
+            </div>
+
+            <div id="llmFbNodeList" class="proactive-history-list">
+              <div class="dream-empty">尚未添加备用模型节点；添加后开启上方开关即可在主模型异常时无感接管。</div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 6. Progressive SKILL.md On-Demand Loader -->
+      <div class="config-section">
+        <div class="section-head">
+          <h2 class="section-title">操作技能渐进式按需加载（SKILL.md · 不破前缀缓存）</h2>
+          <span id="skillsBadge" class="rel-stage-badge num">0 项技能</span>
+        </div>
+        <p class="section-desc">平时仅把技能名称与一句话简介注入动态 <code>&lt;turn_context&gt;</code>，静态系统提示词零变动；需要时由模型调用 <code>load_skill</code> 按需读取正文（支持只读 <code>skills/</code> 与 <code>state/skills/</code>）。</p>
+
+        <div class="switch-row" style="margin-bottom:0;">
+          <div class="switch-row-label">
+            <strong>启用 SKILL.md 渐进式索引与按需加载</strong>
+            <span id="skillsStatsText" class="num">已发现 0 项技能 · 索引约 0 字符 · 按需加载 0 次</span>
+          </div>
+          <label class="toggle-switch" aria-label="启用技能渐进加载开关">
+            <input type="checkbox" id="skillsEnabledToggle" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <details class="l3-adv section-fold" id="skillsFoldDetails">
+          <summary class="section-fold-summary">
+            <span>展开已发现技能目录与手动刷新</span>
+          </summary>
+          <div class="section-fold-body">
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+              <button type="button" class="btn" id="skillsRefreshBtn" style="padding:5px 12px;font-size:12px;">重新扫描技能目录</button>
+              <span style="font-size:12px;color:var(--ink-muted);">新增或修改 SKILL.md 后自动按 mtime 刷新</span>
+            </div>
+            <div id="skillsList" class="proactive-history-list">
+              <div class="dream-empty">尚未扫描到技能文件。</div>
             </div>
           </div>
         </details>

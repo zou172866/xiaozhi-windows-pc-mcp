@@ -15,8 +15,10 @@ import threading
 import time
 from urllib.parse import urlparse
 
+import future_tasks
 import persona_versions
 import proactive_companion
+import qq_bot_bridge
 import runtime_events
 import voiceprint_router
 from console import shared
@@ -25,12 +27,16 @@ from console.routes import (
     archives,
     audio_api,
     config,
+    future_tasks as future_tasks_routes,
     gsv,
     l3,
+    llm_fallback as llm_fallback_routes,
     logs,
     mobile_push as mobile_push_routes,
     pc_mic,
     proactive,
+    qq_bot as qq_bot_routes,
+    skills as skills_routes,
     state,
     tavern,
     voiceprint,
@@ -261,6 +267,10 @@ _GET_ROUTES = {
     "/api/voiceprint": voiceprint.handle_get_voiceprint,
     "/api/companion-widget": voiceprint.handle_get_companion_widget,
     "/api/mobile-push": mobile_push_routes.handle_get_mobile_push,
+    "/api/future-tasks": future_tasks_routes.handle_get_future_tasks,
+    "/api/llm-fallback": llm_fallback_routes.handle_get_llm_fallback,
+    "/api/qq-bot": qq_bot_routes.handle_get_qq_bot,
+    "/api/skills": skills_routes.handle_get_skills,
 }
 
 _POST_ROUTES = {
@@ -304,6 +314,12 @@ _POST_ROUTES = {
     "/api/mobile-push/test": mobile_push_routes.handle_post_mobile_push_test,
     "/api/mobile-push/briefing": mobile_push_routes.handle_post_mobile_push_briefing,
     "/api/pc-mic/session": pc_mic.handle_post_pc_mic_session,
+    "/api/future-tasks": future_tasks_routes.handle_post_future_tasks,
+    "/api/llm-fallback": llm_fallback_routes.handle_post_llm_fallback,
+    "/api/qq-bot": qq_bot_routes.handle_post_qq_bot,
+    "/api/qq-bot/action": qq_bot_routes.handle_post_qq_bot_action,
+    "/api/qq-bot/notify": qq_bot_routes.handle_post_qq_bot_notify,
+    "/api/skills": skills_routes.handle_post_skills,
 }
 
 
@@ -313,6 +329,14 @@ def _flush_console_state_on_shutdown() -> None:
         proactive_companion.stop_proactive_companion(timeout=1.5)
     except Exception as exc:
         shared._log_rate_limited("shutdown_stop_proactive", exc)
+    try:
+        future_tasks.stop_future_tasks(timeout=1.5)
+    except Exception as exc:
+        shared._log_rate_limited("shutdown_stop_future_tasks", exc)
+    try:
+        qq_bot_bridge.stop_qq_bot_bridge(timeout=1.5)
+    except Exception as exc:
+        shared._log_rate_limited("shutdown_stop_qq_bot", exc)
     try:
         voiceprint_router.unload_voiceprint_model(run_gc=False)
     except Exception as exc:
@@ -376,6 +400,14 @@ def start_console_background() -> None:
         proactive_companion.start_proactive_companion()
     except Exception as exc:
         shared._log_rate_limited("start_proactive_companion", exc)
+    try:
+        future_tasks.start_future_tasks()
+    except Exception as exc:
+        shared._log_rate_limited("start_future_tasks", exc)
+    try:
+        qq_bot_bridge.start_qq_bot_bridge_if_enabled()
+    except Exception as exc:
+        shared._log_rate_limited("start_qq_bot", exc)
 
     def _boot_sync():
         need_persona = True

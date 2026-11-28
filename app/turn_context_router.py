@@ -154,6 +154,7 @@ def build_turn_context_block(
     speech_style_block: str = "",
     speakers_block: str = "",
     vocal_cue_block: str = "",
+    skills_block: str = "",
 ) -> str:
     """Assemble a single <turn_context> envelope combining all per-turn volatile signals."""
     parts: List[str] = []
@@ -177,6 +178,8 @@ def build_turn_context_block(
         parts.append(speech_style_block.strip())
     if speakers_block and speakers_block.strip():
         parts.append(speakers_block.strip())
+    if skills_block and skills_block.strip():
+        parts.append(skills_block.strip())
     if not parts:
         return ""
     body = "\n\n".join(parts)
@@ -364,6 +367,14 @@ def apply_turn_context_to_messages(
                 speakers_blocks.append(spk_extra)
         speakers_joined = "\n\n".join(b for b in speakers_blocks if b.strip())
 
+        skills_blk = ""
+        try:
+            import skill_loader as _skill_loader
+
+            skills_blk = _skill_loader.get_skill_registry().build_turn_context_index()
+        except Exception:
+            skills_blk = ""
+
         turn_ctx = build_turn_context_block(
             context_block=ctx_joined,
             memory_text=effective_memory,
@@ -371,6 +382,7 @@ def apply_turn_context_to_messages(
             speech_style_block=speech_style_blk,
             speakers_block=speakers_joined,
             vocal_cue_block=vc_clean,
+            skills_block=skills_blk,
         )
 
     if isinstance(out_meta, dict):
@@ -514,8 +526,10 @@ def record_llm_usage(
         "ttft_ms": ttft_val,
     }
     with _stats_lock:
+        turn_index = int(_usage_totals["turns"]) + 1
+        entry["turn_index"] = turn_index
         _usage_history.append(entry)
-        _usage_totals["turns"] += 1
+        _usage_totals["turns"] = turn_index
         _usage_totals["prompt_tokens_total"] += pt
         _usage_totals["completion_tokens_total"] += ct
         if hit is not None:
@@ -589,6 +603,57 @@ def get_llm_cache_stats() -> Dict[str, Any]:
     ttfts = [float(r["ttft_ms"]) for r in recent if r.get("ttft_ms") is not None]
     avg_ttft = round(sum(ttfts) / len(ttfts), 1) if ttfts else None
 
+    recent_turns: List[Dict[str, Any]] = []
+    low_hit_alert_count = 0
+    window_slice = recent[-8:]
+    prev_model: Optional[str] = None
+    prev_mode: Optional[str] = None
+    annotated_window: List[Dict[str, Any]] = []
+    for r in window_slice:
+        r_pt = int(r.get("prompt_tokens") or 0)
+        r_hit = r.get("prompt_cache_hit_tokens")
+        r_miss = r.get("prompt_cache_miss_tokens")
+        r_rate = r.get("hit_rate_pct")
+        r_model = str(r.get("model") or "")
+        r_mode = str(r.get("mode") or "split")
+        t_idx = int(r.get("turn_index") or 0)
+        # Turn 1 or first turn after switching model/mode is a legitimate cold start, not a cache-bust bug
+        cold_start = (
+            t_idx == 1
+            or (prev_model is not None and r_model != prev_model)
+            or (prev_mode is not None and r_mode != prev_mode)
+        )
+        prev_model = r_model
+        prev_mode = r_mode
+        is_alert = bool(
+            (not cold_start)
+            and r_mode == "split"
+            and isinstance(r_rate, (int, float))
+            and r_pt >= 600
+            and float(r_rate) < 50.0
+        )
+        if is_alert:
+            low_hit_alert_count += 1
+        r_ts = float(r.get("ts") or 0.0)
+        t_str = datetime.fromtimestamp(r_ts).strftime("%H:%M:%S") if r_ts > 0 else "--:--:--"
+        annotated_window.append(
+            {
+                "turn": t_idx,
+                "time": t_str,
+                "model": r_model,
+                "mode": r_mode,
+                "prompt_tokens": r_pt,
+                "cache_hit_tokens": int(r_hit) if r_hit is not None else None,
+                "cache_miss_tokens": int(r_miss) if r_miss is not None else None,
+                "hit_rate_pct": r_rate,
+                "ttft_ms": r.get("ttft_ms"),
+                "cold_start": cold_start,
+                "alert": is_alert,
+            }
+        )
+    recent_turns = list(reversed(annotated_window))
+    alert_active = bool(recent_turns and recent_turns[0].get("alert"))
+
     return {
         "mode": get_turn_context_mode(),
         "turns": int(tot["turns"]),
@@ -604,6 +669,9 @@ def get_llm_cache_stats() -> Dict[str, Any]:
         "last_ttft_ms": tot["last_ttft_ms"],
         "recent_avg_ttft_ms": avg_ttft,
         "last_model": tot["last_model"],
+        "recent_turns": recent_turns,
+        "low_hit_alert_count": low_hit_alert_count,
+        "alert_active": alert_active,
     }
 
 

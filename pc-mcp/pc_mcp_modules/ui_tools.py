@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Optional
 
 from PIL import ImageGrab
 import pyautogui
@@ -24,6 +25,8 @@ from .security import (
     trigger_emergency_stop,
 )
 from .vision import (
+    _capture_click_feedback,
+    _compute_frame_fingerprint,
     _compute_region_hash,
     _get_target_monitor_rect,
     _grab_monitor_rgb,
@@ -157,6 +160,7 @@ def _pc_ui_action_locked(
     estop_fn = facade_attr("is_emergency_stop_active", is_emergency_stop_active)
     trigger_estop_fn = facade_attr("trigger_emergency_stop", trigger_emergency_stop)
     clear_clip_fn = facade_attr("_clear_clipboard", _clear_clipboard)
+    click_feedback_fn = facade_attr("_capture_click_feedback", _capture_click_feedback)
 
     def _estop_msg() -> str:
         return "安全急停已触发（Ctrl+Alt+Pause），已立即中止当前 L2 操作并降回安全挡。"
@@ -205,7 +209,9 @@ def _pc_ui_action_locked(
             pass
         return False
 
-    def _is_target_region_fresh_locked(loc_obj, cx: int, cy: int) -> bool:
+    def _is_target_region_fresh_locked(
+        loc_obj, cx: int, cy: int, fp_out: Optional[dict] = None
+    ) -> bool:
         """Re-capture screenshot under _gui_lock and compare perceptual region hash before clicking (E-3, P2-2)."""
         expected_hash = str(getattr(loc_obj, "region_hash", "") or "")
         if not expected_hash:
@@ -216,6 +222,9 @@ def _pc_ui_action_locked(
         mon_left = int(expected_mon[0]) if expected_mon is not None else 0
         mon_top = int(expected_mon[1]) if expected_mon is not None else 0
         fresh_img = _grab_monitor_rgb(ig, expected_mon)
+        if fp_out is not None:
+            fp_out["fp"] = _compute_frame_fingerprint(fresh_img)
+            fp_out["mon"] = expected_mon
         if expected_size is not None and fresh_img.size != expected_size:
             return False
         try:
@@ -226,6 +235,30 @@ def _pc_ui_action_locked(
             fresh_hash, _ = region_hash_fn(fresh_img, cx, cy, box=expected_box)
         match_fn = facade_attr("_region_hashes_match", _region_hashes_match)
         return bool(fresh_hash and match_fn(expected_hash, fresh_hash))
+
+    def _post_click_feedback_suffix(
+        cx: int,
+        cy: int,
+        *,
+        monitor_rect=None,
+        fp_before=None,
+    ) -> str:
+        """Capture red-ring click feedback image & screen change hint without failing clicks."""
+        if estop_fn():
+            return ""
+        try:
+            tmod.sleep(0.15)
+            fb = click_feedback_fn(ig, cx, cy, monitor_rect=monitor_rect, fp_before=fp_before)
+        except Exception:
+            return ""
+        if not isinstance(fb, dict) or not fb.get("ok"):
+            return ""
+        changed = fb.get("changed")
+        if changed is False:
+            return "（提示：点击后画面未见明显变化，可能点偏或目标未响应；红圈落点反馈图已更新）"
+        if changed is True:
+            return "（画面已变化，红圈落点反馈图已更新）"
+        return "（红圈落点反馈图已更新）"
 
     def _type_clipboard_locked(target_label: str) -> str:
         if estop_fn():
@@ -315,7 +348,8 @@ def _pc_ui_action_locked(
                     cx, cy, src_desc = int(loc[0]), int(loc[1]), str(loc[2])
 
                     with _gui_lock:
-                        if not _is_target_region_fresh_locked(loc, cx, cy):
+                        fp_box: dict = {"fp": None, "mon": getattr(loc, "monitor_rect", None)}
+                        if not _is_target_region_fresh_locked(loc, cx, cy, fp_out=fp_box):
                             logging.getLogger("xiaozhi.pc_mcp").warning(
                                 "[Vision] Target region changed before %s on '%s' (attempt %d/%d); %s",
                                 act,
@@ -351,6 +385,9 @@ def _pc_ui_action_locked(
                             )
                             return clk_err
                         _move_and_click(cx, cy, act)
+                        fb_suffix = _post_click_feedback_suffix(
+                            cx, cy, monitor_rect=fp_box.get("mon"), fp_before=fp_box.get("fp")
+                        )
                         audit_fn(
                             tool="pc_ui_action",
                             action=act,
@@ -361,7 +398,7 @@ def _pc_ui_action_locked(
                             detail=src_desc,
                         )
                         verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
-                        return f"已精准{verb} {src_desc}，物理像素坐标 ({cx}, {cy})。"
+                        return f"已精准{verb} {src_desc}，物理像素坐标 ({cx}, {cy})。{fb_suffix}"
             elif _is_explicit_screen_point_valid(x, y):
                 with _gui_lock:
                     fg_info = fg_info_fn()
@@ -378,7 +415,16 @@ def _pc_ui_action_locked(
                             detail=clk_err,
                         )
                         return clk_err
+                    exp_mon = _get_target_monitor_rect(int((tgt_info or {}).get("hwnd") or 0) or None)
+                    fp_before = None
+                    try:
+                        fp_before = _compute_frame_fingerprint(_grab_monitor_rgb(ig, exp_mon))
+                    except Exception:
+                        fp_before = None
                     _move_and_click(x, y, act)
+                    fb_suffix = _post_click_feedback_suffix(
+                        x, y, monitor_rect=exp_mon, fp_before=fp_before
+                    )
                     audit_fn(
                         tool="pc_ui_action",
                         action=act,
@@ -388,7 +434,7 @@ def _pc_ui_action_locked(
                         target=f"({x},{y})",
                     )
                     verb = {"click": "点击", "double_click": "双击", "right_click": "右键点击"}[act]
-                    return f"已{verb}屏幕物理坐标 ({x}, {y})。"
+                    return f"已{verb}屏幕物理坐标 ({x}, {y})。{fb_suffix}"
             audit_fn(
                 tool="pc_ui_action",
                 action=act,

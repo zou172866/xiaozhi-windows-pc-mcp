@@ -113,6 +113,24 @@ def _install_pc_pcm_input() -> None:
     pc_pcm_input.install_pc_pcm_input_patch()
 
 
+def _install_future_task_tool() -> None:
+    from patches import future_task_tool
+
+    future_task_tool.install_future_task_tool_patch()
+
+
+def _install_llm_fallback_pool() -> None:
+    import llm_fallback_router
+
+    llm_fallback_router.apply_llm_fallback_pool_patch()
+
+
+def _install_skill_progressive_loader() -> None:
+    from patches import skill_loader_patch
+
+    skill_loader_patch.install_skill_loader_patch()
+
+
 def install_all(
     *,
     chdir: bool = True,
@@ -163,6 +181,7 @@ def install_all(
             ("mei_wakeup_responses", _install_mei_wakeup, "helloHandle", "[MeiEmotionRouter]"),
             ("idle_farewell", _install_idle_farewell, "receiveAudioHandle.no_voice_close_connect", "[MeiEmotionRouter]"),
             ("reply_length_llm", _install_reply_length, "OpenAI.LLMProvider", "[ReplyLengthRouter]"),
+            ("llm_fallback_pool", _install_llm_fallback_pool, "OpenAI.LLMProvider.__init__", "[LLMFallback]"),
             ("llm_prefix_cache", _install_llm_prefix_cache, "OpenAI.LLMProvider.__init__", "[LLMCache]"),
             (
                 "vad_speculative",
@@ -187,6 +206,18 @@ def install_all(
                 _install_pc_pcm_input,
                 "ConnectionHandler._decode_opus_packet",
                 "[PCPcmInput]",
+            ),
+            (
+                "future_task_tool",
+                _install_future_task_tool,
+                "plugins_func.register.all_function_registry",
+                "[FutureTasks]",
+            ),
+            (
+                "skill_progressive_loader",
+                _install_skill_progressive_loader,
+                "plugins_func.register.all_function_registry",
+                "[SkillLoader]",
             ),
         ):
             patch_registry.run_patch_installer(

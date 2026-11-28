@@ -26,6 +26,7 @@ _ALLOWED_PROACTIVE_KEYS = frozenset(
         "allow_l3_finish_notify",
         "allow_open_loop_followup",
         "inner_life_enabled",
+        "allow_taskbar_inbox",
         "vocal_cue_enabled",
     }
 )
@@ -47,6 +48,7 @@ def _validate_proactive_update(payload: dict) -> Dict[str, Any]:
         "allow_l3_finish_notify",
         "allow_open_loop_followup",
         "inner_life_enabled",
+        "allow_taskbar_inbox",
         "vocal_cue_enabled",
     ):
         if bkey in payload:
@@ -126,8 +128,12 @@ def handle_post_proactive(handler) -> None:
         saved = runtime_settings.set_proactive(**cleaned) if cleaned else runtime_settings.get_proactive()
         try:
             running = proactive_companion.sync_proactive_lifecycle()
+            eng = proactive_companion.get_proactive_engine()
+            if "enabled" in cleaned or "allow_taskbar_inbox" in cleaned:
+                want_inbox = bool(saved.get("enabled", False) and saved.get("allow_taskbar_inbox", False))
+                eng.sync_host_inbox_state(want_inbox)
             if running:
-                proactive_companion.get_proactive_engine().wake()
+                eng.wake()
         except Exception as exc:
             shared._log_rate_limited("proactive_wake", exc)
         snap = proactive_companion.get_proactive_snapshot(refresh_live=False, history_limit=20)

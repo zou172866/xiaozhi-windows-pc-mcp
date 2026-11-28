@@ -17,7 +17,7 @@ from .context_policy import enforce_context_policy
 from .engine import Conflict, Engine
 from .generation import draft_reply
 from .models import CommitRequest, Key, Memory, Model, Text, Usage
-from .providers import CompatibleProvider, ProviderError
+from .providers import CompatibleProvider, FallbackProvider, ProviderError
 
 
 class Settings(Model):
@@ -943,9 +943,60 @@ class Runtime:
 
         return self.operation(character_id, "index", request_id, {}, run)
 
+    def _build_env_summary_fallbacks(self, *, max_output_tokens: int) -> list[CompatibleProvider]:
+        """Build optional backup summary providers from env without breaking default single-node mode."""
+        out: list[CompatibleProvider] = []
+        fb_url = (os.environ.get("COMPANION_SUMMARY_FALLBACK_BASE_URL") or "").strip()
+        fb_model = (os.environ.get("COMPANION_SUMMARY_FALLBACK_MODEL") or "").strip()
+        fb_key = (os.environ.get("COMPANION_SUMMARY_FALLBACK_KEY") or "").strip()
+        if fb_url and fb_model:
+            try:
+                out.append(
+                    CompatibleProvider(
+                        base_url=fb_url,
+                        model=fb_model,
+                        api_key=fb_key or None,
+                        timeout_seconds=self.settings.timeout_seconds,
+                        max_output_tokens=max_output_tokens,
+                        transport=self.transport,
+                    )
+                )
+            except ValueError:
+                pass
+        raw_list = (os.environ.get("COMPANION_FALLBACK_PROVIDERS") or "").strip()
+        if raw_list:
+            try:
+                items = json.loads(raw_list)
+            except ValueError:
+                items = []
+            if isinstance(items, list):
+                for item in items[:4]:
+                    if not isinstance(item, dict):
+                        continue
+                    u = str(item.get("base_url") or "").strip()
+                    m = str(item.get("model") or "").strip()
+                    k = str(item.get("api_key") or "").strip()
+                    if not k and item.get("api_key_env"):
+                        k = (os.environ.get(str(item["api_key_env"])) or "").strip()
+                    if u and m:
+                        try:
+                            out.append(
+                                CompatibleProvider(
+                                    base_url=u,
+                                    model=m,
+                                    api_key=k or None,
+                                    timeout_seconds=self.settings.timeout_seconds,
+                                    max_output_tokens=max_output_tokens,
+                                    transport=self.transport,
+                                )
+                            )
+                        except ValueError:
+                            continue
+        return out
+
     def memory_provider(self):
         if self.settings.summary_model or self.settings.summary_base_url:
-            return CompatibleProvider(
+            primary = CompatibleProvider(
                 base_url=self.settings.summary_base_url,
                 model=self.settings.summary_model,
                 api_key=self.settings.summary_key.get_secret_value(),
@@ -953,11 +1004,15 @@ class Runtime:
                 max_output_tokens=self.settings.memory_max_output_tokens,
                 transport=self.transport,
             )
+            fallbacks = self._build_env_summary_fallbacks(
+                max_output_tokens=self.settings.memory_max_output_tokens
+            )
+            return FallbackProvider([primary, *fallbacks]) if fallbacks else primary
         if self._provider is not None:
             return self._provider
         if not self.settings.base_url or not self.settings.model:
             raise ValueError("Configure a memory writer or chat provider")
-        return CompatibleProvider(
+        primary = CompatibleProvider(
             base_url=self.settings.base_url,
             model=self.settings.model,
             api_key=self.settings.api_key.get_secret_value(),
@@ -965,6 +1020,10 @@ class Runtime:
             max_output_tokens=self.settings.memory_max_output_tokens,
             transport=self.transport,
         )
+        fallbacks = self._build_env_summary_fallbacks(
+            max_output_tokens=self.settings.memory_max_output_tokens
+        )
+        return FallbackProvider([primary, *fallbacks]) if fallbacks else primary
 
     def reconcile(self, character_id, request_id):
         from .knowledge import RECONCILE_PROMPT, Transitions

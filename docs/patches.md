@@ -11,7 +11,7 @@
 ## 概览与启动顺序
 
 - **锁定上游镜像版本**：`xiaozhi-esp32-server` `0.9.8`（`docker-compose.yml` 锁定 `@sha256` digest）
-- **补丁总数**：`23` 项（`security` 安全类 `5` 项 + `experience` 体验类 `18` 项）
+- **补丁总数**：`26` 项（`security` 安全类 `5` 项 + `experience` 体验类 `21` 项）
 - **唯一启动入口**：`app/boot.py`（模块导入零副作用，由 `install_all()` 显式挂载全部补丁 → `patches/contracts.py` 轻量契约自检写入注册表 → `enforce_security_boot_gate()` 安全门禁 → 启动 `18080` 控制台与上游 `app.py`）
 - **实时自检接口**：`GET http://127.0.0.1:18080/api/health`（返回每个补丁的状态、契约结果、早绑重绑列表与 `contract_self_check` 结果）
 
@@ -47,6 +47,9 @@
 | 21 | `cloud_audio_api` | `experience` | `app/patches/cloud_audio.py` | `core.providers.{asr.{openai,qwen3_asr_flash,aliyunbl_stream,doubao,doubao_stream},tts.{openai,siliconflow,doubao,fishspeech,alibl_stream,huoshan_double_stream,minimax_httpstream}}` | async speech_to_text / receive_audio / text_to_speak / start_session / finish_session / open_audio_channels + sync {DoubaoTTS,DoubaoASR,DoubaoStreamASR,AliyunBLStreamASR,MinimaxTTSHTTPStream}.__init__; non-blocking cloud HTTP, SSRF/secret redaction, ESP32 emotion-tag sync, and 48kHz/44.1kHz PC speaker passthrough | fail-soft (skips mismatched cloud provider targets, marks /api/health degraded) | `tests/container/test_cloud_audio_api.py`<br>`tests/container/test_upstream_contracts.py` |
 | 22 | `voiceprint_mcp_guard` | `experience` | `app/patches/voiceprint.py` | `core.providers.tools.server_mcp.mcp_manager.ServerMCPManager.execute_tool` | async method execute_tool(self, tool_name, arguments); default-off zero-overhead guard blocking non-owner privileged host MCP tools under voiceprint full_guard and honoring screen_peek toggle | fail-soft (falls back to upstream MCP tool dispatch, marks /api/health degraded) | `tests/container/test_phase2_voiceprint_widget.py`<br>`tests/container/test_upstream_contracts.py` |
 | 23 | `pc_pcm_audio_input` | `experience` | `app/patches/pc_pcm_input.py` | `core.connection.ConnectionHandler._decode_opus_packet` | sync method _decode_opus_packet(self, opus_packet); passes validated 16-bit PCM frames straight to VAD/ASR when conn.audio_format == 'pcm', keeping ESP32 opus path unchanged | fail-soft (skips mount on contract mismatch -> Opus-only WS input, marks /api/health degraded) | `tests/container/test_pc_mic_input.py`<br>`tests/container/test_upstream_contracts.py` |
+| 24 | `future_task_tool` | `experience` | `app/patches/future_task_tool.py` | `plugins_func.register.all_function_registry` | registered ToolType.SYSTEM_CTL plugin callable manage_future_task(conn, action, ...) + auto-intent exposure for durable SQLite one-shot & 5-field Cron reminders | fail-soft (skips mount on contract mismatch, console /api/future-tasks remains available, marks /api/health degraded) | `tests/container/test_future_tasks.py`<br>`tests/container/test_upstream_contracts.py` |
+| 25 | `llm_fallback_pool` | `experience` | `app/llm_fallback_router.py` | `OpenAI.LLMProvider.__init__` | sync __init__(self, config) wrapping client.chat.completions.create beneath llm_prefix_cache for stream first-chunk-safe multi-model failover with SSRF check and cooldown | fail-soft (keeps primary LLM direct pass-through, marks /api/health degraded) | `tests/container/test_llm_fallback_router.py`<br>`tests/container/test_upstream_contracts.py` |
+| 26 | `skill_progressive_loader` | `experience` | `app/patches/skill_loader_patch.py` | `plugins_func.register.all_function_registry` | registered ToolType.SYSTEM_CTL plugin callable load_skill(conn, skill_name) + prefix-cache-safe <available_skills> turn_context metadata index | fail-soft (skips mount on contract mismatch, static system prompt unchanged, marks /api/health degraded) | `tests/container/test_skill_loader.py`<br>`tests/container/test_upstream_contracts.py` |
 
 ## 升级上游镜像或增删补丁后的必跑命令
 

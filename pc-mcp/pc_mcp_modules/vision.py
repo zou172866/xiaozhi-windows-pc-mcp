@@ -23,6 +23,7 @@ import pyautogui
 from . import (
     CONFIG_YAML as _DEFAULT_CONFIG_YAML,
     LEGACY_CONFIG_YAML as _LEGACY_CONFIG_YAML,
+    LAST_ACTION_FEEDBACK_IMG as _DEFAULT_LAST_ACTION_FEEDBACK_IMG,
     LAST_GROUNDING_IMG as _DEFAULT_LAST_GROUNDING_IMG,
     _com_mta_scope,
     _get_env_key,
@@ -512,6 +513,114 @@ def _collect_uia_elements(
                 mon_top=mon_top,
             )
         return _walk_uia_controls(auto, root, max_items, sw, sh)
+
+
+def _compute_frame_fingerprint(img: Any) -> Optional[tuple[int, ...]]:
+    """Compute a compact 16x16 grayscale fingerprint for post-action screen-change detection."""
+    if not isinstance(img, Image.Image):
+        return None
+    try:
+        resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR")
+        gray = img.convert("L").resize((16, 16), resample)
+        return tuple(gray.tobytes())
+    except Exception:
+        return None
+
+
+def _frames_changed(
+    fp_before: Optional[tuple[int, ...]],
+    fp_after: Optional[tuple[int, ...]],
+    *,
+    threshold: float = 1.8,
+) -> Optional[bool]:
+    """Compare two 16x16 grayscale fingerprints; returns True if mean pixel diff exceeds threshold."""
+    if not fp_before or not fp_after or len(fp_before) != len(fp_after):
+        return None
+    mad = sum(abs(a - b) for a, b in zip(fp_before, fp_after)) / float(len(fp_before))
+    return mad > float(threshold)
+
+
+def _draw_click_feedback_marker(base_img: Image.Image, local_x: int, local_y: int) -> Image.Image:
+    """Draw a high-contrast red ring + hollow crosshair at the actual click coordinate."""
+    annotated = base_img.copy()
+    w, h = annotated.size
+    cx = max(0, min(w - 1, int(local_x)))
+    cy = max(0, min(h - 1, int(local_y)))
+    dr = ImageDraw.Draw(annotated)
+    # Outer white halo so the red ring stays crisp on dark or red backgrounds
+    dr.ellipse([cx - 17, cy - 17, cx + 17, cy + 17], outline=(255, 255, 255), width=5)
+    dr.ellipse([cx - 16, cy - 16, cx + 16, cy + 16], outline=(239, 68, 68), width=3)
+    for seg in (
+        [cx - 24, cy, cx - 7, cy],
+        [cx + 7, cy, cx + 24, cy],
+        [cx, cy - 24, cx, cy - 7],
+        [cx, cy + 7, cx, cy + 24],
+    ):
+        dr.line(seg, fill=(255, 255, 255), width=5)
+        dr.line(seg, fill=(239, 68, 68), width=3)
+    return annotated
+
+
+def _save_feedback_image(
+    img: Image.Image,
+    *,
+    mark_xy: Optional[tuple[int, int]] = None,
+    dest_path: Optional[Path] = None,
+    max_edge: int = 1280,
+) -> Optional[str]:
+    """Optionally draw red click ring, downscale to max_edge, and atomically write JPEG feedback image."""
+    if not isinstance(img, Image.Image):
+        return None
+    target = Path(dest_path) if dest_path is not None else Path(
+        facade_attr("LAST_ACTION_FEEDBACK_IMG", _DEFAULT_LAST_ACTION_FEEDBACK_IMG)
+    )
+    out = _draw_click_feedback_marker(img, mark_xy[0], mark_xy[1]) if mark_xy is not None else img.copy()
+    w, h = out.size
+    long_edge = max(w, h)
+    if long_edge > max_edge and long_edge > 0:
+        scale = float(max_edge) / float(long_edge)
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        out = out.resize((max(1, int(round(w * scale))), max(1, int(round(h * scale)))), resample)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_img = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        out.convert("RGB").save(tmp_img, format="JPEG", quality=84)
+        os.replace(tmp_img, target)
+    except Exception:
+        try:
+            tmp_img.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    return str(target)
+
+
+def _capture_click_feedback(
+    ig: Any,
+    cx: int,
+    cy: int,
+    *,
+    monitor_rect: Optional[tuple[int, int, int, int]] = None,
+    fp_before: Optional[tuple[int, ...]] = None,
+    dest_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Capture post-click screenshot, overlay red click marker, and check whether screen changed."""
+    try:
+        after_img = _grab_monitor_rgb(ig, monitor_rect)
+        if not isinstance(after_img, Image.Image):
+            return {"ok": False, "changed": None, "path": ""}
+        fp_after = _compute_frame_fingerprint(after_img)
+        changed = _frames_changed(fp_before, fp_after)
+        mon_left = int(monitor_rect[0]) if monitor_rect is not None else 0
+        mon_top = int(monitor_rect[1]) if monitor_rect is not None else 0
+        saved = _save_feedback_image(
+            after_img,
+            mark_xy=(int(cx) - mon_left, int(cy) - mon_top),
+            dest_path=dest_path,
+        )
+        return {"ok": bool(saved), "changed": changed, "path": saved or "", "fingerprint": fp_after}
+    except Exception:
+        return {"ok": False, "changed": None, "path": ""}
 
 
 def _draw_som_overlay(

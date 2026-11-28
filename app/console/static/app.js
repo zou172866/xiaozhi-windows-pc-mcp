@@ -136,8 +136,64 @@
     proactiveRhythmText: document.getElementById("proactiveRhythmText"),
     proactiveVocalCueText: document.getElementById("proactiveVocalCueText"),
     proactiveInnerLifeText: document.getElementById("proactiveInnerLifeText"),
+    proactiveInboxText: document.getElementById("proactiveInboxText"),
+    taskbarInboxEnabledToggle: document.getElementById("taskbarInboxEnabledToggle"),
     proactiveStatsText: document.getElementById("proactiveStatsText"),
     proactiveHistoryList: document.getElementById("proactiveHistoryList"),
+    futureTasksBadge: document.getElementById("futureTasksBadge"),
+    futureTasksFoldDetails: document.getElementById("futureTasksFoldDetails"),
+    ftTitleInput: document.getElementById("ftTitleInput"),
+    ftScheduleTypeSelect: document.getElementById("ftScheduleTypeSelect"),
+    ftOnceWrap: document.getElementById("ftOnceWrap"),
+    ftCronWrap: document.getElementById("ftCronWrap"),
+    ftRunAtInput: document.getElementById("ftRunAtInput"),
+    ftCronInput: document.getElementById("ftCronInput"),
+    ftKindSelect: document.getElementById("ftKindSelect"),
+    ftDeliverySelect: document.getElementById("ftDeliverySelect"),
+    ftMessageInput: document.getElementById("ftMessageInput"),
+    ftCreateBtn: document.getElementById("ftCreateBtn"),
+    ftRefreshBtn: document.getElementById("ftRefreshBtn"),
+    ftStatsText: document.getElementById("ftStatsText"),
+    ftTaskList: document.getElementById("ftTaskList"),
+    llmFbBadge: document.getElementById("llmFbBadge"),
+    llmFbEnabledToggle: document.getElementById("llmFbEnabledToggle"),
+    llmFbToggleHint: document.getElementById("llmFbToggleHint"),
+    llmFbFoldDetails: document.getElementById("llmFbFoldDetails"),
+    llmFbCooldownInput: document.getElementById("llmFbCooldownInput"),
+    llmFbNodeLabelInput: document.getElementById("llmFbNodeLabelInput"),
+    llmFbNodeUrlInput: document.getElementById("llmFbNodeUrlInput"),
+    llmFbNodeModelInput: document.getElementById("llmFbNodeModelInput"),
+    llmFbNodeEnvInput: document.getElementById("llmFbNodeEnvInput"),
+    llmFbNodeKeyInput: document.getElementById("llmFbNodeKeyInput"),
+    llmFbAddBtn: document.getElementById("llmFbAddBtn"),
+    llmFbSaveCooldownBtn: document.getElementById("llmFbSaveCooldownBtn"),
+    llmFbResetHealthBtn: document.getElementById("llmFbResetHealthBtn"),
+    llmFbStatsText: document.getElementById("llmFbStatsText"),
+    llmFbNodeList: document.getElementById("llmFbNodeList"),
+    qqBotBadge: document.getElementById("qqBotBadge"),
+    qqBotEnabledToggle: document.getElementById("qqBotEnabledToggle"),
+    qqBotStatusHint: document.getElementById("qqBotStatusHint"),
+    qqBotFoldDetails: document.getElementById("qqBotFoldDetails"),
+    qqBotAppIdInput: document.getElementById("qqBotAppIdInput"),
+    qqBotAppSecretInput: document.getElementById("qqBotAppSecretInput"),
+    qqBotAllowedUsersInput: document.getElementById("qqBotAllowedUsersInput"),
+    qqBotAllowedGroupsInput: document.getElementById("qqBotAllowedGroupsInput"),
+    qqBotBatchQuietInput: document.getElementById("qqBotBatchQuietInput"),
+    qqBotSandboxToggle: document.getElementById("qqBotSandboxToggle"),
+    qqBotShareMemToggle: document.getElementById("qqBotShareMemToggle"),
+    qqBotAllowL3Toggle: document.getElementById("qqBotAllowL3Toggle"),
+    qqBotCredStatusText: document.getElementById("qqBotCredStatusText"),
+    qqBotSaveBtn: document.getElementById("qqBotSaveBtn"),
+    qqBotPairBtn: document.getElementById("qqBotPairBtn"),
+    qqBotReconnectBtn: document.getElementById("qqBotReconnectBtn"),
+    qqBotPairText: document.getElementById("qqBotPairText"),
+    qqBotPendingList: document.getElementById("qqBotPendingList"),
+    skillsBadge: document.getElementById("skillsBadge"),
+    skillsStatsText: document.getElementById("skillsStatsText"),
+    skillsEnabledToggle: document.getElementById("skillsEnabledToggle"),
+    skillsFoldDetails: document.getElementById("skillsFoldDetails"),
+    skillsRefreshBtn: document.getElementById("skillsRefreshBtn"),
+    skillsList: document.getElementById("skillsList"),
     voiceprintBadge: document.getElementById("voiceprintBadge"),
     voiceprintEnabledToggle: document.getElementById("voiceprintEnabledToggle"),
     voiceprintEnabledHint: document.getElementById("voiceprintEnabledHint"),
@@ -258,6 +314,8 @@
     dsKeyBadge: document.getElementById("dsKeyBadge"),
     gemKeyBadge: document.getElementById("gemKeyBadge"),
     llmCacheRateBadge: document.getElementById("llmCacheRateBadge"),
+    llmCacheAlertPill: document.getElementById("llmCacheAlertPill"),
+    llmCacheTurnList: document.getElementById("llmCacheTurnList"),
     asrEngineBadge: document.getElementById("asrEngineBadge"),
     lowspecPresetBar: document.getElementById("lowspecPresetBar"),
     asrProviderSelect: document.getElementById("asrProviderSelect"),
@@ -1316,11 +1374,13 @@
     if (cfg) {
       const enabled = Boolean(cfg.enabled);
       const innerLifeEnabled = Boolean(cfg.inner_life_enabled);
+      const taskbarInboxEnabled = Boolean(cfg.allow_taskbar_inbox);
       const vocalCueEnabled = Boolean(snap.vocal_cue_enabled);
       const mode = VALID_PROACTIVE_MODES.has(cfg.delivery_mode) ? cfg.delivery_mode : "dry_run";
       if (!proactiveSaving) {
         if (els.proactiveEnabledToggle) els.proactiveEnabledToggle.checked = enabled;
         if (els.innerLifeEnabledToggle) els.innerLifeEnabledToggle.checked = innerLifeEnabled;
+        if (els.taskbarInboxEnabledToggle) els.taskbarInboxEnabledToggle.checked = taskbarInboxEnabled;
         if (els.vocalCueEnabledToggle) els.vocalCueEnabledToggle.checked = vocalCueEnabled;
         renderProactiveModeButtons(mode);
         if (!proactiveVolDragging && els.proactiveVolumeRange && typeof cfg.pc_speaker_volume === "number") {
@@ -1397,6 +1457,35 @@
       } else {
         els.proactiveInnerLifeText.textContent = "尚未拉取今日角色微日常（点击「刷新角色日常」生成）";
         els.proactiveInnerLifeText.style.color = "var(--ink-muted)";
+      }
+    }
+
+    if (els.proactiveInboxText) {
+      const ib = rhy && typeof rhy.inbox_summary === "object" ? rhy.inbox_summary : null;
+      const proactiveOn = Boolean(cfg && cfg.enabled);
+      const wantInbox = Boolean(cfg && cfg.allow_taskbar_inbox);
+      if (!wantInbox) {
+        els.proactiveInboxText.textContent = "已关闭（宿主机零监听线程）";
+        els.proactiveInboxText.style.color = "var(--ink-muted)";
+      } else if (!proactiveOn) {
+        els.proactiveInboxText.textContent = "已勾选（请先开启上方主动陪伴总开关后生效）";
+        els.proactiveInboxText.style.color = "var(--warn)";
+      } else if (!rhy || !rhy.online || !ib) {
+        els.proactiveInboxText.textContent = "已勾选，等待宿主机 18900 同步…";
+        els.proactiveInboxText.style.color = "var(--ink-muted)";
+      } else if (ib.error) {
+        els.proactiveInboxText.textContent = `监听异常：${ib.error}`;
+        els.proactiveInboxText.style.color = "var(--danger)";
+      } else if (Array.isArray(ib.items) && ib.items.length) {
+        const apps = ib.items.slice(0, 3).map((x) => x.app || x.exe || "程序").join("、");
+        els.proactiveInboxText.textContent = `已聚合 ${ib.items.length} 项动静（${apps}）`;
+        els.proactiveInboxText.style.color = "var(--accent)";
+      } else if (ib.staging_count > 0) {
+        els.proactiveInboxText.textContent = `监测到 ${ib.staging_count} 个程序活动，10 秒静默防抖聚合中…`;
+        els.proactiveInboxText.style.color = "var(--ink)";
+      } else {
+        els.proactiveInboxText.textContent = ib.enabled ? "监听中（当前无未读任务栏动静）" : "等待启用宿主机监听";
+        els.proactiveInboxText.style.color = "var(--ink-muted)";
       }
     }
 
@@ -1485,6 +1574,16 @@
     });
   }
 
+  if (els.taskbarInboxEnabledToggle) {
+    els.taskbarInboxEnabledToggle.addEventListener("change", () => {
+      const nextEn = Boolean(els.taskbarInboxEnabledToggle.checked);
+      saveProactiveConfig(
+        { allow_taskbar_inbox: nextEn },
+        nextEn ? "已开启任务栏 10 秒防抖信箱感知" : "已关闭任务栏信箱感知（宿主机监听将停止）"
+      );
+    });
+  }
+
   if (els.proactiveModeGrid) {
     els.proactiveModeGrid.addEventListener("click", (e) => {
       const btn = e.target.closest(".mode-btn");
@@ -1492,9 +1591,13 @@
       const nextMode = btn.dataset.proactiveMode;
       if (!nextMode || nextMode === proactiveMode) return;
       renderProactiveModeButtons(nextMode);
-      const label = nextMode === "pc_speaker"
-        ? "已切换为「电脑音响轻声播报」（自动遵守免打扰与心流门控）"
-        : "已切换为「静默试运行」（仅记录到控制台，不发声）";
+      const modeToastMap = {
+        pc_speaker: "已切换为「电脑音响轻声播报」（自动遵守免打扰与心流门控）",
+        mobile_push: "已切换为「仅推手机通知栏」（零声音，需开启手机推送通道）",
+        pc_and_mobile: "已切换为「电脑轻声播报 + 同步推手机留痕」",
+        dry_run: "已切换为「静默试运行」（仅记录到控制台，不发声）",
+      };
+      const label = modeToastMap[nextMode] || "主动陪伴播报模式已切换";
       saveProactiveConfig({ delivery_mode: nextMode }, label);
     });
   }
@@ -4675,13 +4778,65 @@
         const rate = (typeof lc.recent_hit_rate_pct === "number")
           ? lc.recent_hit_rate_pct
           : lc.overall_hit_rate_pct;
+        const alertCount = Number(lc.low_hit_alert_count || 0);
+        const alertActive = Boolean(lc.alert_active);
         if (typeof rate === "number" && lc.turns > 0) {
           const ttftTxt = (typeof lc.last_ttft_ms === "number") ? ` · 首字 ${Math.round(lc.last_ttft_ms)}ms` : "";
-          els.llmCacheRateBadge.textContent = `${rate.toFixed(1)}% (${lc.turns}轮${ttftTxt} · ${lc.mode || "split"})`;
-          els.llmCacheRateBadge.style.color = rate >= 70 ? "var(--accent)" : "var(--warn)";
+          const warnTag = alertActive ? " · ⚠低命中" : "";
+          els.llmCacheRateBadge.textContent = `${rate.toFixed(1)}% (${lc.turns}轮${ttftTxt} · ${lc.mode || "split"})${warnTag}`;
+          els.llmCacheRateBadge.style.color = alertActive
+            ? "var(--danger)"
+            : (rate >= 70 ? "var(--accent)" : "var(--warn)");
         } else {
           els.llmCacheRateBadge.textContent = `待对话 (${lc.mode || "split"})`;
           els.llmCacheRateBadge.style.color = "var(--ink-muted)";
+        }
+        if (els.llmCacheAlertPill) {
+          if (alertActive) {
+            els.llmCacheAlertPill.textContent = `最近一轮缓存低命中（近期异常 ${alertCount} 轮）`;
+            els.llmCacheAlertPill.style.color = "var(--danger)";
+          } else if (alertCount > 0) {
+            els.llmCacheAlertPill.textContent = `近期 ${alertCount} 轮低命中`;
+            els.llmCacheAlertPill.style.color = "var(--warn)";
+          } else if (lc.turns > 0) {
+            els.llmCacheAlertPill.textContent = "前缀缓存健康";
+            els.llmCacheAlertPill.style.color = "var(--accent)";
+          } else {
+            els.llmCacheAlertPill.textContent = "待对话";
+            els.llmCacheAlertPill.style.color = "var(--ink-muted)";
+          }
+        }
+        if (els.llmCacheTurnList) {
+          const turns = Array.isArray(lc.recent_turns) ? lc.recent_turns : [];
+          const cacheSig = JSON.stringify(turns);
+          if (els.llmCacheTurnList.dataset.sig !== cacheSig) {
+            els.llmCacheTurnList.dataset.sig = cacheSig;
+            els.llmCacheTurnList.innerHTML = "";
+            if (!turns.length) {
+              const empty = document.createElement("div");
+              empty.className = "dream-empty";
+              empty.textContent = "暂无对话轮次记录，开始语音或文字对话后将实时显示每轮缓存命中与首字延迟。";
+              els.llmCacheTurnList.appendChild(empty);
+            } else {
+              for (const item of turns) {
+                const row = document.createElement("div");
+                row.className = item.alert ? "cache-turn-row is-alert" : "cache-turn-row";
+                const left = document.createElement("span");
+                left.className = "num";
+                const tag = item.cold_start ? " [冷启]" : (item.alert ? " [⚠低命中]" : "");
+                left.textContent = `#${item.turn || "-"} · ${item.time || "--"} · ${item.model || "LLM"}${tag}`;
+                const right = document.createElement("span");
+                right.className = "num";
+                const rateStr = (typeof item.hit_rate_pct === "number") ? `${item.hit_rate_pct.toFixed(1)}%` : "未上报";
+                const hitStr = (item.cache_hit_tokens != null) ? `${item.cache_hit_tokens}/${item.prompt_tokens}` : `${item.prompt_tokens || 0} tok`;
+                const ttftStr = (typeof item.ttft_ms === "number") ? ` · ${Math.round(item.ttft_ms)}ms` : "";
+                right.textContent = `命中 ${rateStr} (${hitStr})${ttftStr}`;
+                row.appendChild(left);
+                row.appendChild(right);
+                els.llmCacheTurnList.appendChild(row);
+              }
+            }
+          }
         }
       }
 
@@ -4809,7 +4964,10 @@
     if (!isTabVisible()) return;
     if (pollTimer === null) {
       pollTimer = setInterval(() => {
-        if (isTabVisible()) pollState();
+        if (isTabVisible()) {
+          pollState();
+          maybeRefreshQqBotStatus();
+        }
       }, 1200);
     }
     pollState(true);
@@ -4855,8 +5013,11 @@
     return "daily";
   }
 
+  let activeConfigTab = "daily";
+
   function setActiveConfigTab(tabKey, persist = true) {
     const nextKey = VALID_CONFIG_TABS.has(tabKey) ? tabKey : "daily";
+    activeConfigTab = nextKey;
     if (els.configTabBar && typeof els.configTabBar.querySelectorAll === "function") {
       els.configTabBar.querySelectorAll(".config-tab-btn").forEach((btn) => {
         const active = Boolean(btn.dataset && btn.dataset.configTab === nextKey);
@@ -4878,6 +5039,9 @@
           window.localStorage.setItem(CONFIG_TAB_STORAGE_KEY, nextKey);
         }
       } catch (_) {}
+      if (nextKey === "memory" && typeof fetchQqBotStatus === "function") {
+        fetchQqBotStatus();
+      }
     }
   }
 
@@ -5578,10 +5742,664 @@
     window.addEventListener("beforeunload", () => stopPcMic(true));
   }
 
+  // --- Future Tasks & Cron Reminders (Phase 1) ---
+  let ftBusy = false;
+
+  function renderFutureTasksUI(data) {
+    if (!data || typeof data !== "object") return;
+    const activeCnt = Number(data.active_count || 0);
+    const maxCnt = Number(data.max_active_tasks || 50);
+    const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+    const runs = Array.isArray(data.runs) ? data.runs : [];
+    if (els.futureTasksBadge) els.futureTasksBadge.textContent = `${activeCnt} 条活跃`;
+    if (els.ftStatsText) els.ftStatsText.textContent = `活跃 ${activeCnt}/${maxCnt} · 最近触发 ${runs.length} 条`;
+    if (!els.ftTaskList) return;
+    els.ftTaskList.innerHTML = "";
+    if (!tasks.length) {
+      const empty = document.createElement("div");
+      empty.className = "dream-empty";
+      empty.textContent = "暂无定时提醒；可直接对小智说“10分钟后提醒我喝水”或在上方创建。";
+      els.ftTaskList.appendChild(empty);
+      return;
+    }
+    const statusZh = { active: "运行中", paused: "已暂停", completed: "已完成", cancelled: "已取消", missed: "已过期跳过" };
+    for (const t of tasks.slice(0, 20)) {
+      const card = document.createElement("div");
+      card.className = "proactive-item";
+      const head = document.createElement("div");
+      head.className = "proactive-item-head";
+      const left = document.createElement("span");
+      const sched = t.schedule_type === "cron" ? `Cron ${t.cron_expr}` : "一次性";
+      left.textContent = `${t.title || "--"} · ${statusZh[t.status] || t.status} · ${sched}`;
+      const right = document.createElement("span");
+      right.className = "num";
+      right.textContent = t.next_run_text ? `下次 ${t.next_run_text}` : (t.last_run_text ? `上次 ${t.last_run_text}` : t.id);
+      head.appendChild(left);
+      head.appendChild(right);
+      card.appendChild(head);
+
+      const body = document.createElement("div");
+      body.className = "proactive-item-text";
+      body.textContent = `${t.message || ""}${t.last_result ? `（${t.last_result}）` : ""}`;
+      card.appendChild(body);
+
+      const acts = document.createElement("div");
+      acts.style.display = "flex";
+      acts.style.gap = "6px";
+      acts.style.marginTop = "6px";
+      const mkBtn = (label, action, extra) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "btn";
+        b.style.padding = "2px 8px";
+        b.style.fontSize = "11.5px";
+        b.textContent = label;
+        b.addEventListener("click", () => runFutureTaskAction(action, t.id, extra));
+        return b;
+      };
+      acts.appendChild(mkBtn("试跑", "trigger", { force_dry_run: true }));
+      if (t.status === "active") acts.appendChild(mkBtn("暂停", "pause"));
+      if (t.status === "paused") acts.appendChild(mkBtn("恢复", "resume"));
+      if (t.status === "active" || t.status === "paused") acts.appendChild(mkBtn("取消", "cancel"));
+      acts.appendChild(mkBtn("删除", "delete"));
+      card.appendChild(acts);
+      els.ftTaskList.appendChild(card);
+    }
+  }
+
+  async function fetchFutureTasksStatus() {
+    try {
+      const resp = await fetch("/api/future-tasks", { headers: consoleHeaders(false) });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.ok) renderFutureTasksUI(data);
+    } catch (_) {}
+  }
+
+  async function runFutureTaskAction(action, taskId, extra) {
+    if (ftBusy) return;
+    ftBusy = true;
+    try {
+      const resp = await consolePost("/api/future-tasks", Object.assign({ action, task_id: taskId }, extra || {}));
+      const res = await resp.json();
+      if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "操作失败");
+      if (res.state) renderFutureTasksUI(res.state);
+      showBanner("info", action === "trigger" ? `试跑完成：${(res.run && res.run.rendered_text) || "已记录"}` : "定时任务状态已更新");
+      scheduleHideBanner(3000);
+    } catch (err) {
+      showBanner("err", `定时任务操作失败：${err.message}`);
+    } finally {
+      ftBusy = false;
+    }
+  }
+
+  if (els.ftScheduleTypeSelect) {
+    const syncFtSchedUi = () => {
+      const isCron = els.ftScheduleTypeSelect.value === "cron";
+      if (els.ftOnceWrap) els.ftOnceWrap.style.display = isCron ? "none" : "";
+      if (els.ftCronWrap) els.ftCronWrap.style.display = isCron ? "" : "none";
+    };
+    els.ftScheduleTypeSelect.addEventListener("change", syncFtSchedUi);
+    syncFtSchedUi();
+  }
+
+  if (els.ftCreateBtn) {
+    els.ftCreateBtn.addEventListener("click", async () => {
+      if (ftBusy) return;
+      const title = String((els.ftTitleInput && els.ftTitleInput.value) || "").trim();
+      const message = String((els.ftMessageInput && els.ftMessageInput.value) || "").trim();
+      const schedule_type = String((els.ftScheduleTypeSelect && els.ftScheduleTypeSelect.value) || "once");
+      const task_kind = String((els.ftKindSelect && els.ftKindSelect.value) || "reminder");
+      const delivery = String((els.ftDeliverySelect && els.ftDeliverySelect.value) || "pc_and_mobile");
+      const payload = { action: "create", title, message, schedule_type, task_kind, delivery };
+      if (schedule_type === "cron") {
+        payload.cron_expr = String((els.ftCronInput && els.ftCronInput.value) || "").trim();
+      } else {
+        const rawTime = String((els.ftRunAtInput && els.ftRunAtInput.value) || "").trim();
+        if (/^\d+(?:\.\d+)?$/.test(rawTime)) {
+          payload.delay_minutes = Number(rawTime);
+        } else {
+          payload.run_at = rawTime;
+        }
+      }
+      ftBusy = true;
+      try {
+        const resp = await consolePost("/api/future-tasks", payload);
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "创建失败");
+        if (res.state) renderFutureTasksUI(res.state);
+        if (els.ftTitleInput) els.ftTitleInput.value = "";
+        if (els.ftMessageInput) els.ftMessageInput.value = "";
+        showBanner("info", `已创建定时任务「${res.task.title}」（下次 ${res.task.next_run_text || "--"}）`);
+        scheduleHideBanner(3200);
+      } catch (err) {
+        showBanner("err", `创建定时任务失败：${err.message}`);
+      } finally {
+        ftBusy = false;
+      }
+    });
+  }
+
+  if (els.ftRefreshBtn) {
+    els.ftRefreshBtn.addEventListener("click", () => fetchFutureTasksStatus());
+  }
+
+  // --- Multi-Model LLM Fallback Pool (Phase 2) ---
+  let llmFbBusy = false;
+  let llmFbNodesCache = [];
+
+  function renderLlmFallbackUI(data) {
+    if (!data || typeof data !== "object") return;
+    const cfg = data.config || {};
+    const stats = data.stats || {};
+    const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+    llmFbNodesCache = nodes;
+    const enabled = Boolean(cfg.enabled);
+    if (els.llmFbEnabledToggle) els.llmFbEnabledToggle.checked = enabled;
+    if (els.llmFbCooldownInput && cfg.cooldown_seconds != null) els.llmFbCooldownInput.value = String(cfg.cooldown_seconds);
+    if (els.llmFbBadge) els.llmFbBadge.textContent = enabled ? `已启用 · ${nodes.length} 备` : `已关闭 · ${nodes.length} 备`;
+    if (els.llmFbStatsText) {
+      els.llmFbStatsText.textContent = `累计切换 ${stats.total_failovers || 0} 次 · 当前 ${stats.last_active_node || "primary"}`;
+    }
+    if (!els.llmFbNodeList) return;
+    els.llmFbNodeList.innerHTML = "";
+    if (!nodes.length) {
+      const empty = document.createElement("div");
+      empty.className = "dream-empty";
+      empty.textContent = "尚未添加备用模型节点；添加后开启上方开关即可在主模型异常时无感接管。";
+      els.llmFbNodeList.appendChild(empty);
+      return;
+    }
+    for (const n of nodes) {
+      const card = document.createElement("div");
+      card.className = "proactive-item";
+      const head = document.createElement("div");
+      head.className = "proactive-item-head";
+      const left = document.createElement("span");
+      left.textContent = `${n.label || n.id} · ${n.model} · ${n.cooling_seconds > 0 ? `冷却 ${n.cooling_seconds}s` : "健康"}`;
+      const right = document.createElement("span");
+      right.className = "num";
+      right.textContent = n.key_configured ? `${n.key_source} (${n.key_masked || "***"})` : "未配置密钥";
+      head.appendChild(left);
+      head.appendChild(right);
+      card.appendChild(head);
+      const body = document.createElement("div");
+      body.className = "proactive-item-text";
+      body.textContent = `${n.base_url} · 成功 ${n.success_count || 0} / 失败 ${n.fail_count || 0}${n.last_error ? ` · ${n.last_error}` : ""}`;
+      card.appendChild(body);
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "btn";
+      delBtn.style.marginTop = "6px";
+      delBtn.style.padding = "2px 8px";
+      delBtn.style.fontSize = "11.5px";
+      delBtn.textContent = "移除节点";
+      delBtn.addEventListener("click", async () => {
+        if (llmFbBusy) return;
+        llmFbBusy = true;
+        try {
+          const nextNodes = llmFbNodesCache.filter((x) => x.id !== n.id).map((x) => ({
+            id: x.id, label: x.label, base_url: x.base_url, model: x.model, api_key_env: x.api_key_env, enabled: x.enabled !== false,
+          }));
+          const resp = await consolePost("/api/llm-fallback", { nodes: nextNodes, secrets: { [n.id]: null } });
+          const res = await resp.json();
+          if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "移除失败");
+          renderLlmFallbackUI(res);
+          showBanner("info", `已移除备用模型节点「${n.label || n.id}」`);
+          scheduleHideBanner(2600);
+        } catch (err) {
+          showBanner("err", `移除备用节点失败：${err.message}`);
+        } finally {
+          llmFbBusy = false;
+        }
+      });
+      card.appendChild(delBtn);
+      els.llmFbNodeList.appendChild(card);
+    }
+  }
+
+  async function fetchLlmFallbackStatus() {
+    try {
+      const resp = await fetch("/api/llm-fallback", { headers: consoleHeaders(false) });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.ok) renderLlmFallbackUI(data);
+    } catch (_) {}
+  }
+
+  if (els.llmFbEnabledToggle) {
+    els.llmFbEnabledToggle.addEventListener("change", async () => {
+      if (llmFbBusy) return;
+      const enabled = Boolean(els.llmFbEnabledToggle.checked);
+      llmFbBusy = true;
+      try {
+        const resp = await consolePost("/api/llm-fallback", { enabled });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "保存失败");
+        renderLlmFallbackUI(res);
+        if (enabled && els.llmFbFoldDetails) els.llmFbFoldDetails.open = true;
+        showBanner("info", enabled ? "已启用多模型自动灾备切换" : "已关闭多模型自动灾备切换");
+        scheduleHideBanner(2600);
+      } catch (err) {
+        els.llmFbEnabledToggle.checked = !enabled;
+        showBanner("err", `切换模型灾备失败：${err.message}`);
+      } finally {
+        llmFbBusy = false;
+      }
+    });
+  }
+
+  if (els.llmFbAddBtn) {
+    els.llmFbAddBtn.addEventListener("click", async () => {
+      if (llmFbBusy) return;
+      const base_url = String((els.llmFbNodeUrlInput && els.llmFbNodeUrlInput.value) || "").trim();
+      const model = String((els.llmFbNodeModelInput && els.llmFbNodeModelInput.value) || "").trim();
+      const label = String((els.llmFbNodeLabelInput && els.llmFbNodeLabelInput.value) || "").trim() || model || "备用节点";
+      const api_key_env = String((els.llmFbNodeEnvInput && els.llmFbNodeEnvInput.value) || "").trim();
+      const rawKey = String((els.llmFbNodeKeyInput && els.llmFbNodeKeyInput.value) || "").trim();
+      const nid = `fb-${Date.now().toString(36).slice(-6)}`;
+      const nextNodes = llmFbNodesCache.map((x) => ({
+        id: x.id, label: x.label, base_url: x.base_url, model: x.model, api_key_env: x.api_key_env, enabled: x.enabled !== false,
+      }));
+      nextNodes.push({ id: nid, label, base_url, model, api_key_env, enabled: true });
+      const payload = { nodes: nextNodes };
+      if (rawKey) payload.secrets = { [nid]: rawKey };
+      llmFbBusy = true;
+      try {
+        const resp = await consolePost("/api/llm-fallback", payload);
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "添加失败");
+        renderLlmFallbackUI(res);
+        if (els.llmFbNodeLabelInput) els.llmFbNodeLabelInput.value = "";
+        if (els.llmFbNodeUrlInput) els.llmFbNodeUrlInput.value = "";
+        if (els.llmFbNodeModelInput) els.llmFbNodeModelInput.value = "";
+        if (els.llmFbNodeEnvInput) els.llmFbNodeEnvInput.value = "";
+        if (els.llmFbNodeKeyInput) els.llmFbNodeKeyInput.value = "";
+        showBanner("info", `已添加备用节点「${label}」`);
+        scheduleHideBanner(2800);
+      } catch (err) {
+        showBanner("err", `添加备用节点失败：${err.message}`);
+      } finally {
+        llmFbBusy = false;
+      }
+    });
+  }
+
+  if (els.llmFbSaveCooldownBtn) {
+    els.llmFbSaveCooldownBtn.addEventListener("click", async () => {
+      if (llmFbBusy) return;
+      const cd = Number((els.llmFbCooldownInput && els.llmFbCooldownInput.value) || 60);
+      llmFbBusy = true;
+      try {
+        const resp = await consolePost("/api/llm-fallback", { cooldown_seconds: Math.round(cd) });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "保存失败");
+        renderLlmFallbackUI(res);
+        showBanner("info", "冷却时间已保存");
+        scheduleHideBanner(2400);
+      } catch (err) {
+        showBanner("err", `保存冷却时间失败：${err.message}`);
+      } finally {
+        llmFbBusy = false;
+      }
+    });
+  }
+
+  if (els.llmFbResetHealthBtn) {
+    els.llmFbResetHealthBtn.addEventListener("click", async () => {
+      if (llmFbBusy) return;
+      llmFbBusy = true;
+      try {
+        const resp = await consolePost("/api/llm-fallback", { reset_health: true });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "重置失败");
+        renderLlmFallbackUI(res);
+        showBanner("info", "已重置所有主备模型冷却状态");
+        scheduleHideBanner(2400);
+      } catch (err) {
+        showBanner("err", `重置失败：${err.message}`);
+      } finally {
+        llmFbBusy = false;
+      }
+    });
+  }
+
+  // --- Official QQ Bot v2 WebSocket Bidirectional Bridge (Phase 3) ---
+  let qqBotBusy = false;
+  let qqBotDirty = false;
+  let qqBotLastFetchAt = 0;
+  let qqBotNeedFastPoll = false;
+  let qqBotEnabledCached = false;
+
+  for (const qEl of [
+    els.qqBotSandboxToggle,
+    els.qqBotShareMemToggle,
+    els.qqBotAllowL3Toggle,
+    els.qqBotAllowedUsersInput,
+    els.qqBotAllowedGroupsInput,
+    els.qqBotBatchQuietInput,
+  ]) {
+    if (qEl) {
+      qEl.addEventListener("input", () => { qqBotDirty = true; });
+      qEl.addEventListener("change", () => { qqBotDirty = true; });
+    }
+  }
+
+  function renderQqBotUI(data, forceForm = false) {
+    if (!data || typeof data !== "object") return;
+    const cfg = data.config || {};
+    const cred = data.credentials || {};
+    const rt = data.runtime || {};
+    const pair = data.pairing || {};
+    const enabled = Boolean(cfg.enabled);
+    qqBotEnabledCached = enabled;
+    qqBotNeedFastPoll = Boolean(pair.active || (enabled && !rt.connected));
+    if (els.qqBotEnabledToggle) els.qqBotEnabledToggle.checked = enabled;
+    if (forceForm || !qqBotDirty) {
+      if (els.qqBotSandboxToggle) els.qqBotSandboxToggle.checked = Boolean(cfg.sandbox);
+      if (els.qqBotShareMemToggle) els.qqBotShareMemToggle.checked = cfg.share_primary_memory !== false;
+      if (els.qqBotAllowL3Toggle) els.qqBotAllowL3Toggle.checked = Boolean(cfg.allow_l3_dispatch);
+      if (els.qqBotAllowedUsersInput) {
+        els.qqBotAllowedUsersInput.value = (cfg.allowed_openids || []).join(", ");
+      }
+      if (els.qqBotAllowedGroupsInput) {
+        els.qqBotAllowedGroupsInput.value = (cfg.allowed_group_openids || []).join(", ");
+      }
+      if (els.qqBotBatchQuietInput && cfg.batch_quiet_ms != null) {
+        els.qqBotBatchQuietInput.value = String(cfg.batch_quiet_ms);
+      }
+    }
+    if (els.qqBotBadge) {
+      els.qqBotBadge.textContent = !enabled ? "已关闭" : (rt.connected ? "已在线" : "重连中");
+    }
+    if (els.qqBotCredStatusText) {
+      const cText = cred.configured ? `凭据已就绪 (${cred.source}: ${cred.app_id_masked})` : "未配置 AppID/AppSecret";
+      const errPart = rt.last_error ? ` · ${rt.last_error}` : "";
+      els.qqBotCredStatusText.textContent = `${cText} · 今日主动 ${rt.proactive_today || 0}/${rt.proactive_daily_limit || 10}${errPart}`;
+    }
+    if (els.qqBotPairText) {
+      els.qqBotPairText.textContent = pair.active
+        ? `配对码 ${pair.code}（私聊直接发「${pair.code}」或「配对 ${pair.code}」，剩余 ${pair.expires_in_seconds}s）`
+        : "配对码未激活";
+    }
+    if (!els.qqBotPendingList) return;
+    const pending = Array.isArray(pair.pending) ? pair.pending : [];
+    const recent = Array.isArray(data.recent_messages) ? data.recent_messages : [];
+    const listSig = JSON.stringify({ pending, recent: recent.slice(0, 6) });
+    if (els.qqBotPendingList.dataset.sig === listSig) return;
+    els.qqBotPendingList.dataset.sig = listSig;
+    els.qqBotPendingList.innerHTML = "";
+    if (!pending.length && !recent.length) {
+      const empty = document.createElement("div");
+      empty.className = "dream-empty";
+      empty.textContent = "暂无待审批配对请求或最近消息记录。";
+      els.qqBotPendingList.appendChild(empty);
+      return;
+    }
+    for (const p of pending) {
+      const card = document.createElement("div");
+      card.className = "proactive-item";
+      const head = document.createElement("div");
+      head.className = "proactive-item-head";
+      head.textContent = `待绑定主人请求 · ${p.masked_openid || p.openid} · ${p.time || ""}`;
+      card.appendChild(head);
+      const approveBtn = document.createElement("button");
+      approveBtn.type = "button";
+      approveBtn.className = "btn primary";
+      approveBtn.style.marginTop = "6px";
+      approveBtn.style.padding = "2px 10px";
+      approveBtn.style.fontSize = "11.5px";
+      approveBtn.textContent = "批准绑定为主人";
+      approveBtn.addEventListener("click", async () => {
+        if (qqBotBusy) return;
+        qqBotBusy = true;
+        try {
+          const resp = await consolePost("/api/qq-bot/action", { action: "approve_pairing", openid: p.openid, set_as_owner: true });
+          const res = await resp.json();
+          if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "绑定失败");
+          if (res.qq_bot) renderQqBotUI(res.qq_bot);
+          showBanner("info", "已批准 QQ 主人绑定，现在可以直接在 QQ 私聊对话啦");
+          scheduleHideBanner(3200);
+        } catch (err) {
+          showBanner("err", `批准绑定失败：${err.message}`);
+        } finally {
+          qqBotBusy = false;
+        }
+      });
+      card.appendChild(approveBtn);
+      els.qqBotPendingList.appendChild(card);
+    }
+    for (const m of recent.slice(0, 6)) {
+      const card = document.createElement("div");
+      card.className = "proactive-item";
+      const head = document.createElement("div");
+      head.className = "proactive-item-head";
+      head.textContent = `${m.time || "--"} · ${m.channel === "group" ? "群@" : "私聊"} (${m.sender || "--"}) · ${m.ok ? "已回复" : "失败"}`;
+      card.appendChild(head);
+      const body = document.createElement("div");
+      body.className = "proactive-item-text";
+      body.textContent = `问：${m.user_preview || ""} → 答：${m.reply_preview || ""}`;
+      card.appendChild(body);
+      els.qqBotPendingList.appendChild(card);
+    }
+  }
+
+  async function fetchQqBotStatus() {
+    qqBotLastFetchAt = Date.now();
+    try {
+      const resp = await fetch("/api/qq-bot", { headers: consoleHeaders(false) });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.ok) renderQqBotUI(data);
+    } catch (_) {}
+  }
+
+  function maybeRefreshQqBotStatus() {
+    if (qqBotBusy) return;
+    const now = Date.now();
+    if (qqBotNeedFastPoll) {
+      if (now - qqBotLastFetchAt >= 2500) fetchQqBotStatus();
+      return;
+    }
+    if (qqBotEnabledCached && activeConfigTab === "memory" && now - qqBotLastFetchAt >= 8000) {
+      fetchQqBotStatus();
+    }
+  }
+
+  if (els.qqBotEnabledToggle) {
+    els.qqBotEnabledToggle.addEventListener("change", async () => {
+      if (qqBotBusy) return;
+      const enabled = Boolean(els.qqBotEnabledToggle.checked);
+      qqBotBusy = true;
+      try {
+        const resp = await consolePost("/api/qq-bot", { enabled });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "切换失败");
+        renderQqBotUI(res);
+        if (enabled && els.qqBotFoldDetails) els.qqBotFoldDetails.open = true;
+        showBanner("info", enabled ? "已开启 QQ 官方机器人 WebSocket 长连接" : "已关闭 QQ 官方机器人");
+        scheduleHideBanner(2800);
+      } catch (err) {
+        els.qqBotEnabledToggle.checked = !enabled;
+        showBanner("err", `切换 QQ 机器人开关失败：${err.message}`);
+      } finally {
+        qqBotBusy = false;
+      }
+    });
+  }
+
+  if (els.qqBotSaveBtn) {
+    els.qqBotSaveBtn.addEventListener("click", async () => {
+      if (qqBotBusy) return;
+      const parseList = (el) => String((el && el.value) || "").split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+      const rawBqStr = String((els.qqBotBatchQuietInput && els.qqBotBatchQuietInput.value) || "").trim();
+      const parsedBq = rawBqStr === "" ? 3500 : Number(rawBqStr);
+      const safeBq = Number.isFinite(parsedBq) ? Math.max(0, Math.min(15000, Math.round(parsedBq))) : 3500;
+      const payload = {
+        sandbox: Boolean(els.qqBotSandboxToggle && els.qqBotSandboxToggle.checked),
+        share_primary_memory: Boolean(els.qqBotShareMemToggle && els.qqBotShareMemToggle.checked),
+        allow_l3_dispatch: Boolean(els.qqBotAllowL3Toggle && els.qqBotAllowL3Toggle.checked),
+        allowed_openids: parseList(els.qqBotAllowedUsersInput),
+        allowed_group_openids: parseList(els.qqBotAllowedGroupsInput),
+        batch_quiet_ms: safeBq,
+      };
+      const aid = String((els.qqBotAppIdInput && els.qqBotAppIdInput.value) || "").trim();
+      const asec = String((els.qqBotAppSecretInput && els.qqBotAppSecretInput.value) || "").trim();
+      if (aid || asec) {
+        payload.secrets = {};
+        if (aid) payload.secrets.app_id = aid;
+        if (asec) payload.secrets.app_secret = asec;
+      }
+      qqBotBusy = true;
+      try {
+        const resp = await consolePost("/api/qq-bot", payload);
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "保存失败");
+        qqBotDirty = false;
+        renderQqBotUI(res, true);
+        if (els.qqBotAppIdInput) els.qqBotAppIdInput.value = "";
+        if (els.qqBotAppSecretInput) els.qqBotAppSecretInput.value = "";
+        showBanner("info", "QQ 官方机器人配置已保存");
+        scheduleHideBanner(2800);
+      } catch (err) {
+        showBanner("err", `保存 QQ 机器人配置失败：${err.message}`);
+      } finally {
+        qqBotBusy = false;
+      }
+    });
+  }
+
+  if (els.qqBotPairBtn) {
+    els.qqBotPairBtn.addEventListener("click", async () => {
+      if (qqBotBusy) return;
+      qqBotBusy = true;
+      try {
+        const resp = await consolePost("/api/qq-bot/action", { action: "start_pairing" });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "生成失败");
+        if (res.qq_bot) renderQqBotUI(res.qq_bot);
+        showBanner("info", `配对码已生成：${res.pairing.code}，请私聊机器人直接发送「${res.pairing.code}」或「配对 ${res.pairing.code}」`);
+        scheduleHideBanner(5000);
+      } catch (err) {
+        showBanner("err", `生成配对码失败：${err.message}`);
+      } finally {
+        qqBotBusy = false;
+      }
+    });
+  }
+
+  if (els.qqBotReconnectBtn) {
+    els.qqBotReconnectBtn.addEventListener("click", async () => {
+      if (qqBotBusy) return;
+      qqBotBusy = true;
+      try {
+        const resp = await consolePost("/api/qq-bot/action", { action: "reconnect" });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "重连失败");
+        if (res.qq_bot) renderQqBotUI(res.qq_bot);
+        showBanner("info", "已触发 QQ 机器人网关重连");
+        scheduleHideBanner(2600);
+      } catch (err) {
+        showBanner("err", `重连失败：${err.message}`);
+      } finally {
+        qqBotBusy = false;
+      }
+    });
+  }
+
+  // --- Progressive SKILL.md Loader (Phase 4) ---
+  let skillsBusy = false;
+
+  function renderSkillsUI(data) {
+    if (!data || typeof data !== "object") return;
+    const enabled = data.enabled !== false;
+    const list = Array.isArray(data.skills) ? data.skills : [];
+    if (els.skillsEnabledToggle) els.skillsEnabledToggle.checked = enabled;
+    if (els.skillsBadge) els.skillsBadge.textContent = enabled ? `${list.length} 项技能` : "已关闭";
+    if (els.skillsStatsText) {
+      els.skillsStatsText.textContent = `已发现 ${list.length} 项技能 · 索引约 ${data.estimated_index_chars || 0} 字符 · 按需加载 ${data.on_demand_loads || 0} 次`;
+    }
+    if (!els.skillsList) return;
+    els.skillsList.innerHTML = "";
+    if (!list.length) {
+      const empty = document.createElement("div");
+      empty.className = "dream-empty";
+      empty.textContent = "未发现 SKILL.md（可将技能文件夹放入 skills/ 或 state/skills/）。";
+      els.skillsList.appendChild(empty);
+      return;
+    }
+    for (const s of list) {
+      const card = document.createElement("div");
+      card.className = "proactive-item";
+      const head = document.createElement("div");
+      head.className = "proactive-item-head";
+      head.textContent = `${s.name} · ${s.source === "user" ? "用户自定义" : "内置只读"} · ${s.size_bytes || 0}B`;
+      card.appendChild(head);
+      const body = document.createElement("div");
+      body.className = "proactive-item-text";
+      body.textContent = s.description || "";
+      card.appendChild(body);
+      els.skillsList.appendChild(card);
+    }
+  }
+
+  async function fetchSkillsStatus() {
+    try {
+      const resp = await fetch("/api/skills", { headers: consoleHeaders(false) });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.ok) renderSkillsUI(data);
+    } catch (_) {}
+  }
+
+  if (els.skillsEnabledToggle) {
+    els.skillsEnabledToggle.addEventListener("change", async () => {
+      if (skillsBusy) return;
+      const enabled = Boolean(els.skillsEnabledToggle.checked);
+      skillsBusy = true;
+      try {
+        const resp = await consolePost("/api/skills", { enabled });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "保存失败");
+        renderSkillsUI(res);
+        showBanner("info", enabled ? "已启用 SKILL.md 渐进式按需加载" : "已关闭 SKILL.md 渐进式加载");
+        scheduleHideBanner(2400);
+      } catch (err) {
+        els.skillsEnabledToggle.checked = !enabled;
+        showBanner("err", `切换技能加载开关失败：${err.message}`);
+      } finally {
+        skillsBusy = false;
+      }
+    });
+  }
+
+  if (els.skillsRefreshBtn) {
+    els.skillsRefreshBtn.addEventListener("click", async () => {
+      if (skillsBusy) return;
+      skillsBusy = true;
+      try {
+        const resp = await consolePost("/api/skills", { refresh: true });
+        const res = await resp.json();
+        if (!resp.ok || !res || !res.ok) throw new Error((res && res.error) || "刷新失败");
+        renderSkillsUI(res);
+        showBanner("info", `已重新扫描技能目录，共发现 ${res.count || 0} 项`);
+        scheduleHideBanner(2400);
+      } catch (err) {
+        showBanner("err", `扫描技能目录失败：${err.message}`);
+      } finally {
+        skillsBusy = false;
+      }
+    });
+  }
+
   setActiveConfigTab(readSavedConfigTab(), false);
   loadAudioCatalog();
   fetchDreamStatus(true);
   fetchProactiveStatus(true);
+  fetchFutureTasksStatus();
+  fetchLlmFallbackStatus();
+  fetchQqBotStatus();
+  fetchSkillsStatus();
   fetchVoiceprintStatus(true);
   fetchMobilePushStatus();
   if (isTabVisible()) {

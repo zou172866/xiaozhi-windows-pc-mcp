@@ -16,9 +16,16 @@ from .models import CommitRequest, TurnContext, Usage
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message: str = "", *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retryable = bool(retryable)
 
 
 @dataclass(frozen=True)
@@ -144,15 +151,24 @@ class CompatibleProvider:
                         ),
                     },
                 )
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            raise ProviderError(
+                "Provider connection could not be established; safe to fail over.",
+                retryable=True,
+            ) from None
         except httpx.HTTPError:
             raise ProviderError(
-                "Provider connection failed; not retried. Billing status may be unknown."
+                "Provider connection failed; not retried. Billing status may be unknown.",
+                retryable=False,
             ) from None
         if not response.is_success:
             # Never echo server bodies, URL credentials or request headers to a host tool.
+            # Only deterministic pre-execution upstream rejections (429/502/503/504) are retryable.
+            retryable = response.status_code in (429, 502, 503, 504)
             raise ProviderError(
                 f"Provider HTTP {response.status_code}; not retried. Check provider dashboard.",
                 status_code=response.status_code,
+                retryable=retryable,
             )
         try:
             data = response.json()
@@ -176,3 +192,62 @@ class CompatibleProvider:
             raise ProviderError(
                 "Malformed provider envelope; not retried. Check provider billing."
             ) from None
+
+
+class FallbackProvider:
+    """Ordered failover chain across CompatibleProvider nodes for deterministic upstream outages.
+
+    Preserves the no-silent-recharge invariant: fails over ONLY when `ProviderError.retryable`
+    is True (ConnectError/ConnectTimeout or HTTP 429/502/503/504). ReadTimeout and uncertain
+    post-submission failures propagate immediately for quarantine.
+    """
+
+    def __init__(
+        self,
+        providers: list[CompatibleProvider],
+        *,
+        cooldown_seconds: float = 60.0,
+        now_fn=None,
+    ):
+        if not providers:
+            raise ValueError("FallbackProvider requires at least one provider")
+        self.providers = list(providers)
+        self.cooldown_seconds = max(5.0, float(cooldown_seconds))
+        self._now_fn = now_fn
+        self._cooldown_until: dict[int, float] = {}
+        self.model = self.providers[0].model
+        self.base_url = self.providers[0].base_url
+
+    def _now(self) -> float:
+        import time as _time
+
+        return float(self._now_fn()) if callable(self._now_fn) else _time.monotonic()
+
+    def _ordered_indices(self) -> list[int]:
+        now = self._now()
+        healthy = [i for i in range(len(self.providers)) if self._cooldown_until.get(i, 0.0) <= now]
+        cooling = [i for i in range(len(self.providers)) if self._cooldown_until.get(i, 0.0) > now]
+        return healthy + cooling
+
+    def _run_chain(self, call_fn) -> Completion:
+        ordered = self._ordered_indices()
+        last_exc: ProviderError | None = None
+        for pos, idx in enumerate(ordered):
+            prov = self.providers[idx]
+            try:
+                res = call_fn(prov)
+                self._cooldown_until.pop(idx, None)
+                return res
+            except ProviderError as exc:
+                last_exc = exc
+                if not exc.retryable or pos + 1 >= len(ordered):
+                    raise
+                self._cooldown_until[idx] = self._now() + self.cooldown_seconds
+        assert last_exc is not None
+        raise last_exc
+
+    def complete(self, context: TurnContext) -> Completion:
+        return self._run_chain(lambda p: p.complete(context))
+
+    def structured(self, instructions: str, data: str | list[dict]) -> Completion:
+        return self._run_chain(lambda p: p.structured(instructions, data))

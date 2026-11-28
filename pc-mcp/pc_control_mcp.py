@@ -41,148 +41,56 @@ pyautogui.FAILSAFE = os.environ.get("PC_MCP_DISABLE_FAILSAFE", "").strip().lower
 pyautogui.PAUSE = 0.08
 
 from pc_mcp_modules import (  # noqa: E402
-    ACTIVE_DIR,
-    CONFIG_YAML,
-    CONTAINER_TOKENS_ENV_FILE,
-    DATA_DIR,
-    HEARTBEAT_FILE,
-    L2_AUDIT_LOG_FILE,
-    LAST_GROUNDING_IMG,
-    LEGACY_TOKEN_FILE,
-    LOG_FILE,
-    LOGS_DIR,
-    MODE_FILE,
-    PENDING_DIR,
-    RUNTIME_SETTINGS_FILE,
-    SECRETS_DIR,
-    SERVER_DIR,
-    STATE_DIR,
-    TASKS_ROOT,
-    TOKEN_FILE,
-    _CF_UNICODETEXT,
-    _RPC_E_CHANGED_MODE,
-    _audit_log_lock,
-    _clipboard_lock,
-    _com_mta_scope,
-    _get_env_key,
-    _gui_lock,
+    ACTIVE_DIR, CONFIG_YAML, CONTAINER_TOKENS_ENV_FILE, DATA_DIR, HEARTBEAT_FILE,
+    L2_AUDIT_LOG_FILE, LAST_ACTION_FEEDBACK_IMG, LAST_GROUNDING_IMG, LEGACY_TOKEN_FILE,
+    LOG_FILE, LOGS_DIR, MODE_FILE, PENDING_DIR, PROCEDURES_DIR, RUNTIME_SETTINGS_FILE,
+    SECRETS_DIR, SERVER_DIR, STATE_DIR, TASKS_ROOT, TOKEN_FILE,
+    _CF_UNICODETEXT, _RPC_E_CHANGED_MODE, _audit_log_lock, _clipboard_lock,
+    _com_mta_scope, _get_env_key, _gui_lock, bg_desktop, procedures, taskbar_inbox,
 )
 from pc_mcp_modules.audio_bridge import (  # noqa: E402
-    _ALLOWED_L3_CONFIG_KEYS,
-    _WAVEFORMATEX,
-    _WAVEHDR,
-    _WinMMPlayer,
-    _get_soft_limiter_lut,
-    _scale_pcm16,
-    _validate_l3_config_payload,
-    _winmm,
-    register_http_routes,
+    _ALLOWED_L3_CONFIG_KEYS, _WAVEFORMATEX, _WAVEHDR, _WinMMPlayer,
+    _get_soft_limiter_lut, _scale_pcm16, _validate_l3_config_payload,
+    _winmm, register_http_routes,
 )
 from pc_mcp_modules.launcher import (  # noqa: E402
-    _BROWSER_PROCS,
-    _BUILTIN_APPS,
-    _COMMON_WEBSITES,
-    _find_start_menu_shortcut,
-    _get_default_browser_proc,
-    _pc_open_app_or_web_locked,
-    _shell_open,
+    _BROWSER_PROCS, _BUILTIN_APPS, _COMMON_WEBSITES, _find_start_menu_shortcut,
+    _get_default_browser_proc, _pc_open_app_or_web_locked, _shell_open,
 )
 from pc_mcp_modules.security import (  # noqa: E402
-    _ACTIVE_BEARER_TOKEN,
-    _BLOCKED_EXACT_HOTKEYS,
-    _BLOCKED_HOTKEY_COMBOS,
-    _BLOCKED_INPUT_PROCESSES,
-    _BLOCKED_INPUT_WINDOW_CLASSES,
-    _BLOCKED_SUBSET_HOTKEYS,
-    _CREATE_TASK_DIALOG_TITLES,
-    _HOTKEY_ALIAS_MAP,
-    _RUN_DIALOG_TITLES,
-    _SECRET_PATTERNS,
-    _VALID_MODES,
-    _AccessLogNoiseFilter,
-    _LocalBearerAndHostMiddleware,
-    _SecretRedactingFilter,
-    _build_allowed_hosts_and_origins,
-    _check_click_guard,
-    _check_foreground_hotkey_guard,
-    _check_foreground_input_guard,
-    _check_hotkey_blacklist,
-    _check_permission,
-    _configure_logging,
-    _get_audit_extra_secrets,
-    _get_mode,
-    _is_explorer_address_or_search_bar,
-    _parse_and_normalize_hotkey,
-    _sanitize_audit_text,
-    _summarize_typed_text_for_audit,
-    _validate_hotkey_keys,
-    _write_l2_audit_log,
-    EmergencyStopLockedError,
-    clear_emergency_stop,
-    is_emergency_stop_active,
+    _ACTIVE_BEARER_TOKEN, _BLOCKED_EXACT_HOTKEYS, _BLOCKED_HOTKEY_COMBOS,
+    _BLOCKED_INPUT_PROCESSES, _BLOCKED_INPUT_WINDOW_CLASSES, _BLOCKED_SUBSET_HOTKEYS,
+    _CREATE_TASK_DIALOG_TITLES, _HOTKEY_ALIAS_MAP, _RUN_DIALOG_TITLES,
+    _SECRET_PATTERNS, _VALID_MODES, _AccessLogNoiseFilter, _LocalBearerAndHostMiddleware,
+    _SecretRedactingFilter, _build_allowed_hosts_and_origins, _check_click_guard,
+    _check_foreground_hotkey_guard, _check_foreground_input_guard, _check_hotkey_blacklist,
+    _check_permission, _configure_logging, _get_audit_extra_secrets, _get_mode,
+    _is_explorer_address_or_search_bar, _parse_and_normalize_hotkey, _sanitize_audit_text,
+    _summarize_typed_text_for_audit, _validate_hotkey_keys, _write_l2_audit_log,
+    EmergencyStopLockedError, clear_emergency_stop, is_emergency_stop_active,
     load_or_create_pc_mcp_token as _load_or_create_pc_mcp_token_impl,
-    redact_secrets,
-    set_active_bearer_token,
-    set_host_mode,
-    start_emergency_stop_hotkey_listener,
-    stop_emergency_stop_hotkey_listener,
+    redact_secrets, set_active_bearer_token, set_host_mode,
+    start_emergency_stop_hotkey_listener, stop_emergency_stop_hotkey_listener,
     trigger_emergency_stop,
 )
-from pc_mcp_modules.ui_tools import (  # noqa: E402
-    _clear_clipboard,
-    _pc_ui_action_locked,
-    inspect_window_ui,
-)
+from pc_mcp_modules.ui_tools import _clear_clipboard, _pc_ui_action_locked, inspect_window_ui  # noqa: E402
 from pc_mcp_modules.vision import (  # noqa: E402
-    LocateResult,
-    _POSITIONAL_HINTS,
-    _call_vision_llm,
-    _collect_uia_elements,
-    _compute_region_hash,
-    _draw_som_overlay,
-    _parse_json_obj,
-    _parse_mark_id,
-    _prefer_gemini_vision,
-    _region_hashes_match,
-    _smart_locate_target,
-    _walk_uia_controls,
-    look_at_screen,
-    peek_active_window,
+    LocateResult, _POSITIONAL_HINTS, _call_vision_llm, _capture_click_feedback,
+    _collect_uia_elements, _compute_frame_fingerprint, _compute_region_hash,
+    _draw_click_feedback_marker, _draw_som_overlay, _frames_changed, _parse_json_obj,
+    _parse_mark_id, _prefer_gemini_vision, _region_hashes_match, _save_feedback_image,
+    _smart_locate_target, _walk_uia_controls, look_at_screen, peek_active_window,
 )
 from pc_mcp_modules.winapi import (  # noqa: E402
-    DesktopRhythmTracker,
-    SMTO_ABORTIFHUNG,
-    SMTO_NORMAL,
-    VK_MEDIA_NEXT_TRACK,
-    VK_MEDIA_PLAY_PAUSE,
-    VK_MEDIA_PREV_TRACK,
-    VK_VOLUME_MUTE,
-    _broadcast_screen_off,
-    _desktop_rhythm_tracker,
-    _dwmapi,
-    _force_foreground_window,
-    _get_active_window_clipped_rect,
-    _get_focused_control_info,
-    _get_foreground_window_info,
-    _get_process_name_by_pid,
-    _get_user_idle_seconds,
-    _get_window_info_at_point,
-    _get_window_info_by_hwnd,
-    _get_window_title,
-    _is_window_cloaked,
-    _is_window_fullscreen,
-    _kernel32,
-    _list_top_windows,
-    _set_or_get_volume,
-    _shell32,
-    check_screen_peek_privacy,
-    _tap_vk,
-    _user32,
-    check_system_status,
-    classify_desktop_activity,
-    get_desktop_rhythm_snapshot,
-    run_system_control,
-    sanitize_window_title,
+    DesktopRhythmTracker, SMTO_ABORTIFHUNG, SMTO_NORMAL, VK_MEDIA_NEXT_TRACK,
+    VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK, VK_VOLUME_MUTE, _broadcast_screen_off,
+    _desktop_rhythm_tracker, _dwmapi, _force_foreground_window, _get_active_window_clipped_rect,
+    _get_focused_control_info, _get_foreground_window_info, _get_process_name_by_pid,
+    _get_user_idle_seconds, _get_window_info_at_point, _get_window_info_by_hwnd,
+    _get_window_title, _is_window_cloaked, _is_window_fullscreen, _kernel32,
+    _list_top_windows, _set_or_get_volume, _shell32, check_screen_peek_privacy,
+    _tap_vk, _user32, check_system_status, classify_desktop_activity,
+    get_desktop_rhythm_snapshot, run_system_control, sanitize_window_title,
 )
 
 
@@ -365,6 +273,90 @@ def pc_agent_task(
     return l3_backends.dispatch_task(instr, follow_up_last=bool(follow_up_last))
 
 
+@mcp.tool()
+def pc_bg_window_action(
+    action: str,
+    window_keyword: str = "",
+    element_name: str = "",
+    x: int = -1,
+    y: int = -1,
+    text: str = "",
+    press_enter: bool = False,
+    hotkey: str = "",
+    scroll_clicks: int = -3,
+    question: str = "",
+) -> str:
+    """[L2 后台无打扰窗口操控] 通过 Win32 PrintWindow + PostMessage 在后台操作指定窗口，不动用户鼠标、不抢前台焦点、不碰剪贴板（需 full 挡）。
+    若遇到管理员权限程序（ELEVATED）或后台投递后画面无变化（如部分游戏直读硬件输入），会自动明确提示改用前台 pc_ui_action。
+    action 可选:
+    - list_windows: 列举当前可见桌面窗口标题与进程名
+    - inspect: 后台截取指定窗口客户区并用视觉模型描述内容（配合 window_keyword、question）
+    - click / double_click / right_click: 在后台窗口内按 element_name（自动视觉定位）或客户区坐标 (x, y) 静默点击
+    - type_text: 后台静默向窗口输入中英文文本（可选先点 element_name 或 x, y；press_enter=True 追加回车）
+    - hotkey: 向后台窗口发送非黑名单快捷键（如 ctrl+s、enter、esc）
+    - scroll: 在后台窗口指定或中心位置滚轮滚动
+    """
+    return bg_desktop.execute_bg_window_action(
+        action=action,
+        window_keyword=window_keyword,
+        element_name=element_name,
+        x=x,
+        y=y,
+        text=text,
+        press_enter=press_enter,
+        hotkey=hotkey,
+        scroll_clicks=scroll_clicks,
+        question=question,
+    )
+
+
+@mcp.tool()
+def pc_ui_procedure(
+    action: str = "list",
+    category: str = "",
+    name: str = "",
+    procedure_json: str = "",
+    args_json: str = "",
+    note: str = "",
+    allow_outward: bool = False,
+) -> str:
+    """[L2 可复用操作剧本沉淀与确定性回放] 把走通的后台窗口或前台屏幕操作保存为参数化 JSON 剧本，下次零大模型调用直接回放（需 full 挡）。
+    action 可选:
+    - list: 列出已保存的分类或某分类下的剧本与说明
+    - get: 查看指定 category/name 剧本内容与参数
+    - save: 校验并保存剧本（不传 procedure_json 时返回完整 JSON 格式说明；覆盖前自动备份旧版本）
+    - run: 按 args_json 确定性回放剧本（标记 outward=True 的对外发送步骤默认先暂停确认，显式传 allow_outward=True 才放行）
+    - rollback: 将剧本回退至上一个备份版本
+    - note: 为分类编写简要使用说明（guide.md）
+    - delete: 删除指定剧本
+    """
+    return procedures.handle_procedure_tool(
+        action=action,
+        category=category,
+        name=name,
+        procedure_json=procedure_json,
+        args_json=args_json,
+        note=note,
+        allow_outward=allow_outward,
+    )
+
+
+@mcp.tool()
+def pc_sandbox_file(action: str, rel_path: str = "", content: str = "") -> str:
+    """[沙箱受限工作区文件] 仅在独立沙箱工作区内执行 list/read/write/delete（需 full 挡，Win32 句柄级拦截软硬链接逃逸）。"""
+    from pc_mcp_modules.sandbox import handle_sandbox_file_tool
+
+    return handle_sandbox_file_tool(action=action, rel_path=rel_path, content=content)
+
+
+@mcp.tool()
+def pc_sandbox_run(script_rel_path: str = "", inline_python: str = "", timeout_sec: int = 15) -> str:
+    """[Windows AppContainer 沙箱脚本执行] 在内核级零网络、低权限 AppContainer 隔离盒内运行工作区 Python 脚本（需 full 挡，Job Object 限额超时强杀）。"""
+    from pc_mcp_modules.sandbox import handle_sandbox_run_tool
+
+    return handle_sandbox_run_tool(script_rel_path=script_rel_path, inline_python=inline_python, timeout_sec=timeout_sec)
+
+
 _pc_audio_player = _WinMMPlayer()
 register_http_routes(mcp, _pc_audio_player)
 
@@ -394,6 +386,7 @@ if __name__ == "__main__":
     log = _configure_logging(bearer_token)
     start_emergency_stop_hotkey_listener()
     atexit.register(stop_emergency_stop_hotkey_listener)
+    atexit.register(taskbar_inbox.stop_taskbar_inbox)
     try:
         reaped = l3_backends.reap_stale_running_tasks()
         if reaped:

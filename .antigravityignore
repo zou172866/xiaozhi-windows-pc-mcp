@@ -1,0 +1,125 @@
+# .antigravityignore — Context Filter for xiaozhi-server
+# Soft AI context filter (Layer 3). Pair sensitive paths with Layer 1 permissions.deny
+# (Strict Mode) and Layer 2 .gitignore. Keeps active source code, docs, tests, and templates readable.
+
+# ==============================================================================
+# 1. Workspace bloat, runtime state & private data
+#    (Note: data/ root is kept readable because core *.ps1 scripts live there)
+# ==============================================================================
+models/
+backups/
+anima-data/
+state/
+config/runtime/
+pc-mcp/state/
+voices/
+logs/
+tmp/
+data/obsidian_export/
+data/anima/
+data/agy_tasks/
+data/voices/
+data/nvs*
+data/chat_history.json
+data/pc_mcp_token.txt
+data/last_som_grounding.jpg
+data/*.migrated.bak
+data/anima_outbox.sqlite*
+data/memory_archives.sqlite*
+
+# ==============================================================================
+# 2. Dependencies, lockfiles & build caches
+# ==============================================================================
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+uv.lock
+poetry.lock
+dist/
+build/
+*.tsbuildinfo
+*.log
+*.log.*
+*.tmp
+*.bak
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+Thumbs.db
+
+# Generated UI build artifacts (source lives in anima-brain/ui/)
+anima-brain/src/companion_engine/static/memory-panel.html
+anima-brain/src/companion_engine/static/provider-settings.html
+anima-brain/src/companion_engine/static/voice-player.html
+anima-brain/src/companion_engine/static/voice-player-notices.txt
+
+# ==============================================================================
+# 3. Heavy archives, model weights, firmware binaries & media
+#    (Keeps *.png, *.svg, *.jpg, *.json, *.md readable for docs & diagrams)
+# ==============================================================================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.bin
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.mp4
+*.mov
+*.mkv
+*.avi
+
+# ==============================================================================
+# 4. Local env, secrets & keys
+#    (Layer 3 soft filter only — enforce hard blocking in Layer 1 permissions.deny)
+# ==============================================================================
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.envrc
+secrets/
+*.pem
+*.key
+*.dpapi
+*.dpapi.lock
+xiaozhi-tavern*.json
+
+# ==============================================================================
+# 5. Optional toggles (uncomment if you want an even leaner AI index)
+# ==============================================================================
+# anima-brain/docs/assets/
+# anima-brain/examples/
+# config/nmc_stations_cache.json
+# docker-compose.override.yml

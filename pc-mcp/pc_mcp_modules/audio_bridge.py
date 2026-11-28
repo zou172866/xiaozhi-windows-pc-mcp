@@ -25,9 +25,12 @@ from .security import (
     EmergencyStopLockedError,
     _check_permission,
     _get_mode,
+    _write_l2_audit_log,
     is_emergency_stop_active,
+    redact_secrets,
     set_host_mode,
 )
+from . import taskbar_inbox
 from .vision import peek_active_window
 from .winapi import _kernel32, get_desktop_rhythm_snapshot
 
@@ -568,6 +571,8 @@ def register_http_routes(mcp, player: _WinMMPlayer) -> None:
             snap = {"ok": False}
         audio_st = player.status()
         l3_summary = await asyncio.to_thread(_summarize_l3_rhythm_status, l3_mod)
+        inbox_mod = facade_attr("taskbar_inbox", taskbar_inbox)
+        inbox_summary = inbox_mod.get_taskbar_inbox().get_summary()
         payload = {
             "ok": bool(snap.get("ok", True)),
             "idle_seconds": float(snap.get("idle_seconds", 0.0)),
@@ -580,8 +585,56 @@ def register_http_routes(mcp, player: _WinMMPlayer) -> None:
             "returned_from_away": bool(snap.get("returned_from_away", False)),
             "pc_audio_busy": bool(audio_st.get("playing") or int(audio_st.get("queued") or 0) > 0),
             "l3_status": l3_summary,
+            "inbox_summary": inbox_summary,
         }
         return _StarletteJSONResponse(payload)
+
+    @mcp.custom_route("/desktop/inbox", methods=["GET"])
+    async def _desktop_inbox_get_route(request: _StarletteRequest):
+        inbox_mod = facade_attr("taskbar_inbox", taskbar_inbox)
+        snap = inbox_mod.get_taskbar_inbox().get_summary()
+        return _StarletteJSONResponse({"ok": True, **snap})
+
+    @mcp.custom_route("/desktop/inbox/config", methods=["POST"])
+    async def _desktop_inbox_config_route(request: _StarletteRequest):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or not body:
+                return _StarletteJSONResponse({"ok": False, "error": "请提供信箱配置字段"}, status_code=400)
+            allowed = frozenset({"enabled", "quiet_seconds", "extra_ignore", "clear"})
+            extra = sorted(str(k) for k in body.keys() if k not in allowed)
+            if extra:
+                return _StarletteJSONResponse(
+                    {"ok": False, "error": f"禁止提交未知字段: {', '.join(extra[:6])}"},
+                    status_code=400,
+                )
+            if "enabled" in body and not isinstance(body["enabled"], bool):
+                return _StarletteJSONResponse({"ok": False, "error": "enabled 必须为布尔值"}, status_code=400)
+            if "quiet_seconds" in body and (
+                isinstance(body["quiet_seconds"], bool)
+                or not isinstance(body["quiet_seconds"], (int, float))
+            ):
+                return _StarletteJSONResponse({"ok": False, "error": "quiet_seconds 必须为数字 (2..60)"}, status_code=400)
+            if "extra_ignore" in body:
+                if not isinstance(body["extra_ignore"], list) or not all(
+                    isinstance(x, str) for x in body["extra_ignore"]
+                ):
+                    return _StarletteJSONResponse({"ok": False, "error": "extra_ignore 必须为字符串数组"}, status_code=400)
+            if "clear" in body and not isinstance(body["clear"], bool):
+                return _StarletteJSONResponse({"ok": False, "error": "clear 必须为布尔值"}, status_code=400)
+            inbox_mod = facade_attr("taskbar_inbox", taskbar_inbox)
+            snap = await asyncio.to_thread(
+                inbox_mod.get_taskbar_inbox().configure,
+                enabled=body["enabled"] if "enabled" in body else None,
+                quiet_seconds=body["quiet_seconds"] if "quiet_seconds" in body else None,
+                extra_ignore=body["extra_ignore"] if "extra_ignore" in body else None,
+                clear_pending=bool(body.get("clear", False)),
+            )
+            return _StarletteJSONResponse({"ok": True, **snap})
+        except ValueError as exc:
+            return _StarletteJSONResponse({"ok": False, "error": redact_secrets(str(exc))}, status_code=400)
+        except Exception as exc:
+            return _StarletteJSONResponse({"ok": False, "error": redact_secrets(str(exc))}, status_code=400)
 
     @mcp.custom_route("/audio/status", methods=["GET"])
     async def _audio_status_route(request: _StarletteRequest):
@@ -694,6 +747,50 @@ def register_http_routes(mcp, player: _WinMMPlayer) -> None:
             return _StarletteJSONResponse(overview)
         except Exception as exc:
             return _StarletteJSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    @mcp.custom_route("/l3/dispatch", methods=["POST"])
+    async def _l3_dispatch_route(request: _StarletteRequest):
+        check_perm_fn = facade_attr("_check_permission", _check_permission)
+        estop_fn = facade_attr("is_emergency_stop_active", is_emergency_stop_active)
+        if estop_fn():
+            return _StarletteJSONResponse(
+                {"ok": False, "error": "安全急停已激活，已拒绝远程派发 L3 任务", "emergency_stopped": True},
+                status_code=423,
+            )
+        perm_err = check_perm_fn("L3")
+        if perm_err:
+            return _StarletteJSONResponse({"ok": False, "error": perm_err}, status_code=403)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                return _StarletteJSONResponse({"ok": False, "error": "请求体必须为 JSON 对象"}, status_code=400)
+            extra = [k for k in body.keys() if k not in ("instruction", "follow_up_last", "source")]
+            if extra:
+                return _StarletteJSONResponse(
+                    {"ok": False, "error": f"禁止提交未知字段: {', '.join(sorted(str(k) for k in extra))}"},
+                    status_code=400,
+                )
+            raw_instr = body.get("instruction")
+            if not isinstance(raw_instr, str) or not raw_instr.strip():
+                return _StarletteJSONResponse({"ok": False, "error": "任务说明 instruction 必须为非空字符串"}, status_code=400)
+            instr = raw_instr.strip()[:1000]
+            raw_fu = body.get("follow_up_last", False)
+            if not isinstance(raw_fu, bool):
+                return _StarletteJSONResponse({"ok": False, "error": "follow_up_last 必须为布尔值"}, status_code=400)
+            src_tag = str(body.get("source") or "http_api").strip()[:40]
+            l3_mod = facade_attr("l3_backends", l3_backends)
+            msg = await asyncio.to_thread(l3_mod.dispatch_task, instr, follow_up_last=raw_fu)
+            facade_attr("_write_l2_audit_log", _write_l2_audit_log)(
+                tool="http_l3_dispatch",
+                action="dispatch",
+                outcome="allowed",
+                reason="ok",
+                target=src_tag,
+                detail=redact_secrets(instr[:120]),
+            )
+            return _StarletteJSONResponse({"ok": True, "message": str(msg)})
+        except Exception as exc:
+            return _StarletteJSONResponse({"ok": False, "error": redact_secrets(str(exc))}, status_code=400)
 
     @mcp.custom_route("/desktop/screen-peek", methods=["POST"])
     async def _desktop_screen_peek_route(request: _StarletteRequest):

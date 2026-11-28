@@ -256,6 +256,33 @@ PATCH_CATALOG: List[Dict[str, Any]] = [
         "failure_behavior": "fail-soft (skips mount on contract mismatch -> Opus-only WS input, marks /api/health degraded)",
         "tests": ["tests/container/test_pc_mic_input.py", "tests/container/test_upstream_contracts.py"],
     },
+    {
+        "name": "future_task_tool",
+        "module": "app/patches/future_task_tool.py",
+        "target": "plugins_func.register.all_function_registry",
+        "category": "experience",
+        "contract": "registered ToolType.SYSTEM_CTL plugin callable manage_future_task(conn, action, ...) + auto-intent exposure for durable SQLite one-shot & 5-field Cron reminders",
+        "failure_behavior": "fail-soft (skips mount on contract mismatch, console /api/future-tasks remains available, marks /api/health degraded)",
+        "tests": ["tests/container/test_future_tasks.py", "tests/container/test_upstream_contracts.py"],
+    },
+    {
+        "name": "llm_fallback_pool",
+        "module": "app/llm_fallback_router.py",
+        "target": "OpenAI.LLMProvider.__init__",
+        "category": "experience",
+        "contract": "sync __init__(self, config) wrapping client.chat.completions.create beneath llm_prefix_cache for stream first-chunk-safe multi-model failover with SSRF check and cooldown",
+        "failure_behavior": "fail-soft (keeps primary LLM direct pass-through, marks /api/health degraded)",
+        "tests": ["tests/container/test_llm_fallback_router.py", "tests/container/test_upstream_contracts.py"],
+    },
+    {
+        "name": "skill_progressive_loader",
+        "module": "app/patches/skill_loader_patch.py",
+        "target": "plugins_func.register.all_function_registry",
+        "category": "experience",
+        "contract": "registered ToolType.SYSTEM_CTL plugin callable load_skill(conn, skill_name) + prefix-cache-safe <available_skills> turn_context metadata index",
+        "failure_behavior": "fail-soft (skips mount on contract mismatch, static system prompt unchanged, marks /api/health degraded)",
+        "tests": ["tests/container/test_skill_loader.py", "tests/container/test_upstream_contracts.py"],
+    },
 ]
 
 

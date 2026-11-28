@@ -44,12 +44,12 @@ class TestUpstreamImageContracts(unittest.TestCase):
             f"Upstream SERVER_VERSION mismatch: got {info.get('actual')!r}, expected {info.get('expected')!r}",
         )
 
-    def test_all_23_patches_registered_ok_and_match_catalog(self):
+    def test_all_26_patches_registered_ok_and_match_catalog(self):
         catalog = self.patch_registry.get_patch_catalog()
         catalog_names = [p["name"] for p in catalog]
         self.assertEqual(len(catalog_names), len(set(catalog_names)), "Duplicate names in PATCH_CATALOG")
         expected_patches = set(catalog_names)
-        self.assertEqual(len(expected_patches), 23, f"Expected 23 cataloged patches, got {len(expected_patches)}")
+        self.assertEqual(len(expected_patches), 26, f"Expected 26 cataloged patches, got {len(expected_patches)}")
 
         # Verify security category metadata matches SECURITY_PATCH_NAMES 1-to-1
         for entry in catalog:
@@ -178,6 +178,18 @@ class TestUpstreamImageContracts(unittest.TestCase):
         self.assertTrue(getattr(HuoshanTTS, "_pc_audio_stream_patched", False))
         self.assertTrue(getattr(MinimaxTTS, "_pc_audio_stream_patched", False))
 
+        # Phase 1 & Phase 4 auto-exposed native tools must appear in ServerPluginExecutor.get_tools()
+        import asyncio
+        import types
+        from config import config_loader
+        from core.providers.tools.server_plugins.plugin_executor import ServerPluginExecutor
+
+        loaded_cfg = asyncio.run(config_loader.load_config())
+        pe = ServerPluginExecutor(types.SimpleNamespace(config=loaded_cfg))
+        exposed_tools = set(pe.get_tools().keys())
+        self.assertIn("manage_future_task", exposed_tools)
+        self.assertIn("load_skill", exposed_tools)
+
     def test_h1_zero_import_side_effects_and_boot_contract_self_check(self):
         """H-1: Importing boot / start_with_env / patches has ZERO side effects; install_all records contract self-check."""
         import json as _json
@@ -200,8 +212,8 @@ class TestUpstreamImageContracts(unittest.TestCase):
                 f"os.chdir({td!r}); "
                 "cwd0 = os.getcwd(); "
                 "th0 = {t.name for t in threading.enumerate()}; "
-                "import boot, start_with_env, patch_registry, mei_emotion_router, pc_audio_router, reply_length_router, nmc_weather_patch, console_server; "
-                "import patches, patches.auth, patches.memory_hooks, patches.asr, patches.cloud_audio, patches.contracts, patches.emotion, console.server, console.shared; "
+                "import boot, start_with_env, patch_registry, mei_emotion_router, pc_audio_router, reply_length_router, nmc_weather_patch, console_server, future_tasks, llm_fallback_router, qq_bot_bridge, skill_loader; "
+                "import patches, patches.auth, patches.memory_hooks, patches.asr, patches.cloud_audio, patches.contracts, patches.emotion, patches.future_task_tool, patches.skill_loader_patch, console.server, console.shared; "
                 "cwd1 = os.getcwd(); "
                 "th1 = {t.name for t in threading.enumerate()}; "
                 "patches = patch_registry.get_all_patches(); "

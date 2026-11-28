@@ -10,6 +10,16 @@
 
 ## 更新说明
 
+### v2.0.0（2026-11-28）· 定时提醒、多模型兜底、QQ 双向桥与反重力完成通知、AppContainer 沙箱与技能按需加载
+
+已合入 `main` 并打标签 `v2.0.0`：
+
+- **原生定时提醒与 5 段 Cron 调度（Phase 1）**：新增 [app/future_tasks.py](app/future_tasks.py)（SQLite WAL + 纯标准库 5 段 Cron、≥5 分钟最小间隔、50 条上限、重启防风暴跳过）与 `manage_future_task` 工具，支持桌面播报、手机推送与 QQ 主动提醒及忙碌顺延回退。
+- **双端多模型自动兜底（Phase 2）**：新增 [app/llm_fallback_router.py](app/llm_fallback_router.py)（首包前安全切备、节点冷却、防 SSRF 校验，绝不在流式输出中途切备）与 `anima-brain` `FallbackProvider`（仅在确定性 `429/502/503/504/ConnectError` 切备，绝不对 `ReadTimeout` 重复计费）。
+- **QQ 官方机器人双向桥与外部任务通知（Phase 3）**：新增 [app/qq_bot_bridge.py](app/qq_bot_bridge.py)（默认关闭、官方 `wss://*.sgroup.qq.com` 白名单、6 位配对码 fail-closed 审批、连发攒批防抖与引用块注入隔离、远程 L3 双重门禁）及 `POST /api/qq-bot/notify` 受控通知入口，配合本机 `xiaozhi-task-notifier`（`v1.1.0`）实现反重力项目与对话完成自动 QQ 推送（`18080` 主通道 + 离线直连兜底）。
+- **Windows AppContainer 隔离沙箱、后台桌面与技能按需加载（Phase 4）**：新增宿主机 [pc-mcp/pc_mcp_modules/sandbox.py](pc-mcp/pc_mcp_modules/sandbox.py)（原生零网络 `AppContainer` + Win32 句柄级重解析点/硬链接逃逸拦截 + Job Object 超时强杀）、后台桌面/Procedure/任务栏收件箱模块，以及 [app/skill_loader.py](app/skill_loader.py)（仅向动态 `<turn_context>` 注入 `<available_skills>` 摘要，保持静态 system prompt 字节不变、`load_skill` 按需脱敏加载）。
+- **补丁契约与隐私卫生**：启动补丁契约扩展至 **26 项**（同步自动生成 [docs/patches.md](docs/patches.md)），并新增 `.antigravityignore` 隔离本地隐私与运行态目录。
+
 ### 2026-11-23 · 酒馆剧情分档、本地中文陪伴模型与罗小黑多情绪音色
 
 已合入 `main`：
@@ -37,7 +47,7 @@
 
 ### 2. 本地 Web 控制台（`http://localhost:18080`）
 - 免重启热切 **安全挡位**、**L3 后台引擎**、**ESP32 喇叭 / Windows 48kHz 电脑音响直通**、**回复字数与讲故事篇幅**、**Anima Brain 亲密度/浪漫尺度**、**投机 VAD 开关与参数**、**ASR 同音词纠错表**、**空闲告别模式**、**Obsidian 同步开关**与 **LLM / TTS 模型**；
-- 内置 `X-Console-Token` 与严格 `CSP` 防护、云端 ASR/TTS SSRF 门禁与空闲热切、`/api/health` 21 项补丁契约与启动自检状态面板、LLM 前缀缓存命中率与 TTFT 遥测。
+- 内置 `X-Console-Token` 与严格 `CSP` 防护、云端 ASR/TTS SSRF 门禁与空闲热切、`/api/health` 26 项补丁契约与启动自检状态面板、LLM 前缀缓存命中率与 TTFT 遥测。
 
 ### 3. 工程化、稳定性与跨电脑开箱即用
 - **纯国内免梯子 & 无独显友好**：双击 `一键初始化配置.bat` 自动探测局域网 IP、配置 `.env` 占位符（密钥零明文落盘），无独显自动跳过 `19880` GPU 引擎走免显存 `EdgeTTS`；
@@ -61,9 +71,9 @@ xiaozhi-server/
 ├── 打开网页控制台.bat / 查看实时日志.bat  # 18080 控制台与日志快捷入口
 ├── app/                                 # 只读挂入主容器的模块化服务端代码（零导入副作用）
 │   ├── boot.py                          # 唯一启动入口（install_all -> 契约自检 -> 安全门禁 -> 控制台 -> 上游）
-│   ├── patches/                         # 21 项契约补丁（registry, contracts, auth, cloud_audio, memory_hooks, asr, pc_audio, reply_length, weather, emotion/*）
+│   ├── patches/                         # 26 项契约补丁（registry, contracts, auth, cloud_audio, memory_hooks, asr, pc_audio, reply_length, weather, future_task_tool, skill_loader_patch, emotion/*）
 │   ├── console/                         # 18080 Web 控制台（server, shared, routes/*, static/{index.html,app.css,app.js}）
-│   └── ...                              # anima_memory_provider, memory_archives, vad_speculative_router, turn_context_router, xz_common 等
+│   └── ...                              # anima_memory_provider, future_tasks, llm_fallback_router, qq_bot_bridge, skill_loader, vad_speculative_router, turn_context_router, xz_common 等
 ├── anima-brain/                         # 可复现非 root Docker 镜像（锁定 digest + Py3.12 constraints + 构建期 UI 打包）
 ├── integrations/sillytavern/            # 「用小智继续」SillyTavern 酒馆剧情交接扩展与 Node 测试
 ├── pc-mcp/                              # 宿主机 Windows 三层操控 MCP (18900)
@@ -77,7 +87,7 @@ xiaozhi-server/
 ├── data/                                # 宿主机 PowerShell 运维脚本（start_all.ps1, stop_all.ps1, init_setup.ps1, host_process.ps1）
 ├── tests/container/                     # 容器离线单测、契约测试与联机集成测试（不进入生产挂载）
 ├── scripts/                             # run_tests.py、pc_talk.py（电脑对话客户端）、pack_release.py、generate_patches_doc.py
-├── docs/patches.md                      # 自动生成的 21 项补丁契约总表
+├── docs/patches.md                      # 自动生成的 26 项补丁契约总表
 └── skills/windows-pc-mcp-automation/    # 可独立安装的 Windows 桌面操控 Agent Skill
 ```
 

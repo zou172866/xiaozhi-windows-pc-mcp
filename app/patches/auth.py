@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import sys
 from typing import Any
 
 import patch_registry
@@ -108,6 +109,42 @@ def _expand_env(obj):
     return obj
 
 
+_AUTO_INTENT_FUNCTIONS: list[str] = []
+
+
+def _inject_auto_intent_functions(data: Any) -> None:
+    if not _AUTO_INTENT_FUNCTIONS or not isinstance(data, dict):
+        return
+    intent_cfg = data.get("Intent")
+    if isinstance(intent_cfg, dict):
+        fc_cfg = intent_cfg.get("function_call")
+        if isinstance(fc_cfg, dict) and isinstance(fc_cfg.get("functions"), list):
+            existing = set(fc_cfg["functions"])
+            for fn_name in _AUTO_INTENT_FUNCTIONS:
+                if fn_name not in existing:
+                    fc_cfg["functions"].append(fn_name)
+                    existing.add(fn_name)
+
+
+def register_auto_intent_function(name: str) -> None:
+    """Register a built-in tool name to auto-expose in Intent.function_call.functions."""
+    fn = str(name or "").strip()
+    if fn and fn not in _AUTO_INTENT_FUNCTIONS:
+        _AUTO_INTENT_FUNCTIONS.append(fn)
+    # Backfill already-cached main_config if earlier boot imports triggered check_config_file/load_config
+    cache_mod = sys.modules.get("core.utils.cache.manager")
+    if cache_mod is not None:
+        try:
+            cm = getattr(cache_mod, "cache_manager", None)
+            ct = getattr(cache_mod, "CacheType", None)
+            if cm is not None and ct is not None and hasattr(ct, "CONFIG"):
+                cached_cfg = cm.get(ct.CONFIG, "main_config")
+                if isinstance(cached_cfg, dict):
+                    _inject_auto_intent_functions(cached_cfg)
+        except Exception:
+            pass
+
+
 def _make_patched_read_config(_orig):
     @functools.wraps(_orig)
     def _patched_read_config(config_path, *args, **kwargs):
@@ -116,6 +153,7 @@ def _make_patched_read_config(_orig):
         if isinstance(data, dict):
             if "turn_context_mode" in data:
                 turn_context_router.set_config_turn_context_mode(data.get("turn_context_mode"))
+            _inject_auto_intent_functions(data)
         if isinstance(data, dict) and isinstance(data.get("server"), dict):
             srv = data["server"]
             base_name = os.path.basename(str(config_path or ""))

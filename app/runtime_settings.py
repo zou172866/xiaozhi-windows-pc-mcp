@@ -124,6 +124,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "allow_l3_finish_notify": True,
         "allow_open_loop_followup": True,
         "inner_life_enabled": False,
+        "allow_taskbar_inbox": False,
     },
     "vocal_cue": {
         "enabled": False,
@@ -143,6 +144,25 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "forward_briefing": False,
         "respect_quiet_hours": True,
         "max_daily_pushes": 12,
+    },
+    "llm_fallback": {
+        "enabled": False,
+        "cooldown_seconds": 60,
+        "nodes": [],
+    },
+    "qq_bot": {
+        "enabled": False,
+        "sandbox": False,
+        "share_primary_memory": True,
+        "memory_device_id": "",
+        "allow_l3_dispatch": False,
+        "owner_openid": "",
+        "allowed_openids": [],
+        "allowed_group_openids": [],
+        "batch_quiet_ms": 3500,
+    },
+    "skill_loader": {
+        "enabled": True,
     },
 }
 
@@ -377,6 +397,7 @@ def normalize_proactive(raw: Any) -> Dict[str, Any]:
         "allow_l3_finish_notify": _coerce_bool(d.get("allow_l3_finish_notify"), True),
         "allow_open_loop_followup": _coerce_bool(d.get("allow_open_loop_followup"), True),
         "inner_life_enabled": _coerce_bool(d.get("inner_life_enabled"), False),
+        "allow_taskbar_inbox": _coerce_bool(d.get("allow_taskbar_inbox"), False),
     }
 
 
@@ -428,6 +449,70 @@ def normalize_mobile_push(raw: Any) -> Dict[str, Any]:
     }
 
 
+def normalize_llm_fallback(raw: Any) -> Dict[str, Any]:
+    d = raw if isinstance(raw, dict) else {}
+    raw_nodes = d.get("nodes") if isinstance(d.get("nodes"), list) else []
+    nodes: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_nodes[:6]:
+        if not isinstance(item, dict):
+            continue
+        nid = str(item.get("id") or "").strip()[:32]
+        url = str(item.get("base_url") or "").strip().rstrip("/")[:256]
+        mdl = str(item.get("model") or "").strip()[:120]
+        if not nid or nid == "primary" or nid in seen or not url or not mdl:
+            continue
+        seen.add(nid)
+        nodes.append(
+            {
+                "id": nid,
+                "label": str(item.get("label") or nid).strip()[:48] or nid,
+                "base_url": url,
+                "model": mdl,
+                "api_key_env": str(item.get("api_key_env") or "").strip()[:64],
+                "enabled": _coerce_bool(item.get("enabled"), True),
+            }
+        )
+    return {
+        "enabled": _coerce_bool(d.get("enabled"), False),
+        "cooldown_seconds": _clamp_int(d.get("cooldown_seconds", 60), 10, 600, 60),
+        "nodes": nodes,
+    }
+
+
+def normalize_qq_bot(raw: Any) -> Dict[str, Any]:
+    d = raw if isinstance(raw, dict) else {}
+
+    def _clean_ids(val: Any) -> list[str]:
+        if not isinstance(val, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in val[:32]:
+            s = str(item or "").strip()[:128]
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    return {
+        "enabled": _coerce_bool(d.get("enabled"), False),
+        "sandbox": _coerce_bool(d.get("sandbox"), False),
+        "share_primary_memory": _coerce_bool(d.get("share_primary_memory"), True),
+        "memory_device_id": str(d.get("memory_device_id") or "").strip()[:64],
+        "allow_l3_dispatch": _coerce_bool(d.get("allow_l3_dispatch"), False),
+        "owner_openid": str(d.get("owner_openid") or "").strip()[:128],
+        "allowed_openids": _clean_ids(d.get("allowed_openids")),
+        "allowed_group_openids": _clean_ids(d.get("allowed_group_openids")),
+        "batch_quiet_ms": _clamp_int(d.get("batch_quiet_ms", 3500), 0, 15000, 3500),
+    }
+
+
+def normalize_skill_loader(raw: Any) -> Dict[str, bool]:
+    d = raw if isinstance(raw, dict) else {}
+    return {"enabled": _coerce_bool(d.get("enabled"), True)}
+
+
 def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
     d = raw if isinstance(raw, dict) else {}
     return {
@@ -444,6 +529,9 @@ def normalize_runtime_settings(raw: Any) -> Dict[str, Any]:
         "voiceprint": normalize_voiceprint(d.get("voiceprint")),
         "screen_peek": normalize_screen_peek(d.get("screen_peek")),
         "mobile_push": normalize_mobile_push(d.get("mobile_push")),
+        "llm_fallback": normalize_llm_fallback(d.get("llm_fallback")),
+        "qq_bot": normalize_qq_bot(d.get("qq_bot")),
+        "skill_loader": normalize_skill_loader(d.get("skill_loader")),
     }
 
 
@@ -833,6 +921,7 @@ def set_proactive(
     allow_l3_finish_notify: Optional[bool] = None,
     allow_open_loop_followup: Optional[bool] = None,
     inner_life_enabled: Optional[bool] = None,
+    allow_taskbar_inbox: Optional[bool] = None,
     settings_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     for bname, bval in (
@@ -841,6 +930,7 @@ def set_proactive(
         ("allow_l3_finish_notify", allow_l3_finish_notify),
         ("allow_open_loop_followup", allow_open_loop_followup),
         ("inner_life_enabled", inner_life_enabled),
+        ("allow_taskbar_inbox", allow_taskbar_inbox),
     ):
         if bval is not None and not isinstance(bval, bool):
             raise ValueError(f"{bname} must be a boolean, got {type(bval).__name__}")
@@ -911,6 +1001,8 @@ def set_proactive(
             next_cfg["allow_open_loop_followup"] = bool(allow_open_loop_followup)
         if inner_life_enabled is not None:
             next_cfg["inner_life_enabled"] = bool(inner_life_enabled)
+        if allow_taskbar_inbox is not None:
+            next_cfg["allow_taskbar_inbox"] = bool(allow_taskbar_inbox)
         return normalize_proactive(next_cfg)
 
     saved = update_runtime_section("proactive", _upd, settings_path=settings_path)
@@ -1076,3 +1168,149 @@ def set_mobile_push(
 
     saved = update_runtime_section("mobile_push", _upd, settings_path=settings_path)
     return dict(saved["mobile_push"])
+
+
+def get_llm_fallback(settings_path: Optional[str] = None) -> Dict[str, Any]:
+    sec = read_runtime_settings(settings_path)["llm_fallback"]
+    return {
+        "enabled": bool(sec["enabled"]),
+        "cooldown_seconds": int(sec["cooldown_seconds"]),
+        "nodes": [dict(n) for n in (sec.get("nodes") or [])],
+    }
+
+
+def set_llm_fallback(
+    *,
+    enabled: Optional[bool] = None,
+    cooldown_seconds: Optional[int] = None,
+    nodes: Optional[list[Dict[str, Any]]] = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be a boolean, got {type(enabled).__name__}")
+    cd_val: Optional[int] = None
+    if cooldown_seconds is not None:
+        if isinstance(cooldown_seconds, bool) or not isinstance(cooldown_seconds, int):
+            raise ValueError("cooldown_seconds must be an integer")
+        if cooldown_seconds < 10 or cooldown_seconds > 600:
+            raise ValueError("cooldown_seconds must be between 10 and 600")
+        cd_val = cooldown_seconds
+    if nodes is not None and not isinstance(nodes, list):
+        raise ValueError("nodes must be a list")
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if enabled is not None:
+            next_cfg["enabled"] = bool(enabled)
+        if cd_val is not None:
+            next_cfg["cooldown_seconds"] = cd_val
+        if nodes is not None:
+            next_cfg["nodes"] = list(nodes)
+        return normalize_llm_fallback(next_cfg)
+
+    saved = update_runtime_section("llm_fallback", _upd, settings_path=settings_path)
+    return get_llm_fallback(settings_path) if saved is None else {
+        "enabled": bool(saved["llm_fallback"]["enabled"]),
+        "cooldown_seconds": int(saved["llm_fallback"]["cooldown_seconds"]),
+        "nodes": [dict(n) for n in (saved["llm_fallback"].get("nodes") or [])],
+    }
+
+
+def get_qq_bot(settings_path: Optional[str] = None) -> Dict[str, Any]:
+    sec = read_runtime_settings(settings_path)["qq_bot"]
+    return {
+        "enabled": bool(sec["enabled"]),
+        "sandbox": bool(sec["sandbox"]),
+        "share_primary_memory": bool(sec["share_primary_memory"]),
+        "memory_device_id": str(sec["memory_device_id"]),
+        "allow_l3_dispatch": bool(sec["allow_l3_dispatch"]),
+        "owner_openid": str(sec["owner_openid"]),
+        "allowed_openids": list(sec["allowed_openids"]),
+        "allowed_group_openids": list(sec["allowed_group_openids"]),
+        "batch_quiet_ms": int(sec.get("batch_quiet_ms", 3500)),
+    }
+
+
+def set_qq_bot(
+    *,
+    enabled: Optional[bool] = None,
+    sandbox: Optional[bool] = None,
+    share_primary_memory: Optional[bool] = None,
+    memory_device_id: Optional[str] = None,
+    allow_l3_dispatch: Optional[bool] = None,
+    owner_openid: Optional[str] = None,
+    allowed_openids: Optional[list[str]] = None,
+    allowed_group_openids: Optional[list[str]] = None,
+    batch_quiet_ms: Optional[int] = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    for name, bval in (
+        ("enabled", enabled),
+        ("sandbox", sandbox),
+        ("share_primary_memory", share_primary_memory),
+        ("allow_l3_dispatch", allow_l3_dispatch),
+    ):
+        if bval is not None and not isinstance(bval, bool):
+            raise ValueError(f"{name} must be a boolean")
+    if memory_device_id is not None and not isinstance(memory_device_id, str):
+        raise ValueError("memory_device_id must be a string")
+    if owner_openid is not None and not isinstance(owner_openid, str):
+        raise ValueError("owner_openid must be a string")
+    if allowed_openids is not None and not isinstance(allowed_openids, list):
+        raise ValueError("allowed_openids must be a list")
+    if allowed_group_openids is not None and not isinstance(allowed_group_openids, list):
+        raise ValueError("allowed_group_openids must be a list")
+    bq_val: Optional[int] = None
+    if batch_quiet_ms is not None:
+        if isinstance(batch_quiet_ms, bool) or not isinstance(batch_quiet_ms, int):
+            raise ValueError("batch_quiet_ms must be an integer")
+        if batch_quiet_ms < 0 or batch_quiet_ms > 15000:
+            raise ValueError("batch_quiet_ms must be between 0 and 15000")
+        bq_val = batch_quiet_ms
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if enabled is not None:
+            next_cfg["enabled"] = bool(enabled)
+        if sandbox is not None:
+            next_cfg["sandbox"] = bool(sandbox)
+        if share_primary_memory is not None:
+            next_cfg["share_primary_memory"] = bool(share_primary_memory)
+        if memory_device_id is not None:
+            next_cfg["memory_device_id"] = str(memory_device_id).strip()[:64]
+        if allow_l3_dispatch is not None:
+            next_cfg["allow_l3_dispatch"] = bool(allow_l3_dispatch)
+        if owner_openid is not None:
+            next_cfg["owner_openid"] = str(owner_openid).strip()[:128]
+        if allowed_openids is not None:
+            next_cfg["allowed_openids"] = list(allowed_openids)
+        if allowed_group_openids is not None:
+            next_cfg["allowed_group_openids"] = list(allowed_group_openids)
+        if bq_val is not None:
+            next_cfg["batch_quiet_ms"] = bq_val
+        return normalize_qq_bot(next_cfg)
+
+    saved = update_runtime_section("qq_bot", _upd, settings_path=settings_path)
+    return dict(saved["qq_bot"])
+
+
+def get_skill_loader(settings_path: Optional[str] = None) -> Dict[str, bool]:
+    return {"enabled": bool(read_runtime_settings(settings_path)["skill_loader"]["enabled"])}
+
+
+def set_skill_loader(
+    *,
+    enabled: Optional[bool] = None,
+    settings_path: Optional[str] = None,
+) -> Dict[str, bool]:
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be a boolean, got {type(enabled).__name__}")
+
+    def _upd(cur: dict) -> dict:
+        next_cfg = dict(cur or {})
+        if enabled is not None:
+            next_cfg["enabled"] = bool(enabled)
+        return normalize_skill_loader(next_cfg)
+
+    saved = update_runtime_section("skill_loader", _upd, settings_path=settings_path)
+    return {"enabled": bool(saved["skill_loader"]["enabled"])}
